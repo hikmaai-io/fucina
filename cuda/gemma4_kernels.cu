@@ -742,7 +742,7 @@ __global__ void sliding_attn_decode_kernel(
     for (int t = 0; t < window_len; t++) {
         int ring_idx = (cursor - window_len + t + window_size) % window_size;
         float k_d = (tid < head_dim)
-            ? k_cache[kv_head * window_size * head_dim + ring_idx * head_dim + tid]
+            ? k_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid]
             : 0.0f;
         float s = q_d * k_d;
         s = block_reduce_sum(s, smem);   // smem[0..31] used here, scores untouched
@@ -769,7 +769,7 @@ __global__ void sliding_attn_decode_kernel(
     if (tid < head_dim) {
         for (int t = 0; t < window_len; t++) {
             int ring_idx = (cursor - window_len + t + window_size) % window_size;
-            float v_d = v_cache[kv_head * window_size * head_dim + ring_idx * head_dim + tid];
+            float v_d = v_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid];
             out += scores[t] * v_d;
         }
         output[q_head * head_dim + tid] = out;
