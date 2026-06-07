@@ -20,9 +20,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-
-namespace cg = cooperative_groups;
-
 // =========================================================================
 // GGUF File Layout
 // =========================================================================
@@ -489,10 +486,7 @@ __global__ void gemv_kernel(
     float sum = 0.0f;
     for (int i = threadIdx.x; i < in_dim; i += blockDim.x)
         sum += decode_weight(row, i, fmt) * x[i];
-    // Use cooperative_groups reduction instead of custom block_reduce
-    namespace cg = cooperative_groups;
-    cg::thread_block tb = cg::this_thread_block();
-    sum = cg::reduce(tb, sum, cg::plus<float>());
+    // Use cooperative_groups reduction instead of custom block_reduce    sum = block_reduce_sum(sum, smem);
     if (threadIdx.x == 0) out[idx] = sum;
 }
 
@@ -507,10 +501,7 @@ __global__ void gemv_pair_kernel(
     int             out_dim,
     int             fmt)
 {
-    extern __shared__ float smem[];
-    namespace cg = cooperative_groups;
-    cg::thread_block tb = cg::this_thread_block();
-    int idx = blockIdx.x;
+    extern __shared__ float smem[];    int idx = blockIdx.x;
     if (idx >= out_dim) return;
     size_t row_bytes = fmt == 0 ? in_dim : (size_t)(in_dim/32)*34;
     const uint8_t *rg = weight_gate + (size_t)idx * row_bytes;
@@ -521,8 +512,8 @@ __global__ void gemv_pair_kernel(
         sg += decode_weight(rg, i, fmt) * xi;
         su += decode_weight(ru, i, fmt) * xi;
     }
-    sg = cg::reduce(tb, sg, cg::plus<float>());
-    su = cg::reduce(tb, su, cg::plus<float>());
+    sg = block_reduce_sum(sg, smem);
+    su = block_reduce_sum(su, smem);
     if (threadIdx.x == 0) { out_gate[idx] = sg; out_up[idx] = su; }
 }
 
@@ -602,8 +593,8 @@ __global__ void gemv_lora_pair_kernel(
         sg += decode_weight(rg, i, fmt) * xi;
         su += decode_weight(ru, i, fmt) * xi;
     }
-    sg = cg::reduce(tb, sg, cg::plus<float>());
-    su = cg::reduce(tb, su, cg::plus<float>());
+    sg = block_reduce_sum(sg, smem);
+    su = block_reduce_sum(su, smem);
 
     float lg = 0.0f, lu = 0.0f;
     if (lora_scale != 0.0f) {
