@@ -162,6 +162,18 @@ int gemma4_engine_decode_batched(
     float           *logits_out      // [K × VOCAB_SIZE]
 );
 
+// Greedy generation with prompt-lookup speculative decoding. Forwards [g,draft...]
+// per step in one weight pass; (1+accepted) tokens per ~one token's bandwidth.
+// Fills out_tokens (≤ max_new); returns count generated; *n_accepted_out (or NULL)
+// gets the total drafts accepted. draft_k ≤ GEMMA4_SPEC_MAX-1.
+int gemma4_engine_generate_spec(
+    gemma4_engine_t *eng,
+    const int32_t   *prompt, int n_prompt,
+    int32_t         *out_tokens, int max_new,
+    const int32_t   *stop_ids, int n_stop,
+    int              draft_k,
+    int             *n_accepted_out);
+
 // Speculative verify batch: verify K draft tokens in parallel
 // Returns number of accepted tokens (0..K)
 int gemma4_engine_verify_batch(

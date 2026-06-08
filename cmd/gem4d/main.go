@@ -69,6 +69,8 @@ type CLIArgs struct {
 	Predict     int
 	Keep        int
 	NoDisplay   bool
+	Spec        bool
+	DraftK      int
 
 	// Server
 	Host    string
@@ -107,6 +109,8 @@ func parseFlags() CLIArgs {
 	flag.IntVar(&a.Threads, "threads", 8, "Number of CPU threads for preprocessing")
 	flag.BoolVar(&a.FlashAttn, "flash-attn", true, "Use Flash Attention")
 
+	flag.BoolVar(&a.Spec, "spec", true, "Prompt-lookup speculative decoding (greedy/temp=0 only)")
+	flag.IntVar(&a.DraftK, "draft-k", 6, "Max speculative draft length per step")
 	flag.Float64Var(&a.Temperature, "temp", 0.8, "Sampling temperature")
 	flag.IntVar(&a.TopK, "top-k", 40, "Top-K sampling")
 	flag.Float64Var(&a.TopP, "top-p", 0.95, "Top-P sampling")
@@ -297,6 +301,36 @@ func main() {
 		// Tokenize
 		tokens := tok.Encode(prompt, true, false)
 		log.Printf("gem4d: prompt has %d tokens", len(tokens))
+
+		// Greedy + spec enabled → prompt-lookup speculative decode (one weight pass
+		// per [g, draft...]; produces the exact same tokens as plain greedy decode).
+		if args.Spec && args.Temperature <= 0 {
+			nToGen := args.Predict
+			if nToGen < 0 {
+				nToGen = 512
+			}
+			stops := []int32{tok.EOS, tok.EndOfTurn}
+			genStart := time.Now()
+			out, nAccepted, err := eng.GenerateSpec(tokens, nToGen, stops, args.DraftK)
+			if err != nil {
+				log.Fatalf("gem4d: spec generate failed: %v", err)
+			}
+			genElapsed := time.Since(genStart)
+			fmt.Print(prompt)
+			for _, t := range out {
+				if tok.IsStop(t) {
+					break
+				}
+				fmt.Print(tok.Decode([]int32{t}))
+			}
+			fmt.Println()
+			genTPS := float64(len(out)) / genElapsed.Seconds()
+			log.Printf("gem4d: [spec] generated %d tokens in %.2fs (%.1f tok/s), "+
+				"%d drafts accepted (avg %.2f tokens/step, draft-k=%d)",
+				len(out), genElapsed.Seconds(), genTPS, nAccepted,
+				float64(len(out))/float64(max(1, len(out)-nAccepted)), args.DraftK)
+			return
+		}
 
 		// Prefill directly (bypass KVCache to isolate any cache bugs)
 		prefillStart := time.Now()

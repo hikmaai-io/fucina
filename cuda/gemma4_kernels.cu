@@ -3226,6 +3226,134 @@ int gemma4_engine_verify_batch(
 }
 
 // =========================================================================
+// ─── Greedy Speculative Decode (prompt-lookup) ──────────────────────────
+// =========================================================================
+
+// Longest-suffix n-gram draft: find the most recent earlier occurrence of the
+// current suffix of hist[0..n-1] (lengths max_ng..min_ng) and propose the up-to
+// max_d tokens that followed it. Zero model cost. Returns the draft length.
+static int prompt_lookup_draft(const int32_t *hist, int n, int32_t *draft,
+                               int max_d, int min_ng, int max_ng)
+{
+    if (max_d <= 0) return 0;
+    for (int ng = max_ng; ng >= min_ng; ng--) {
+        if (n < ng + 1) continue;
+        const int32_t *suf = hist + n - ng;
+        for (int i = n - ng - 1; i >= 0; i--) {
+            int match = 1;
+            for (int j = 0; j < ng; j++) if (hist[i+j] != suf[j]) { match = 0; break; }
+            if (!match) continue;
+            int d = 0;
+            for (int j = i + ng; j < n && d < max_d; j++) draft[d++] = hist[j];
+            if (d > 0) return d;
+        }
+    }
+    return 0;
+}
+
+// Greedy generation with prompt-lookup speculative decoding. Each step forwards
+// [g, draft...] in ONE weight pass (gemma4_engine_decode_batched), commits the
+// confirmed prefix, and gets the next step's logits for free from the same pass —
+// so a matched draft of length a yields (1+a) tokens per ~one token's bandwidth.
+// Greedy/argmax only (exact: accepted iff the model's argmax equals the draft).
+// Draft length is capped to keep the partial-accept KV rollback inside the sliding
+// window (full speedup for the first ~window tokens; plain decode beyond).
+// Fills out_tokens (≤ max_new), returns the count generated. n_accepted_out (or
+// NULL) receives the total drafts accepted (for measuring the acceptance rate).
+int gemma4_engine_generate_spec(
+    gemma4_engine_t *eng,
+    const int32_t   *prompt, int n_prompt,
+    int32_t         *out_tokens, int max_new,
+    const int32_t   *stop_ids, int n_stop,
+    int              draft_k,
+    int             *n_accepted_out)
+{
+    if (!eng || !eng->loaded || n_prompt <= 0 || max_new <= 0) return -1;
+    if (draft_k > GEMMA4_SPEC_MAX - 1) draft_k = GEMMA4_SPEC_MAX - 1;
+    int V = GEMMA4_VOCAB_SIZE;
+
+    int cap = n_prompt + max_new + 8;
+    int32_t *hist = (int32_t*)malloc((size_t)cap*sizeof(int32_t));
+    float   *logits = (float*)malloc((size_t)V*sizeof(float));
+    float   *Lbuf = (float*)malloc((size_t)(draft_k+1)*V*sizeof(float));
+    int32_t  batch[GEMMA4_SPEC_MAX];
+    if (!hist || !logits || !Lbuf) { free(hist); free(logits); free(Lbuf); return -1; }
+
+    auto is_stop = [&](int t){ for (int s=0;s<n_stop;s++) if (stop_ids[s]==t) return 1; return 0; };
+
+    memcpy(hist, prompt, (size_t)n_prompt*sizeof(int32_t));
+    int n = n_prompt;
+
+    // Prefill the prompt → logits predicting the first generated token.
+    if (gemma4_engine_prefill(eng, prompt, n_prompt, logits) != 0) {
+        free(hist); free(logits); free(Lbuf); return -1;
+    }
+
+    // Adaptive speculation: track the accepted-fraction EMA and stop drafting when
+    // it falls low (novel text where prompt-lookup mostly misses), re-probing every
+    // PROBE steps so a workload that turns copy-heavy resumes speculating. This caps
+    // the wrong-draft overhead so spec never meaningfully regresses vs plain greedy.
+    const float SPEC_ON = 0.45f;   // need a healthy hit rate to keep drafting
+    const int   PROBE   = 64;      // re-probe rarely so misses stay cheap
+    float ema = 1.0f;          // optimistic start
+    int   since_probe = 0;
+
+    int generated = 0, total_accepted = 0, stop = 0;
+    while (generated < max_new && !stop) {
+        int g = gemma4_sample_argmax(logits, V);
+        out_tokens[generated++] = g; hist[n++] = g;
+        if (is_stop(g)) break;
+
+        int pos = eng->global_n_tokens;                 // g not yet in the cache
+        int room = GEMMA4_SLIDING_WINDOW - 1 - pos;      // keep rollback inside the window
+        int want_spec = (ema > SPEC_ON) || (since_probe >= PROBE);
+        int maxd = want_spec ? draft_k : 0;
+        if (maxd > room) maxd = room; if (maxd < 0) maxd = 0;
+        if (generated + 1 >= max_new) maxd = 0;          // no point drafting past the budget
+
+        int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k);
+
+        // No n-gram match → nothing to speculate. Use the fast single-token decode
+        // (avoids decode_batched's per-call allocation/sync overhead), so spec is
+        // never slower than plain greedy on novel text — only the matched-but-wrong
+        // drafts cost anything, and a matched-and-right draft is the win.
+        if (D == 0) {
+            if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
+            since_probe++;
+            continue;
+        }
+
+        batch[0] = g;
+        int K = D + 1;
+        if (gemma4_engine_decode_batched(eng, batch, K, Lbuf) != 0) {
+            if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
+            continue;
+        }
+
+        // Accept the longest draft prefix whose predecessor's argmax matches it.
+        int a = 0;
+        while (a < D && gemma4_sample_argmax(Lbuf + (size_t)a*V, V) == batch[1+a]) a++;
+        total_accepted += a;
+        ema = 0.6f*ema + 0.4f*((float)a/(float)D);    // update acceptance estimate
+        since_probe = 0;
+
+        // Discard the rejected drafts from the KV cache (keep g + a accepted).
+        int keep = pos + 1 + a;
+        if (keep < eng->global_n_tokens) gemma4_engine_rewind(eng, keep);
+
+        for (int i = 0; i < a && generated < max_new; i++) {
+            int t = batch[1+i]; out_tokens[generated++] = t; hist[n++] = t;
+            if (is_stop(t)) { stop = 1; break; }
+        }
+        memcpy(logits, Lbuf + (size_t)a*V, (size_t)V*sizeof(float));  // next-step logits, free
+    }
+
+    if (n_accepted_out) *n_accepted_out = total_accepted;
+    free(hist); free(logits); free(Lbuf);
+    return generated;
+}
+
+// =========================================================================
 // ─── Sampling ───────────────────────────────────────────────────────────
 // =========================================================================
 

@@ -188,6 +188,34 @@ func (e *Engine) Decode(token int32) ([]float32, error) {
 	return logits, nil
 }
 
+// GenerateSpec runs greedy generation with prompt-lookup speculative decoding.
+// It prefills `prompt` internally and generates up to maxNew tokens, stopping at
+// any id in stops. Returns the generated tokens and the total number of drafts
+// accepted (for measuring the acceptance rate). Greedy/argmax only — produces the
+// exact same tokens as a plain greedy decode, just faster on context-reusing text.
+func (e *Engine) GenerateSpec(prompt []int32, maxNew int, stops []int32, draftK int) ([]int32, int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	out := make([]int32, maxNew)
+	var nacc C.int
+	var stopsPtr *C.int32_t
+	if len(stops) > 0 {
+		stopsPtr = (*C.int32_t)(unsafe.Pointer(&stops[0]))
+	}
+	ng := C.gemma4_engine_generate_spec(
+		e.ptr,
+		(*C.int32_t)(unsafe.Pointer(&prompt[0])), C.int(len(prompt)),
+		(*C.int32_t)(unsafe.Pointer(&out[0])), C.int(maxNew),
+		stopsPtr, C.int(len(stops)),
+		C.int(draftK), &nacc,
+	)
+	if ng < 0 {
+		return nil, 0, fmt.Errorf("gem4d: generate_spec failed")
+	}
+	return out[:ng], int(nacc), nil
+}
+
 // Argmax returns the index of the highest value in logits.
 func Argmax(logits []float32) int {
 	return int(C.gemma4_sample_argmax(
