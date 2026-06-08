@@ -1008,6 +1008,88 @@ __global__ void global_attn_decode_kernel(
 }
 
 // =========================================================================
+// ─── Token-tree attention (speculative tree verify) ─────────────────────
+// =========================================================================
+// Each tree node attends over the FROZEN committed cache PLUS only its ANCESTOR
+// draft nodes (its root→self path), never sibling branches — so attention is not
+// position-causal but follows the tree. Implemented as the flash decode kernel
+// over the committed cache, then the SAME online-softmax accumulators continued
+// over the node's ancestor draft K/V (fp32 scratch dk/dv, NOT in the ring). Exact;
+// scale 1.0. dk/dv layout [node][n_kv_heads*head_dim]. anc[0..n_anc) = ancestor
+// draft-node indices (path incl. self). One block per (node,head): launch per node.
+
+__global__ void sliding_tree_attn_kernel(
+    float *output, const float *q,
+    const kv_t *k_cache, const kv_t *v_cache,
+    int n_heads, int n_kv_heads, int head_dim, int window_size, int cursor, int filled,
+    const float *dk, const float *dv, const int *anc, int n_anc, int okv)
+{
+    extern __shared__ float smem[];
+    int q_head  = blockIdx.x;
+    int kv_head = q_head / (n_heads / n_kv_heads);
+    int tid     = threadIdx.x;
+    int window_len = min(filled, window_size);
+
+    float q_d = (tid < head_dim) ? q[q_head * head_dim + tid] : 0.0f;
+    float acc = 0.0f, m = -INFINITY, l = 0.0f;
+
+    for (int t = 0; t < window_len; t++) {                       // committed window
+        int ring_idx = (cursor - window_len + t + window_size) % window_size;
+        float k_d = (tid < head_dim)
+            ? fp8_to_float(k_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid]) : 0.0f;
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float m_new = fmaxf(m, s), alpha = __expf(m - m_new), p = __expf(s - m_new);
+        l = l * alpha + p;
+        float v_d = (tid < head_dim)
+            ? fp8_to_float(v_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid]) : 0.0f;
+        acc = acc * alpha + p * v_d; m = m_new;
+    }
+    for (int a = 0; a < n_anc; a++) {                            // ancestor draft nodes
+        int j = anc[a];
+        float k_d = (tid < head_dim) ? dk[(size_t)j*okv + kv_head*head_dim + tid] : 0.0f;
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float m_new = fmaxf(m, s), alpha = __expf(m - m_new), p = __expf(s - m_new);
+        l = l * alpha + p;
+        float v_d = (tid < head_dim) ? dv[(size_t)j*okv + kv_head*head_dim + tid] : 0.0f;
+        acc = acc * alpha + p * v_d; m = m_new;
+    }
+    if (tid < head_dim)
+        output[q_head * head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
+}
+
+__global__ void global_tree_attn_kernel(
+    float *output, const float *q,
+    const kv_t *k_cache, const kv_t *v_cache,
+    int n_heads, int head_dim, int ctx_len,
+    const float *dk, const float *dv, const int *anc, int n_anc, int okv)
+{
+    extern __shared__ float smem[];
+    int q_head = blockIdx.x, tid = threadIdx.x;
+    float q_d = (tid < head_dim) ? q[q_head * head_dim + tid] : 0.0f;
+    float acc = 0.0f, m = -INFINITY, l = 0.0f;
+
+    for (int t = 0; t < ctx_len; t++) {                          // committed context
+        float k_d = (tid < head_dim) ? fp8_to_float(k_cache[t * head_dim + tid]) : 0.0f;
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float m_new = fmaxf(m, s), alpha = __expf(m - m_new), p = __expf(s - m_new);
+        l = l * alpha + p;
+        float v_d = (tid < head_dim) ? fp8_to_float(v_cache[t * head_dim + tid]) : 0.0f;
+        acc = acc * alpha + p * v_d; m = m_new;
+    }
+    for (int a = 0; a < n_anc; a++) {                            // ancestor draft nodes
+        int j = anc[a];
+        float k_d = (tid < head_dim) ? dk[(size_t)j*okv + tid] : 0.0f;   // n_kv_heads==1
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float m_new = fmaxf(m, s), alpha = __expf(m - m_new), p = __expf(s - m_new);
+        l = l * alpha + p;
+        float v_d = (tid < head_dim) ? dv[(size_t)j*okv + tid] : 0.0f;
+        acc = acc * alpha + p * v_d; m = m_new;
+    }
+    if (tid < head_dim)
+        output[q_head * head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
+}
+
+// =========================================================================
 // ─── Batched-prefill kernels (Step 2 Phase 2 + Step 3 attention) ────────
 // =========================================================================
 // Token-major "rows" variants of decode_layer's elementwise steps, plus a
@@ -1137,6 +1219,37 @@ __global__ void rope_rows_kernel(
         float k0 = kh[d], k1 = kh[d + half];
         kh[d] = k0 * c - k1 * s;  kh[d + half] = k0 * s + k1 * c;
     }
+}
+
+// RoPE variant taking a per-row position array (row_pos[row] = absolute position),
+// for token-tree decode where a node's position is base_pos + depth (NOT base_pos + row).
+__global__ void rope_rows_pos_kernel(
+    float *q, float *k, const int *row_pos, int n_heads, int n_kv_heads,
+    int head_dim, int rows, float theta_base, const float *freq_factors)
+{
+    int d = threadIdx.x, half = head_dim / 2;
+    if (d >= half) return;
+    int head = blockIdx.x, row = blockIdx.y;
+    if (row >= rows) return;
+    int pos = row_pos[row];
+    float ff    = freq_factors ? freq_factors[d] : 1.0f;
+    float theta = powf(theta_base, -2.0f * d / head_dim) / ff;
+    float c = cosf(pos * theta), s = sinf(pos * theta);
+    float *qh = q + ((size_t)row * n_heads + head) * head_dim;
+    float q0 = qh[d], q1 = qh[d + half];
+    qh[d] = q0 * c - q1 * s;  qh[d + half] = q0 * s + q1 * c;
+    if (head < n_kv_heads) {
+        float *kh = k + ((size_t)row * n_kv_heads + head) * head_dim;
+        float k0 = kh[d], k1 = kh[d + half];
+        kh[d] = k0 * c - k1 * s;  kh[d + half] = k0 * s + k1 * c;
+    }
+}
+
+// Copy one draft node's K/V (fp32) into the row-major shadow at [node]. Used to stash
+// per-layer tree K/V for committing the accepted path after verify. n = okv elements.
+__global__ void copy_rows_kernel(float *dst, const float *src, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
 }
 
 // Masked row-softmax over a col-major score matrix S [N×N] (S[i + j*N] = score of
@@ -1437,6 +1550,15 @@ struct gemma4_engine {
     // tok, x, norm, inf, q, k, v, attn, o, gate, up, logitsK.
     float  *d_sb[12];
     int     sb_ready;
+    // Token-tree speculative scratch (decode_tree). Per-layer shadow of all K draft
+    // nodes' post-RoPE K/V (fp32), so committed KV stays frozen during the tree forward
+    // and the accepted path is committed afterward without a sliding-ring overwrite.
+    float  *d_tree_k[GEMMA4_MAX_LAYERS];   // [SPEC_MAX × max_okv] per layer
+    float  *d_tree_v[GEMMA4_MAX_LAYERS];
+    int    *d_anc;             // [SPEC_MAX × SPEC_MAX] flattened per-node ancestor paths
+    int    *d_anc_off;         // [SPEC_MAX + 1] offsets into d_anc
+    int    *d_treepos;         // [SPEC_MAX] absolute RoPE position per node (pos+depth)
+    int     tree_ready;
     int    *d_sample_id;       // 4-byte device scratch for GPU-side sampled token id
     int8_t *d_qx;              // [GEMMA4_INTERMEDIATE] int8 activation for dp4a MMVQ
     float  *d_dx;              // [GEMMA4_INTERMEDIATE/32] per-block activation scales
@@ -2216,6 +2338,13 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
         CUDA_FREE(eng->d_bf16_layer[p]);
     for (int p = 0; p < 12; p++)
         CUDA_FREE(eng->d_sb[p]);
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        CUDA_FREE(eng->d_tree_k[l]);
+        CUDA_FREE(eng->d_tree_v[l]);
+    }
+    CUDA_FREE(eng->d_anc);
+    CUDA_FREE(eng->d_anc_off);
+    CUDA_FREE(eng->d_treepos);
     CUDA_FREE(eng->d_sample_id);
     CUDA_FREE(eng->d_qx);
     CUDA_FREE(eng->d_dx);
@@ -3357,6 +3486,199 @@ int gemma4_engine_decode_batched(
 }
 
 // =========================================================================
+// ─── Token-tree speculative decode ──────────────────────────────────────
+// =========================================================================
+
+static int ensure_tree_scratch(gemma4_engine_t *eng)
+{
+    if (eng->tree_ready) return 0;
+    const size_t M = GEMMA4_SPEC_MAX;
+    const size_t MAXOKV = (size_t)GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM; // 2048 ≥ global 512
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        if (cudaMalloc(&eng->d_tree_k[l], M*MAXOKV*sizeof(float)) != cudaSuccess) return -1;
+        if (cudaMalloc(&eng->d_tree_v[l], M*MAXOKV*sizeof(float)) != cudaSuccess) return -1;
+    }
+    if (cudaMalloc(&eng->d_anc,     M*M*sizeof(int))   != cudaSuccess) return -1;
+    if (cudaMalloc(&eng->d_anc_off, (M+1)*sizeof(int)) != cudaSuccess) return -1;
+    if (cudaMalloc(&eng->d_treepos, M*sizeof(int))     != cudaSuccess) return -1;
+    eng->tree_ready = 1;
+    return 0;
+}
+
+// Forward a draft TREE of K nodes in ONE weight pass. tokens[K] = node tokens (BFS
+// order, parent before child); depth[K] = node depth (root's children are depth 0);
+// anc_flat/anc_off describe each node's ancestor path (indices into [0,K), INCLUDING
+// self, root-first). Attention is tree-masked: every node attends the FROZEN committed
+// cache plus only its ancestors. State is NOT advanced; each layer's node K/V is stashed
+// in d_tree_k/v[l] so commit_tree can write the accepted path afterward. Writes
+// logits_out[K*VOCAB] (row i = distribution AFTER node i). Returns 0 / -2 (LoRA) / -1.
+static int gemma4_engine_decode_tree(
+    gemma4_engine_t *eng, const int32_t *tokens, const int *depth,
+    const int *anc_flat, const int *anc_off, int K, float *logits_out)
+{
+    if (!eng->loaded || K <= 0) return -1;
+    if (eng->lora_loaded) return -2;
+    if (K > GEMMA4_SPEC_MAX) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_tree_scratch(eng) != 0) return -1;
+
+    cudaStream_t stream = eng->stream;
+    const int H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE;
+    const int HD2 = 32 * sizeof(float), HEADS = GEMMA4_HEADS;
+    const int pos = eng->global_n_tokens;                 // committed length (frozen)
+    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+
+    int32_t *d_tok = (int32_t*)eng->d_sb[0];
+    float *d_x   = eng->d_sb[1],  *d_norm = eng->d_sb[2], *d_inf = eng->d_sb[3];
+    float *d_q   = eng->d_sb[4],  *d_k    = eng->d_sb[5], *d_v   = eng->d_sb[6];
+    float *d_attn= eng->d_sb[7],  *d_o    = eng->d_sb[8], *d_gate= eng->d_sb[9];
+    float *d_up  = eng->d_sb[10], *d_logitsK = eng->d_sb[11];
+
+    // Per-node absolute RoPE positions = pos + depth[i].
+    int h_treepos[GEMMA4_SPEC_MAX];
+    for (int i = 0; i < K; i++) h_treepos[i] = pos + depth[i];
+    cudaMemcpyAsync(d_tok, tokens, (size_t)K*sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(eng->d_treepos, h_treepos, (size_t)K*sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(eng->d_anc, anc_flat, (size_t)anc_off[K]*sizeof(int), cudaMemcpyHostToDevice, stream);
+
+    embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, K, H, stream);
+    scale_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, K*H, sqrtf((float)H));
+
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        layer_type_t lt = eng->layer_types[l];
+        int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+        int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+        int oq  = HEADS*hd, okv = nkv*hd;
+        const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
+        const float *w_post_a = eng->d_w_post_attn_norm + (size_t)l*H;
+        const float *w_ffn    = eng->d_w_ffn_norm       + (size_t)l*H;
+        const float *w_post_f = eng->d_w_post_ffn_norm  + (size_t)l*H;
+        const float *w_qn     = eng->d_w_q_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+        const float *w_kn     = eng->d_w_k_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+        const __typeof__(eng->tensors.layers[0]) *L = &eng->tensors.layers[l];
+
+        rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_inf, d_x, w_attn, H, K, GEMMA4_RMS_EPS);
+        gemv_batched_w(eng, d_q, weight_fp8(eng, L->attn_q), d_inf, H, oq, K, stream);
+        per_head_rms_norm_rows_kernel<<<dim3(HEADS,K),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, K, GEMMA4_RMS_EPS);
+        gemv_batched_w(eng, d_k, weight_fp8(eng, L->attn_k), d_inf, H, okv, K, stream);
+        if (lt == LAYER_SLIDING) {
+            gemv_batched_w(eng, d_v, weight_fp8(eng, L->attn_v), d_inf, H, okv, K, stream);
+        } else {
+            cudaMemcpyAsync(d_v, d_k, (size_t)K*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        }
+        per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_v, NULL, nkv, hd, K, GEMMA4_RMS_EPS);
+        per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, K, GEMMA4_RMS_EPS);
+
+        float theta = (lt==LAYER_SLIDING)? 10000.0f : 1000000.0f;
+        const float *ff = (lt==LAYER_SLIDING)? NULL : eng->d_rope_freqs;
+        rope_rows_pos_kernel<<<dim3(HEADS,K),hd/2,0,stream>>>(d_q, d_k, eng->d_treepos, HEADS, nkv, hd, K, theta, ff);
+
+        // Stash this layer's node K/V (post-RoPE) for committing the accepted path later.
+        cudaMemcpyAsync(eng->d_tree_k[l], d_k, (size_t)K*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(eng->d_tree_v[l], d_v, (size_t)K*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+
+        // Tree-masked attention: committed cache (frozen) + this node's ancestors.
+        const int smemA = 32 * (int)sizeof(float);
+        if (lt == LAYER_SLIDING) {
+            size_t lstride = (size_t)GEMMA4_SLIDING_WINDOW * okv;
+            kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
+            kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
+            int cur = eng->sliding_cursor[l], fil = eng->sliding_filled[l];
+            for (int i = 0; i < K; i++)
+                sliding_tree_attn_kernel<<<HEADS, hd, smemA, stream>>>(
+                    d_attn + (size_t)i*oq, d_q + (size_t)i*oq, kc, vc,
+                    HEADS, nkv, hd, GEMMA4_SLIDING_WINDOW, cur, fil,
+                    d_k, d_v, eng->d_anc + anc_off[i], anc_off[i+1]-anc_off[i], okv);
+        } else {
+            int slot = eng->global_slot[l];
+            size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+            kv_t *kc = eng->d_global_k + (size_t)slot*lstride;
+            kv_t *vc = eng->d_global_v + (size_t)slot*lstride;
+            for (int i = 0; i < K; i++)
+                global_tree_attn_kernel<<<HEADS, hd, smemA, stream>>>(
+                    d_attn + (size_t)i*oq, d_q + (size_t)i*oq, kc, vc,
+                    HEADS, hd, pos, d_k, d_v, eng->d_anc + anc_off[i], anc_off[i+1]-anc_off[i], okv);
+        }
+
+        gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, K, stream);
+        rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_a, H, K, GEMMA4_RMS_EPS);
+        residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
+
+        rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_inf, d_x, w_ffn, H, K, GEMMA4_RMS_EPS);
+        gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, K, stream);
+        gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, K, stream);
+        geglu_kernel<<<grid1d((size_t)K*I),256,0,stream>>>(d_inf, d_gate, d_up, K*I);
+        gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, K, stream);
+        rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_f, H, K, GEMMA4_RMS_EPS);
+        residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
+        if (eng->h_out_scale[l] != 1.0f)
+            scale_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, K*H, eng->h_out_scale[l]);
+    }
+
+    int vocab = GEMMA4_VOCAB_SIZE;
+    rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, K, GEMMA4_RMS_EPS);
+    gemv_batched_w(eng, d_logitsK, weight_fp8(eng, eng->tensors.output_weight), d_norm, H, vocab, K, stream);
+    logit_softcap_kernel<<<grid1d((size_t)K*vocab),256,0,stream>>>(d_logitsK, GEMMA4_SOFTCAP, K*vocab);
+    if (eng->n_suppress > 0)
+        for (int i = 0; i < K; i++)
+            suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
+                d_logitsK + (size_t)i*vocab, eng->d_suppress, eng->n_suppress, vocab);
+    if (logits_out)
+        cudaMemcpyAsync(logits_out, d_logitsK, (size_t)K*vocab*sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gem4d: decode_tree CUDA error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Commit the accepted path (a nodes; path[p] is the node at depth p) into the real KV
+// cache at committed positions pos..pos+a-1, advancing state by a. Reads the per-layer
+// node K/V stashed by decode_tree.
+static int gemma4_engine_commit_tree(gemma4_engine_t *eng, const int *path, int a)
+{
+    if (a <= 0) return 0;
+    cudaStream_t stream = eng->stream;
+    const int pos = eng->global_n_tokens;
+    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        layer_type_t lt = eng->layer_types[l];
+        int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+        int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+        int okv = nkv*hd;
+        if (lt == LAYER_SLIDING) {
+            size_t lstride = (size_t)GEMMA4_SLIDING_WINDOW * okv;
+            kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
+            kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
+            for (int p = 0; p < a; p++) {
+                int node = path[p], cur = eng->sliding_cursor[l];
+                kv_write_sliding_kernel<<<dim3(grid1d(okv),1),256,0,stream>>>(
+                    kc, vc, eng->d_tree_k[l] + (size_t)node*okv, eng->d_tree_v[l] + (size_t)node*okv,
+                    cur, 0, 1, okv, GEMMA4_SLIDING_WINDOW);
+                eng->sliding_cursor[l] = (cur + 1) % GEMMA4_SLIDING_WINDOW;
+                if (eng->sliding_filled[l] < GEMMA4_SLIDING_WINDOW) eng->sliding_filled[l]++;
+            }
+        } else {
+            int slot = eng->global_slot[l];
+            size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+            kv_t *kc = eng->d_global_k + (size_t)slot*lstride;
+            kv_t *vc = eng->d_global_v + (size_t)slot*lstride;
+            for (int p = 0; p < a; p++) {
+                int node = path[p];
+                kv_write_global_kernel<<<dim3(grid1d(hd),1),256,0,stream>>>(
+                    kc, vc, eng->d_tree_k[l] + (size_t)node*okv, eng->d_tree_v[l] + (size_t)node*okv,
+                    pos + p, 1, hd);
+            }
+        }
+    }
+    eng->global_n_tokens += a;
+    cudaStreamSynchronize(stream);
+    return 0;
+}
+
+// =========================================================================
 // ─── Verification Batch ─────────────────────────────────────────────────
 // =========================================================================
 
@@ -3536,6 +3858,94 @@ static inline double spec_rng(uint64_t *s) {
 // `hist` holds the token history (prompt + room for max_new); `n` is its current
 // length; `logits` predicts the next position. Returns the count appended to
 // out_tokens; *n_accepted_out (or NULL) gets the total drafts accepted.
+// Build a speculative TREE from prompt-lookup. Node 0 = g (the confirmed token,
+// forwarded at the current position); its descendants are the recurring continuations.
+// Finds the longest recurring suffix (which ends at g), then BFS-expands the top-B
+// continuations at each divergence (frequency-weighted) up to max_nodes / max_depth.
+// Fills tokens/depth/parent (BFS order, parent before child) + ancestor CSR
+// (anc_flat/anc_off, root-first incl self). Returns node count K (≥1). B==1 ⇒ the
+// tree is exactly the linear consensus draft with g prepended.
+static int build_token_tree(
+    const int32_t *hist, int n, int32_t g, int min_ng, int max_ng,
+    int max_nodes, int max_depth, int B,
+    int32_t *tokens, int *depth, int *parent, int *anc_flat, int *anc_off)
+{
+    enum { MAX_OCC = 16 };
+    struct QItem { unsigned mask; int off; int parent_node; };
+    tokens[0] = g; depth[0] = 0; parent[0] = -1;
+    int K = 1;
+    if (max_nodes >= 2 && max_depth >= 1) {
+        int occ[MAX_OCC], nocc = 0;
+        for (int ng = max_ng; ng >= min_ng; ng--) {
+            if (n < ng + 1) continue;
+            const int32_t *suf = hist + n - ng;        // suffix ends at g (hist[n-1]==g)
+            nocc = 0;
+            for (int i = n - ng - 1; i >= 0 && nocc < MAX_OCC; i--) {
+                int match = 1;
+                for (int j = 0; j < ng; j++) if (hist[i+j] != suf[j]) { match = 0; break; }
+                if (match) occ[nocc++] = i + ng;       // continuation position after match
+            }
+            if (nocc > 0) break;
+        }
+        if (nocc > 0) {
+            if (max_nodes > GEMMA4_SPEC_MAX) max_nodes = GEMMA4_SPEC_MAX;
+            QItem queue[GEMMA4_SPEC_MAX + 1];
+            int qh = 0, qt = 0;
+            unsigned all = (nocc >= 32) ? 0xffffffffu : ((1u << nocc) - 1u);
+            QItem root; root.mask = all; root.off = 0; root.parent_node = 0;
+            queue[qt++] = root;                        // children of root g
+            while (qh < qt && K < max_nodes) {
+                QItem it = queue[qh++];
+                if (it.off >= max_depth) continue;
+                int cand_tok[MAX_OCC], cand_cnt[MAX_OCC], ncand = 0;
+                for (int b = 0; b < nocc; b++) {
+                    if (!(it.mask & (1u<<b))) continue;
+                    int p = occ[b] + it.off;
+                    if (p >= n) continue;
+                    int t = hist[p], f = -1;
+                    for (int c = 0; c < ncand; c++) if (cand_tok[c]==t){ f=c; break; }
+                    if (f < 0){ cand_tok[ncand]=t; cand_cnt[ncand]=1; ncand++; }
+                    else cand_cnt[f]++;
+                }
+                // Selective branching: always take the top continuation; add the 2nd
+                // ONLY at a genuine near-tie (2nd count ≥ half the top's). A K-node verify
+                // cost scales with K on this GPU, so unconditional branching loses — fork
+                // only where the model is actually likely to diverge from the top draft.
+                for (int sel = 0; sel < B && sel < ncand && K < max_nodes; sel++) {
+                    int best = sel;                    // selection-sort top-B by count
+                    for (int c = sel+1; c < ncand; c++) if (cand_cnt[c] > cand_cnt[best]) best = c;
+                    int tt=cand_tok[sel]; cand_tok[sel]=cand_tok[best]; cand_tok[best]=tt;
+                    int cc=cand_cnt[sel]; cand_cnt[sel]=cand_cnt[best]; cand_cnt[best]=cc;
+                    if (sel >= 1 && cand_cnt[sel]*2 < cand_cnt[0]) break;   // not a near-tie
+                    int t = cand_tok[sel], node = K++;
+                    tokens[node] = t; parent[node] = it.parent_node;
+                    depth[node]  = depth[it.parent_node] + 1;
+                    unsigned cm = 0;
+                    for (int b = 0; b < nocc; b++) {
+                        if (!(it.mask & (1u<<b))) continue;
+                        int p = occ[b] + it.off;
+                        if (p < n && hist[p] == t) cm |= (1u<<b);
+                    }
+                    if (qt <= GEMMA4_SPEC_MAX) {
+                        QItem ch; ch.mask = cm; ch.off = it.off+1; ch.parent_node = node;
+                        queue[qt++] = ch;
+                    }
+                }
+            }
+        }
+    }
+
+    int off = 0;                                       // ancestor CSR (root-first, incl self)
+    for (int i = 0; i < K; i++) {
+        anc_off[i] = off;
+        int tmp[GEMMA4_SPEC_MAX], m = 0;
+        for (int x = i; x >= 0; x = parent[x]) tmp[m++] = x;
+        for (int j = m - 1; j >= 0; j--) anc_flat[off++] = tmp[j];
+    }
+    anc_off[K] = off;
+    return K;
+}
+
 static int run_spec_loop(
     gemma4_engine_t *eng, int32_t *hist, int n, float *logits,
     int32_t *out_tokens, int max_new, const int32_t *stop_ids, int n_stop,
@@ -3543,7 +3953,9 @@ static int run_spec_loop(
     int *n_accepted_out)
 {
     int V = GEMMA4_VOCAB_SIZE;
-    float *Lbuf = (float*)malloc((size_t)(draft_k+1)*V*sizeof(float));
+    // Lbuf holds one logit row per forwarded token; the tree path forwards up to
+    // GEMMA4_SPEC_MAX nodes, the linear path up to draft_k+1.
+    float *Lbuf = (float*)malloc((size_t)GEMMA4_SPEC_MAX*V*sizeof(float));
     int32_t batch[GEMMA4_SPEC_MAX];
     if (!Lbuf) return -1;
     auto is_stop = [&](int t){ for (int s=0;s<n_stop;s++) if (stop_ids[s]==t) return 1; return 0; };
@@ -3551,6 +3963,13 @@ static int run_spec_loop(
     uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
     int cold = 0;             // consecutive fully-rejected draft attempts (light backoff)
     float ema_a = (float)draft_k;   // EMA of accepted tokens/step; starts optimistic
+
+    // Token-tree drafting (GEM4D_TREE=1): hedge multiple continuations per step,
+    // verified in one weight pass. Default off — the proven linear path stays default.
+    static int use_tree = -1;
+    if (use_tree < 0) { const char *e = getenv("GEM4D_TREE"); use_tree = (e && e[0]=='1'); }
+    int32_t t_tok[GEMMA4_SPEC_MAX]; int t_depth[GEMMA4_SPEC_MAX], t_parent[GEMMA4_SPEC_MAX];
+    int t_anc[GEMMA4_SPEC_MAX*GEMMA4_SPEC_MAX], t_ancoff[GEMMA4_SPEC_MAX+1];
 
     int g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
     int generated = 0, total_accepted = 0, stop = 0;
@@ -3573,6 +3992,45 @@ static int run_spec_loop(
         if (cold >= 4) { maxd = 0; cold = 0; }
         if (maxd > room) maxd = room; if (maxd < 0) maxd = 0;
         if (generated + 1 >= max_new) maxd = 0;
+
+        if (use_tree && maxd > 0) {
+            int max_depth = maxd;
+            int max_nodes = max_depth * 2;                 // branch factor 2
+            if (max_nodes > GEMMA4_SPEC_MAX) max_nodes = GEMMA4_SPEC_MAX;
+            int K = build_token_tree(hist, n, g, 2, draft_k, max_nodes, max_depth, 2,
+                                     t_tok, t_depth, t_parent, t_anc, t_ancoff);
+            if (K <= 1 ||
+                gemma4_engine_decode_tree(eng, t_tok, t_depth, t_anc, t_ancoff, K, Lbuf) != 0) {
+                if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
+                g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+                continue;
+            }
+            // Verify: node 0 = g (forwarded at pos). Walk the tree from g's logit row,
+            // following the sampled token; accept the matching child at each level.
+            int a = 0, curnode = 0, g_next = -1;
+            int commitpath[GEMMA4_SPEC_MAX]; commitpath[0] = 0;
+            const float *cur = Lbuf;                        // g's row predicts first draft
+            for (;;) {
+                int pred = host_sample(cur, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+                int child = -1;
+                for (int i = 0; i < K; i++)
+                    if (t_parent[i] == curnode && t_tok[i] == pred) { child = i; break; }
+                if (child < 0) { g_next = pred; break; }
+                a++; commitpath[a] = child;
+                out_tokens[generated++] = pred; hist[n++] = pred;
+                curnode = child; cur = Lbuf + (size_t)child*V;
+                if (is_stop(pred)) { stop = 1; break; }
+                if (generated >= max_new) break;
+            }
+            total_accepted += a;
+            ema_a = 0.5f*ema_a + 0.5f*(float)a;
+            cold = (a == 0) ? cold + 1 : 0;
+            gemma4_engine_commit_tree(eng, commitpath, a + 1);   // commit g + accepted drafts
+            if (stop || generated >= max_new) break;
+            g = (g_next >= 0) ? g_next
+                              : host_sample(cur, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+            continue;
+        }
 
         int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k);
         if (D == 0) {
