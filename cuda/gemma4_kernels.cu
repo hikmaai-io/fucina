@@ -1336,6 +1336,7 @@ struct gemma4_engine {
     // tok, x, norm, inf, q, k, v, attn, o, gate, up, logitsK.
     float  *d_sb[12];
     int     sb_ready;
+    int    *d_sample_id;       // 4-byte device scratch for GPU-side sampled token id
 
     // Suppressed token ids (tokenizer.ggml.suppress_tokens) masked to -inf
     int32_t *d_suppress;
@@ -2105,6 +2106,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
         CUDA_FREE(eng->d_bf16_layer[p]);
     for (int p = 0; p < 12; p++)
         CUDA_FREE(eng->d_sb[p]);
+    CUDA_FREE(eng->d_sample_id);
     #undef CUDA_FREE
 
     // LoRA cleanup
@@ -3376,6 +3378,129 @@ int gemma4_sample_argmax(
         }
     }
     return best;
+}
+
+// =========================================================================
+// ─── GPU-side sampling (no logits D2H) ──────────────────────────────────
+// =========================================================================
+// One block samples the whole vocab on the GPU and writes a single token id, so a
+// decode step returns 4 bytes instead of copying 262k logits to host and selecting
+// on the CPU. temp<=0 → argmax. Otherwise the full pipeline: temperature → top-k
+// (value-threshold via binary search, no global sort) → softmax → top-p → min-p →
+// multinomial(rnd). Candidates above the top-k threshold (≤ SAMP_MAXK) are gathered
+// to shared memory and the small tail (sort/top-p/min-p/draw) runs on one thread.
+// Logits are expected to already carry softcap + suppression.
+#define SAMP_MAXK 256
+__global__ void sample_logits_kernel(
+    const float *logits, int V, float temp, int top_k, float top_p, float min_p,
+    float rnd, int *out_id)
+{
+    const int T = blockDim.x, tid = threadIdx.x;
+    __shared__ float red[32];
+    __shared__ int   sCount;
+
+    // ── Greedy: block argmax ──
+    if (temp <= 0.0f) {
+        float best = -INFINITY; int bi = 0;
+        for (int i = tid; i < V; i += T) { float v = logits[i]; if (v > best) { best = v; bi = i; } }
+        // reduce (value,index) across the block via shared memory
+        __shared__ float vred[1024]; __shared__ int ired[1024];
+        vred[tid] = best; ired[tid] = bi; __syncthreads();
+        for (int s = T >> 1; s > 0; s >>= 1) {
+            if (tid < s && vred[tid+s] > vred[tid]) { vred[tid] = vred[tid+s]; ired[tid] = ired[tid+s]; }
+            __syncthreads();
+        }
+        if (tid == 0) *out_id = ired[0];
+        return;
+    }
+
+    // ── 1. global max (for numerically-stable softmax + threshold hi bound) ──
+    float m = -INFINITY;
+    for (int i = tid; i < V; i += T) m = fmaxf(m, logits[i]);
+    m = block_reduce_max(m, red);
+    __shared__ float sM; if (tid == 0) sM = m; __syncthreads(); m = sM;
+
+    // ── 2. top-k value threshold via binary search on the logit value ──
+    __shared__ float sThr;
+    if (top_k > 0 && top_k < V) {
+        float mn = INFINITY;
+        for (int i = tid; i < V; i += T) mn = fminf(mn, logits[i]);
+        mn = -block_reduce_max(-mn, red);
+        __shared__ float sLo, sHi; if (tid == 0) { sLo = mn; sHi = m; } __syncthreads();
+        for (int it = 0; it < 32; it++) {
+            float mid = 0.5f * (sLo + sHi);
+            int c = 0;
+            for (int i = tid; i < V; i += T) if (logits[i] >= mid) c++;
+            float cf = block_reduce_sum((float)c, red);
+            if (tid == 0) { if ((int)cf > top_k) sLo = mid; else sHi = mid; }
+            __syncthreads();
+        }
+        if (tid == 0) sThr = sLo;
+    } else if (tid == 0) sThr = -INFINITY;
+    __syncthreads();
+    float thr = sThr;
+
+    // ── 3. gather candidates >= threshold into shared memory (capped) ──
+    __shared__ int   cid[SAMP_MAXK];
+    __shared__ float clg[SAMP_MAXK];
+    if (tid == 0) sCount = 0; __syncthreads();
+    for (int i = tid; i < V; i += T) {
+        if (logits[i] >= thr) {
+            int p = atomicAdd(&sCount, 1);
+            if (p < SAMP_MAXK) { cid[p] = i; clg[p] = logits[i]; }
+        }
+    }
+    __syncthreads();
+    int N = sCount < SAMP_MAXK ? sCount : SAMP_MAXK;
+
+    // ── 4. small tail on one thread: sort desc, softmax, top-p, min-p, draw ──
+    if (tid == 0) {
+        for (int a = 1; a < N; a++) {          // insertion sort, N ≤ SAMP_MAXK
+            int ci = cid[a]; float cv = clg[a]; int b = a - 1;
+            while (b >= 0 && clg[b] < cv) { clg[b+1] = clg[b]; cid[b+1] = cid[b]; b--; }
+            clg[b+1] = cv; cid[b+1] = ci;
+        }
+        float invT = 1.0f / temp, mx = clg[0], sum = 0.0f;
+        float pr[SAMP_MAXK];
+        for (int a = 0; a < N; a++) { pr[a] = __expf((clg[a]-mx)*invT); sum += pr[a]; }
+        for (int a = 0; a < N; a++) pr[a] /= sum;
+        if (top_p > 0.0f && top_p < 1.0f) {
+            float cum = 0.0f; int cut = N;
+            for (int a = 0; a < N; a++) { cum += pr[a]; if (cum >= top_p) { cut = a+1; break; } }
+            N = cut;
+        }
+        if (min_p > 0.0f) {
+            float th = min_p * pr[0]; int keep = 0;
+            for (int a = 0; a < N; a++) { if (pr[a] >= th) keep = a+1; else break; }
+            if (keep > 0) N = keep;
+        }
+        float z = 0.0f; for (int a = 0; a < N; a++) z += pr[a];
+        float r = rnd * z, acc = 0.0f; int sel = cid[N > 0 ? N-1 : 0];
+        for (int a = 0; a < N; a++) { acc += pr[a]; if (r <= acc) { sel = cid[a]; break; } }
+        *out_id = sel;
+    }
+}
+
+// Sample a token from the engine's resident logits (eng->d_logits) entirely on the
+// GPU; only the 4-byte token id is copied to host. rnd ∈ [0,1) is the host RNG draw
+// (unused for greedy). Returns the token id, or -1 on error.
+int gemma4_engine_sample_device(
+    gemma4_engine_t *eng, float temp, int top_k, float top_p, float min_p, float rnd)
+{
+    if (!eng || !eng->loaded) return -1;
+    if (!eng->d_sample_id) {
+        if (cudaMalloc(&eng->d_sample_id, sizeof(int)) != cudaSuccess) {
+            cudaGetLastError(); return -1;
+        }
+    }
+    sample_logits_kernel<<<1, 1024, 0, eng->stream>>>(
+        eng->d_logits, GEMMA4_VOCAB_SIZE, temp, top_k, top_p, min_p, rnd,
+        eng->d_sample_id);
+    int id = -1;
+    cudaMemcpyAsync(&id, eng->d_sample_id, sizeof(int), cudaMemcpyDeviceToHost, eng->stream);
+    cudaStreamSynchronize(eng->stream);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    return id;
 }
 
 // =========================================================================

@@ -188,6 +188,12 @@ int gemma4_engine_verify_batch(
 
 int gemma4_sample_argmax(const float *logits, int vocab_size);
 
+// GPU-side sampling over the engine's resident logits (eng->d_logits): temp<=0 →
+// argmax, else temperature → top-k → softmax → top-p → min-p → multinomial(rnd).
+// Only the 4-byte token id crosses to host (no 262k logits D2H). rnd ∈ [0,1).
+int gemma4_engine_sample_device(
+    gemma4_engine_t *eng, float temp, int top_k, float top_p, float min_p, float rnd);
+
 // ─── Session save/restore ────────────────────────────────────────────
 
 int gemma4_engine_save_session(

@@ -349,19 +349,37 @@ func main() {
 			nToGenerate = 1 << 20
 		}
 
+		// GPU-side sampling: when no repeat penalty is configured, select each token
+		// on the device and decode without copying the 262k logits to host (4-byte id
+		// instead of 1 MB per token, and no CPU sampling round-trip). Repeat penalty
+		// still needs the host sampler (it edits logits using the token history).
+		gpuSample := args.RepeatPenalty == 1.0
+		temp := float32(args.Temperature)
+
 		fmt.Print(prompt)
 		genStart := time.Now()
 		generated := 0
 		for i := 0; i < nToGenerate; i++ {
-			if logits == nil {
-				break
+			var token int32
+			var err error
+			if gpuSample {
+				token, err = eng.SampleDevice(temp, args.TopK,
+					float32(args.TopP), float32(args.MinP), float32(rng.Float64()))
+			} else {
+				if logits == nil {
+					break
+				}
+				token, err = sample(logits, args, rng, nil)
 			}
-			token, err := sample(logits, args, rng, nil)
 			if err != nil || tok.IsStop(token) {
 				break
 			}
 			fmt.Print(tok.Decode([]int32{token}))
-			logits, err = eng.Decode(token)
+			if gpuSample {
+				err = eng.DecodeNoCopy(token)
+			} else {
+				logits, err = eng.Decode(token)
+			}
 			if err != nil {
 				break
 			}

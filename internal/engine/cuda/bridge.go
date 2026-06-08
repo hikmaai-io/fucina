@@ -216,6 +216,32 @@ func (e *Engine) GenerateSpec(prompt []int32, maxNew int, stops []int32, draftK 
 	return out[:ng], int(nacc), nil
 }
 
+// DecodeNoCopy decodes a single token but leaves the logits on the GPU (no 262k
+// D2H). Pair it with SampleDevice, which selects the next token on-device.
+func (e *Engine) DecodeNoCopy(token int32) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if C.gemma4_engine_decode(e.ptr, C.int32_t(token), nil) != 0 {
+		return fmt.Errorf("gem4d: decode failed")
+	}
+	return nil
+}
+
+// SampleDevice selects the next token from the engine's resident logits entirely on
+// the GPU (temp<=0 → argmax, else temperature/top-k/top-p/min-p/multinomial), so only
+// the 4-byte id crosses to host. rnd must be in [0,1). Repeat penalty is not applied
+// here — callers using it must fall back to the host sampler.
+func (e *Engine) SampleDevice(temp float32, topK int, topP, minP, rnd float32) (int32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	id := C.gemma4_engine_sample_device(e.ptr, C.float(temp), C.int(topK),
+		C.float(topP), C.float(minP), C.float(rnd))
+	if id < 0 {
+		return 0, fmt.Errorf("gem4d: device sample failed")
+	}
+	return int32(id), nil
+}
+
 // Argmax returns the index of the highest value in logits.
 func Argmax(logits []float32) int {
 	return int(C.gemma4_sample_argmax(
