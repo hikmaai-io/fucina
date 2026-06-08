@@ -405,6 +405,52 @@ func logGenSpeed(start time.Time, generated int) {
 // multinomial. Temperature 0 is greedy argmax. The previous implementation used
 // two O(n²) bubble sorts over the full 262144-token vocab per token (~7e10 ops);
 // this sorts once with sort.Slice (O(n log n)) and truncates.
+// topKIndices returns the indices of the k largest values, sorted descending, via
+// a bounded size-k min-heap (single O(V) pass). k<=0 or k>=len → all indices sorted.
+func topKIndices(vals []float64, k int) []int {
+	n := len(vals)
+	if k <= 0 || k >= n {
+		idx := make([]int, n)
+		for i := range idx {
+			idx[i] = i
+		}
+		sort.Slice(idx, func(a, b int) bool { return vals[idx[a]] > vals[idx[b]] })
+		return idx
+	}
+	h := make([]int, 0, k) // min-heap of indices keyed by vals[idx]
+	for i := 0; i < n; i++ {
+		if len(h) < k {
+			h = append(h, i)
+			for j := len(h) - 1; j > 0; {
+				p := (j - 1) / 2
+				if vals[h[p]] <= vals[h[j]] {
+					break
+				}
+				h[p], h[j] = h[j], h[p]
+				j = p
+			}
+		} else if vals[i] > vals[h[0]] {
+			h[0] = i
+			for j := 0; ; {
+				l, r, sm := 2*j+1, 2*j+2, j
+				if l < k && vals[h[l]] < vals[h[sm]] {
+					sm = l
+				}
+				if r < k && vals[h[r]] < vals[h[sm]] {
+					sm = r
+				}
+				if sm == j {
+					break
+				}
+				h[j], h[sm] = h[sm], h[j]
+				j = sm
+			}
+		}
+	}
+	sort.Slice(h, func(a, b int) bool { return vals[h[a]] > vals[h[b]] })
+	return h
+}
+
 func (s *Server) sampleToken(logits []float32, params GenerationParams, rng *rand.Rand) (int32, error) {
 	if len(logits) == 0 {
 		return 0, fmt.Errorf("empty logits")
@@ -435,21 +481,15 @@ func (s *Server) sampleToken(logits []float32, params GenerationParams, rng *ran
 		id int32
 		p  float64
 	}
-	cands := make([]cand, n)
-	maxLogit := scaled[0]
-	for _, v := range scaled {
-		if v > maxLogit {
-			maxLogit = v
-		}
-	}
-	for i, v := range scaled {
-		cands[i] = cand{int32(i), math.Exp(v - maxLogit)}
-	}
-	sort.Slice(cands, func(a, b int) bool { return cands[a].p > cands[b].p })
 
-	// Top-k: keep the K highest (off-by-one fixed: K elements, not K+1).
-	if params.TopK > 0 && params.TopK < len(cands) {
-		cands = cands[:params.TopK]
+	// Select the top-k by scaled logit (temperature is monotonic) with a bounded
+	// min-heap — one O(V) pass instead of sorting/allocating over all 262k logits
+	// every token (~30 ms/token otherwise). Top-k disabled → full sort fallback.
+	idx := topKIndices(scaled, params.TopK)
+	maxLogit := scaled[idx[0]] // idx is sorted descending by scaled value
+	cands := make([]cand, len(idx))
+	for i, id := range idx {
+		cands[i] = cand{int32(id), math.Exp(scaled[id] - maxLogit)}
 	}
 
 	// Normalize the (sorted, truncated) candidates.

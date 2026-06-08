@@ -566,6 +566,60 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 
 // ─── Prompt sampling ──────────────────────────────────────────────
 
+type cand struct {
+	id int32
+	lg float32
+}
+
+// topKCandidates returns the k highest-logit candidates sorted descending, using a
+// bounded size-k min-heap — a single O(V) pass instead of sorting all 262k logits
+// (the previous full sort + 262k-element allocation cost ~30 ms per token). k<=0 or
+// k>=len falls back to a full sort (top-k disabled → top-p/min-p need the full order).
+func topKCandidates(logits []float32, k int) []cand {
+	n := len(logits)
+	if k <= 0 || k >= n {
+		cands := make([]cand, n)
+		for i := range logits {
+			cands[i] = cand{int32(i), logits[i]}
+		}
+		sort.Slice(cands, func(a, b int) bool { return cands[a].lg > cands[b].lg })
+		return cands
+	}
+	h := make([]cand, 0, k) // min-heap keyed by lg: h[0] is the smallest kept
+	for i := 0; i < n; i++ {
+		lg := logits[i]
+		if len(h) < k {
+			h = append(h, cand{int32(i), lg})
+			for j := len(h) - 1; j > 0; { // sift up
+				p := (j - 1) / 2
+				if h[p].lg <= h[j].lg {
+					break
+				}
+				h[p], h[j] = h[j], h[p]
+				j = p
+			}
+		} else if lg > h[0].lg {
+			h[0] = cand{int32(i), lg}
+			for j := 0; ; { // sift down
+				l, r, small := 2*j+1, 2*j+2, j
+				if l < k && h[l].lg < h[small].lg {
+					small = l
+				}
+				if r < k && h[r].lg < h[small].lg {
+					small = r
+				}
+				if small == j {
+					break
+				}
+				h[j], h[small] = h[small], h[j]
+				j = small
+			}
+		}
+	}
+	sort.Slice(h, func(a, b int) bool { return h[a].lg > h[b].lg })
+	return h
+}
+
 // sample draws the next token from logits applying the configured pipeline:
 // repeat-penalty → temperature → top-k → top-p → min-p → multinomial.
 // Temperature <= 0 forces greedy argmax (deterministic).
@@ -574,53 +628,35 @@ func sample(logits []float32, args CLIArgs, rng *rand.Rand, pastTokens []int32) 
 		return int32(cuda.Argmax(logits)), nil
 	}
 
-	// Work on a copy so callers keep raw logits.
-	l := make([]float32, len(logits))
-	copy(l, logits)
-
-	// Repeat penalty on raw logits (llama.cpp applies before temperature).
+	// Repeat penalty, applied in place (logits is regenerated each decode step, so
+	// no defensive copy is needed). llama.cpp applies it before temperature.
 	if args.RepeatPenalty != 1.0 && len(pastTokens) > 0 {
 		rp := float32(args.RepeatPenalty)
 		for _, id := range pastTokens {
-			if id < 0 || int(id) >= len(l) {
+			if id < 0 || int(id) >= len(logits) {
 				continue
 			}
-			if l[id] > 0 {
-				l[id] /= rp
+			if logits[id] > 0 {
+				logits[id] /= rp
 			} else {
-				l[id] *= rp
+				logits[id] *= rp
 			}
 		}
 	}
 
-	// Temperature.
-	invT := float32(1.0 / args.Temperature)
-	for i := range l {
-		l[i] *= invT
-	}
+	// Candidate selection. Temperature is monotonic so it does not change the
+	// ordering — select the top-k on the raw (penalized) logits FIRST, then apply
+	// temperature/softmax to just those k. This avoids sorting and allocating over
+	// the whole 262k vocab every token (the dominant per-token CPU cost otherwise).
+	cands := topKCandidates(logits, args.TopK)
 
-	// Build (id, logit) candidates.
-	type cand struct {
-		id int32
-		lg float32
-	}
-	cands := make([]cand, len(l))
-	for i := range l {
-		cands[i] = cand{int32(i), l[i]}
-	}
-	sort.Slice(cands, func(a, b int) bool { return cands[a].lg > cands[b].lg })
-
-	// Top-k.
-	if args.TopK > 0 && args.TopK < len(cands) {
-		cands = cands[:args.TopK]
-	}
-
-	// Softmax over the (sorted, truncated) candidates.
-	maxLg := cands[0].lg
+	// Softmax over the (sorted) candidates, with temperature folded in.
+	invT := float64(1.0 / args.Temperature)
+	maxLg := float64(cands[0].lg)
 	var sum float64
 	probs := make([]float64, len(cands))
 	for i, c := range cands {
-		p := math.Exp(float64(c.lg - maxLg))
+		p := math.Exp((float64(c.lg) - maxLg) * invT)
 		probs[i] = p
 		sum += p
 	}
