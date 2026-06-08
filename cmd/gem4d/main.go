@@ -119,7 +119,7 @@ func parseFlags() CLIArgs {
 	flag.Float64Var(&a.TopP, "top-p", 0.95, "Top-P sampling (gemma-4 default 0.95)")
 	flag.Float64Var(&a.MinP, "min-p", 0.0, "Min-P sampling (gemma-4 default off)")
 	flag.Int64Var(&a.Seed, "seed", -1, "Random seed (-1 = random)")
-	flag.Float64Var(&a.RepeatPenalty, "repeat-penalty", 1.1, "Repeat penalty")
+	flag.Float64Var(&a.RepeatPenalty, "repeat-penalty", 1.0, "Repeat penalty (gemma-4 default: off)")
 	flag.Float64Var(&a.FrequencyPenalty, "frequency-penalty", 0.0, "Frequency penalty")
 	flag.Float64Var(&a.PresencePenalty, "presence-penalty", 0.0, "Presence penalty")
 
@@ -305,16 +305,22 @@ func main() {
 		tokens := tok.Encode(prompt, true, false)
 		log.Printf("gem4d: prompt has %d tokens", len(tokens))
 
-		// Greedy + spec enabled → prompt-lookup speculative decode (one weight pass
-		// per [g, draft...]; produces the exact same tokens as plain greedy decode).
-		if args.Spec && args.Temperature <= 0 {
+		// Spec enabled (and no repeat penalty, which the spec path can't apply) →
+		// prompt-lookup speculative decode. Works for greedy AND sampling; the output
+		// distribution is identical to plain decode at the same temperature.
+		if args.Spec && args.RepeatPenalty == 1.0 {
 			nToGen := args.Predict
 			if nToGen < 0 {
 				nToGen = 512
 			}
+			seed := uint64(args.Seed)
+			if args.Seed < 0 {
+				seed = uint64(time.Now().UnixNano())
+			}
 			stops := []int32{tok.EOS, tok.EndOfTurn}
 			genStart := time.Now()
-			out, nAccepted, err := eng.GenerateSpec(tokens, nToGen, stops, args.DraftK)
+			out, nAccepted, err := eng.GenerateSpec(tokens, nToGen, stops, args.DraftK,
+				float32(args.Temperature), args.TopK, float32(args.TopP), float32(args.MinP), seed)
 			if err != nil {
 				log.Fatalf("gem4d: spec generate failed: %v", err)
 			}
@@ -779,7 +785,7 @@ Sampling options:
   --top-p F                  Top-P sampling (gemma-4 default: 0.95)
   --min-p F                  Min-P sampling (gemma-4 default: 0.0/off)
   --seed N                   Seed (-1 = random)
-  --repeat-penalty F         Repeat penalty (default: 1.1)
+  --repeat-penalty F         Repeat penalty (gemma-4 default: 1.0/off)
 
 Generation options:
   -p, --prompt PROMPT        Prompt string

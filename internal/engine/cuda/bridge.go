@@ -5,7 +5,7 @@
 
 package cuda
 
-// #cgo LDFLAGS: -L${SRCDIR}/../../../cuda -lgem4d -lcudart -lcublas -lcuda -lpthread -lstdc++
+// #cgo LDFLAGS: -L${SRCDIR}/../../../cuda -lgem4d -lcudart -lcublas -lcuda -lpthread -lstdc++ -lm
 // #cgo CFLAGS: -I/usr/local/cuda-13/include -I${SRCDIR}/../../../cuda
 //
 // #include "gemma4_kernels.cuh"
@@ -193,7 +193,8 @@ func (e *Engine) Decode(token int32) ([]float32, error) {
 // any id in stops. Returns the generated tokens and the total number of drafts
 // accepted (for measuring the acceptance rate). Greedy/argmax only — produces the
 // exact same tokens as a plain greedy decode, just faster on context-reusing text.
-func (e *Engine) GenerateSpec(prompt []int32, maxNew int, stops []int32, draftK int) ([]int32, int, error) {
+func (e *Engine) GenerateSpec(prompt []int32, maxNew int, stops []int32, draftK int,
+	temp float32, topK int, topP, minP float32, seed uint64) ([]int32, int, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -208,7 +209,9 @@ func (e *Engine) GenerateSpec(prompt []int32, maxNew int, stops []int32, draftK 
 		(*C.int32_t)(unsafe.Pointer(&prompt[0])), C.int(len(prompt)),
 		(*C.int32_t)(unsafe.Pointer(&out[0])), C.int(maxNew),
 		stopsPtr, C.int(len(stops)),
-		C.int(draftK), &nacc,
+		C.int(draftK),
+		C.float(temp), C.int(topK), C.float(topP), C.float(minP), C.uint64_t(seed),
+		&nacc,
 	)
 	if ng < 0 {
 		return nil, 0, fmt.Errorf("gem4d: generate_spec failed")

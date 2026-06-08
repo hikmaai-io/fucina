@@ -3350,20 +3350,73 @@ static int prompt_lookup_draft(const int32_t *hist, int n, int32_t *draft,
 }
 
 // Greedy generation with prompt-lookup speculative decoding. Each step forwards
+// Host-side sampler mirroring sample_logits_kernel: temp<=0 → argmax; else
+// temperature → top-k (bounded partial selection) → softmax → top-p → min-p →
+// multinomial(rnd). Used by the speculative loop, where sampling each draft
+// position from the TARGET distribution and accepting iff it equals the draft
+// preserves the exact target sampling distribution (the draft proposal is a point
+// mass, so standard speculative sampling reduces to this). rnd ∈ [0,1).
+#define HSAMP_MAXK 256
+static int host_sample(const float *logits, int V, float temp,
+                       int top_k, float top_p, float min_p, double rnd)
+{
+    if (temp <= 0.0f) return gemma4_sample_argmax(logits, V);
+    int K = (top_k > 0 && top_k < V) ? top_k : HSAMP_MAXK;
+    if (K > HSAMP_MAXK) K = HSAMP_MAXK;
+    // bounded size-K min-heap of indices by logit
+    int   hid[HSAMP_MAXK]; int hn = 0;
+    for (int i = 0; i < V; i++) {
+        float v = logits[i];
+        if (hn < K) {
+            int j = hn++; hid[j] = i;
+            while (j > 0) { int p=(j-1)/2; if (logits[hid[p]]<=logits[hid[j]]) break;
+                int t=hid[p]; hid[p]=hid[j]; hid[j]=t; j=p; }
+        } else if (v > logits[hid[0]]) {
+            hid[0] = i; int j=0;
+            for (;;) { int l=2*j+1,r=2*j+2,s=j;
+                if (l<K && logits[hid[l]]<logits[hid[s]]) s=l;
+                if (r<K && logits[hid[r]]<logits[hid[s]]) s=r;
+                if (s==j) break; int t=hid[j]; hid[j]=hid[s]; hid[s]=t; j=s; }
+        }
+    }
+    // sort descending by logit (insertion; K small)
+    for (int a=1;a<hn;a++){ int id=hid[a]; float lv=logits[id]; int b=a-1;
+        while (b>=0 && logits[hid[b]]<lv){ hid[b+1]=hid[b]; b--; } hid[b+1]=id; }
+    float invT = 1.0f/temp, mx = logits[hid[0]], probs[HSAMP_MAXK], sum=0.0f;
+    for (int a=0;a<hn;a++){ probs[a]=expf((logits[hid[a]]-mx)*invT); sum+=probs[a]; }
+    for (int a=0;a<hn;a++) probs[a]/=sum;
+    if (top_p>0.0f && top_p<1.0f){ float c=0; int cut=hn;
+        for (int a=0;a<hn;a++){ c+=probs[a]; if (c>=top_p){cut=a+1;break;} } hn=cut; }
+    if (min_p>0.0f){ float th=min_p*probs[0]; int keep=0;
+        for (int a=0;a<hn;a++){ if (probs[a]>=th) keep=a+1; else break; } if (keep>0) hn=keep; }
+    float z=0; for (int a=0;a<hn;a++) z+=probs[a];
+    float r=(float)rnd*z, acc=0;
+    for (int a=0;a<hn;a++){ acc+=probs[a]; if (r<=acc) return hid[a]; }
+    return hid[hn>0?hn-1:0];
+}
+
+// xorshift128+ style PRNG for reproducible host sampling draws.
+static inline double spec_rng(uint64_t *s) {
+    uint64_t x = *s; x ^= x << 13; x ^= x >> 7; x ^= x << 17; *s = x;
+    return (double)(x >> 11) * (1.0 / 9007199254740992.0);
+}
+
 // [g, draft...] in ONE weight pass (gemma4_engine_decode_batched), commits the
 // confirmed prefix, and gets the next step's logits for free from the same pass —
 // so a matched draft of length a yields (1+a) tokens per ~one token's bandwidth.
-// Greedy/argmax only (exact: accepted iff the model's argmax equals the draft).
-// Draft length is capped to keep the partial-accept KV rollback inside the sliding
-// window (full speedup for the first ~window tokens; plain decode beyond).
-// Fills out_tokens (≤ max_new), returns the count generated. n_accepted_out (or
-// NULL) receives the total drafts accepted (for measuring the acceptance rate).
+// Works for BOTH greedy (temp<=0) and sampling (temp>0): each position is drawn
+// from the target distribution and the draft is accepted iff the draw matches it,
+// which preserves the exact target distribution. Draft length is capped to keep the
+// partial-accept KV rollback inside the sliding window (full speedup for the first
+// ~window tokens; plain decode beyond). Fills out_tokens (≤ max_new), returns the
+// count generated. n_accepted_out (or NULL) receives the total drafts accepted.
 int gemma4_engine_generate_spec(
     gemma4_engine_t *eng,
     const int32_t   *prompt, int n_prompt,
     int32_t         *out_tokens, int max_new,
     const int32_t   *stop_ids, int n_stop,
     int              draft_k,
+    float            temp, int top_k, float top_p, float min_p, uint64_t seed,
     int             *n_accepted_out)
 {
     if (!eng || !eng->loaded || n_prompt <= 0 || max_new <= 0) return -1;
@@ -3396,9 +3449,14 @@ int gemma4_engine_generate_spec(
     float ema = 1.0f;          // optimistic start
     int   since_probe = 0;
 
+    uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
+    // `g` is the next token to emit/forward, already drawn from `logits` (the dist
+    // for its position). Carrying it across iterations lets a rejected draft REUSE
+    // the sample drawn from the target at that position — re-drawing would bias the
+    // output toward the draft token.
+    int g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
     int generated = 0, total_accepted = 0, stop = 0;
     while (generated < max_new && !stop) {
-        int g = gemma4_sample_argmax(logits, V);
         out_tokens[generated++] = g; hist[n++] = g;
         if (is_stop(g)) break;
 
@@ -3411,13 +3469,12 @@ int gemma4_engine_generate_spec(
 
         int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k);
 
-        // No n-gram match → nothing to speculate. Use the fast single-token decode
-        // (avoids decode_batched's per-call allocation/sync overhead), so spec is
-        // never slower than plain greedy on novel text — only the matched-but-wrong
-        // drafts cost anything, and a matched-and-right draft is the win.
+        // No n-gram match → nothing to speculate. Fast single-token decode (avoids
+        // decode_batched's overhead), so spec never regresses vs plain decode.
         if (D == 0) {
             if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
             since_probe++;
+            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
             continue;
         }
 
@@ -3425,17 +3482,24 @@ int gemma4_engine_generate_spec(
         int K = D + 1;
         if (gemma4_engine_decode_batched(eng, batch, K, Lbuf) != 0) {
             if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
+            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
             continue;
         }
 
-        // Accept the longest draft prefix whose predecessor's argmax matches it.
-        int a = 0;
-        while (a < D && gemma4_sample_argmax(Lbuf + (size_t)a*V, V) == batch[1+a]) a++;
+        // Verify drafts by SAMPLING each position from the target (greedy → argmax).
+        // Accept the longest prefix that matches; the first mismatch's sample is the
+        // corrected token for that position and is carried as the next `g`.
+        int a = 0, rejected = -1;
+        while (a < D) {
+            int s = host_sample(Lbuf + (size_t)a*V, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+            if (s == batch[1+a]) { a++; }
+            else { rejected = s; break; }
+        }
         total_accepted += a;
-        ema = 0.6f*ema + 0.4f*((float)a/(float)D);    // update acceptance estimate
+        ema = 0.6f*ema + 0.4f*((float)a/(float)D);
         since_probe = 0;
 
-        // Discard the rejected drafts from the KV cache (keep g + a accepted).
+        // Keep g + a accepted drafts; discard rejected drafts' K/V.
         int keep = pos + 1 + a;
         if (keep < eng->global_n_tokens) gemma4_engine_rewind(eng, keep);
 
@@ -3443,7 +3507,15 @@ int gemma4_engine_generate_spec(
             int t = batch[1+i]; out_tokens[generated++] = t; hist[n++] = t;
             if (is_stop(t)) { stop = 1; break; }
         }
-        memcpy(logits, Lbuf + (size_t)a*V, (size_t)V*sizeof(float));  // next-step logits, free
+        if (stop) break;
+
+        if (a < D) {   // rejected at position a → reuse that sample as the next token
+            memcpy(logits, Lbuf + (size_t)a*V, (size_t)V*sizeof(float));
+            g = rejected;
+        } else {       // all drafts accepted → draw the next token fresh from L[D]
+            memcpy(logits, Lbuf + (size_t)D*V, (size_t)V*sizeof(float));
+            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+        }
     }
 
     if (n_accepted_out) *n_accepted_out = total_accepted;

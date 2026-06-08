@@ -17,7 +17,7 @@ NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo --use_fast_math \
              --threads 8
 
 CGO_CFLAGS   := -I$(CUDA_HOME)/include
-CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcuda -lpthread -lstdc++
+CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcuda -lpthread -lstdc++ -lm
 
 .PHONY: all clean test cuda lib gem4d smoke profile
 

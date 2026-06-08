@@ -172,6 +172,7 @@ int gemma4_engine_generate_spec(
     int32_t         *out_tokens, int max_new,
     const int32_t   *stop_ids, int n_stop,
     int              draft_k,
+    float temp, int top_k, float top_p, float min_p, uint64_t seed,
     int             *n_accepted_out);
 
 // Speculative verify batch: verify K draft tokens in parallel
