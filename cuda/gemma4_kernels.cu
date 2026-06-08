@@ -231,6 +231,12 @@ static inline __device__ __nv_fp8_storage_t float_to_fp8(float v) {
     return __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
 }
 
+// KV-cache element type: FP8 E4M3 (1 byte). K/V are post-(QK/V)-RMSNorm and (for K)
+// post-RoPE, so O(1) magnitude — well inside E4M3's ±448 range. Storing the cache in
+// FP8 cuts KV bytes/token 4× vs fp32 (the dominant decode + long-context cost); the
+// flash attention kernels dequantize in-register. Indexing is unchanged (1 byte/elem).
+typedef __nv_fp8_storage_t kv_t;
+
 // ─── Unified weight element decode ─────────────────────────────────────
 //
 // Reads ONE logical weight element from a quantised weight tensor and returns
@@ -877,8 +883,8 @@ __global__ void rope_global_kernel(
 __global__ void sliding_attn_decode_kernel(
     float       *output,       // [n_heads × head_dim]
     const float *q,            // [n_heads × head_dim]
-    const float *k_cache,      // [window_size][n_kv_heads][head_dim]
-    const float *v_cache,
+    const kv_t  *k_cache,      // [window_size][n_kv_heads][head_dim] FP8
+    const kv_t  *v_cache,
     int          n_heads,
     int          n_kv_heads,
     int          head_dim,
@@ -901,7 +907,7 @@ __global__ void sliding_attn_decode_kernel(
     for (int t = 0; t < window_len; t++) {
         int ring_idx = (cursor - window_len + t + window_size) % window_size;
         float k_d = (tid < head_dim)
-            ? k_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid]
+            ? fp8_to_float(k_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid])
             : 0.0f;
         // Full dot product, broadcast to every thread (block_reduce_sum returns the
         // reduced value to all lanes; attention scale is 1.0 for gemma4).
@@ -911,7 +917,7 @@ __global__ void sliding_attn_decode_kernel(
         float p     = __expf(s - m_new);
         l   = l * alpha + p;
         float v_d = (tid < head_dim)
-            ? v_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid]
+            ? fp8_to_float(v_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid])
             : 0.0f;
         acc = acc * alpha + p * v_d;
         m   = m_new;
@@ -936,8 +942,8 @@ __global__ void sliding_attn_decode_kernel(
 __global__ void global_attn_decode_kernel(
     float       *output,       // [n_heads × head_dim]
     const float *q,            // [n_heads × head_dim]
-    const float *k_cache,      // [ctx_len][head_dim]
-    const float *v_cache,      // [ctx_len][head_dim]
+    const kv_t  *k_cache,      // [ctx_len][head_dim] FP8
+    const kv_t  *v_cache,      // [ctx_len][head_dim] FP8
     int          n_heads,
     int          head_dim,
     int          ctx_len)
@@ -952,13 +958,13 @@ __global__ void global_attn_decode_kernel(
     float l   = 0.0f;
 
     for (int t = 0; t < ctx_len; t++) {
-        float k_d = (tid < head_dim) ? k_cache[t * head_dim + tid] : 0.0f;
+        float k_d = (tid < head_dim) ? fp8_to_float(k_cache[t * head_dim + tid]) : 0.0f;
         float s = block_reduce_sum(q_d * k_d, smem);
         float m_new = fmaxf(m, s);
         float alpha = __expf(m - m_new);
         float p     = __expf(s - m_new);
         l   = l * alpha + p;
-        float v_d = (tid < head_dim) ? v_cache[t * head_dim + tid] : 0.0f;
+        float v_d = (tid < head_dim) ? fp8_to_float(v_cache[t * head_dim + tid]) : 0.0f;
         acc = acc * alpha + p * v_d;
         m   = m_new;
     }
@@ -1139,7 +1145,7 @@ __global__ void attn_softmax_colmajor_kernel(
 // k/vcache point at the layer's ring base [window][kvhd]. grid=(ceil(kvhd/256),
 // count), block=256.
 __global__ void kv_write_sliding_kernel(
-    float *kcache, float *vcache, const float *kb, const float *vb,
+    kv_t *kcache, kv_t *vcache, const float *kb, const float *vb,
     int base, int first, int count, int kvhd, int window)
 {
     int i = blockIdx.y;                                // 0..count-1
@@ -1147,22 +1153,22 @@ __global__ void kv_write_sliding_kernel(
     if (i >= count || j >= kvhd) return;
     int t    = first + i;                              // token index within batch
     int slot = (base + t) % window;
-    kcache[(size_t)slot * kvhd + j] = kb[(size_t)t * kvhd + j];
-    vcache[(size_t)slot * kvhd + j] = vb[(size_t)t * kvhd + j];
+    kcache[(size_t)slot * kvhd + j] = float_to_fp8(kb[(size_t)t * kvhd + j]);
+    vcache[(size_t)slot * kvhd + j] = float_to_fp8(vb[(size_t)t * kvhd + j]);
 }
 
 // Scatter the batch's K/V into the linear global cache at positions base..base+rows-1.
 // k/vcache point at the layer slot's base [capacity][hd]. grid=(ceil(hd/256), rows).
 __global__ void kv_write_global_kernel(
-    float *kcache, float *vcache, const float *kb, const float *vb,
+    kv_t *kcache, kv_t *vcache, const float *kb, const float *vb,
     int base, int rows, int hd)
 {
     int t = blockIdx.y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= rows || j >= hd) return;
     int pos = base + t;
-    kcache[(size_t)pos * hd + j] = kb[(size_t)t * hd + j];
-    vcache[(size_t)pos * hd + j] = vb[(size_t)t * hd + j];
+    kcache[(size_t)pos * hd + j] = float_to_fp8(kb[(size_t)t * hd + j]);
+    vcache[(size_t)pos * hd + j] = float_to_fp8(vb[(size_t)t * hd + j]);
 }
 
 // =========================================================================
@@ -1417,17 +1423,17 @@ struct gemma4_engine {
     float *d_w_out_norm;        // [GEMMA4_HIDDEN_SIZE]
     float  h_out_scale[GEMMA4_MAX_LAYERS]; // layer_output_scale scalars (host)
 
-    // KV cache (device)
-    // Sliding: 40 layers × 1024 window × 8 heads × 256 head_dim (fp32).
-    float  *d_sliding_k;       // [40 × 1024 × 8 × 256]
-    float  *d_sliding_v;
+    // KV cache (device) — FP8 E4M3 (1 byte/elem), see kv_t.
+    // Sliding: 40 layers × 1024 window × 8 heads × 256 head_dim.
+    kv_t   *d_sliding_k;       // [40 × 1024 × 8 × 256]
+    kv_t   *d_sliding_v;
     int     sliding_cursor[GEMMA4_MAX_LAYERS];
     int     sliding_filled[GEMMA4_MAX_LAYERS];
 
-    // Global: 8 slots × ctx_size × 512 (fp32). K and V stored separately because
-    // K gets RMSNorm+RoPE while V gets only plain (weightless) RMSNorm.
-    float  *d_global_k;  // [n_layers_global × ctx_size × 512]
-    float  *d_global_v;
+    // Global: 8 slots × ctx_size × 512. K and V stored separately because K gets
+    // RMSNorm+RoPE while V gets only plain (weightless) RMSNorm.
+    kv_t   *d_global_k;  // [n_layers_global × ctx_size × 512]
+    kv_t   *d_global_v;
     int     global_n_tokens;
     int     global_kv_capacity;
     // Max dynamic shared memory (bytes) the global-attn kernel may use, after
@@ -2075,9 +2081,9 @@ gemma4_engine_t* gemma4_engine_create(
     }
 
     // KV cache allocation
-    // Sliding: 40 × 8 × 1024 × 256 × sizeof(float) = 40 × 8 × 1024 × 256 × 4 = 320 MB
+    // Sliding: 40 × 8 × 1024 × 256 × sizeof(kv_t) (FP8 = 1 byte) = 80 MB.
     size_t sliding_kv_size = (size_t)GEMMA4_MAX_LAYERS *
-        GEMMA4_KV_HEADS * GEMMA4_SLIDING_WINDOW * GEMMA4_HEAD_DIM * sizeof(float);
+        GEMMA4_KV_HEADS * GEMMA4_SLIDING_WINDOW * GEMMA4_HEAD_DIM * sizeof(kv_t);
     if (cudaMalloc(&eng->d_sliding_k, sliding_kv_size) != cudaSuccess ||
         cudaMalloc(&eng->d_sliding_v, sliding_kv_size) != cudaSuccess) {
         fprintf(stderr, "gem4d: failed to allocate sliding KV cache (%.1f MB ×2)\n",
@@ -2092,7 +2098,7 @@ gemma4_engine_t* gemma4_engine_create(
     // a slot (not all 48), so this is ~6× smaller than indexing by absolute id.
     eng->global_kv_capacity = context_size;
     size_t global_kv_size = (size_t)eng->n_layers_global *
-        context_size * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
+        context_size * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
     if (cudaMalloc(&eng->d_global_k, global_kv_size) != cudaSuccess ||
         cudaMalloc(&eng->d_global_v, global_kv_size) != cudaSuccess) {
         fprintf(stderr, "gem4d: failed to allocate global KV cache (%.1f MB ×2)\n",
@@ -2386,19 +2392,18 @@ static int decode_layer(
             1000000.0f, eng->d_rope_freqs);
     }
 
-    // ── 6. Write K (and V) into KV cache ─────────────────────────────────
+    // ── 6. Write K (and V) into KV cache (fp32 activation → FP8 cache) ────
     int kv_size = n_kv_heads * head_dim;
+    unsigned kvg = (kv_size + 255) / 256;
     if (ltype == LAYER_SLIDING) {
         int cursor = eng->sliding_cursor[layer];
         size_t layer_stride = (size_t)GEMMA4_SLIDING_WINDOW * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
-        float *k_slot = eng->d_sliding_k + layer * layer_stride
+        kv_t *k_slot = eng->d_sliding_k + layer * layer_stride
                         + (size_t)cursor * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
-        float *v_slot = eng->d_sliding_v + layer * layer_stride
+        kv_t *v_slot = eng->d_sliding_v + layer * layer_stride
                         + (size_t)cursor * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
-        cudaMemcpyAsync(k_slot, eng->d_attn_k,
-            kv_size * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(v_slot, eng->d_attn_v,
-            kv_size * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(k_slot, eng->d_attn_k, kv_size);
+        copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(v_slot, eng->d_attn_v, kv_size);
         eng->sliding_cursor[layer] = (cursor + 1) % GEMMA4_SLIDING_WINDOW;
         if (eng->sliding_filled[layer] < GEMMA4_SLIDING_WINDOW)
             eng->sliding_filled[layer]++;
@@ -2406,14 +2411,12 @@ static int decode_layer(
         int n = eng->global_n_tokens;
         int slot = eng->global_slot[layer];
         size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
-        float *k_slot = eng->d_global_k + (size_t)slot * layer_stride
+        kv_t *k_slot = eng->d_global_k + (size_t)slot * layer_stride
                         + (size_t)n * GEMMA4_GLOBAL_HEAD_DIM;
-        float *v_slot = eng->d_global_v + (size_t)slot * layer_stride
+        kv_t *v_slot = eng->d_global_v + (size_t)slot * layer_stride
                         + (size_t)n * GEMMA4_GLOBAL_HEAD_DIM;
-        cudaMemcpyAsync(k_slot, eng->d_attn_k,
-            kv_size * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(v_slot, eng->d_attn_v,
-            kv_size * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(k_slot, eng->d_attn_k, kv_size);
+        copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(v_slot, eng->d_attn_v, kv_size);
     }
 
     // ── 7. Attention ─────────────────────────────────────────────────────
@@ -2811,8 +2814,8 @@ int gemma4_engine_prefill_batched(
         if (lt == LAYER_SLIDING) {
             int count = (N < GEMMA4_SLIDING_WINDOW)? N : GEMMA4_SLIDING_WINDOW;
             int first = N - count;
-            float *kc = eng->d_sliding_k + (size_t)l*GEMMA4_SLIDING_WINDOW*kvhd;
-            float *vc = eng->d_sliding_v + (size_t)l*GEMMA4_SLIDING_WINDOW*kvhd;
+            kv_t *kc = eng->d_sliding_k + (size_t)l*GEMMA4_SLIDING_WINDOW*kvhd;
+            kv_t *vc = eng->d_sliding_v + (size_t)l*GEMMA4_SLIDING_WINDOW*kvhd;
             kv_write_sliding_kernel<<<dim3(grid1d(kvhd),count),256,0,stream>>>(
                 kc, vc, d_k, d_v, base, first, count, kvhd, GEMMA4_SLIDING_WINDOW);
             eng->sliding_cursor[l] = (base + N) % GEMMA4_SLIDING_WINDOW;
@@ -3175,8 +3178,8 @@ int gemma4_engine_decode_batched(
         const int smemA = 32 * (int)sizeof(float);
         if (lt == LAYER_SLIDING) {
             size_t lstride = (size_t)GEMMA4_SLIDING_WINDOW * okv;
-            float *kc = eng->d_sliding_k + (size_t)l*lstride;
-            float *vc = eng->d_sliding_v + (size_t)l*lstride;
+            kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
+            kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
             for (int i = 0; i < K; i++) {
                 int cur = eng->sliding_cursor[l];
                 kv_write_sliding_kernel<<<dim3(grid1d(okv),1),256,0,stream>>>(
@@ -3192,8 +3195,8 @@ int gemma4_engine_decode_batched(
         } else {
             int slot = eng->global_slot[l];
             size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
-            float *kc = eng->d_global_k + (size_t)slot*lstride;
-            float *vc = eng->d_global_v + (size_t)slot*lstride;
+            kv_t *kc = eng->d_global_k + (size_t)slot*lstride;
+            kv_t *vc = eng->d_global_v + (size_t)slot*lstride;
             for (int i = 0; i < K; i++) {
                 int gpos = pos + i;
                 kv_write_global_kernel<<<dim3(grid1d(hd),1),256,0,stream>>>(
@@ -3967,7 +3970,7 @@ int gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep) {
 // sized its cache — load validates the saved n_tokens fits this engine.
 static uint64_t session_sliding_bytes(void) {
     return (uint64_t)GEMMA4_MAX_LAYERS *
-        GEMMA4_KV_HEADS * GEMMA4_SLIDING_WINDOW * GEMMA4_HEAD_DIM * sizeof(float);
+        GEMMA4_KV_HEADS * GEMMA4_SLIDING_WINDOW * GEMMA4_HEAD_DIM * sizeof(kv_t);
 }
 
 int gemma4_engine_save_session(
@@ -3980,7 +3983,7 @@ int gemma4_engine_save_session(
     uint64_t sliding_bytes = session_sliding_bytes();
     uint64_t cursor_bytes  = 2 * (uint64_t)GEMMA4_MAX_LAYERS * sizeof(int);
     uint64_t global_rows   = (uint64_t)eng->n_layers_global * eng->global_n_tokens;
-    uint64_t global_bytes  = global_rows * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
+    uint64_t global_bytes  = global_rows * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
 
     uint64_t needed = sizeof(uint32_t) * 3 + cursor_bytes
         + 2 * sliding_bytes + 2 * global_bytes;
@@ -4005,7 +4008,7 @@ int gemma4_engine_save_session(
 
     // Global K/V: copy only the first n_tokens rows of each global slot, packed.
     uint64_t used_per_slot = (uint64_t)eng->global_n_tokens
-        * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
+        * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
     size_t slot_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
     for (int g = 0; g < eng->n_layers_global; g++) {
         cudaMemcpy(p, eng->d_global_k + (size_t)g * slot_stride,
@@ -4045,7 +4048,7 @@ int gemma4_engine_load_session(
     if (n_tokens < 0 || n_tokens > eng->global_kv_capacity) return -1;
 
     uint64_t global_rows  = (uint64_t)n_global * n_tokens;
-    uint64_t global_bytes = global_rows * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
+    uint64_t global_bytes = global_rows * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
     uint64_t needed = min_header + 2 * global_bytes;
     if (size < needed) return -1;
 
@@ -4062,7 +4065,7 @@ int gemma4_engine_load_session(
     p += sliding_bytes;
 
     uint64_t used_per_slot = (uint64_t)n_tokens
-        * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
+        * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
     size_t slot_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
     for (int g = 0; g < n_global; g++) {
         cudaMemcpy(eng->d_global_k + (size_t)g * slot_stride, p,
