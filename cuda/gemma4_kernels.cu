@@ -2982,6 +2982,65 @@ int gemma4_engine_prefill(
 // ─── Engine Decode ──────────────────────────────────────────────────────
 // =========================================================================
 
+// Diagnostic: measure the CUDA-graph launch-overhead win on the decode step.
+// Times `reps` normal launches of the decode kernel sequence vs `reps` replays of
+// the same sequence captured into a graph. Output is meaningless (positions are
+// baked/fixed); only the wall-clock difference matters → it isolates launch
+// overhead. global_n_tokens is held fixed so the global-attn length doesn't drift.
+int gemma4_engine_bench_graph(gemma4_engine_t *eng, int reps)
+{
+    if (!eng->loaded) return -1;
+    cudaStream_t stream = eng->stream;
+    const int H = GEMMA4_HIDDEN_SIZE;
+    int32_t token = 200;
+    int pos = eng->global_n_tokens;
+
+    auto body = [&]() {
+        embed_w(eng, eng->d_x, weight_fp8(eng, eng->tensors.token_embd), &token, 1, H, stream);
+        scale_kernel<<<(H+255)/256,256,0,stream>>>(eng->d_x, H, sqrtf((float)H));
+        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) decode_layer(eng, l, pos, pos+1, stream);
+        rms_norm_kernel<<<1,256,32*sizeof(float),stream>>>(
+            eng->d_norm, eng->d_x, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
+        gemv_w(eng, eng->d_logits, weight_fp8(eng, eng->tensors.output_weight),
+               eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream);
+    };
+
+    body(); cudaStreamSynchronize(stream);  // warmup
+
+    cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+    cudaEventRecord(a, stream);
+    for (int i = 0; i < reps; i++) body();
+    cudaEventRecord(b, stream); cudaEventSynchronize(b);
+    float msn = 0; cudaEventElapsedTime(&msn, a, b);
+
+    cudaGraph_t g; cudaGraphExec_t e;
+    cudaError_t ce = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+    if (ce == cudaSuccess) { body(); ce = cudaStreamEndCapture(stream, &g); }
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "graph bench: capture failed: %s\n", cudaGetErrorString(ce));
+        cudaEventDestroy(a); cudaEventDestroy(b); return -1;
+    }
+    if (cudaGraphInstantiate(&e, g, NULL, NULL, 0) != cudaSuccess) {
+        fprintf(stderr, "graph bench: instantiate failed\n");
+        cudaGraphDestroy(g); cudaEventDestroy(a); cudaEventDestroy(b); return -1;
+    }
+    cudaGraphLaunch(e, stream); cudaStreamSynchronize(stream);  // warmup replay
+    cudaEventRecord(a, stream);
+    for (int i = 0; i < reps; i++) cudaGraphLaunch(e, stream);
+    cudaEventRecord(b, stream); cudaEventSynchronize(b);
+    float msg = 0; cudaEventElapsedTime(&msg, a, b);
+
+    fprintf(stderr,
+        "graph bench (reps=%d): normal %.3f ms/tok (%.1f tok/s) | graph %.3f ms/tok "
+        "(%.1f tok/s) | launch overhead removed = %.1f%%\n",
+        reps, msn/reps, 1000.0*reps/msn, msg/reps, 1000.0*reps/msg,
+        100.0*(msn-msg)/msn);
+
+    cudaGraphExecDestroy(e); cudaGraphDestroy(g);
+    cudaEventDestroy(a); cudaEventDestroy(b);
+    return 0;
+}
+
 int gemma4_engine_decode(
     gemma4_engine_t *eng,
     int32_t          token,
@@ -3435,8 +3494,13 @@ int gemma4_engine_generate_spec(
     memcpy(hist, prompt, (size_t)n_prompt*sizeof(int32_t));
     int n = n_prompt;
 
-    // Prefill the prompt → logits predicting the first generated token.
-    if (gemma4_engine_prefill(eng, prompt, n_prompt, logits) != 0) {
+    // Prefill the prompt → logits predicting the first generated token. Use the
+    // BATCHED prefill (one weight pass over the whole prompt, ~900 tok/s); fall back
+    // to token-by-token only if it declines (non-fresh sequence). The token-by-token
+    // path would otherwise prefill the entire prompt at decode speed (~15 tok/s).
+    int prc = gemma4_engine_prefill_batched(eng, prompt, n_prompt, logits);
+    if (prc == -2) prc = gemma4_engine_prefill(eng, prompt, n_prompt, logits);
+    if (prc != 0) {
         free(hist); free(logits); free(Lbuf); return -1;
     }
 
