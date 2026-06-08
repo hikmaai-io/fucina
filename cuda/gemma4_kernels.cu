@@ -310,6 +310,40 @@ __global__ void dequant_to_bf16_kernel(
     if (i < n) dst[i] = __float2bfloat16(decode_weight(src, (int)i, fmt));
 }
 
+// ─── NVFP4 accuracy-spike simulation ───────────────────────────────────
+// Round a value to the nearest NVFP4 (E2M1) magnitude: {0,.5,1,1.5,2,3,4,6}.
+static __device__ __forceinline__ float round_e2m1(float x) {
+    float s = (x < 0.0f) ? -1.0f : 1.0f;
+    x = fabsf(x);
+    const float lv[8] = {0.0f,0.5f,1.0f,1.5f,2.0f,3.0f,4.0f,6.0f};
+    float best = lv[0], bd = fabsf(x - lv[0]);
+    #pragma unroll
+    for (int i = 1; i < 8; i++) { float d = fabsf(x - lv[i]); if (d < bd) { bd = d; best = lv[i]; } }
+    return s * best;
+}
+
+// Simulate NVFP4 weight quantization (E2M1 + per-16-block E4M3 scale) by round-
+// tripping Q8_0/FP8 weights through NVFP4 into BF16. One thread per 16-element
+// block. Used ONLY to measure accuracy drift vs Q8_0 before building the real
+// NVFP4 path (no speed benefit — it still produces BF16).
+__global__ void nvfp4_sim_kernel(
+    __nv_bfloat16 *dst, const uint8_t *src, uint64_t n, int fmt)
+{
+    uint64_t b = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;   // 16-block index
+    uint64_t base = b * 16;
+    if (base >= n) return;
+    int cnt = (int)((n - base < 16) ? (n - base) : 16);
+    float amax = 0.0f;
+    for (int i = 0; i < cnt; i++) amax = fmaxf(amax, fabsf(decode_weight(src, (int)(base+i), fmt)));
+    float scale = amax / 6.0f;
+    scale = fp8_to_float(float_to_fp8(scale));            // block scale stored as E4M3
+    float inv = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+    for (int i = 0; i < cnt; i++) {
+        float w = decode_weight(src, (int)(base+i), fmt);
+        dst[base+i] = __float2bfloat16(round_e2m1(w * inv) * scale);
+    }
+}
+
 // Convert f32 -> bf16 (for activations feeding the cuBLAS GEMM).
 __global__ void f32_to_bf16_kernel(__nv_bfloat16 *dst, const float *src, uint64_t n) {
     uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
@@ -1406,6 +1440,7 @@ struct gemma4_engine {
     int    *d_sample_id;       // 4-byte device scratch for GPU-side sampled token id
     int8_t *d_qx;              // [GEMMA4_INTERMEDIATE] int8 activation for dp4a MMVQ
     float  *d_dx;              // [GEMMA4_INTERMEDIATE/32] per-block activation scales
+    int     nvfp4_sim;         // 1 = simulate NVFP4 weight quant in prefill (accuracy spike)
 
     // Suppressed token ids (tokenizer.ggml.suppress_tokens) masked to -inf
     int32_t *d_suppress;
@@ -1685,6 +1720,7 @@ gemma4_engine_t* gemma4_engine_create(
     if (!eng) return NULL;
 
     eng->format = format;
+    eng->nvfp4_sim = getenv("GEM4D_NVFP4_SIM") ? 1 : 0;  // accuracy-spike flag
     eng->context_size = context_size;
     eng->device_id = device_id;
     eng->loaded = 0;
@@ -2634,13 +2670,18 @@ static int build_bf16_weights(gemma4_engine_t *eng)
 // reading the scratch, so there is no overwrite hazard.
 static void dequant_layer_bf16(gemma4_engine_t *eng, int l, cudaStream_t stream)
 {
+    int nvfp4_sim = eng->nvfp4_sim;   // accuracy spike (set at create from env)
     for (int p = 0; p < PJ_COUNT; p++) {
         uint64_t off; int in_dim, out_dim;
         if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;
         uint64_t n = (uint64_t)in_dim * out_dim;
         const uint8_t *src = weight_fp8(eng, off);
-        dequant_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
-            eng->d_bf16_layer[p], src, n, FMT(eng));
+        if (nvfp4_sim)
+            nvfp4_sim_kernel<<<(unsigned)((n/16 + 255) / 256), 256, 0, stream>>>(
+                eng->d_bf16_layer[p], src, n, FMT(eng));
+        else
+            dequant_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
+                eng->d_bf16_layer[p], src, n, FMT(eng));
     }
 }
 
