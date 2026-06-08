@@ -111,10 +111,13 @@ func parseFlags() CLIArgs {
 
 	flag.BoolVar(&a.Spec, "spec", true, "Prompt-lookup speculative decoding (greedy/temp=0 only)")
 	flag.IntVar(&a.DraftK, "draft-k", 6, "Max speculative draft length per step")
-	flag.Float64Var(&a.Temperature, "temp", 0.8, "Sampling temperature")
-	flag.IntVar(&a.TopK, "top-k", 40, "Top-K sampling")
-	flag.Float64Var(&a.TopP, "top-p", 0.95, "Top-P sampling")
-	flag.Float64Var(&a.MinP, "min-p", 0.05, "Min-P sampling")
+	// Defaults follow the google/gemma-4-12B model card's standardized sampling
+	// configuration (temperature 1.0, top_p 0.95, top_k 64; no min-p). The GGUF
+	// embeds the same values in general.sampling.{temp,top_k,top_p}.
+	flag.Float64Var(&a.Temperature, "temp", 1.0, "Sampling temperature (gemma-4 default 1.0)")
+	flag.IntVar(&a.TopK, "top-k", 64, "Top-K sampling (gemma-4 default 64)")
+	flag.Float64Var(&a.TopP, "top-p", 0.95, "Top-P sampling (gemma-4 default 0.95)")
+	flag.Float64Var(&a.MinP, "min-p", 0.0, "Min-P sampling (gemma-4 default off)")
 	flag.Int64Var(&a.Seed, "seed", -1, "Random seed (-1 = random)")
 	flag.Float64Var(&a.RepeatPenalty, "repeat-penalty", 1.1, "Repeat penalty")
 	flag.Float64Var(&a.FrequencyPenalty, "frequency-penalty", 0.0, "Frequency penalty")
@@ -771,10 +774,10 @@ Inference options:
   --flash-attn               Use Flash Attention (default: true)
 
 Sampling options:
-  --temp F                   Temperature (default: 0.8)
-  --top-k N                  Top-K sampling (default: 40)
-  --top-p F                  Top-P sampling (default: 0.95)
-  --min-p F                  Min-P sampling (default: 0.05)
+  --temp F                   Temperature (gemma-4 default: 1.0)
+  --top-k N                  Top-K sampling (gemma-4 default: 64)
+  --top-p F                  Top-P sampling (gemma-4 default: 0.95)
+  --min-p F                  Min-P sampling (gemma-4 default: 0.0/off)
   --seed N                   Seed (-1 = random)
   --repeat-penalty F         Repeat penalty (default: 1.1)
 

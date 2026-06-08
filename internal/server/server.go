@@ -110,13 +110,16 @@ type ModelInfo struct {
 }
 
 func DefaultParams() GenerationParams {
+	// google/gemma-4-12B model-card standardized sampling config (also embedded in
+	// the GGUF general.sampling.*): temperature 1.0, top_p 0.95, top_k 64, no min-p
+	// or repeat penalty.
 	return GenerationParams{
-		Temperature:     0.8,
+		Temperature:     1.0,
 		TopP:            0.95,
-		TopK:            40,
-		MinP:            0.05,
+		TopK:            64,
+		MinP:            0.0,
 		Seed:            0,
-		RepeatPenalty:   1.1,
+		RepeatPenalty:   1.0,
 		FrequencyPenalty: 0.0,
 		PresencePenalty: 0.0,
 		MaxTokens:       512,
