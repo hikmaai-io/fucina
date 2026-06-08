@@ -3430,21 +3430,51 @@ int gemma4_engine_verify_batch(
 // Longest-suffix n-gram draft: find the most recent earlier occurrence of the
 // current suffix of hist[0..n-1] (lengths max_ng..min_ng) and propose the up-to
 // max_d tokens that followed it. Zero model cost. Returns the draft length.
+// Consensus prompt-lookup draft. Finds the longest suffix of `hist` (length
+// max_ng..min_ng) that recurs earlier, then drafts its continuation — but only as
+// far as the recent occurrences AGREE. A draft token is emitted only when it is the
+// continuation in a (weak-)majority of the most-recent matches; the draft is cut at
+// the first low-consensus position. This raises acceptance precision (fewer wasted
+// draft tokens, hence higher effective tok/s) on structured/repetitive text, and
+// degrades exactly to plain prompt-lookup when only one match exists (thresh==1).
+// Verify still samples each position from the exact target distribution, so accuracy
+// is unchanged regardless of draft quality. Returns draft length.
 static int prompt_lookup_draft(const int32_t *hist, int n, int32_t *draft,
                                int max_d, int min_ng, int max_ng)
 {
     if (max_d <= 0) return 0;
+    enum { MAX_OCC = 16 };
+    int occ[MAX_OCC];
     for (int ng = max_ng; ng >= min_ng; ng--) {
         if (n < ng + 1) continue;
         const int32_t *suf = hist + n - ng;
-        for (int i = n - ng - 1; i >= 0; i--) {
+        // collect up to MAX_OCC most-recent earlier occurrences of the suffix
+        int nocc = 0;
+        for (int i = n - ng - 1; i >= 0 && nocc < MAX_OCC; i--) {
             int match = 1;
             for (int j = 0; j < ng; j++) if (hist[i+j] != suf[j]) { match = 0; break; }
-            if (!match) continue;
-            int d = 0;
-            for (int j = i + ng; j < n && d < max_d; j++) draft[d++] = hist[j];
-            if (d > 0) return d;
+            if (match) occ[nocc++] = i + ng;   // position right after the matched context
         }
+        if (nocc == 0) continue;
+        int thresh = (nocc + 1) / 2;            // weak majority; ==1 when nocc==1
+        // Confidence cap: a single occurrence is only trusted as far ahead as the
+        // matched context is long (a 5-gram match → up to 5 tokens; a lone 2-gram → 2).
+        // Multiple agreeing occurrences are trusted to the full draft budget.
+        int cap = max_d;
+        if (nocc == 1 && cap > ng) cap = ng;
+        int d = 0;
+        for (int dd = 0; dd < cap; dd++) {
+            int p0 = occ[0] + dd;               // most-recent occurrence's continuation
+            if (p0 >= n) break;
+            int cand = hist[p0], agree = 0;
+            for (int k = 0; k < nocc; k++) {
+                int p = occ[k] + dd;
+                if (p < n && hist[p] == cand) agree++;
+            }
+            if (agree < thresh) break;          // low consensus → stop drafting here
+            draft[d++] = cand;
+        }
+        if (d > 0) return d;
     }
     return 0;
 }
@@ -3518,11 +3548,9 @@ static int run_spec_loop(
     if (!Lbuf) return -1;
     auto is_stop = [&](int t){ for (int s=0;s<n_stop;s++) if (stop_ids[s]==t) return 1; return 0; };
 
-    const float SPEC_ON = 0.45f;
-    const int   PROBE   = 64;
-    float ema = 1.0f;
-    int   since_probe = 0;
     uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
+    int cold = 0;             // consecutive fully-rejected draft attempts (light backoff)
+    float ema_a = (float)draft_k;   // EMA of accepted tokens/step; starts optimistic
 
     int g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
     int generated = 0, total_accepted = 0, stop = 0;
@@ -3532,15 +3560,23 @@ static int run_spec_loop(
 
         int pos = eng->global_n_tokens;
         int room = GEMMA4_SLIDING_WINDOW - 1 - pos;
-        int want_spec = (ema > SPEC_ON) || (since_probe >= PROBE);
-        int maxd = want_spec ? draft_k : 0;
+        // Adaptive draft length. A K-token batched verify costs ~2x a single decode on
+        // this hardware (the per-token attention/sampling work is NOT fully amortized by
+        // the one shared weight pass), so break-even needs accepted/D > ~0.23 — over-
+        // drafting on low-acceptance text loses. Size the draft to the recent accepted
+        // run (+1 probe token): verbatim/repetitive text grows it to draft_k for a big
+        // win; novel text shrinks it toward the floor so a rejected draft stays cheap.
+        // Light backoff: after a short run of total rejections, skip one step, then retry.
+        int maxd = (int)(ema_a + 1.5f);
+        if (maxd > draft_k) maxd = draft_k;
+        if (maxd < 2)       maxd = 2;
+        if (cold >= 4) { maxd = 0; cold = 0; }
         if (maxd > room) maxd = room; if (maxd < 0) maxd = 0;
         if (generated + 1 >= max_new) maxd = 0;
 
         int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k);
         if (D == 0) {
             if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
-            since_probe++;
             g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
             continue;
         }
@@ -3558,8 +3594,8 @@ static int run_spec_loop(
             else { rejected = s; break; }
         }
         total_accepted += a;
-        ema = 0.6f*ema + 0.4f*((float)a/(float)D);
-        since_probe = 0;
+        ema_a = 0.5f*ema_a + 0.5f*(float)a;
+        cold = (a == 0) ? cold + 1 : 0;
         int keep = pos + 1 + a;
         if (keep < eng->global_n_tokens) gemma4_engine_rewind(eng, keep);
         for (int i = 0; i < a && generated < max_new; i++) {
