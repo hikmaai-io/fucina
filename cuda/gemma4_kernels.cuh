@@ -43,6 +43,7 @@
 #define GEMMA4_SOFTCAP           30.0f
 #define GEMMA4_RMS_EPS           1e-6f
 #define GEMMA4_MAX_LORA_RANK     64
+#define GEMMA4_SPEC_MAX          16      // max draft length per batched-decode pass
 
 // Special tokens
 #define GEMMA4_BOS_ID  2
@@ -149,6 +150,16 @@ int gemma4_engine_decode(
     gemma4_engine_t *eng,
     int32_t          token,
     float           *logits_out     // [VOCAB_SIZE] output logits
+);
+
+// Batched decode: forward K tokens in ONE weight pass, continuing the sequence.
+// Writes logits_out[K × VOCAB_SIZE] (row i = logits after token i), advances the
+// cache by K. K ≤ GEMMA4_SPEC_MAX. Returns 0 ok, -2 defer (LoRA), -1 error.
+int gemma4_engine_decode_batched(
+    gemma4_engine_t *eng,
+    const int32_t   *tokens,         // [K] tokens to forward
+    int              K,
+    float           *logits_out      // [K × VOCAB_SIZE]
 );
 
 // Speculative verify batch: verify K draft tokens in parallel

@@ -553,6 +553,65 @@ __global__ void gemv_pair_kernel(
     if (threadIdx.x == 0) { out_gate[idx] = sg; out_up[idx] = su; }
 }
 
+// Batched GEMV on a quantized weight: out[NK][out_dim] = x[NK][in_dim] · Wᵀ, reading
+// each weight row ONCE and reusing the decoded element across all NK input vectors.
+// This is the decode-speed lever: NK draft tokens cost ~one token's WEIGHT bandwidth
+// (12.65 GB), not NK× — what makes speculative decoding pay. NK is a COMPILE-TIME
+// constant so acc[NK] stays in REGISTERS and the k-loops fully unroll (a dynamic K
+// puts acc[] in local memory, whose per-element RMW traffic scales with K and erases
+// the win). Token-major: x[k*in_dim+i], out[k*out_dim+idx]. One block per output row.
+template<int NK>
+__global__ void gemv_batched_kernel_t(
+    float          *out,      // [NK × out_dim]
+    const uint8_t  *weight,   // row-major [out_dim × in_dim]
+    const float    *x,        // [NK × in_dim]
+    int             in_dim,
+    int             out_dim,
+    int             fmt)
+{
+    extern __shared__ float smem[];
+    int idx = blockIdx.x;
+    if (idx >= out_dim) return;
+    const uint8_t *row = weight + (size_t)idx * (fmt == 0 ? in_dim : (size_t)(in_dim/32)*34);
+    float acc[NK];
+    #pragma unroll
+    for (int k = 0; k < NK; k++) acc[k] = 0.0f;
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        float w = decode_weight(row, i, fmt);          // decode the weight element ONCE
+        #pragma unroll
+        for (int k = 0; k < NK; k++) acc[k] += w * x[(size_t)k*in_dim + i];
+    }
+    #pragma unroll
+    for (int k = 0; k < NK; k++) {
+        float s = block_reduce_sum(acc[k], smem);
+        if (threadIdx.x == 0) out[(size_t)k*out_dim + idx] = s;
+    }
+}
+
+// Dispatch the batched GEMV to the compile-time-NK kernel. K ≤ 8 → one weight pass;
+// K > 8 is split into ≤8-wide chunks (each re-reads the weight, still far cheaper
+// than K separate decodes).
+static void gemv_batched_launch(
+    float *out, const uint8_t *weight, const float *x,
+    int in_dim, int out_dim, int K, int fmt, cudaStream_t stream)
+{
+    dim3 g(out_dim); int b = 256; size_t sm = 32*sizeof(float);
+    #define LAUNCH(NK) gemv_batched_kernel_t<NK><<<g,b,sm,stream>>>(out,weight,x,in_dim,out_dim,fmt)
+    switch (K) {
+        case 1: LAUNCH(1); break;  case 2: LAUNCH(2); break;
+        case 3: LAUNCH(3); break;  case 4: LAUNCH(4); break;
+        case 5: LAUNCH(5); break;  case 6: LAUNCH(6); break;
+        case 7: LAUNCH(7); break;  case 8: LAUNCH(8); break;
+        default:
+            for (int o = 0; o < K; o += 8) {
+                int kk = (K - o < 8) ? (K - o) : 8;
+                gemv_batched_launch(out + (size_t)o*out_dim, weight,
+                                    x + (size_t)o*in_dim, in_dim, out_dim, kk, fmt, stream);
+            }
+    }
+    #undef LAUNCH
+}
+
 // =========================================================================
 // ─── Unified LoRA GEMV: out[j] = Wx[j] + scale*(B*(A*x))[j] ────────────────
 // Works for both FP8 and Q8_0 via decode_weight(). All reductions use
@@ -2097,6 +2156,15 @@ static inline void gemv_w(
         out, weight, x, in_dim, out_dim, FMT(eng));
 }
 
+// Batched GEMV: Y[K][out_dim] = X[K][in_dim] · weightᵀ, weight read once for all K.
+static inline void gemv_batched_w(
+    const gemma4_engine_t *eng,
+    float *out, const uint8_t *weight, const float *x,
+    int in_dim, int out_dim, int K, cudaStream_t stream)
+{
+    gemv_batched_launch(out, weight, x, in_dim, out_dim, K, FMT(eng), stream);
+}
+
 static inline void embed_w(
     const gemma4_engine_t *eng,
     float *out, const uint8_t *table, const int32_t *tokens,
@@ -2896,6 +2964,197 @@ int gemma4_engine_decode(
         return -1;
     }
 
+    return 0;
+}
+
+// =========================================================================
+// ─── Batched Decode (one weight pass over K tokens) ─────────────────────
+// =========================================================================
+// Forward K tokens [pos .. pos+K-1] CONTINUING the current sequence, reading each
+// weight matrix ONCE for all K (the projection/FFN GEMMs are the 12.65 GB/token
+// bandwidth cost). This is the engine primitive that makes speculative decoding
+// pay off: K sequential decodes read the weights K times; this reads them once,
+// so an accepted draft of length K costs ~one token's bandwidth. K must be small
+// (≤ GEMMA4_SPEC_MAX). Attention is done per token against the live cache (reusing
+// the single-query flash decode kernels), so causality is exact. Writes
+// logits_out[K × VOCAB] (row i = logits AFTER token i) and advances the cache by K.
+// Returns 0 on success, -2 if it must defer to sequential decode (LoRA active),
+// -1 on error. Math matches gemma4_engine_decode token-for-token.
+int gemma4_engine_decode_batched(
+    gemma4_engine_t *eng, const int32_t *tokens, int K, float *logits_out)
+{
+    if (!eng->loaded || K <= 0) return -1;
+    if (eng->lora_loaded) return -2;                 // batched path has no LoRA support
+    if (K > GEMMA4_SPEC_MAX) return -1;
+
+    cudaStream_t stream = eng->stream;
+    const int H   = GEMMA4_HIDDEN_SIZE;
+    const int I   = GEMMA4_INTERMEDIATE;
+    const int HD2 = 32 * sizeof(float);
+    const int HEADS = GEMMA4_HEADS;
+    const int pos = eng->global_n_tokens;            // captured; advanced only at end
+    const int OQ_MAX  = GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM; // 8192
+    const int OKV_MAX = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;     // 2048
+
+    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0, stream);
+
+    // Scratch (token-major, K rows — tiny since K ≤ GEMMA4_SPEC_MAX). All fp32:
+    // the batched GEMV reads Q8_0 weights directly (no BF16 dequant), so K tokens
+    // cost ~one token's weight bandwidth.
+    int32_t *d_tok=0;
+    float *d_x=0,*d_norm=0,*d_inf=0,*d_q=0,*d_k=0,*d_v=0,*d_attn=0,*d_o=0,*d_gate=0,*d_up=0;
+    int ok = 1;
+    #define DALLOC(p,bytes) do{ if(cudaMalloc(&(p),(size_t)(bytes))!=cudaSuccess) ok=0; }while(0)
+    DALLOC(d_tok,  (size_t)K*sizeof(int32_t));
+    DALLOC(d_x,    (size_t)K*H*sizeof(float));
+    DALLOC(d_norm, (size_t)K*H*sizeof(float));
+    DALLOC(d_inf,  (size_t)K*I*sizeof(float));    // normed input / FFN intermediate
+    DALLOC(d_q,    (size_t)K*OQ_MAX*sizeof(float));
+    DALLOC(d_k,    (size_t)K*OKV_MAX*sizeof(float));
+    DALLOC(d_v,    (size_t)K*OKV_MAX*sizeof(float));
+    DALLOC(d_attn, (size_t)K*OQ_MAX*sizeof(float));
+    DALLOC(d_o,    (size_t)K*H*sizeof(float));
+    DALLOC(d_gate, (size_t)K*I*sizeof(float));
+    DALLOC(d_up,   (size_t)K*I*sizeof(float));
+    #undef DALLOC
+    float *fb[] = {d_x,d_norm,d_inf,d_q,d_k,d_v,d_attn,d_o,d_gate,d_up};
+    if (!ok) {
+        for (float *p : fb) if(p) cudaFree(p);
+        if(d_tok) cudaFree(d_tok);
+        cudaGetLastError();
+        return -1;
+    }
+
+    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+
+    cudaMemcpyAsync(d_tok, tokens, (size_t)K*sizeof(int32_t),
+                    cudaMemcpyHostToDevice, stream);
+    embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, K, H, stream);
+    scale_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, K*H, sqrtf((float)H));
+
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        layer_type_t lt = eng->layer_types[l];
+        int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+        int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+        int oq  = HEADS*hd, okv = nkv*hd;
+        const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
+        const float *w_post_a = eng->d_w_post_attn_norm + (size_t)l*H;
+        const float *w_ffn    = eng->d_w_ffn_norm       + (size_t)l*H;
+        const float *w_post_f = eng->d_w_post_ffn_norm  + (size_t)l*H;
+        const float *w_qn     = eng->d_w_q_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+        const float *w_kn     = eng->d_w_k_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+        const __typeof__(eng->tensors.layers[0]) *L = &eng->tensors.layers[l];
+
+        // Pre-attn norm (fp32) → Q,K,V batched GEMV (Q8_0 read once, reused over K).
+        rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_inf, d_x, w_attn, H, K, GEMMA4_RMS_EPS);
+        gemv_batched_w(eng, d_q, weight_fp8(eng, L->attn_q), d_inf, H, oq, K, stream);
+        per_head_rms_norm_rows_kernel<<<dim3(HEADS,K),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, K, GEMMA4_RMS_EPS);
+        gemv_batched_w(eng, d_k, weight_fp8(eng, L->attn_k), d_inf, H, okv, K, stream);
+        if (lt == LAYER_SLIDING) {
+            gemv_batched_w(eng, d_v, weight_fp8(eng, L->attn_v), d_inf, H, okv, K, stream);
+            per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_v, NULL, nkv, hd, K, GEMMA4_RMS_EPS);
+        } else {
+            cudaMemcpyAsync(d_v, d_k, (size_t)K*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_v, NULL, nkv, hd, K, GEMMA4_RMS_EPS);
+        }
+        per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, K, GEMMA4_RMS_EPS);
+
+        if (lt == LAYER_SLIDING)
+            rope_rows_kernel<<<dim3(HEADS,K),hd/2,0,stream>>>(d_q, d_k, pos, HEADS, nkv, hd, K, 10000.0f, NULL);
+        else
+            rope_rows_kernel<<<dim3(HEADS,K),hd/2,0,stream>>>(d_q, d_k, pos, HEADS, nkv, hd, K, 1000000.0f, eng->d_rope_freqs);
+
+        // Attention: per token, write its K/V into the live cache then attend against
+        // everything up to it (exact causality; reuses the flash decode kernels).
+        const int smemA = 32 * (int)sizeof(float);
+        if (lt == LAYER_SLIDING) {
+            size_t lstride = (size_t)GEMMA4_SLIDING_WINDOW * okv;
+            float *kc = eng->d_sliding_k + (size_t)l*lstride;
+            float *vc = eng->d_sliding_v + (size_t)l*lstride;
+            for (int i = 0; i < K; i++) {
+                int cur = eng->sliding_cursor[l];
+                kv_write_sliding_kernel<<<dim3(grid1d(okv),1),256,0,stream>>>(
+                    kc, vc, d_k + (size_t)i*okv, d_v + (size_t)i*okv,
+                    cur, 0, 1, okv, GEMMA4_SLIDING_WINDOW);
+                eng->sliding_cursor[l] = (cur + 1) % GEMMA4_SLIDING_WINDOW;
+                if (eng->sliding_filled[l] < GEMMA4_SLIDING_WINDOW) eng->sliding_filled[l]++;
+                sliding_attn_decode_kernel<<<HEADS, hd, smemA, stream>>>(
+                    d_attn + (size_t)i*oq, d_q + (size_t)i*oq, kc, vc,
+                    HEADS, nkv, hd, GEMMA4_SLIDING_WINDOW,
+                    eng->sliding_cursor[l], eng->sliding_filled[l]);
+            }
+        } else {
+            int slot = eng->global_slot[l];
+            size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+            float *kc = eng->d_global_k + (size_t)slot*lstride;
+            float *vc = eng->d_global_v + (size_t)slot*lstride;
+            for (int i = 0; i < K; i++) {
+                int gpos = pos + i;
+                kv_write_global_kernel<<<dim3(grid1d(hd),1),256,0,stream>>>(
+                    kc, vc, d_k + (size_t)i*okv, d_v + (size_t)i*okv, gpos, 1, hd);
+                global_attn_decode_kernel<<<HEADS, hd, smemA, stream>>>(
+                    d_attn + (size_t)i*oq, d_q + (size_t)i*oq, kc, vc,
+                    HEADS, hd, gpos + 1);
+            }
+        }
+
+        // O projection (input d_attn is already fp32) → d_o; post-attn norm; residual.
+        gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, K, stream);
+        rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_a, H, K, GEMMA4_RMS_EPS);
+        residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
+
+        // FFN (fp32 batched GEMV throughout).
+        rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_inf, d_x, w_ffn, H, K, GEMMA4_RMS_EPS);
+        gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, K, stream);
+        gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, K, stream);
+        geglu_kernel<<<grid1d((size_t)K*I),256,0,stream>>>(d_inf, d_gate, d_up, K*I);
+        gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, K, stream);
+        rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_f, H, K, GEMMA4_RMS_EPS);
+        residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
+        if (eng->h_out_scale[l] != 1.0f)
+            scale_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, K*H, eng->h_out_scale[l]);
+    }
+
+    // Output norm (batched) + LM head as ONE batched GEMV (tied LM head read once
+    // for all K) + softcap + suppress, then D2H all K logit rows.
+    int vocab = GEMMA4_VOCAB_SIZE;
+    float *d_logitsK = NULL;
+    if (cudaMalloc(&d_logitsK, (size_t)K*vocab*sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        for (float *p : fb) cudaFree(p);
+        cudaFree(d_tok);
+        return -1;
+    }
+    rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, K, GEMMA4_RMS_EPS);
+    gemv_batched_w(eng, d_logitsK, weight_fp8(eng, eng->tensors.output_weight),
+                   d_norm, H, vocab, K, stream);
+    logit_softcap_kernel<<<grid1d((size_t)K*vocab),256,0,stream>>>(d_logitsK, GEMMA4_SOFTCAP, K*vocab);
+    if (eng->n_suppress > 0)
+        for (int i = 0; i < K; i++)
+            suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
+                d_logitsK + (size_t)i*vocab, eng->d_suppress, eng->n_suppress, vocab);
+    if (logits_out)
+        cudaMemcpyAsync(logits_out, d_logitsK, (size_t)K*vocab*sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+
+    eng->global_n_tokens += K;
+
+    cudaEventRecord(t1, stream);
+    cudaEventSynchronize(t1);
+    float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
+    eng->decode_time_ms += ms;
+    eng->n_decode_tokens += K;
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+
+    for (float *p : fb) cudaFree(p);
+    cudaFree(d_logitsK); cudaFree(d_tok);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gem4d: decode_batched CUDA error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
     return 0;
 }
 
