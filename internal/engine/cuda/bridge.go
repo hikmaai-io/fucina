@@ -245,6 +245,41 @@ func (e *Engine) SampleDevice(temp float32, topK int, topP, minP, rnd float32) (
 	return int32(id), nil
 }
 
+// GenerateSpecContinue runs speculative generation continuing from the engine's
+// already-prefilled state (server path). history = prompt tokens in the cache,
+// firstLogits = post-prefill logits. Returns generated tokens + drafts accepted.
+func (e *Engine) GenerateSpecContinue(history []int32, firstLogits []float32,
+	maxNew int, stops []int32, draftK int,
+	temp float32, topK int, topP, minP float32, seed uint64) ([]int32, int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	out := make([]int32, maxNew)
+	var nacc C.int
+	var histPtr *C.int32_t
+	if len(history) > 0 {
+		histPtr = (*C.int32_t)(unsafe.Pointer(&history[0]))
+	}
+	var stopsPtr *C.int32_t
+	if len(stops) > 0 {
+		stopsPtr = (*C.int32_t)(unsafe.Pointer(&stops[0]))
+	}
+	ng := C.gemma4_engine_generate_spec_continue(
+		e.ptr,
+		histPtr, C.int(len(history)),
+		(*C.float)(unsafe.Pointer(&firstLogits[0])),
+		(*C.int32_t)(unsafe.Pointer(&out[0])), C.int(maxNew),
+		stopsPtr, C.int(len(stops)),
+		C.int(draftK),
+		C.float(temp), C.int(topK), C.float(topP), C.float(minP), C.uint64_t(seed),
+		&nacc,
+	)
+	if ng < 0 {
+		return nil, 0, fmt.Errorf("gem4d: generate_spec_continue failed")
+	}
+	return out[:ng], int(nacc), nil
+}
+
 // Argmax returns the index of the highest value in logits.
 func Argmax(logits []float32) int {
 	return int(C.gemma4_sample_argmax(

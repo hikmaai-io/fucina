@@ -175,6 +175,18 @@ int gemma4_engine_generate_spec(
     float temp, int top_k, float top_p, float min_p, uint64_t seed,
     int             *n_accepted_out);
 
+// Server path: speculative generation continuing from an ALREADY-prefilled engine.
+// `history` = prompt tokens in the cache; `first_logits` = post-prefill logits.
+int gemma4_engine_generate_spec_continue(
+    gemma4_engine_t *eng,
+    const int32_t   *history, int n_history,
+    const float     *first_logits,
+    int32_t         *out_tokens, int max_new,
+    const int32_t   *stop_ids, int n_stop,
+    int              draft_k,
+    float temp, int top_k, float top_p, float min_p, uint64_t seed,
+    int             *n_accepted_out);
+
 // Speculative verify batch: verify K draft tokens in parallel
 // Returns number of accepted tokens (0..K)
 int gemma4_engine_verify_batch(

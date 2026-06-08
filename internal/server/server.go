@@ -329,29 +329,59 @@ func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams
 
 	generated := 0
 	var toks []int32
-	rng := rand.New(rand.NewSource(params.Seed))
 	tcEnd := s.tokenizer.ToolCallEnd
-
 	genStart := time.Now()
-	for generated < params.MaxTokens {
-		if logits == nil {
-			break
+
+	if params.RepeatPenalty == 1.0 {
+		// Speculative decoding (default): one weight pass per [g, draft...], same
+		// output distribution as plain decode. Continues from the prefilled state.
+		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
+		if wantTools && tcEnd >= 0 {
+			stops = append(stops, tcEnd)
 		}
-		token, err := s.sampleToken(logits, params, rng)
-		if err != nil || s.tokenizer.IsStop(token) {
-			break
+		seed := uint64(params.Seed)
+		if params.Seed < 0 {
+			seed = uint64(time.Now().UnixNano())
 		}
-		toks = append(toks, token)
-		s.kv.AppendDecoded(token)
-		generated++
-		// A tool call ends with <tool_call|>: stop the turn there so we can parse it.
-		if wantTools && tcEnd >= 0 && token == tcEnd {
-			break
+		history := s.kv.CurrentTokens()
+		var err error
+		toks, _, err = s.engine.GenerateSpecContinue(history, logits, params.MaxTokens,
+			stops, 6, float32(params.Temperature), params.TopK,
+			float32(params.TopP), float32(params.MinP), seed)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("generation failed: %v", err), http.StatusInternalServerError)
+			return
 		}
-		var err2 error
-		logits, err2 = s.engine.Decode(token)
-		if err2 != nil {
-			break
+		// Sync the prefix cache with the tokens actually committed to the engine
+		// KV (a trailing stop token may be emitted but not forwarded).
+		committed := s.engine.NTokens() - promptTokens
+		for i := 0; i < committed && i < len(toks); i++ {
+			s.kv.AppendDecoded(toks[i])
+		}
+		generated = len(toks)
+	} else {
+		// Repeat-penalty path: the host sampler can't be expressed in spec, so use
+		// the plain per-token decode loop with the CPU sampler.
+		rng := rand.New(rand.NewSource(params.Seed))
+		for generated < params.MaxTokens {
+			if logits == nil {
+				break
+			}
+			token, err := s.sampleToken(logits, params, rng)
+			if err != nil || s.tokenizer.IsStop(token) {
+				break
+			}
+			toks = append(toks, token)
+			s.kv.AppendDecoded(token)
+			generated++
+			if wantTools && tcEnd >= 0 && token == tcEnd {
+				break
+			}
+			var err2 error
+			logits, err2 = s.engine.Decode(token)
+			if err2 != nil {
+				break
+			}
 		}
 	}
 	logGenSpeed(genStart, generated)

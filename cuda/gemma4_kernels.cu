@@ -3501,6 +3501,85 @@ static inline double spec_rng(uint64_t *s) {
     return (double)(x >> 11) * (1.0 / 9007199254740992.0);
 }
 
+// Core speculative generation loop, shared by generate_spec (which prefills first)
+// and generate_spec_continue (server path: cache already prefilled, logits supplied).
+// `hist` holds the token history (prompt + room for max_new); `n` is its current
+// length; `logits` predicts the next position. Returns the count appended to
+// out_tokens; *n_accepted_out (or NULL) gets the total drafts accepted.
+static int run_spec_loop(
+    gemma4_engine_t *eng, int32_t *hist, int n, float *logits,
+    int32_t *out_tokens, int max_new, const int32_t *stop_ids, int n_stop,
+    int draft_k, float temp, int top_k, float top_p, float min_p, uint64_t seed,
+    int *n_accepted_out)
+{
+    int V = GEMMA4_VOCAB_SIZE;
+    float *Lbuf = (float*)malloc((size_t)(draft_k+1)*V*sizeof(float));
+    int32_t batch[GEMMA4_SPEC_MAX];
+    if (!Lbuf) return -1;
+    auto is_stop = [&](int t){ for (int s=0;s<n_stop;s++) if (stop_ids[s]==t) return 1; return 0; };
+
+    const float SPEC_ON = 0.45f;
+    const int   PROBE   = 64;
+    float ema = 1.0f;
+    int   since_probe = 0;
+    uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
+
+    int g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+    int generated = 0, total_accepted = 0, stop = 0;
+    while (generated < max_new && !stop) {
+        out_tokens[generated++] = g; hist[n++] = g;
+        if (is_stop(g)) break;
+
+        int pos = eng->global_n_tokens;
+        int room = GEMMA4_SLIDING_WINDOW - 1 - pos;
+        int want_spec = (ema > SPEC_ON) || (since_probe >= PROBE);
+        int maxd = want_spec ? draft_k : 0;
+        if (maxd > room) maxd = room; if (maxd < 0) maxd = 0;
+        if (generated + 1 >= max_new) maxd = 0;
+
+        int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k);
+        if (D == 0) {
+            if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
+            since_probe++;
+            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+            continue;
+        }
+        batch[0] = g;
+        int K = D + 1;
+        if (gemma4_engine_decode_batched(eng, batch, K, Lbuf) != 0) {
+            if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
+            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+            continue;
+        }
+        int a = 0, rejected = -1;
+        while (a < D) {
+            int s = host_sample(Lbuf + (size_t)a*V, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+            if (s == batch[1+a]) { a++; }
+            else { rejected = s; break; }
+        }
+        total_accepted += a;
+        ema = 0.6f*ema + 0.4f*((float)a/(float)D);
+        since_probe = 0;
+        int keep = pos + 1 + a;
+        if (keep < eng->global_n_tokens) gemma4_engine_rewind(eng, keep);
+        for (int i = 0; i < a && generated < max_new; i++) {
+            int t = batch[1+i]; out_tokens[generated++] = t; hist[n++] = t;
+            if (is_stop(t)) { stop = 1; break; }
+        }
+        if (stop) break;
+        if (a < D) {
+            memcpy(logits, Lbuf + (size_t)a*V, (size_t)V*sizeof(float));
+            g = rejected;
+        } else {
+            memcpy(logits, Lbuf + (size_t)D*V, (size_t)V*sizeof(float));
+            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+        }
+    }
+    free(Lbuf);
+    if (n_accepted_out) *n_accepted_out = total_accepted;
+    return generated;
+}
+
 // [g, draft...] in ONE weight pass (gemma4_engine_decode_batched), commits the
 // confirmed prefix, and gets the next step's logits for free from the same pass —
 // so a matched draft of length a yields (1+a) tokens per ~one token's bandwidth.
@@ -3526,11 +3605,7 @@ int gemma4_engine_generate_spec(
     int cap = n_prompt + max_new + 8;
     int32_t *hist = (int32_t*)malloc((size_t)cap*sizeof(int32_t));
     float   *logits = (float*)malloc((size_t)V*sizeof(float));
-    float   *Lbuf = (float*)malloc((size_t)(draft_k+1)*V*sizeof(float));
-    int32_t  batch[GEMMA4_SPEC_MAX];
-    if (!hist || !logits || !Lbuf) { free(hist); free(logits); free(Lbuf); return -1; }
-
-    auto is_stop = [&](int t){ for (int s=0;s<n_stop;s++) if (stop_ids[s]==t) return 1; return 0; };
+    if (!hist || !logits) { free(hist); free(logits); return -1; }
 
     memcpy(hist, prompt, (size_t)n_prompt*sizeof(int32_t));
     int n = n_prompt;
@@ -3542,89 +3617,45 @@ int gemma4_engine_generate_spec(
     int prc = gemma4_engine_prefill_batched(eng, prompt, n_prompt, logits);
     if (prc == -2) prc = gemma4_engine_prefill(eng, prompt, n_prompt, logits);
     if (prc != 0) {
-        free(hist); free(logits); free(Lbuf); return -1;
+        free(hist); free(logits); return -1;
     }
 
-    // Adaptive speculation: track the accepted-fraction EMA and stop drafting when
-    // it falls low (novel text where prompt-lookup mostly misses), re-probing every
-    // PROBE steps so a workload that turns copy-heavy resumes speculating. This caps
-    // the wrong-draft overhead so spec never meaningfully regresses vs plain greedy.
-    const float SPEC_ON = 0.45f;   // need a healthy hit rate to keep drafting
-    const int   PROBE   = 64;      // re-probe rarely so misses stay cheap
-    float ema = 1.0f;          // optimistic start
-    int   since_probe = 0;
+    int generated = run_spec_loop(eng, hist, n, logits, out_tokens, max_new,
+        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, seed, n_accepted_out);
 
-    uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
-    // `g` is the next token to emit/forward, already drawn from `logits` (the dist
-    // for its position). Carrying it across iterations lets a rejected draft REUSE
-    // the sample drawn from the target at that position — re-drawing would bias the
-    // output toward the draft token.
-    int g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
-    int generated = 0, total_accepted = 0, stop = 0;
-    while (generated < max_new && !stop) {
-        out_tokens[generated++] = g; hist[n++] = g;
-        if (is_stop(g)) break;
+    free(hist); free(logits);
+    return generated;
+}
 
-        int pos = eng->global_n_tokens;                 // g not yet in the cache
-        int room = GEMMA4_SLIDING_WINDOW - 1 - pos;      // keep rollback inside the window
-        int want_spec = (ema > SPEC_ON) || (since_probe >= PROBE);
-        int maxd = want_spec ? draft_k : 0;
-        if (maxd > room) maxd = room; if (maxd < 0) maxd = 0;
-        if (generated + 1 >= max_new) maxd = 0;          // no point drafting past the budget
+// Server path: continue speculative generation from the ALREADY-prefilled engine
+// state. `history` is the prompt tokens currently in the cache (for n-gram drafting),
+// `first_logits` the post-prefill logits predicting the first generated token. Does
+// NOT prefill. Same exact-distribution guarantees as gemma4_engine_generate_spec.
+int gemma4_engine_generate_spec_continue(
+    gemma4_engine_t *eng,
+    const int32_t   *history, int n_history,
+    const float     *first_logits,
+    int32_t         *out_tokens, int max_new,
+    const int32_t   *stop_ids, int n_stop,
+    int              draft_k,
+    float            temp, int top_k, float top_p, float min_p, uint64_t seed,
+    int             *n_accepted_out)
+{
+    if (!eng || !eng->loaded || n_history < 0 || max_new <= 0) return -1;
+    if (draft_k > GEMMA4_SPEC_MAX - 1) draft_k = GEMMA4_SPEC_MAX - 1;
+    int V = GEMMA4_VOCAB_SIZE;
 
-        int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k);
+    int cap = n_history + max_new + 8;
+    int32_t *hist = (int32_t*)malloc((size_t)cap*sizeof(int32_t));
+    float   *logits = (float*)malloc((size_t)V*sizeof(float));
+    if (!hist || !logits) { free(hist); free(logits); return -1; }
+    if (n_history > 0) memcpy(hist, history, (size_t)n_history*sizeof(int32_t));
+    memcpy(logits, first_logits, (size_t)V*sizeof(float));
 
-        // No n-gram match → nothing to speculate. Fast single-token decode (avoids
-        // decode_batched's overhead), so spec never regresses vs plain decode.
-        if (D == 0) {
-            if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
-            since_probe++;
-            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
-            continue;
-        }
+    int generated = run_spec_loop(eng, hist, n_history, logits, out_tokens, max_new,
+        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, seed, n_accepted_out);
 
-        batch[0] = g;
-        int K = D + 1;
-        if (gemma4_engine_decode_batched(eng, batch, K, Lbuf) != 0) {
-            if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
-            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
-            continue;
-        }
-
-        // Verify drafts by SAMPLING each position from the target (greedy → argmax).
-        // Accept the longest prefix that matches; the first mismatch's sample is the
-        // corrected token for that position and is carried as the next `g`.
-        int a = 0, rejected = -1;
-        while (a < D) {
-            int s = host_sample(Lbuf + (size_t)a*V, V, temp, top_k, top_p, min_p, spec_rng(&rng));
-            if (s == batch[1+a]) { a++; }
-            else { rejected = s; break; }
-        }
-        total_accepted += a;
-        ema = 0.6f*ema + 0.4f*((float)a/(float)D);
-        since_probe = 0;
-
-        // Keep g + a accepted drafts; discard rejected drafts' K/V.
-        int keep = pos + 1 + a;
-        if (keep < eng->global_n_tokens) gemma4_engine_rewind(eng, keep);
-
-        for (int i = 0; i < a && generated < max_new; i++) {
-            int t = batch[1+i]; out_tokens[generated++] = t; hist[n++] = t;
-            if (is_stop(t)) { stop = 1; break; }
-        }
-        if (stop) break;
-
-        if (a < D) {   // rejected at position a → reuse that sample as the next token
-            memcpy(logits, Lbuf + (size_t)a*V, (size_t)V*sizeof(float));
-            g = rejected;
-        } else {       // all drafts accepted → draw the next token fresh from L[D]
-            memcpy(logits, Lbuf + (size_t)D*V, (size_t)V*sizeof(float));
-            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
-        }
-    }
-
-    if (n_accepted_out) *n_accepted_out = total_accepted;
-    free(hist); free(logits); free(Lbuf);
+    free(hist); free(logits);
     return generated;
 }
 
