@@ -144,12 +144,24 @@ func (e *Engine) Prefill(tokens []int32) ([]float32, error) {
 	// Only get logits for the last token
 	logits := make([]float32, 262144)
 
-	ret := C.gemma4_engine_prefill(
+	// Fast path: batched BF16 tensor-core prefill (one weight pass for the whole
+	// prompt). Returns -2 when not applicable (e.g. the KV cache is not empty), in
+	// which case we fall back to the proven token-by-token path. Both produce the
+	// same last-token logits (parity-verified).
+	ret := C.gemma4_engine_prefill_batched(
 		e.ptr,
 		(*C.int32_t)(unsafe.Pointer(&tokens[0])),
 		C.int(len(tokens)),
 		(*C.float)(unsafe.Pointer(&logits[0])),
 	)
+	if ret == -2 {
+		ret = C.gemma4_engine_prefill(
+			e.ptr,
+			(*C.int32_t)(unsafe.Pointer(&tokens[0])),
+			C.int(len(tokens)),
+			(*C.float)(unsafe.Pointer(&logits[0])),
+		)
+	}
 	if ret != 0 {
 		return nil, fmt.Errorf("gem4d: prefill failed")
 	}

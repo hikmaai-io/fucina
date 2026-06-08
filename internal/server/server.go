@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -257,22 +258,30 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 }
 
+// modelTurnOpen opens an assistant turn and pre-fills an empty thought channel
+// (thinking disabled by default), so the model does not stream its reasoning.
+const modelTurnOpen = "<|turn>model\n<|channel>thought\n<channel|>"
+
+// renderChatTemplate builds the gemma-4 prompt. The real vocab uses <|turn> /
+// <turn|> delimiters (NOT <start_of_turn>/<end_of_turn>, which are not tokens).
 func (s *Server) renderChatTemplate(messages []ChatMessage) string {
 	var sb strings.Builder
 	for i, msg := range messages {
 		switch msg.Role {
-		case "system", "user":
-			sb.WriteString(fmt.Sprintf("<start_of_turn>user\n%s<end_of_turn>\n", msg.Content))
+		case "system":
+			fmt.Fprintf(&sb, "<|turn>system\n%s<turn|>\n", msg.Content)
+		case "user":
+			fmt.Fprintf(&sb, "<|turn>user\n%s<turn|>\n", msg.Content)
 		case "assistant":
 			if i == len(messages)-1 {
-				sb.WriteString("<start_of_turn>model\n")
+				sb.WriteString(modelTurnOpen)
 			} else {
-				sb.WriteString(fmt.Sprintf("<start_of_turn>model\n%s<end_of_turn>\n", msg.Content))
+				fmt.Fprintf(&sb, "<|turn>model\n%s<turn|>\n", msg.Content)
 			}
 		}
 	}
 	if len(messages) > 0 && messages[len(messages)-1].Role != "assistant" {
-		sb.WriteString("<start_of_turn>model\n")
+		sb.WriteString(modelTurnOpen)
 	}
 	return sb.String()
 }
@@ -292,7 +301,7 @@ func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams
 			break
 		}
 		token, err := s.sampleToken(logits, params, rng)
-		if err != nil || token == s.tokenizer.EOS {
+		if err != nil || s.tokenizer.IsStop(token) {
 			break
 		}
 		tokenStr := s.tokenizer.Decode([]int32{token})
@@ -354,7 +363,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, params GenerationParams, 
 			break
 		}
 		token, err := s.sampleToken(logits, params, rng)
-		if err != nil || token == s.tokenizer.EOS {
+		if err != nil || s.tokenizer.IsStop(token) {
 			break
 		}
 		tokenStr := s.tokenizer.Decode([]int32{token})
@@ -392,6 +401,10 @@ func logGenSpeed(start time.Time, generated int) {
 		generated, elapsed.Seconds(), tps)
 }
 
+// sampleToken applies repeat-penalty → temperature → top-k → top-p → min-p →
+// multinomial. Temperature 0 is greedy argmax. The previous implementation used
+// two O(n²) bubble sorts over the full 262144-token vocab per token (~7e10 ops);
+// this sorts once with sort.Slice (O(n log n)) and truncates.
 func (s *Server) sampleToken(logits []float32, params GenerationParams, rng *rand.Rand) (int32, error) {
 	if len(logits) == 0 {
 		return 0, fmt.Errorf("empty logits")
@@ -400,15 +413,15 @@ func (s *Server) sampleToken(logits []float32, params GenerationParams, rng *ran
 		return int32(cuda.Argmax(logits)), nil
 	}
 	n := len(logits)
+
 	scaled := make([]float64, n)
 	for i, v := range logits {
 		scaled[i] = float64(v) / params.Temperature
 	}
 	if params.RepeatPenalty != 1.0 {
-		// Penalize tokens in the current sequence (prompt + generated). The kv
-		// lock is held for the whole request, so reading CurrentTokens is safe.
+		// kv lock is held for the whole request, so CurrentTokens is safe.
 		for _, past := range s.kv.CurrentTokens() {
-			if int(past) < n {
+			if int(past) >= 0 && int(past) < n {
 				if scaled[past] < 0 {
 					scaled[past] *= params.RepeatPenalty
 				} else {
@@ -417,85 +430,78 @@ func (s *Server) sampleToken(logits []float32, params GenerationParams, rng *ran
 			}
 		}
 	}
+
+	type cand struct {
+		id int32
+		p  float64
+	}
+	cands := make([]cand, n)
 	maxLogit := scaled[0]
 	for _, v := range scaled {
 		if v > maxLogit {
 			maxLogit = v
 		}
 	}
-	probs := make([]float64, n)
-	var sum float64
 	for i, v := range scaled {
-		probs[i] = math.Exp(v - maxLogit)
-		sum += probs[i]
+		cands[i] = cand{int32(i), math.Exp(v - maxLogit)}
+	}
+	sort.Slice(cands, func(a, b int) bool { return cands[a].p > cands[b].p })
+
+	// Top-k: keep the K highest (off-by-one fixed: K elements, not K+1).
+	if params.TopK > 0 && params.TopK < len(cands) {
+		cands = cands[:params.TopK]
 	}
 
-	// Top-K
-	if params.TopK > 0 && params.TopK < n {
-		type pair struct{ idx int; p float64 }
-		sorted := make([]pair, n)
-		for i := 0; i < n; i++ {
-			sorted[i] = pair{i, probs[i]}
-		}
-		for i := 0; i < n; i++ {
-			for j := i + 1; j < n; j++ {
-				if sorted[j].p > sorted[i].p {
-					sorted[i], sorted[j] = sorted[j], sorted[i]
-				}
-			}
-		}
-		threshold := sorted[params.TopK].p
-		for i := range probs {
-			if probs[i] < threshold {
-				probs[i] = 0
-			}
-		}
-		sum = 0
-		for _, v := range probs {
-			sum += v
-		}
+	// Normalize the (sorted, truncated) candidates.
+	var sum float64
+	for _, c := range cands {
+		sum += c.p
 	}
-
-	// Top-P
-	if params.TopP > 0 && params.TopP < 1.0 {
-		type pair struct{ idx int; p float64 }
-		sorted := make([]pair, n)
-		for i := 0; i < n; i++ {
-			sorted[i] = pair{i, probs[i]}
-		}
-		for i := 0; i < n; i++ {
-			for j := i + 1; j < n; j++ {
-				if sorted[j].p > sorted[i].p {
-					sorted[i], sorted[j] = sorted[j], sorted[i]
-				}
-			}
-		}
-		cum := 0.0
-		for _, p := range sorted {
-			if cum >= params.TopP {
-				probs[p.idx] = 0
-			} else {
-				cum += p.p
-			}
-		}
-		sum = 0
-		for _, v := range probs {
-			sum += v
-		}
-	}
-
 	if sum <= 0 {
 		return int32(cuda.Argmax(logits)), nil
 	}
-	r := rng.Float64() * sum
-	cum := 0.0
-	for i, p := range probs {
-		cum += p
-		if r <= cum {
-			return int32(i), nil
+
+	// Top-p: smallest prefix whose cumulative prob >= TopP.
+	if params.TopP > 0 && params.TopP < 1.0 {
+		cum, cut := 0.0, len(cands)
+		for i := range cands {
+			cum += cands[i].p / sum
+			if cum >= params.TopP {
+				cut = i + 1
+				break
+			}
+		}
+		cands = cands[:cut]
+	}
+
+	// Min-p: drop candidates below MinP * max_prob (cands[0] is the max).
+	if params.MinP > 0 {
+		thresh := params.MinP * cands[0].p
+		keep := 1
+		for i := 1; i < len(cands); i++ {
+			if cands[i].p >= thresh {
+				keep = i + 1
+			} else {
+				break
+			}
+		}
+		cands = cands[:keep]
+	}
+
+	// Draw from the surviving candidates.
+	var z float64
+	for _, c := range cands {
+		z += c.p
+	}
+	r := rng.Float64() * z
+	var acc float64
+	for _, c := range cands {
+		acc += c.p
+		if r <= acc {
+			return c.id, nil
 		}
 	}
-	return int32(cuda.Argmax(logits)), nil
+	return cands[len(cands)-1].id, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

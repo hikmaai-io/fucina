@@ -293,6 +293,23 @@ __global__ void copy_f32_to_fp8_kernel(
     if (i < n) dst[i] = float_to_fp8(src[i]);
 }
 
+// Dequantize a weight matrix (Q8_0 or FP8) to BF16, preserving the source's
+// row-major [out_dim][in_dim] element order (element e -> dst[e]). Used to build
+// the persistent BF16 weight buffer for batched cuBLAS prefill (Step 2). Caller
+// must keep per-call n < 2^31 (true for every projection: max = 15360×3840 ≈ 59M).
+__global__ void dequant_to_bf16_kernel(
+    __nv_bfloat16 *dst, const uint8_t *src, uint64_t n, int fmt)
+{
+    uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(decode_weight(src, (int)i, fmt));
+}
+
+// Convert f32 -> bf16 (for activations feeding the cuBLAS GEMM).
+__global__ void f32_to_bf16_kernel(__nv_bfloat16 *dst, const float *src, uint64_t n) {
+    uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(src[i]);
+}
+
 // ─── Argmax over vocab_size ───────────────────────────────────────────
 
 __global__ void argmax_kernel(
@@ -377,6 +394,25 @@ __device__ float block_reduce_sum(float val, float *smem) {
     val = (lane < n_warps) ? smem[lane] : 0.0f;
     for (int off = 16; off > 0; off >>= 1)
         val += __shfl_xor_sync(0xFFFFFFFF, val, off);
+    // Barrier before returning so a back-to-back call cannot overwrite smem
+    // while another warp is still reading it (racecheck: 1620 hazards without).
+    __syncthreads();
+    return val;
+}
+
+// Block max-reduction, same structure/barrier discipline as block_reduce_sum.
+__device__ float block_reduce_max(float val, float *smem) {
+    int lane = threadIdx.x & 31;
+    int wid  = threadIdx.x >> 5;
+    for (int off = 16; off > 0; off >>= 1)
+        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, off));
+    if (lane == 0) smem[wid] = val;
+    __syncthreads();
+    int n_warps = (blockDim.x + 31) >> 5;
+    val = (lane < n_warps) ? smem[lane] : -1e30f;
+    for (int off = 16; off > 0; off >>= 1)
+        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, off));
+    __syncthreads();
     return val;
 }
 
@@ -486,7 +522,7 @@ __global__ void gemv_kernel(
     float sum = 0.0f;
     for (int i = threadIdx.x; i < in_dim; i += blockDim.x)
         sum += decode_weight(row, i, fmt) * x[i];
-    // Use cooperative_groups reduction instead of custom block_reduce    sum = block_reduce_sum(sum, smem);
+    sum = block_reduce_sum(sum, smem);
     if (threadIdx.x == 0) out[idx] = sum;
 }
 
@@ -683,14 +719,15 @@ __global__ void rope_global_kernel(
     int idx = blockIdx.x;
     int half = head_dim / 2;
     if (d >= half) return;
+    (void)context_len;
 
-    // p-RoPE position scaling
-    float eff_pos = (float)pos * ((float)context_len / (float)GEMMA4_MAX_CTX);
-
+    // Matches ggml_rope_ext NEOX (llama.cpp gemma4): theta = pos * base^(-2d/n) / ff.
+    // freq_scale is 1.0 for gemma4 (no rope scaling metadata); positions are NOT
+    // rescaled by context length — freq_factors alone implement p-RoPE.
     float ff    = freq_factors ? freq_factors[d] : 1.0f;
     float theta = powf(theta_base, -2.0f * d / head_dim) / ff;
-    float cos_val = cosf(eff_pos * theta);
-    float sin_val = sinf(eff_pos * theta);
+    float cos_val = cosf(pos * theta);
+    float sin_val = sinf(pos * theta);
 
     float *qh = q + idx * head_dim;
     float q0 = qh[d], q1 = qh[d + half];
@@ -709,16 +746,18 @@ __global__ void rope_global_kernel(
 // ─── Sliding Window Attention Decode (single token) ─────────────────────
 // =========================================================================
 
-// Sliding-window GQA decode, single query token.
-// blockIdx.x = q_head (0..n_heads-1), blockDim.x = head_dim.
-// KV layout: [n_kv_heads][window_size][head_dim] ring buffer.
-// Shared memory: 32 floats for block_reduce + window_size floats for scores.
-// Launch: sliding_attn_decode_kernel<<<n_heads, head_dim,
-//   (32 + window_size)*sizeof(float)>>>
+// Sliding-window GQA decode, single query token. FLASH (online-softmax) form:
+// each thread owns output dim `tid` and accumulates V on the fly while tracking a
+// running max `m` and denominator `l`, so NO O(window) score buffer is needed —
+// shared memory is a constant 32 floats (block_reduce scratch only). This is what
+// lifts the global-attn context cap (see global kernel) and keeps the math
+// numerically stable. blockIdx.x = q_head, blockDim.x = head_dim.
+// KV layout: [window_size][n_kv_heads][head_dim] ring buffer.
+// Launch: sliding_attn_decode_kernel<<<n_heads, head_dim, 32*sizeof(float)>>>
 __global__ void sliding_attn_decode_kernel(
     float       *output,       // [n_heads × head_dim]
     const float *q,            // [n_heads × head_dim]
-    const float *k_cache,      // [n_kv_heads][window_size][head_dim]
+    const float *k_cache,      // [window_size][n_kv_heads][head_dim]
     const float *v_cache,
     int          n_heads,
     int          n_kv_heads,
@@ -727,65 +766,53 @@ __global__ void sliding_attn_decode_kernel(
     int          cursor,
     int          filled)
 {
-    extern __shared__ float smem[];      // [32] reduce + [window_size] scores
-    float *scores = smem + 32;
-
+    extern __shared__ float smem[];      // [32] block_reduce scratch only
     int q_head  = blockIdx.x;
     int kv_head = q_head / (n_heads / n_kv_heads); // GQA mapping
     int tid     = threadIdx.x;
 
     int window_len = min(filled, window_size);
 
-    // ── Compute QK dot products ──────────────────────────────────────
     float q_d = (tid < head_dim) ? q[q_head * head_dim + tid] : 0.0f;
+    float acc = 0.0f;                    // this thread's output element
+    float m   = -INFINITY;               // running row max
+    float l   = 0.0f;                    // running denominator
 
     for (int t = 0; t < window_len; t++) {
         int ring_idx = (cursor - window_len + t + window_size) % window_size;
         float k_d = (tid < head_dim)
             ? k_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid]
             : 0.0f;
-        float s = q_d * k_d;
-        s = block_reduce_sum(s, smem);   // smem[0..31] used here, scores untouched
-        if (tid == 0) scores[t] = s;
-        __syncthreads();
+        // Full dot product, broadcast to every thread (block_reduce_sum returns the
+        // reduced value to all lanes; attention scale is 1.0 for gemma4).
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float m_new = fmaxf(m, s);
+        float alpha = __expf(m - m_new);     // m=-inf on t=0 ⇒ alpha=0 (acc/l are 0)
+        float p     = __expf(s - m_new);
+        l   = l * alpha + p;
+        float v_d = (tid < head_dim)
+            ? v_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid]
+            : 0.0f;
+        acc = acc * alpha + p * v_d;
+        m   = m_new;
     }
 
-    // ── Online softmax (thread 0 computes on scores[]) ───────────────
-    if (tid == 0) {
-        float mx = scores[0];
-        for (int t = 1; t < window_len; t++) mx = fmaxf(mx, scores[t]);
-        float denom = 0.0f;
-        for (int t = 0; t < window_len; t++) {
-            scores[t] = expf(scores[t] - mx);
-            denom += scores[t];
-        }
-        float inv = 1.0f / denom;
-        for (int t = 0; t < window_len; t++) scores[t] *= inv;
-    }
-    __syncthreads();
-
-    // ── Weighted sum of V ────────────────────────────────────────────
-    float out = 0.0f;
-    if (tid < head_dim) {
-        for (int t = 0; t < window_len; t++) {
-            int ring_idx = (cursor - window_len + t + window_size) % window_size;
-            float v_d = v_cache[(ring_idx * n_kv_heads + kv_head) * head_dim + tid];
-            out += scores[t] * v_d;
-        }
-        output[q_head * head_dim + tid] = out;
-    }
+    if (tid < head_dim)
+        output[q_head * head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
 }
 
 // =========================================================================
 // ─── Global Attention Decode (single token) ─────────────────────────────
 // =========================================================================
 
-// Global attention decode, single query token.
-// blockIdx.x = q_head; blockDim.x = head_dim (512).
-// KV cache layout: [ctx_len][head_dim] floats (K=V unified, only K stored).
-// Shared memory: 32 floats for reduce + ctx_len floats for scores.
-// Launch: global_attn_decode_kernel<<<n_heads, head_dim,
-//   (32 + ctx_len)*sizeof(float)>>>
+// Global attention decode, single query token. FLASH (online-softmax) form —
+// identical structure to the sliding kernel above, over the full linear context.
+// Because it keeps a constant 32-float scratch instead of an O(ctx_len) score
+// buffer, there is NO context-length cap (the old version needed (32+ctx_len)
+// floats of dynamic shared memory and silently failed past ~25K tokens). This is
+// the kernel change that unlocks 256K context.
+// blockIdx.x = q_head; blockDim.x = head_dim (512). K=V unified, both stored.
+// Launch: global_attn_decode_kernel<<<n_heads, head_dim, 32*sizeof(float)>>>
 __global__ void global_attn_decode_kernel(
     float       *output,       // [n_heads × head_dim]
     const float *q,            // [n_heads × head_dim]
@@ -795,44 +822,227 @@ __global__ void global_attn_decode_kernel(
     int          head_dim,
     int          ctx_len)
 {
-    extern __shared__ float smem[];    // [32] reduce  +  [ctx_len] scores
-    float *scores = smem + 32;
-
+    extern __shared__ float smem[];    // [32] block_reduce scratch only
     int q_head = blockIdx.x;
     int tid    = threadIdx.x;
 
     float q_d = (tid < head_dim) ? q[q_head * head_dim + tid] : 0.0f;
+    float acc = 0.0f;
+    float m   = -INFINITY;
+    float l   = 0.0f;
 
-    // ── QK dot products ───────────────────────────────────────────────
     for (int t = 0; t < ctx_len; t++) {
         float k_d = (tid < head_dim) ? k_cache[t * head_dim + tid] : 0.0f;
-        float s   = q_d * k_d;
-        s = block_reduce_sum(s, smem);
-        if (tid == 0) scores[t] = s;
-        __syncthreads();
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float m_new = fmaxf(m, s);
+        float alpha = __expf(m - m_new);
+        float p     = __expf(s - m_new);
+        l   = l * alpha + p;
+        float v_d = (tid < head_dim) ? v_cache[t * head_dim + tid] : 0.0f;
+        acc = acc * alpha + p * v_d;
+        m   = m_new;
     }
 
-    // ── Softmax (thread 0) ─────────────────────────────────────────
-    if (tid == 0) {
-        float mx = scores[0];
-        for (int t = 1; t < ctx_len; t++) mx = fmaxf(mx, scores[t]);
-        float denom = 0.0f;
-        for (int t = 0; t < ctx_len; t++) {
-            scores[t] = expf(scores[t] - mx);
-            denom += scores[t];
-        }
-        float inv = 1.0f / denom;
-        for (int t = 0; t < ctx_len; t++) scores[t] *= inv;
-    }
-    __syncthreads();
+    if (tid < head_dim)
+        output[q_head * head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
+}
 
-    // ── Weighted sum of V ─────────────────────────────────────────
-    float out = 0.0f;
-    if (tid < head_dim) {
-        for (int t = 0; t < ctx_len; t++)
-            out += scores[t] * v_cache[t * head_dim + tid];
-        output[q_head * head_dim + tid] = out;
+// =========================================================================
+// ─── Batched-prefill kernels (Step 2 Phase 2 + Step 3 attention) ────────
+// =========================================================================
+// Token-major "rows" variants of decode_layer's elementwise steps, plus a
+// flash-style (online-softmax) prefill attention. All operate on activations
+// laid out [rows × ... × head_dim] with rows = ubatch tokens, so each block
+// handles one (token[,head]) slice. Math matches the single-token kernels above.
+
+// gelu_pytorch_tanh, needed by geglu_bf16_kernel below (the f32 geglu_kernel and
+// its gelu_tanh live further down; declare the helper here to keep this together).
+__device__ inline float gemma4_gelu_tanh(float x) {
+    const float k = 0.7978845608028654f; // sqrt(2/pi)
+    return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
+}
+
+// Per-head RMSNorm over [rows][n_heads][head_dim]. grid=(n_heads, rows),
+// block=head_dim, smem=32 floats. weight [head_dim] or NULL.
+__global__ void per_head_rms_norm_rows_kernel(
+    float *qk, const float *weight, int n_heads, int head_dim, int rows, float eps)
+{
+    extern __shared__ float smem[];
+    int head = blockIdx.x, row = blockIdx.y;
+    if (row >= rows || head >= n_heads) return;
+    int tid = threadIdx.x;
+    float *h = qk + ((size_t)row * n_heads + head) * head_dim;
+    float ss = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) ss += h[i] * h[i];
+    ss = block_reduce_sum(ss, smem);
+    float rms = rsqrtf(ss / head_dim + eps);
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float w = weight ? weight[i] : 1.0f;
+        h[i] = h[i] * rms * w;
     }
+}
+
+// RMSNorm over [rows][n] writing BF16 directly (fuses the f32→bf16 convert that
+// would otherwise precede each GEMM whose input is a normed hidden). weight [n].
+__global__ void rms_norm_rows_bf16_kernel(
+    __nv_bfloat16 *out, const float *x, const float *weight, int n, int rows, float eps)
+{
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    const float *xr = x + (size_t)row * n;
+    __nv_bfloat16 *orow = out + (size_t)row * n;
+    float ss = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) ss += xr[i] * xr[i];
+    ss = block_reduce_sum(ss, smem);
+    float rms = rsqrtf(ss / n + eps);
+    for (int i = tid; i < n; i += blockDim.x) {
+        float w = weight ? weight[i] : 1.0f;
+        orow[i] = __float2bfloat16(xr[i] * rms * w);
+    }
+}
+
+// GeGLU writing BF16 directly (feeds the down GEMM): out = gelu(gate)*up.
+__global__ void geglu_bf16_kernel(
+    __nv_bfloat16 *out, const float *gate, const float *up, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2bfloat16(gemma4_gelu_tanh(gate[i]) * up[i]);
+}
+
+// Broadcast K/V heads to all query heads for batched-attention GEMMs (GQA):
+// src [rows][n_kv_heads][head_dim] → dst [rows][n_heads][head_dim], dst head h
+// copies src kv head h/(n_heads/n_kv_heads). grid=(ceil(head_dim/256), n_heads, rows).
+__global__ void kv_broadcast_bf16_kernel(
+    __nv_bfloat16 *dst, const __nv_bfloat16 *src,
+    int rows, int n_heads, int n_kv_heads, int head_dim)
+{
+    int d   = blockIdx.x * blockDim.x + threadIdx.x;
+    int h   = blockIdx.y;
+    int row = blockIdx.z;
+    if (d >= head_dim || h >= n_heads || row >= rows) return;
+    int kvh = h / (n_heads / n_kv_heads);
+    dst[((size_t)row * n_heads + h) * head_dim + d] =
+        src[((size_t)row * n_kv_heads + kvh) * head_dim + d];
+}
+
+// Masked row-softmax over a BATCH of col-major score matrices S [n_heads][N×N]
+// (batch stride N*N). grid=(N, n_heads). Same masking as the single-matrix version.
+__global__ void attn_softmax_batched_kernel(
+    const float *S, __nv_bfloat16 *P, int N, int window)
+{
+    extern __shared__ float red[];
+    int i = blockIdx.x, h = blockIdx.y;
+    if (i >= N) return;
+    const float   *Sh = S + (size_t)h * N * N;
+    __nv_bfloat16 *Ph = P + (size_t)h * N * N;
+    int tid = threadIdx.x, nt = blockDim.x;
+    int start = (window > 0) ? max(0, i - (window - 1)) : 0;
+    float m = -1e30f;
+    for (int j = start + tid; j <= i; j += nt) m = fmaxf(m, Sh[(size_t)i + (size_t)j * N]);
+    m = block_reduce_max(m, red);
+    float l = 0.0f;
+    for (int j = start + tid; j <= i; j += nt) l += __expf(Sh[(size_t)i + (size_t)j * N] - m);
+    l = block_reduce_sum(l, red);
+    float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int j = tid; j < N; j += nt) {
+        float p = 0.0f;
+        if (j >= start && j <= i) p = __expf(Sh[(size_t)i + (size_t)j * N] - m) * inv;
+        Ph[(size_t)i + (size_t)j * N] = __float2bfloat16(p);
+    }
+}
+
+// NEOX RoPE over [rows][n_heads][head_dim] for Q and [rows][n_kv_heads][head_dim]
+// for K. Position of row r is base_pos+r. ff=freq_factors (global) or NULL (=1,
+// sliding). grid=(n_heads, rows), block=head_dim/2. Matches rope_*_kernel above.
+__global__ void rope_rows_kernel(
+    float *q, float *k, int base_pos, int n_heads, int n_kv_heads,
+    int head_dim, int rows, float theta_base, const float *freq_factors)
+{
+    int d = threadIdx.x, half = head_dim / 2;
+    if (d >= half) return;
+    int head = blockIdx.x, row = blockIdx.y;
+    if (row >= rows) return;
+    int pos = base_pos + row;
+    float ff    = freq_factors ? freq_factors[d] : 1.0f;
+    float theta = powf(theta_base, -2.0f * d / head_dim) / ff;
+    float c = cosf(pos * theta), s = sinf(pos * theta);
+    float *qh = q + ((size_t)row * n_heads + head) * head_dim;
+    float q0 = qh[d], q1 = qh[d + half];
+    qh[d] = q0 * c - q1 * s;  qh[d + half] = q0 * s + q1 * c;
+    if (head < n_kv_heads) {
+        float *kh = k + ((size_t)row * n_kv_heads + head) * head_dim;
+        float k0 = kh[d], k1 = kh[d + half];
+        kh[d] = k0 * c - k1 * s;  kh[d + half] = k0 * s + k1 * c;
+    }
+}
+
+// Masked row-softmax over a col-major score matrix S [N×N] (S[i + j*N] = score of
+// query i, key j, produced by a QK^T GEMM). For each query row i, softmax over
+// keys j ∈ [start_i, i] (causal; sliding adds start_i = max(0, i-window+1)); all
+// other j set to 0 so the following SV GEMM masks correctly. Writes BF16 P in the
+// same col-major layout. Attention scale = 1.0 (gemma4). One block per query row.
+__global__ void attn_softmax_colmajor_kernel(
+    const float *S, __nv_bfloat16 *P, int N, int window)
+{
+    extern __shared__ float red[];
+    int i = blockIdx.x;
+    if (i >= N) return;
+    int tid = threadIdx.x, nt = blockDim.x;
+    int start = (window > 0) ? max(0, i - (window - 1)) : 0;
+
+    float m = -1e30f;
+    for (int j = start + tid; j <= i; j += nt)
+        m = fmaxf(m, S[(size_t)i + (size_t)j * N]);
+    m = block_reduce_max(m, red);
+
+    float l = 0.0f;
+    for (int j = start + tid; j <= i; j += nt)
+        l += __expf(S[(size_t)i + (size_t)j * N] - m);
+    l = block_reduce_sum(l, red);
+    float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+
+    for (int j = tid; j < N; j += nt) {
+        float p = 0.0f;
+        if (j >= start && j <= i)
+            p = __expf(S[(size_t)i + (size_t)j * N] - m) * inv;
+        P[(size_t)i + (size_t)j * N] = __float2bfloat16(p);
+    }
+}
+
+// Scatter the batch's final K/V into the persistent sliding ring. Only the last
+// `count` tokens (= min(rows, window)) survive the window, so we write exactly
+// those — slots are then collision-free (residues unique over any window span)
+// and hold their true most-recent occupant. kvhd = n_kv_heads*head_dim.
+// k/vcache point at the layer's ring base [window][kvhd]. grid=(ceil(kvhd/256),
+// count), block=256.
+__global__ void kv_write_sliding_kernel(
+    float *kcache, float *vcache, const float *kb, const float *vb,
+    int base, int first, int count, int kvhd, int window)
+{
+    int i = blockIdx.y;                                // 0..count-1
+    int j = blockIdx.x * blockDim.x + threadIdx.x;     // 0..kvhd-1
+    if (i >= count || j >= kvhd) return;
+    int t    = first + i;                              // token index within batch
+    int slot = (base + t) % window;
+    kcache[(size_t)slot * kvhd + j] = kb[(size_t)t * kvhd + j];
+    vcache[(size_t)slot * kvhd + j] = vb[(size_t)t * kvhd + j];
+}
+
+// Scatter the batch's K/V into the linear global cache at positions base..base+rows-1.
+// k/vcache point at the layer slot's base [capacity][hd]. grid=(ceil(hd/256), rows).
+__global__ void kv_write_global_kernel(
+    float *kcache, float *vcache, const float *kb, const float *vb,
+    int base, int rows, int hd)
+{
+    int t = blockIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= rows || j >= hd) return;
+    int pos = base + t;
+    kcache[(size_t)pos * hd + j] = kb[(size_t)t * hd + j];
+    vcache[(size_t)pos * hd + j] = vb[(size_t)t * hd + j];
 }
 
 // =========================================================================
@@ -871,6 +1081,21 @@ __global__ void logit_softcap_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     logits[i] = cap * tanhf(logits[i] / cap);
+}
+
+// Mask suppressed token ids with -inf (mirrors llama.cpp's gemma4 logits bias
+// for tokenizer.ggml.suppress_tokens — known checkpoint issue where the model
+// otherwise emits <image|>/<audio|> tokens).
+__global__ void suppress_tokens_kernel(
+    float         *logits,
+    const int32_t *ids,
+    int            n_ids,
+    int            vocab)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_ids) return;
+    int id = ids[i];
+    if (id >= 0 && id < vocab) logits[id] = -INFINITY;
 }
 
 // =========================================================================
@@ -963,6 +1188,24 @@ struct gemma4_engine {
     uint64_t       gguf_size;
     int            gguf_fd;
 
+    // Tensor data copied to device memory at load (llama.cpp-style backend
+    // buffer). When non-NULL, weight accessors return pointers into this
+    // buffer instead of the mmap'd file, avoiding GPU page faults / host
+    // memory reads on every GEMV.
+    uint8_t  *d_weights;
+    uint64_t  tdata_start;   // file offset where tensor data begins
+
+    // ROTATING per-layer BF16 dequant scratch for batched cuBLAS prefill (Step 2).
+    // The 7 projection weights of the CURRENT layer only are dequantized Q8_0/FP8 →
+    // BF16 here (row-major [out_dim][in_dim], same element order as the source) just
+    // before that layer's GEMMs, then reused by the next layer. This replaces the
+    // old persistent 21.8 GB d_bf16[48][7] buffer with a ~0.5 GB scratch — keeping
+    // ~12 GB resident (not ~34 GB) so the GGUF stays page-cached across runs and
+    // cold reloads do not re-pay the slow disk read. proj index: 0=q 1=k 2=v 3=o
+    // 4=gate 5=up 6=down (global layers have no separate V → d_bf16_layer[2] NULL).
+    __nv_bfloat16 *d_bf16_layer[7];     // [out_dim×in_dim] per projection, max-sized
+    int            bf16_ready;          // 1 once the scratch is allocated
+
     // Tensor offsets within mapped file (from start of tensor_data section)
     // All weights are stored in FP8 (or Q8_0)
     struct {
@@ -1005,6 +1248,11 @@ struct gemma4_engine {
     // Layer index helpers: which layers are global
     int             global_layer_indices[GEMMA4_MAX_LAYERS];
     int             n_global;
+    // Inverse map: absolute layer id -> contiguous global cache slot
+    // (0..n_layers_global-1), or -1 for sliding layers. The global KV cache is
+    // allocated for n_layers_global slots only (not all GEMMA4_MAX_LAYERS), so
+    // every read/write into d_global_k/v must index by global_slot[layer].
+    int             global_slot[GEMMA4_MAX_LAYERS];
 
     // Device memory
     float  *d_scratch;         // scratch buffer [1M elements]
@@ -1023,20 +1271,39 @@ struct gemma4_engine {
     float  *d_rope_freqs;      // [GEMMA4_GLOBAL_HEAD_DIM/2] freq_factors for global RoPE
     float  *d_head_norm_w;     // [GEMMA4_GLOBAL_HEAD_DIM] scratch for per-head norm weights
 
+    // Suppressed token ids (tokenizer.ggml.suppress_tokens) masked to -inf
+    int32_t *d_suppress;
+    int      n_suppress;
+
+    // Norm weights preloaded to device at create time (was: per-layer
+    // cudaMemcpyAsync from the mmap'd file on EVERY token — ~400 tiny H2D
+    // copies per decoded token). Layout: [GEMMA4_MAX_LAYERS][stride].
+    float *d_w_attn_norm;       // stride GEMMA4_HIDDEN_SIZE
+    float *d_w_post_attn_norm;  // stride GEMMA4_HIDDEN_SIZE
+    float *d_w_ffn_norm;        // stride GEMMA4_HIDDEN_SIZE
+    float *d_w_post_ffn_norm;   // stride GEMMA4_HIDDEN_SIZE
+    float *d_w_q_norm;          // stride GEMMA4_GLOBAL_HEAD_DIM
+    float *d_w_k_norm;          // stride GEMMA4_GLOBAL_HEAD_DIM
+    float *d_w_out_norm;        // [GEMMA4_HIDDEN_SIZE]
+    float  h_out_scale[GEMMA4_MAX_LAYERS]; // layer_output_scale scalars (host)
+
     // KV cache (device)
-    // Sliding: 40 layers × 8 heads × 1024 × 256 (FP16 for precision)
-    float  *d_sliding_k;       // [40 × 8 × 1024 × 256]
-    float  *d_sliding_v;       // [40 × 8 × 1024 × 256]
+    // Sliding: 40 layers × 1024 window × 8 heads × 256 head_dim (fp32).
+    float  *d_sliding_k;       // [40 × 1024 × 8 × 256]
+    float  *d_sliding_v;
     int     sliding_cursor[GEMMA4_MAX_LAYERS];
     int     sliding_filled[GEMMA4_MAX_LAYERS];
 
-    // Global: 8 layers × 1 head × ctx_size × 512 (float)
-    // K and V are stored separately because K gets RMSNorm+RoPE while
-    // V gets only plain RMSNorm (no weight, no RoPE).
-    float  *d_global_k;  // [GEMMA4_MAX_LAYERS × ctx_size × 512]
-    float  *d_global_v;  // [GEMMA4_MAX_LAYERS × ctx_size × 512]
+    // Global: 8 slots × ctx_size × 512 (fp32). K and V stored separately because
+    // K gets RMSNorm+RoPE while V gets only plain (weightless) RMSNorm.
+    float  *d_global_k;  // [n_layers_global × ctx_size × 512]
+    float  *d_global_v;
     int     global_n_tokens;
     int     global_kv_capacity;
+    // Max dynamic shared memory (bytes) the global-attn kernel may use, after
+    // opting in past the 48 KB static cap. Used to bound n_ctx and to produce a
+    // clear error instead of a silent kernel no-op when the cache outgrows it.
+    int     global_attn_max_smem;
 
     // Convenience macro for CUDA free (used in destroy function)
     #define CUDA_FREE(ptr) do { if (ptr) { cudaFree(ptr); ptr = NULL; } } while(0)
@@ -1208,6 +1475,68 @@ static int gguf_find_tensor_offset(
 
 // ─── Engine Construction ──────────────────────────────────────────────
 
+// Stream the GGUF tensor-data region into the device weight buffer using a pinned
+// double-buffer: a sequential pread (full cache/NVMe bandwidth, ~11 GB/s) overlapped
+// with a pinned H2D copy (~57 GB/s). This replaces a direct cudaMemcpy from the
+// lazily-mmap'd file, which crawls at ~256 MB/s (~48 s for 11.8 GB) because it
+// faults in 12 GB of file-backed pages ON DEMAND in random order through the CUDA
+// pageable-copy path. `fd` must be the open GGUF; `foff` the tensor-data offset.
+// Returns 0 on success, -1 on failure (caller falls back to the mmap copy).
+static int upload_weights_streamed(unsigned char *d_dst, int fd,
+                                   off_t foff, size_t tbytes)
+{
+    const size_t CHUNK = 256ull * 1024 * 1024;      // 256 MB per buffer
+    unsigned char *pinned[2] = { NULL, NULL };
+    cudaStream_t   s[2]      = { NULL, NULL };
+    cudaEvent_t    done[2]   = { NULL, NULL };
+    int rc = 0;
+
+    if (cudaHostAlloc((void **)&pinned[0], CHUNK, cudaHostAllocDefault) != cudaSuccess ||
+        cudaHostAlloc((void **)&pinned[1], CHUNK, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError(); rc = -1; goto cleanup;
+    }
+    cudaStreamCreate(&s[0]); cudaStreamCreate(&s[1]);
+    cudaEventCreate(&done[0]); cudaEventCreate(&done[1]);
+
+    {
+        bool   inflight[2] = { false, false };
+        size_t copied = 0;
+        int    bi = 0;
+        while (copied < tbytes) {
+            size_t n = tbytes - copied; if (n > CHUNK) n = CHUNK;
+            // Reuse buffer bi only after its previous H2D has drained.
+            if (inflight[bi]) { cudaEventSynchronize(done[bi]); inflight[bi] = false; }
+            // Sequential read into the pinned buffer (overlaps the other stream's H2D).
+            size_t got = 0;
+            while (got < n) {
+                ssize_t r = pread(fd, pinned[bi] + got, n - got,
+                                  foff + (off_t)(copied + got));
+                if (r <= 0) { rc = -1; break; }
+                got += (size_t)r;
+            }
+            if (rc) break;
+            cudaMemcpyAsync(d_dst + copied, pinned[bi], n,
+                            cudaMemcpyHostToDevice, s[bi]);
+            cudaEventRecord(done[bi], s[bi]);
+            inflight[bi] = true;
+            copied += n;
+            bi ^= 1;
+        }
+        cudaStreamSynchronize(s[0]);
+        cudaStreamSynchronize(s[1]);
+        if (cudaGetLastError() != cudaSuccess) rc = -1;
+    }
+
+cleanup:
+    if (pinned[0]) cudaFreeHost(pinned[0]);
+    if (pinned[1]) cudaFreeHost(pinned[1]);
+    if (s[0])    cudaStreamDestroy(s[0]);
+    if (s[1])    cudaStreamDestroy(s[1]);
+    if (done[0]) cudaEventDestroy(done[0]);
+    if (done[1]) cudaEventDestroy(done[1]);
+    return rc;
+}
+
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
     tensor_format_t format,
@@ -1285,6 +1614,24 @@ gemma4_engine_t* gemma4_engine_create(
 
     fprintf(stderr, "gem4d: loaded %s (%.2f GB)\n",
             model_path, eng->gguf_size / (1024.0 * 1024.0 * 1024.0));
+
+    // Auto-detect the weight format from the GGUF tensor table. Trusting the
+    // CLI flag is dangerous: decoding Q8_0 blocks as FP8 bytes yields NaNs.
+    {
+        uint64_t _off = 0, _n = 0; uint32_t gtype = 0;
+        if (gguf_find_tensor(eng->gguf_data, eng->gguf_size,
+                "token_embd.weight", &_off, &_n, &gtype) == 0) {
+            tensor_format_t detected =
+                (gtype == GGML_TYPE_Q8_0) ? FORMAT_Q8_0 : FORMAT_FP8;
+            if (detected != eng->format) {
+                fprintf(stderr, "gem4d: GGUF tensor type %u — overriding format "
+                                "%s -> %s\n", gtype,
+                        eng->format == FORMAT_FP8 ? "fp8" : "q8_0",
+                        detected     == FORMAT_FP8 ? "fp8" : "q8_0");
+                eng->format = detected;
+            }
+        }
+    }
 
     // Parse the per-layer attention pattern from GGUF metadata, overriding the
     // defaults computed above. The real Gemma-4 GGUF exposes this as:
@@ -1479,20 +1826,146 @@ gemma4_engine_t* gemma4_engine_create(
         }
     }
 
+    // Suppressed token ids → device list for the -inf logits mask
+    eng->d_suppress = NULL;
+    eng->n_suppress = 0;
+    {
+        gguf_array_t sarr;
+        if (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
+                "tokenizer.ggml.suppress_tokens", &sarr, GGUF_TYPE_ARRAY) == 0
+            && (sarr.elem_type == GGUF_TYPE_INT32 || sarr.elem_type == GGUF_TYPE_UINT32)
+            && sarr.count > 0)
+        {
+            eng->n_suppress = (int)sarr.count;
+            cudaMalloc(&eng->d_suppress, sarr.count * sizeof(int32_t));
+            cudaMemcpy(eng->d_suppress, sarr.data,
+                       sarr.count * sizeof(int32_t), cudaMemcpyHostToDevice);
+            fprintf(stderr, "gem4d: %d suppressed tokens masked\n", eng->n_suppress);
+        }
+    }
+
+    // ── Preload all F32 norm weights to device (once) ────────────────────
+    {
+        const size_t hs = GEMMA4_HIDDEN_SIZE, hd = GEMMA4_GLOBAL_HEAD_DIM;
+        cudaMalloc(&eng->d_w_attn_norm,      GEMMA4_MAX_LAYERS * hs * sizeof(float));
+        cudaMalloc(&eng->d_w_post_attn_norm, GEMMA4_MAX_LAYERS * hs * sizeof(float));
+        cudaMalloc(&eng->d_w_ffn_norm,       GEMMA4_MAX_LAYERS * hs * sizeof(float));
+        cudaMalloc(&eng->d_w_post_ffn_norm,  GEMMA4_MAX_LAYERS * hs * sizeof(float));
+        cudaMalloc(&eng->d_w_q_norm,         GEMMA4_MAX_LAYERS * hd * sizeof(float));
+        cudaMalloc(&eng->d_w_k_norm,         GEMMA4_MAX_LAYERS * hd * sizeof(float));
+        cudaMalloc(&eng->d_w_out_norm,       hs * sizeof(float));
+
+        // missing tensor (offset 0) → identity weight 1.0
+        float *ones = (float *)malloc(hs * sizeof(float));
+        for (size_t i = 0; i < hs; i++) ones[i] = 1.0f;
+
+        #define UPLOAD_NORM(dst, off, n) do { \
+            const void *src = (off) ? (const void *)(eng->gguf_data + (off)) : (const void *)ones; \
+            cudaMemcpy((dst), src, (n) * sizeof(float), cudaMemcpyHostToDevice); \
+        } while (0)
+
+        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+            int head_dim = (eng->layer_types[l] == LAYER_SLIDING)
+                               ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+            UPLOAD_NORM(eng->d_w_attn_norm      + l * hs, eng->tensors.layers[l].attn_norm,      hs);
+            UPLOAD_NORM(eng->d_w_post_attn_norm + l * hs, eng->tensors.layers[l].post_attn_norm, hs);
+            UPLOAD_NORM(eng->d_w_ffn_norm       + l * hs, eng->tensors.layers[l].ffn_norm,       hs);
+            UPLOAD_NORM(eng->d_w_post_ffn_norm  + l * hs, eng->tensors.layers[l].post_ffn_norm,  hs);
+            UPLOAD_NORM(eng->d_w_q_norm + l * hd, eng->tensors.layers[l].attn_q_norm, head_dim);
+            UPLOAD_NORM(eng->d_w_k_norm + l * hd, eng->tensors.layers[l].attn_k_norm, head_dim);
+
+            // layer_output_scale: single F32 scalar, read host-side once
+            eng->h_out_scale[l] = 1.0f;
+            if (eng->tensors.layers[l].layer_out_scale != 0)
+                memcpy(&eng->h_out_scale[l],
+                       eng->gguf_data + eng->tensors.layers[l].layer_out_scale,
+                       sizeof(float));
+        }
+        UPLOAD_NORM(eng->d_w_out_norm, eng->tensors.output_norm, hs);
+        #undef UPLOAD_NORM
+        free(ones);
+    }
+
+    // ── Copy tensor data into device memory (llama.cpp-style residency) ──
+    // GEMV kernels previously dereferenced the mmap'd file from the GPU.
+    // That works on GB10 unified memory but pays page-fault + host-path
+    // costs on every weight read. One bulk upload at load time instead.
+    eng->d_weights = NULL;
+    eng->tdata_start = gguf_tensor_data_start(eng->gguf_data, eng->gguf_size);
+    if (eng->tdata_start != 0) {
+        size_t tbytes = eng->gguf_size - eng->tdata_start;
+        if (cudaMalloc(&eng->d_weights, tbytes) == cudaSuccess) {
+            fprintf(stderr, "gem4d: uploading %.2f GB of weights to device...\n",
+                    tbytes / (1024.0*1024.0*1024.0));
+            // Pinned, double-buffered sequential streaming (fast). Fall back to the
+            // direct mmap copy only if the pinned path fails to initialize.
+            if (upload_weights_streamed(eng->d_weights, eng->gguf_fd,
+                                        (off_t)eng->tdata_start, tbytes) != 0 &&
+                cudaMemcpy(eng->d_weights, eng->gguf_data + eng->tdata_start,
+                           tbytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                fprintf(stderr, "gem4d: weight upload failed — falling back to mmap\n");
+                cudaFree(eng->d_weights);
+                eng->d_weights = NULL;
+            }
+        } else {
+            fprintf(stderr, "gem4d: cudaMalloc(%zu) failed — using mmap'd weights\n",
+                    tbytes);
+            cudaGetLastError(); // clear error state
+        }
+    }
+
+    // Build the absolute-id -> global-slot inverse map from global_layer_indices
+    // (set by the layer-type detection above). Sliding layers map to -1.
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) eng->global_slot[l] = -1;
+    for (int g = 0; g < eng->n_layers_global; g++)
+        eng->global_slot[eng->global_layer_indices[g]] = g;
+
+    // Opt the global-attn decode kernel into the device's full dynamic shared
+    // memory (it needs (32 + n_ctx) floats of scratch — beyond the 48 KB static
+    // cap once n_ctx > ~12K). Without this the launch fails silently and stale
+    // d_attn_out is consumed. We record the opted-in size to bound n_ctx.
+    {
+        int max_optin = 0;
+        cudaDeviceGetAttribute(&max_optin,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id);
+        if (max_optin > 48 * 1024) {
+            cudaError_t fa = cudaFuncSetAttribute(
+                (const void *)global_attn_decode_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_optin);
+            if (fa != cudaSuccess) { cudaGetLastError(); max_optin = 48 * 1024; }
+        } else {
+            max_optin = 48 * 1024;
+        }
+        eng->global_attn_max_smem = max_optin;
+    }
+
     // KV cache allocation
     // Sliding: 40 × 8 × 1024 × 256 × sizeof(float) = 40 × 8 × 1024 × 256 × 4 = 320 MB
     size_t sliding_kv_size = (size_t)GEMMA4_MAX_LAYERS *
         GEMMA4_KV_HEADS * GEMMA4_SLIDING_WINDOW * GEMMA4_HEAD_DIM * sizeof(float);
-    cudaMalloc(&eng->d_sliding_k, sliding_kv_size);
-    cudaMalloc(&eng->d_sliding_v, sliding_kv_size);
+    if (cudaMalloc(&eng->d_sliding_k, sliding_kv_size) != cudaSuccess ||
+        cudaMalloc(&eng->d_sliding_v, sliding_kv_size) != cudaSuccess) {
+        fprintf(stderr, "gem4d: failed to allocate sliding KV cache (%.1f MB ×2)\n",
+                sliding_kv_size / (1024.0*1024.0));
+        cudaGetLastError();
+        free(eng);
+        return NULL;
+    }
 
     // Global K and V caches: float, separate K and V.
-    // Layout: [GEMMA4_MAX_LAYERS][ctx_size][head_dim]
+    // Layout: [n_layers_global][ctx_size][head_dim] — only the global layers get
+    // a slot (not all 48), so this is ~6× smaller than indexing by absolute id.
     eng->global_kv_capacity = context_size;
-    size_t global_kv_size = (size_t)GEMMA4_MAX_LAYERS *
+    size_t global_kv_size = (size_t)eng->n_layers_global *
         context_size * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
-    cudaMalloc(&eng->d_global_k, global_kv_size);
-    cudaMalloc(&eng->d_global_v, global_kv_size);
+    if (cudaMalloc(&eng->d_global_k, global_kv_size) != cudaSuccess ||
+        cudaMalloc(&eng->d_global_v, global_kv_size) != cudaSuccess) {
+        fprintf(stderr, "gem4d: failed to allocate global KV cache (%.1f MB ×2)\n",
+                global_kv_size / (1024.0*1024.0));
+        cudaGetLastError();
+        free(eng);
+        return NULL;
+    }
 
     // LoRA scratch buffers
     cudaMalloc(&eng->d_lora_scratch,
@@ -1553,6 +2026,17 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_global_v);
     CUDA_FREE(eng->d_lora_scratch);
     CUDA_FREE(eng->d_lora_out);
+    CUDA_FREE(eng->d_suppress);
+    CUDA_FREE(eng->d_w_attn_norm);
+    CUDA_FREE(eng->d_w_post_attn_norm);
+    CUDA_FREE(eng->d_w_ffn_norm);
+    CUDA_FREE(eng->d_w_post_ffn_norm);
+    CUDA_FREE(eng->d_w_q_norm);
+    CUDA_FREE(eng->d_w_k_norm);
+    CUDA_FREE(eng->d_w_out_norm);
+    CUDA_FREE(eng->d_weights);
+    for (int p = 0; p < 7; p++)
+        CUDA_FREE(eng->d_bf16_layer[p]);
     #undef CUDA_FREE
 
     // LoRA cleanup
@@ -1586,18 +2070,16 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
 // ─── Weight access helpers ────────────────────────────────────────────
 
 // Tensor offsets stored in eng->tensors are ABSOLUTE file byte offsets
-// (gguf_find_tensor already adds the tensor-data start). These helpers simply
-// index into the mmap'd file.
+// (gguf_find_tensor already adds the tensor-data start). When the weights
+// were copied to device memory (d_weights), return a device pointer into that
+// buffer; otherwise fall back to the mmap'd file (GB10 unified memory).
 static inline const unsigned char* weight_fp8(
     const gemma4_engine_t *eng, uint64_t tensor_offset)
 {
+    if (eng->d_weights)
+        return (const unsigned char *)(eng->d_weights
+                                       + (tensor_offset - eng->tdata_start));
     return (const unsigned char *)(eng->gguf_data + tensor_offset);
-}
-
-static inline const float* weight_f32(
-    const gemma4_engine_t *eng, uint64_t tensor_offset)
-{
-    return (const float *)(eng->gguf_data + tensor_offset);
 }
 
 // ─── Format-dispatching GEMV / embed launchers ─────────────────────────
@@ -1638,24 +2120,15 @@ static inline void embed_w(
 __global__ void gemv_lora_kernel(float*,const uint8_t*,const float*,const float*,const float*,int,int,int,float,int);
 __global__ void gemv_lora_pair_kernel(float*,float*,const uint8_t*,const uint8_t*,const float*,const float*,const float*,const float*,const float*,int,int,int,int,float,int);
 
-// Upload a per-head norm weight (host→device) and call per_head_rms_norm_kernel.
-#define PER_HEAD_NORM(dst, host_weight, n_h, h_dim) do { \
-    if (host_weight) { \
-        cudaMemcpyAsync(eng->d_head_norm_w, (host_weight), \
-            (h_dim) * sizeof(float), cudaMemcpyHostToDevice, stream); \
-    } \
+// Per-head RMSNorm using a norm weight already resident on device (or NULL).
+#define PER_HEAD_NORM(dst, dev_weight, n_h, h_dim) do { \
     per_head_rms_norm_kernel<<<(n_h), (h_dim), smem32, stream>>>( \
-        (dst), (host_weight) ? eng->d_head_norm_w : NULL, (h_dim), GEMMA4_RMS_EPS); \
+        (dst), (dev_weight), (h_dim), GEMMA4_RMS_EPS); \
 } while(0)
 
-// ─── Convenience: upload an F32 norm weight to d_norm and return its pointer ─
-// Upload norm weight into d_norm_w (separate from d_norm output buffer).
-#define LOAD_NORM_W(field) do { \
-    cudaMemcpyAsync(eng->d_norm_w, \
-        weight_f32(eng, eng->tensors.layers[layer].field), \
-        GEMMA4_HIDDEN_SIZE * sizeof(float), \
-        cudaMemcpyHostToDevice, stream); \
-} while(0)
+// Device pointer to layer `layer`'s preloaded hidden-size norm weight.
+#define NORM_W(arr) (eng->arr + (size_t)layer * GEMMA4_HIDDEN_SIZE)
+#define HEAD_NORM_W(arr) (eng->arr + (size_t)layer * GEMMA4_GLOBAL_HEAD_DIM)
 
 static int decode_layer(
     gemma4_engine_t *eng,
@@ -1688,9 +2161,8 @@ static int decode_layer(
                     cudaMemcpyDeviceToDevice, stream);
 
     // ── 1. Pre-attention RMSNorm ──────────────────────────────────────
-    LOAD_NORM_W(attn_norm);
     rms_norm_kernel<<<1, block, smem32, stream>>>(
-        eng->d_norm, eng->d_x, eng->d_norm_w,
+        eng->d_norm, eng->d_x, NORM_W(d_w_attn_norm),
         GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
 
     // ── 2. Q projection (NO per-head norm, NO RoPE for test) ──────────
@@ -1705,9 +2177,7 @@ static int decode_layer(
             weight_fp8(eng, eng->tensors.layers[layer].attn_q),
             eng->d_norm, GEMMA4_HIDDEN_SIZE, out_dim_q, stream);
     }
-    PER_HEAD_NORM(eng->d_attn_q,
-        weight_f32(eng, eng->tensors.layers[layer].attn_q_norm),
-        n_heads, head_dim);
+    PER_HEAD_NORM(eng->d_attn_q, HEAD_NORM_W(d_w_q_norm), n_heads, head_dim);
 
     // ── 3. K projection → per-head RMSNorm ───────────────────────────────
     if (eng->lora_loaded && eng->lora[layer].k.active) {
@@ -1746,9 +2216,7 @@ static int decode_layer(
     }
 
     // Now apply K-norm (after V copy for global layers)
-    PER_HEAD_NORM(eng->d_attn_k,
-        weight_f32(eng, eng->tensors.layers[layer].attn_k_norm),
-        n_kv_heads, head_dim);
+    PER_HEAD_NORM(eng->d_attn_k, HEAD_NORM_W(d_w_k_norm), n_kv_heads, head_dim);
 
     // ── 5. RoPE ──────────────────────────────────────────────────────────
     if (ltype == LAYER_SLIDING) {
@@ -1780,10 +2248,11 @@ static int decode_layer(
             eng->sliding_filled[layer]++;
     } else {
         int n = eng->global_n_tokens;
+        int slot = eng->global_slot[layer];
         size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
-        float *k_slot = eng->d_global_k + layer * layer_stride
+        float *k_slot = eng->d_global_k + (size_t)slot * layer_stride
                         + (size_t)n * GEMMA4_GLOBAL_HEAD_DIM;
-        float *v_slot = eng->d_global_v + layer * layer_stride
+        float *v_slot = eng->d_global_v + (size_t)slot * layer_stride
                         + (size_t)n * GEMMA4_GLOBAL_HEAD_DIM;
         cudaMemcpyAsync(k_slot, eng->d_attn_k,
             kv_size * sizeof(float), cudaMemcpyDeviceToDevice, stream);
@@ -1793,7 +2262,7 @@ static int decode_layer(
 
     // ── 7. Attention ─────────────────────────────────────────────────────
     if (ltype == LAYER_SLIDING) {
-        int smem_sl = (32 + GEMMA4_SLIDING_WINDOW) * (int)sizeof(float);
+        int smem_sl = 32 * (int)sizeof(float);   // flash: constant scratch
         sliding_attn_decode_kernel<<<n_heads, head_dim, smem_sl, stream>>>(
             eng->d_attn_out, eng->d_attn_q,
             eng->d_sliding_k + (size_t)layer * GEMMA4_SLIDING_WINDOW
@@ -1805,15 +2274,25 @@ static int decode_layer(
             eng->sliding_cursor[layer],
             eng->sliding_filled[layer]);
     } else {
-        // n_ctx = tokens already in cache + this one (written above)
+        // n_ctx = tokens already in cache + this one (written above).
+        // Flash kernel uses a constant 32-float scratch, so there is no longer any
+        // context-length shared-memory cap (the old (32+n_ctx)-float buffer capped
+        // ctx at ~25K and failed silently past it).
         int n_ctx = eng->global_n_tokens + 1;
-        int smem_gl = (32 + n_ctx) * (int)sizeof(float);
+        int smem_gl = 32 * (int)sizeof(float);
+        int slot = eng->global_slot[layer];
         size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
         global_attn_decode_kernel<<<n_heads, head_dim, smem_gl, stream>>>(
             eng->d_attn_out, eng->d_attn_q,
-            eng->d_global_k + layer * layer_stride,
-            eng->d_global_v + layer * layer_stride,
+            eng->d_global_k + (size_t)slot * layer_stride,
+            eng->d_global_v + (size_t)slot * layer_stride,
             n_heads, head_dim, n_ctx);
+        {
+            cudaError_t le = cudaGetLastError();
+            if (le != cudaSuccess)
+                fprintf(stderr, "gem4d: global_attn_decode launch failed: %s\n",
+                        cudaGetErrorString(le));
+        }
         // Do NOT increment global_n_tokens here; the engine-level functions
         // (prefill/decode) own the counter and advance it once per token.
     }
@@ -1831,9 +2310,9 @@ static int decode_layer(
             eng->d_attn_out, out_dim_q, GEMMA4_HIDDEN_SIZE, stream);
     }
     // Post-attention sandwich norm
-    LOAD_NORM_W(post_attn_norm);
     rms_norm_kernel<<<1, block, smem32, stream>>>(
-        eng->d_norm, eng->d_x, eng->d_norm_w, GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+        eng->d_norm, eng->d_x, NORM_W(d_w_post_attn_norm),
+        GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
     // Residual: normed_attn_proj + pre-layer input
     residual_add_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
         eng->d_norm, eng->d_residual, GEMMA4_HIDDEN_SIZE);
@@ -1844,9 +2323,9 @@ static int decode_layer(
         GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 
     // ── 9. Pre-FFN RMSNorm ────────────────────────────────────────────────
-    LOAD_NORM_W(ffn_norm);
     rms_norm_kernel<<<1, block, smem32, stream>>>(
-        eng->d_norm, eng->d_x, eng->d_norm_w, GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+        eng->d_norm, eng->d_x, NORM_W(d_w_ffn_norm),
+        GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
 
     // ── 10. Gate + Up projections ─────────────────────────────────────────
     if (eng->lora_loaded && (eng->lora[layer].gate.active || eng->lora[layer].up.active)) {
@@ -1893,23 +2372,343 @@ static int decode_layer(
     }
 
     // ── 13. Post-FFN sandwich norm → residual add ─────────────────────────
-    LOAD_NORM_W(post_ffn_norm);
     rms_norm_kernel<<<1, block, smem32, stream>>>(
-        eng->d_norm, eng->d_x, eng->d_norm_w, GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+        eng->d_norm, eng->d_x, NORM_W(d_w_post_ffn_norm),
+        GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
     residual_add_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
         eng->d_norm, eng->d_residual, GEMMA4_HIDDEN_SIZE);
     cudaMemcpyAsync(eng->d_x, eng->d_norm,
         GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 
-    // ── 14. layer_output_scale ────────────────────────────────────────────
-    if (eng->tensors.layers[layer].layer_out_scale != 0) {
-        float s;
-        cudaMemcpy(&s,
-            weight_f32(eng, eng->tensors.layers[layer].layer_out_scale),
-            sizeof(float), cudaMemcpyHostToHost);
+    // ── 14. layer_output_scale (scalar preloaded at create) ──────────────
+    if (eng->h_out_scale[layer] != 1.0f) {
         scale_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
-            eng->d_x, GEMMA4_HIDDEN_SIZE, s); }
+            eng->d_x, GEMMA4_HIDDEN_SIZE, eng->h_out_scale[layer]);
+    }
 
+    return 0;
+}
+
+// =========================================================================
+// ─── BF16 weight residency + batched GEMM (Step 2 foundation) ───────────
+// =========================================================================
+
+// Projection ids, indexing the rotating per-layer scratch eng->d_bf16_layer[p].
+enum { PJ_Q = 0, PJ_K, PJ_V, PJ_O, PJ_GATE, PJ_UP, PJ_DOWN, PJ_COUNT };
+
+// Resolve a projection's source byte offset + GEMM dims for a layer. Returns 0
+// for projections that do not exist (global layers have no separate V weight).
+static int proj_desc(const gemma4_engine_t *eng, int layer, int p,
+                     uint64_t *offset, int *in_dim, int *out_dim)
+{
+    layer_type_t lt = eng->layer_types[layer];
+    int hd  = (lt == LAYER_SLIDING) ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+    int nkv = (lt == LAYER_SLIDING) ? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+    int oq  = GEMMA4_HEADS * hd;
+    int okv = nkv * hd;
+    const __typeof__(eng->tensors.layers[0]) *L = &eng->tensors.layers[layer];
+    switch (p) {
+        case PJ_Q:    *offset = L->attn_q;      *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = oq;  return 1;
+        case PJ_K:    *offset = L->attn_k;      *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = okv; return 1;
+        case PJ_V:    if (lt != LAYER_SLIDING) return 0;  // global: V = K, no weight
+                      *offset = L->attn_v;      *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = okv; return 1;
+        case PJ_O:    *offset = L->attn_output; *in_dim = oq;  *out_dim = GEMMA4_HIDDEN_SIZE; return 1;
+        case PJ_GATE: *offset = L->ffn_gate;    *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = GEMMA4_INTERMEDIATE; return 1;
+        case PJ_UP:   *offset = L->ffn_up;      *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = GEMMA4_INTERMEDIATE; return 1;
+        case PJ_DOWN: *offset = L->ffn_down;    *in_dim = GEMMA4_INTERMEDIATE; *out_dim = GEMMA4_HIDDEN_SIZE; return 1;
+    }
+    return 0;
+}
+
+// Allocate the ROTATING per-layer BF16 dequant scratch: one buffer per projection
+// slot (0..6), each sized to the widest [out_dim×in_dim] that slot takes over all
+// layers (sliding vs global differ). ~0.5 GB total vs the old persistent 21.8 GB.
+// Idempotent. Returns 0 on success, -1 on allocation failure.
+static int build_bf16_weights(gemma4_engine_t *eng)
+{
+    if (eng->bf16_ready) return 0;
+
+    uint64_t maxn[PJ_COUNT] = {0};
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        for (int p = 0; p < PJ_COUNT; p++) {
+            uint64_t off; int in_dim, out_dim;
+            if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;
+            uint64_t n = (uint64_t)in_dim * out_dim;
+            if (n > maxn[p]) maxn[p] = n;
+        }
+    }
+
+    size_t total = 0;
+    for (int p = 0; p < PJ_COUNT; p++) {
+        eng->d_bf16_layer[p] = NULL;
+        if (maxn[p] == 0) continue;
+        if (cudaMalloc(&eng->d_bf16_layer[p],
+                       maxn[p] * sizeof(__nv_bfloat16)) != cudaSuccess) {
+            fprintf(stderr, "gem4d: BF16 dequant scratch alloc failed at proj %d "
+                    "(%.2f GB in so far)\n", p, total / 1e9);
+            cudaGetLastError();
+            for (int q = 0; q < PJ_COUNT; q++)
+                if (eng->d_bf16_layer[q]) { cudaFree(eng->d_bf16_layer[q]); eng->d_bf16_layer[q] = NULL; }
+            return -1;
+        }
+        total += maxn[p] * sizeof(__nv_bfloat16);
+    }
+    fprintf(stderr, "gem4d: BF16 per-layer dequant scratch (%.2f GB rotating, "
+            "vs 21.8 GB persistent)\n", total / 1e9);
+    eng->bf16_ready = 1;
+    return 0;
+}
+
+// Dequantize the CURRENT layer's 7 projection weights (Q8_0/FP8 → BF16) into the
+// rotating scratch, just before that layer's GEMMs. Single-stream ordering makes
+// this safe: the next layer's dequant is enqueued after this layer's GEMMs finish
+// reading the scratch, so there is no overwrite hazard.
+static void dequant_layer_bf16(gemma4_engine_t *eng, int l, cudaStream_t stream)
+{
+    for (int p = 0; p < PJ_COUNT; p++) {
+        uint64_t off; int in_dim, out_dim;
+        if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;
+        uint64_t n = (uint64_t)in_dim * out_dim;
+        const uint8_t *src = weight_fp8(eng, off);
+        dequant_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
+            eng->d_bf16_layer[p], src, n, FMT(eng));
+    }
+}
+
+// Y[n_tokens × out_dim] = W[out_dim × in_dim] @ X[n_tokens × in_dim], all
+// token-major (row-major). W is BF16 col-major [in_dim × out_dim] (= source
+// row-major [out_dim][in_dim]) → op_T; X is BF16 token-major → col-major
+// [in_dim × n_tokens] op_N; C accumulates in FP32. See derivation in the plan.
+static cublasStatus_t gemm_bf16(
+    gemma4_engine_t *eng, const __nv_bfloat16 *W, const __nv_bfloat16 *X,
+    float *Y, int in_dim, int out_dim, int n_tokens)
+{
+    const float alpha = 1.0f, beta = 0.0f;
+    return cublasGemmEx(
+        eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        out_dim, n_tokens, in_dim,
+        &alpha,
+        W, CUDA_R_16BF, in_dim,
+        X, CUDA_R_16BF, in_dim,
+        &beta,
+        Y, CUDA_R_32F, out_dim,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+
+// =========================================================================
+// ─── Batched Prefill (Step 2 Phase 2 + Step 3) ──────────────────────────
+// =========================================================================
+// Process the WHOLE prompt in one weight pass: per layer, one cuBLAS BF16 GEMM
+// per projection over all N tokens (tensor-core bound) instead of N token-by-
+// token GEMV passes (bandwidth bound). Reproduces decode_layer's math exactly,
+// batched. Requires a FRESH sequence (global_n_tokens==0) so the batch's own
+// linear K/V are the full attention context; returns -2 otherwise (caller falls
+// back to gemma4_engine_prefill). Builds the BF16 weights on first use.
+int gemma4_engine_prefill_batched(
+    gemma4_engine_t *eng, const int32_t *tokens, int n_tokens, float *logits_out)
+{
+    if (!eng->loaded || n_tokens <= 0) return -1;
+    if (eng->global_n_tokens != 0) return -2;             // need fresh sequence
+    if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
+    if (n_tokens > 65535) return -2;                      // grid.y bound
+    if (build_bf16_weights(eng) != 0) return -1;
+
+    cudaStream_t stream = eng->stream;
+    const int N   = n_tokens;
+    const int H   = GEMMA4_HIDDEN_SIZE;
+    const int I   = GEMMA4_INTERMEDIATE;
+    const int HD2 = 32 * sizeof(float);
+    const int base = 0;
+
+    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0, stream);
+
+    // ── Scratch (token-major). Sized to the widest dim each can take. ──
+    const int OQ_MAX = GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM; // 8192
+    const int OKV_MAX = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;    // 2048
+    float *d_x=0,*d_norm=0,*d_q=0,*d_k=0,*d_v=0,*d_attn=0,*d_gate=0,*d_up=0,*d_scores=0;
+    __nv_bfloat16 *d_inb=0,*d_qb=0,*d_kb=0,*d_vb=0,*d_kbx=0,*d_vbx=0,*d_pb=0;
+    const int HEADS = GEMMA4_HEADS;
+    int ok = 1;
+    #define PALLOC(p,elems) do{ if(cudaMalloc(&(p),(size_t)(elems))!=cudaSuccess){ok=0;} }while(0)
+    PALLOC(d_x,    (size_t)N*H*sizeof(float));
+    PALLOC(d_norm, (size_t)N*H*sizeof(float));
+    PALLOC(d_q,    (size_t)N*OQ_MAX*sizeof(float));
+    PALLOC(d_k,    (size_t)N*OKV_MAX*sizeof(float));
+    PALLOC(d_v,    (size_t)N*OKV_MAX*sizeof(float));
+    PALLOC(d_attn, (size_t)N*OQ_MAX*sizeof(float));
+    PALLOC(d_gate, (size_t)N*I*sizeof(float));
+    PALLOC(d_up,   (size_t)N*I*sizeof(float));
+    PALLOC(d_inb,  (size_t)N*I*sizeof(__nv_bfloat16));
+    // Attention scratch (batched-head GEMM path): bf16 Q + bf16 K/V expanded to
+    // all query heads, fp32 score batch [HEADS][N×N] + bf16 prob batch.
+    PALLOC(d_qb,   (size_t)N*OQ_MAX*sizeof(__nv_bfloat16));
+    PALLOC(d_kb,   (size_t)N*OKV_MAX*sizeof(__nv_bfloat16));
+    PALLOC(d_vb,   (size_t)N*OKV_MAX*sizeof(__nv_bfloat16));
+    PALLOC(d_kbx,  (size_t)N*OQ_MAX*sizeof(__nv_bfloat16));
+    PALLOC(d_vbx,  (size_t)N*OQ_MAX*sizeof(__nv_bfloat16));
+    PALLOC(d_pb,   (size_t)HEADS*N*N*sizeof(__nv_bfloat16));
+    PALLOC(d_scores,(size_t)HEADS*N*N*sizeof(float));
+    #undef PALLOC
+    float *fbufs[] = {d_x,d_norm,d_q,d_k,d_v,d_attn,d_gate,d_up,d_scores};
+    __nv_bfloat16 *bbufs[] = {d_inb,d_qb,d_kb,d_vb,d_kbx,d_vbx,d_pb};
+    if (!ok) {
+        fprintf(stderr, "gem4d: batched-prefill scratch alloc failed (N=%d) — fallback\n", N);
+        cudaGetLastError();
+        for (float *p : fbufs) if(p) cudaFree(p);
+        for (__nv_bfloat16 *p : bbufs) if(p) cudaFree(p);
+        return -2;
+    }
+
+    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+    // One projection GEMM: bf16 normed input d_inb → fp32 token-major [N][out].
+    // Weight comes from the rotating per-layer scratch (dequant'd at layer top).
+    auto gemm_proj = [&](int l, int p, int in_dim, int out_dim, float *dst){
+        (void)l;
+        gemm_bf16(eng, eng->d_bf16_layer[p], d_inb, dst, in_dim, out_dim, N);
+    };
+
+    // ── Embedding + √H scale, token-major [N][H] ──
+    embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), tokens, N, H, stream);
+    scale_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, N*H, sqrtf((float)H));
+
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        layer_type_t lt = eng->layer_types[l];
+        int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+        int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+        int oq  = GEMMA4_HEADS*hd, okv = nkv*hd, kvhd = okv;
+        const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
+        const float *w_post_a = eng->d_w_post_attn_norm + (size_t)l*H;
+        const float *w_ffn    = eng->d_w_ffn_norm       + (size_t)l*H;
+        const float *w_post_f = eng->d_w_post_ffn_norm  + (size_t)l*H;
+        const float *w_qn     = eng->d_w_q_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+        const float *w_kn     = eng->d_w_k_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+
+        // Dequant THIS layer's 7 projection weights Q8_0/FP8 → BF16 rotating scratch.
+        dequant_layer_bf16(eng, l, stream);
+
+        // Sandwich-norm block with IN-PLACE residual: d_x stays the pre-block
+        // hidden (the residual) until residual_add folds the normed sub-block
+        // contribution back into it — so no separate d_res buffer or D2D copies.
+        // pre-attn RMSNorm → input prep (one input feeds Q,K,V → smooth group 0)
+        rms_norm_rows_bf16_kernel<<<N,256,HD2,stream>>>(d_inb, d_x, w_attn, H, N, GEMMA4_RMS_EPS);
+
+        // Q,K (and V) projections (one normed input feeds all three)
+        gemm_proj(l, PJ_Q, H, oq, d_q);
+        per_head_rms_norm_rows_kernel<<<dim3(GEMMA4_HEADS,N),hd,HD2,stream>>>(d_q, w_qn, GEMMA4_HEADS, hd, N, GEMMA4_RMS_EPS);
+        gemm_proj(l, PJ_K, H, okv, d_k);
+        if (lt == LAYER_SLIDING) {
+            gemm_proj(l, PJ_V, H, okv, d_v);
+            per_head_rms_norm_rows_kernel<<<dim3(nkv,N),hd,HD2,stream>>>(d_v, NULL, nkv, hd, N, GEMMA4_RMS_EPS);
+        } else {
+            // global: V = raw K projection (pre K-norm), plain per-head RMS
+            cudaMemcpyAsync(d_v, d_k, (size_t)N*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            per_head_rms_norm_rows_kernel<<<dim3(nkv,N),hd,HD2,stream>>>(d_v, NULL, nkv, hd, N, GEMMA4_RMS_EPS);
+        }
+        per_head_rms_norm_rows_kernel<<<dim3(nkv,N),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, N, GEMMA4_RMS_EPS);
+
+        // RoPE Q,K
+        if (lt == LAYER_SLIDING)
+            rope_rows_kernel<<<dim3(GEMMA4_HEADS,N),hd/2,0,stream>>>(d_q, d_k, base, GEMMA4_HEADS, nkv, hd, N, 10000.0f, NULL);
+        else
+            rope_rows_kernel<<<dim3(GEMMA4_HEADS,N),hd/2,0,stream>>>(d_q, d_k, base, GEMMA4_HEADS, nkv, hd, N, 1000000.0f, eng->d_rope_freqs);
+
+        // Attention → d_attn [N][oq], batched over all heads via tensor-core GEMMs:
+        // expand K/V to all query heads (GQA), S=Q·Kᵀ (col-major [HEADS][N×N]) →
+        // masked softmax → P(bf16) → O=V·Pᵀ. Scale 1.0 (gemma4).
+        int window = (lt==LAYER_SLIDING)? GEMMA4_SLIDING_WINDOW : 0;
+        f32_to_bf16_kernel<<<grid1d((size_t)N*oq),256,0,stream>>>(d_qb, d_q, (size_t)N*oq);
+        f32_to_bf16_kernel<<<grid1d((size_t)N*okv),256,0,stream>>>(d_kb, d_k, (size_t)N*okv);
+        f32_to_bf16_kernel<<<grid1d((size_t)N*okv),256,0,stream>>>(d_vb, d_v, (size_t)N*okv);
+        {
+            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),GEMMA4_HEADS,N),256,0,stream>>>(d_kbx, d_kb, N, GEMMA4_HEADS, nkv, hd);
+            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),GEMMA4_HEADS,N),256,0,stream>>>(d_vbx, d_vb, N, GEMMA4_HEADS, nkv, hd);
+            const float a1=1.0f, b0=0.0f;
+            long long sNN = (long long)N * N;
+            // S[h] = Q[h]ᵀ·K[h]  (m=N,n=N,k=hd; A,B col-major [hd×N] ld=oq stride=hd)
+            cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, N, hd,
+                &a1, d_qb,  CUDA_R_16BF, oq, (long long)hd,
+                     d_kbx, CUDA_R_16BF, oq, (long long)hd,
+                &b0, d_scores, CUDA_R_32F, N, sNN,
+                GEMMA4_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            attn_softmax_batched_kernel<<<dim3(N,GEMMA4_HEADS),256,HD2,stream>>>(d_scores, d_pb, N, window);
+            // O[h] = V[h]·P[h]ᵀ  (m=hd,n=N,k=N → C col-major [hd×N] ld=oq stride=hd)
+            cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_N, CUBLAS_OP_T, hd, N, N,
+                &a1, d_vbx, CUDA_R_16BF, oq, (long long)hd,
+                     d_pb,  CUDA_R_16BF, N,  sNN,
+                &b0, d_attn, CUDA_R_32F, oq, (long long)hd,
+                GEMMA4_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        }
+
+        // Write final K/V into the persistent cache for decode continuation.
+        if (lt == LAYER_SLIDING) {
+            int count = (N < GEMMA4_SLIDING_WINDOW)? N : GEMMA4_SLIDING_WINDOW;
+            int first = N - count;
+            float *kc = eng->d_sliding_k + (size_t)l*GEMMA4_SLIDING_WINDOW*kvhd;
+            float *vc = eng->d_sliding_v + (size_t)l*GEMMA4_SLIDING_WINDOW*kvhd;
+            kv_write_sliding_kernel<<<dim3(grid1d(kvhd),count),256,0,stream>>>(
+                kc, vc, d_k, d_v, base, first, count, kvhd, GEMMA4_SLIDING_WINDOW);
+            eng->sliding_cursor[l] = (base + N) % GEMMA4_SLIDING_WINDOW;
+            eng->sliding_filled[l] = (base + N < GEMMA4_SLIDING_WINDOW)? base+N : GEMMA4_SLIDING_WINDOW;
+        } else {
+            int slot = eng->global_slot[l];
+            size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+            kv_write_global_kernel<<<dim3(grid1d(hd),N),256,0,stream>>>(
+                eng->d_global_k + slot*stride, eng->d_global_v + slot*stride,
+                d_k, d_v, base, N, hd);
+        }
+
+        // O projection → temp d_q ; post-attn norm ; fold into residual d_x
+        f32_to_bf16_kernel<<<grid1d((size_t)N*oq),256,0,stream>>>(d_inb, d_attn, (size_t)N*oq);
+        gemm_proj(l, PJ_O, oq, H, d_q);
+        rms_norm_rows_kernel<<<N,256,HD2,stream>>>(d_norm, d_q, w_post_a, H, N, GEMMA4_RMS_EPS);
+        residual_add_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, d_norm, N*H);
+
+        // FFN: pre-norm (d_x is now the post-attn hidden = FFN residual) → bf16
+        // input (reused by gate+up), GeGLU, down → temp d_q, fold into d_x.
+        rms_norm_rows_bf16_kernel<<<N,256,HD2,stream>>>(d_inb, d_x, w_ffn, H, N, GEMMA4_RMS_EPS);
+        gemm_proj(l, PJ_GATE, H, I, d_gate);
+        gemm_proj(l, PJ_UP,   H, I, d_up);
+        geglu_bf16_kernel<<<grid1d((size_t)N*I),256,0,stream>>>(d_inb, d_gate, d_up, N*I);
+        gemm_proj(l, PJ_DOWN, I, H, d_q);
+        rms_norm_rows_kernel<<<N,256,HD2,stream>>>(d_norm, d_q, w_post_f, H, N, GEMMA4_RMS_EPS);
+        residual_add_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, d_norm, N*H);
+        if (eng->h_out_scale[l] != 1.0f)
+            scale_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, N*H, eng->h_out_scale[l]);
+    }
+
+    eng->global_n_tokens += N;
+
+    // ── Output norm + LM head + softcap on the LAST token only ──
+    float *x_last = d_x + (size_t)(N-1)*H;
+    rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
+    gemv_w(eng, eng->d_logits, weight_fp8(eng, eng->tensors.output_weight),
+           eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream);
+    logit_softcap_kernel<<<grid1d(GEMMA4_VOCAB_SIZE),256,0,stream>>>(
+        eng->d_logits, GEMMA4_SOFTCAP, GEMMA4_VOCAB_SIZE);
+    if (eng->n_suppress > 0)
+        suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
+            eng->d_logits, eng->d_suppress, eng->n_suppress, GEMMA4_VOCAB_SIZE);
+    if (logits_out)
+        cudaMemcpyAsync(logits_out, eng->d_logits, GEMMA4_VOCAB_SIZE*sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+
+    cudaEventRecord(t1, stream);
+    cudaEventSynchronize(t1);
+    float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
+    eng->prefill_time_ms += ms;
+    eng->n_prefill_tokens += N;
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+
+    for (float *p : fbufs) cudaFree(p);
+    for (__nv_bfloat16 *p : bbufs) cudaFree(p);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gem4d: batched-prefill CUDA error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
     return 0;
 }
 
@@ -1956,13 +2755,14 @@ int gemma4_engine_prefill(
         }
         eng->global_n_tokens++;
 
-        // Output norm
-        const float *out_norm_w = weight_f32(eng, eng->tensors.output_norm);
-        cudaMemcpyAsync(eng->d_norm_w, out_norm_w, GEMMA4_HIDDEN_SIZE * sizeof(float),
-                        cudaMemcpyHostToDevice, stream);
+        // Output norm + LM head + softcap only for the LAST prefill token.
+        // The LM head is a 262144-row GEMV (~1 GB of weight reads) — running it
+        // for every prompt token wasted >20% of prefill bandwidth for logits
+        // that were thrown away. llama.cpp does the same via inp_out_ids.
+        if (t != n_tokens - 1) continue;
 
         rms_norm_kernel<<<1, 256, 32*sizeof(float), stream>>>(
-            eng->d_norm, eng->d_x, eng->d_norm_w,
+            eng->d_norm, eng->d_x, eng->d_w_out_norm,
             GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
 
         // Output projection: [3840 → 262144]. The LM head is the (tied) token
@@ -1978,8 +2778,11 @@ int gemma4_engine_prefill(
         logit_softcap_kernel<<<(vocab + 255) / 256, 256, 0, stream>>>(
             eng->d_logits, GEMMA4_SOFTCAP, vocab);
 
-        // Copy logits back if needed (only for last token usually)
-        if (logits_out && t == n_tokens - 1) {
+        if (eng->n_suppress > 0)
+            suppress_tokens_kernel<<<(eng->n_suppress + 255) / 256, 256, 0, stream>>>(
+                eng->d_logits, eng->d_suppress, eng->n_suppress, vocab);
+
+        if (logits_out) {
             cudaMemcpyAsync(logits_out, eng->d_logits,
                             vocab * sizeof(float),
                             cudaMemcpyDeviceToHost, stream);
@@ -1996,6 +2799,12 @@ int gemma4_engine_prefill(
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gem4d: prefill CUDA error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
 
     return 0;
 }
@@ -2036,12 +2845,8 @@ int gemma4_engine_decode(
     }
 
     // Output norm + projection + softcap
-    const float *out_norm_w = weight_f32(eng, eng->tensors.output_norm);
-    cudaMemcpyAsync(eng->d_norm_w, out_norm_w, GEMMA4_HIDDEN_SIZE * sizeof(float),
-                    cudaMemcpyHostToDevice, stream);
-
     rms_norm_kernel<<<1, 256, 32*sizeof(float), stream>>>(
-        eng->d_norm, eng->d_x, eng->d_norm_w,
+        eng->d_norm, eng->d_x, eng->d_w_out_norm,
         GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
 
     int vocab = GEMMA4_VOCAB_SIZE;
@@ -2064,6 +2869,10 @@ int gemma4_engine_decode(
     logit_softcap_kernel<<<(vocab + 255) / 256, 256, 0, stream>>>(
         eng->d_logits, GEMMA4_SOFTCAP, vocab);
 
+    if (eng->n_suppress > 0)
+        suppress_tokens_kernel<<<(eng->n_suppress + 255) / 256, 256, 0, stream>>>(
+            eng->d_logits, eng->d_suppress, eng->n_suppress, vocab);
+
     // Copy logits to host
     if (logits_out) {
         cudaMemcpyAsync(logits_out, eng->d_logits,
@@ -2081,6 +2890,12 @@ int gemma4_engine_decode(
 
     eng->global_n_tokens++;
 
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gem4d: decode CUDA error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
     return 0;
 }
 
@@ -2096,20 +2911,27 @@ int gemma4_engine_verify_batch(
     float           *logits_out)
 {
     if (!eng->loaded || K <= 0) return -1;
+    (void)positions; // positions are implied by the cache cursor; reserved for batched verify
 
-    // For now, verify draft tokens one by one
-    // In production, this should use batched attention (CUDA Graph)
-    // with weights shared across the batch
+    // For now, verify draft tokens one by one. Each gemma4_engine_decode advances
+    // BOTH the global token counter and every sliding layer's ring cursor/fill,
+    // so a correct rollback on mismatch must restore all of them — otherwise the
+    // rejected token's K/V stays in-window and corrupts the next real decode.
+    float *host_logits = (float *)malloc(GEMMA4_VOCAB_SIZE * sizeof(float));
+    if (!host_logits) return -1;
+
+    int saved_cursor[GEMMA4_MAX_LAYERS];
+    int saved_filled[GEMMA4_MAX_LAYERS];
 
     int n_accepted = 0;
 
     for (int k = 0; k < K; k++) {
-        float *host_logits = (float *)malloc(GEMMA4_VOCAB_SIZE * sizeof(float));
-
-        // Save current context position before this verification
+        // Snapshot the full KV-cursor state before applying this candidate.
         int saved_n_tokens = eng->global_n_tokens;
+        memcpy(saved_cursor, eng->sliding_cursor, sizeof(saved_cursor));
+        memcpy(saved_filled, eng->sliding_filled, sizeof(saved_filled));
 
-        // Decode candidate token k
+        // Decode candidate token k (mutates the KV cache + counters)
         gemma4_engine_decode(eng, draft_tokens[k], host_logits);
 
         // Check if greedy sample matches draft
@@ -2118,28 +2940,29 @@ int gemma4_engine_verify_batch(
         if (greedy == draft_tokens[k]) {
             n_accepted = k + 1;
 
-            // Copy logits for accepted token
+            // Copy logits for accepted token (slot k per the header contract)
             if (logits_out) {
-                memcpy(logits_out + k * GEMMA4_VOCAB_SIZE,
+                memcpy(logits_out + (size_t)k * GEMMA4_VOCAB_SIZE,
                        host_logits, GEMMA4_VOCAB_SIZE * sizeof(float));
             }
         } else {
-            // Mismatch: rollback to before this token
-            // Use the greedy token as the "correct" next token
+            // Mismatch: roll the cache back to before this token so the rejected
+            // K/V is discarded from BOTH the global cursor and every sliding ring.
             eng->global_n_tokens = saved_n_tokens;
+            memcpy(eng->sliding_cursor, saved_cursor, sizeof(saved_cursor));
+            memcpy(eng->sliding_filled, saved_filled, sizeof(saved_filled));
 
-            // Output the greedy logits
+            // Emit the greedy logits for this position (slot k, not 0).
             if (logits_out) {
-                memcpy(logits_out, host_logits,
-                       GEMMA4_VOCAB_SIZE * sizeof(float));
+                memcpy(logits_out + (size_t)k * GEMMA4_VOCAB_SIZE,
+                       host_logits, GEMMA4_VOCAB_SIZE * sizeof(float));
             }
             free(host_logits);
             return n_accepted;
         }
-
-        free(host_logits);
     }
 
+    free(host_logits);
     return n_accepted;  // All K accepted
 }
 
@@ -2527,46 +3350,68 @@ int gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep) {
 // ─── Session Save/Load ─────────────────────────────────────────────────
 // =========================================================================
 
+// Serialized session layout (one shared layout used by save AND load):
+//   [u32 global_n_tokens][u32 n_layers_global][u32 global_kv_capacity]
+//   [int sliding_cursor[GEMMA4_MAX_LAYERS]]
+//   [int sliding_filled[GEMMA4_MAX_LAYERS]]
+//   [float sliding_k full buffer][float sliding_v full buffer]
+//   [float global_k: n_layers_global × n_tokens × head_dim]   (used rows only)
+//   [float global_v: n_layers_global × n_tokens × head_dim]
+// The global section stores only the used rows of each global slot, packed
+// without the per-slot capacity gap, so it is independent of how either engine
+// sized its cache — load validates the saved n_tokens fits this engine.
+static uint64_t session_sliding_bytes(void) {
+    return (uint64_t)GEMMA4_MAX_LAYERS *
+        GEMMA4_KV_HEADS * GEMMA4_SLIDING_WINDOW * GEMMA4_HEAD_DIM * sizeof(float);
+}
+
 int gemma4_engine_save_session(
     gemma4_engine_t *eng,
     uint8_t         *buffer,
     uint64_t        *size)
 {
-    if (!eng) return -1;
+    if (!eng || !size) return -1;
 
-    // Calculate KV cache size
-    uint64_t sliding_bytes = (uint64_t)GEMMA4_MAX_LAYERS *
-        GEMMA4_KV_HEADS * GEMMA4_SLIDING_WINDOW * GEMMA4_HEAD_DIM * sizeof(float);
+    uint64_t sliding_bytes = session_sliding_bytes();
+    uint64_t cursor_bytes  = 2 * (uint64_t)GEMMA4_MAX_LAYERS * sizeof(int);
+    uint64_t global_rows   = (uint64_t)eng->n_layers_global * eng->global_n_tokens;
+    uint64_t global_bytes  = global_rows * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
 
-    uint64_t global_bytes = (uint64_t)eng->n_layers_global *
-        GEMMA4_GLOBAL_KV_HEADS * eng->global_n_tokens * GEMMA4_GLOBAL_HEAD_DIM * sizeof(unsigned char);
+    uint64_t needed = sizeof(uint32_t) * 3 + cursor_bytes
+        + 2 * sliding_bytes + 2 * global_bytes;
 
-    uint64_t needed = sizeof(uint32_t) * 3 +  // n_tokens, n_global, metadata
-        sliding_bytes + global_bytes;
-
-    if (!buffer) {
-        *size = needed;
-        return 0;
-    }
-
+    if (!buffer) { *size = needed; return 0; }
     if (*size < needed) return -1;
 
     uint8_t *p = buffer;
-    *(uint32_t *)p = eng->global_n_tokens; p += 4;
-    *(uint32_t *)p = eng->n_layers_global; p += 4;
+    *(uint32_t *)p = (uint32_t)eng->global_n_tokens;    p += 4;
+    *(uint32_t *)p = (uint32_t)eng->n_layers_global;    p += 4;
     *(uint32_t *)p = (uint32_t)eng->global_kv_capacity; p += 4;
 
-    // Save sliding KV
+    memcpy(p, eng->sliding_cursor, GEMMA4_MAX_LAYERS * sizeof(int));
+    p += GEMMA4_MAX_LAYERS * sizeof(int);
+    memcpy(p, eng->sliding_filled, GEMMA4_MAX_LAYERS * sizeof(int));
+    p += GEMMA4_MAX_LAYERS * sizeof(int);
+
     cudaMemcpy(p, eng->d_sliding_k, sliding_bytes, cudaMemcpyDeviceToHost);
     p += sliding_bytes;
     cudaMemcpy(p, eng->d_sliding_v, sliding_bytes, cudaMemcpyDeviceToHost);
     p += sliding_bytes;
 
-    // Save global KV K and V (only filled portion)
-    cudaMemcpy(p, eng->d_global_k, global_bytes, cudaMemcpyDeviceToHost);
-    p += global_bytes;
-    cudaMemcpy(p, eng->d_global_v, global_bytes, cudaMemcpyDeviceToHost);
-    p += global_bytes;
+    // Global K/V: copy only the first n_tokens rows of each global slot, packed.
+    uint64_t used_per_slot = (uint64_t)eng->global_n_tokens
+        * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
+    size_t slot_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+    for (int g = 0; g < eng->n_layers_global; g++) {
+        cudaMemcpy(p, eng->d_global_k + (size_t)g * slot_stride,
+                   used_per_slot, cudaMemcpyDeviceToHost);
+        p += used_per_slot;
+    }
+    for (int g = 0; g < eng->n_layers_global; g++) {
+        cudaMemcpy(p, eng->d_global_v + (size_t)g * slot_stride,
+                   used_per_slot, cudaMemcpyDeviceToHost);
+        p += used_per_slot;
+    }
 
     *size = needed;
     return 0;
@@ -2579,32 +3424,50 @@ int gemma4_engine_load_session(
 {
     if (!eng || !buffer) return -1;
 
+    uint64_t sliding_bytes = session_sliding_bytes();
+    uint64_t min_header = sizeof(uint32_t) * 3
+        + 2 * (uint64_t)GEMMA4_MAX_LAYERS * sizeof(int) + 2 * sliding_bytes;
+    if (size < min_header) return -1;
+
     const uint8_t *p = buffer;
-    eng->global_n_tokens = *(const uint32_t *)p; p += 4;
-    int n_global = *(const uint32_t *)p; p += 4;
-    (void)n_global; // validate if needed
-    eng->global_kv_capacity = *(const uint32_t *)p; p += 4;
+    int n_tokens   = (int)*(const uint32_t *)p; p += 4;
+    int n_global   = (int)*(const uint32_t *)p; p += 4;
+    p += 4; // saved global_kv_capacity — informational; this engine keeps its own
 
-    uint64_t sliding_bytes = (uint64_t)GEMMA4_MAX_LAYERS *
-        GEMMA4_KV_HEADS * GEMMA4_SLIDING_WINDOW * GEMMA4_HEAD_DIM * sizeof(float);
+    // Validate against THIS engine — do not blindly overwrite capacity (no
+    // realloc happens, so a larger saved cache would overflow the device buffer).
+    if (n_global != eng->n_layers_global) return -1;
+    if (n_tokens < 0 || n_tokens > eng->global_kv_capacity) return -1;
 
-    // Restore sliding KV
+    uint64_t global_rows  = (uint64_t)n_global * n_tokens;
+    uint64_t global_bytes = global_rows * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
+    uint64_t needed = min_header + 2 * global_bytes;
+    if (size < needed) return -1;
+
+    eng->global_n_tokens = n_tokens;
+
+    memcpy(eng->sliding_cursor, p, GEMMA4_MAX_LAYERS * sizeof(int));
+    p += GEMMA4_MAX_LAYERS * sizeof(int);
+    memcpy(eng->sliding_filled, p, GEMMA4_MAX_LAYERS * sizeof(int));
+    p += GEMMA4_MAX_LAYERS * sizeof(int);
+
     cudaMemcpy(eng->d_sliding_k, p, sliding_bytes, cudaMemcpyHostToDevice);
     p += sliding_bytes;
     cudaMemcpy(eng->d_sliding_v, p, sliding_bytes, cudaMemcpyHostToDevice);
     p += sliding_bytes;
 
-    // Restore global KV
-    uint64_t global_bytes = (uint64_t)GEMMA4_MAX_LAYERS *
-        eng->global_n_tokens * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
-    cudaMemcpy(eng->d_global_k, p, global_bytes, cudaMemcpyHostToDevice);
-    p += global_bytes;
-    cudaMemcpy(eng->d_global_v, p, global_bytes, cudaMemcpyHostToDevice);
-
-    // Reset sliding cursors (invalidate for safety)
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
-        eng->sliding_cursor[l] = eng->global_n_tokens % GEMMA4_SLIDING_WINDOW;
-        eng->sliding_filled[l] = min(eng->global_n_tokens, GEMMA4_SLIDING_WINDOW);
+    uint64_t used_per_slot = (uint64_t)n_tokens
+        * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float);
+    size_t slot_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+    for (int g = 0; g < n_global; g++) {
+        cudaMemcpy(eng->d_global_k + (size_t)g * slot_stride, p,
+                   used_per_slot, cudaMemcpyHostToDevice);
+        p += used_per_slot;
+    }
+    for (int g = 0; g < n_global; g++) {
+        cudaMemcpy(eng->d_global_v + (size_t)g * slot_stride, p,
+                   used_per_slot, cudaMemcpyHostToDevice);
+        p += used_per_slot;
     }
 
     return 0;

@@ -179,6 +179,13 @@ int gemma4_engine_load_session(
     uint64_t         size
 );
 
+// Batched prefill: process the whole prompt in one BF16 tensor-core pass instead
+// of token-by-token GEMV. Requires a fresh sequence (n_tokens in KV cache == 0);
+// returns -2 if not applicable (caller should fall back to gemma4_engine_prefill),
+// 0 on success, -1 on error. Same logits_out contract as gemma4_engine_prefill.
+int gemma4_engine_prefill_batched(
+    gemma4_engine_t *eng, const int32_t *tokens, int n_tokens, float *logits_out);
+
 // ─── Diagnostics ─────────────────────────────────────────────────────
 
 void gemma4_engine_print_info(const gemma4_engine_t *eng);

@@ -14,10 +14,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"sort"
 	"strings"
-	"unicode/utf8"
 )
+
+// spaceMarker is the SentencePiece "▁" (U+2581) used by Gemma to encode a
+// leading space on a token. It is NOT the GPT-2 BPE "Ġ".
+const spaceMarker = "▁"
 
 // Tokenizer handles Gemma 4 tokenization using SentencePiece unigram model.
 type Tokenizer struct {
@@ -25,13 +27,24 @@ type Tokenizer struct {
 	vocabScores []float32
 	vocabSize   int
 
+	// tokenToID maps a token string to its id for O(1) Encode lookups
+	// (replaces the previous O(vocab) linear scan).
+	tokenToID map[string]int32
+
 	// Byte-fallback: for unknown bytes, each byte becomes \x<hex>
 	byteFallback bool
 
-	// Special token IDs
+	// Special token IDs (read from the GGUF vocab by string when present).
 	BOS int32
 	EOS int32
 	PAD int32
+
+	// Gemma-4 turn / channel control tokens. EndOfTurn (<turn|>) terminates an
+	// assistant turn and must be treated as a stop token alongside EOS.
+	StartOfTurn int32 // <|turn>   = 105
+	EndOfTurn   int32 // <turn|>   = 106
+	ChannelOpen int32 // <|channel> = 100
+	ChannelEnd  int32 // <channel|> = 101
 }
 
 // Score represents a token candidate during decoding.
@@ -303,42 +316,72 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 		}
 	}
 
+	// Build the string→id map once (id = vocab index).
+	t.tokenToID = make(map[string]int32, t.vocabSize)
+	for i, s := range t.vocab {
+		// First occurrence wins (ids are unique but be defensive).
+		if _, exists := t.tokenToID[s]; !exists {
+			t.tokenToID[s] = int32(i)
+		}
+	}
+
+	// Resolve control tokens by string so we never hard-code ids that drift
+	// between exports. Defaults match the gemma-4 12B GGUF.
+	lookup := func(s string, def int32) int32 {
+		if id, ok := t.tokenToID[s]; ok {
+			return id
+		}
+		return def
+	}
+	t.StartOfTurn = lookup("<|turn>", 105)
+	t.EndOfTurn = lookup("<turn|>", 106)
+	t.ChannelOpen = lookup("<|channel>", 100)
+	t.ChannelEnd = lookup("<channel|>", 101)
+
 	return t, nil
 }
 
-// Encode tokenizes a string into token IDs.
-// Uses unigram/bpe tokenization: longest prefix match with scores.
+// IsStop reports whether a token id terminates generation (EOS or end-of-turn).
+func (t *Tokenizer) IsStop(id int32) bool {
+	return id == t.EOS || id == t.EndOfTurn
+}
+
+// isControl reports whether an id is a special/control token that must not be
+// rendered into user-visible text.
+func (t *Tokenizer) isControl(id int32) bool {
+	return id == t.BOS || id == t.EOS || id == t.PAD ||
+		id == t.StartOfTurn || id == t.EndOfTurn ||
+		id == t.ChannelOpen || id == t.ChannelEnd
+}
+
+// Encode tokenizes a string into token IDs using greedy longest-prefix match
+// over the SentencePiece vocab. Spaces are first normalized to the "▁" marker
+// (add_space_prefix=false, matching this GGUF), and any byte that cannot be
+// matched falls back to its <0xXX> byte token rather than being dropped.
+//
+// NOTE: this is an approximation of true SentencePiece unigram (Viterbi over
+// scores). It round-trips spaces and byte content correctly; exact id parity
+// with llama.cpp for ambiguous merges is a known follow-up.
 func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
-	// For SentencePiece, we do unigram tokenization with longest match.
-	// This is simplified; production should use the full BPE/Unigram algorithm.
 	var tokens []int32
 
 	if addBos {
 		tokens = append(tokens, t.BOS)
 	}
 
-	// Simple byte-level tokenization using longest prefix match
-	// In practice, this should use the full SentencePiece model
-	// For now, we tokenize by splitting on whitespace and matching
-	// the longest token in the vocab.
+	// SentencePiece space normalization: ' ' -> U+2581.
+	text = strings.ReplaceAll(text, " ", spaceMarker)
 
-	// Build a trie for efficient matching
-	// For simplicity, use a sorted vocab and binary search
-	// This is NOT the full SentencePiece algorithm but handles common cases
-
-	// First try: use pre-built trie for longest prefix match
 	for len(text) > 0 {
 		matched := false
 
-		// Try longest match from full text length down to 1 byte
+		// Longest prefix match, bounded to a sane token byte length.
 		maxLen := len(text)
-		if maxLen > 32 { // Reasonable max token length
-			maxLen = 32
+		if maxLen > 48 {
+			maxLen = 48
 		}
-
 		for l := maxLen; l >= 1; l-- {
-			prefix := text[:l]
-			if id, ok := t.findToken(prefix); ok {
+			if id, ok := t.tokenToID[text[:l]]; ok {
 				tokens = append(tokens, id)
 				text = text[l:]
 				matched = true
@@ -347,20 +390,17 @@ func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 		}
 
 		if !matched {
-			// Byte fallback: encode as individual bytes
-			r, size := utf8.DecodeRuneInString(text)
-			if r == utf8.RuneError && size == 1 {
-				// Use byte token <0xXX>
-				byteToken := fmt.Sprintf("<0x%02X>", text[0])
-				if id, ok := t.findToken(byteToken); ok {
-					tokens = append(tokens, id)
-				} else {
-					tokens = append(tokens, t.PAD)
-				}
-				text = text[1:]
+			// Byte fallback: emit the leading byte as its <0xXX> token.
+			b := text[0]
+			byteToken := fmt.Sprintf("<0x%02X>", b)
+			if id, ok := t.tokenToID[byteToken]; ok {
+				tokens = append(tokens, id)
+			} else if id, ok := t.tokenToID[t.unkOr(b)]; ok {
+				tokens = append(tokens, id)
 			} else {
-				text = text[size:]
+				tokens = append(tokens, t.PAD)
 			}
+			text = text[1:]
 		}
 	}
 
@@ -371,42 +411,58 @@ func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 	return tokens
 }
 
-// Decode converts token IDs back to a string.
+// unkOr returns the <unk> token string as a last-resort fallback label.
+func (t *Tokenizer) unkOr(byte) string { return "<unk>" }
+
+// Decode converts token IDs back to a string. It accumulates raw bytes so that
+// <0xXX> byte tokens (which may split a multi-byte UTF-8 rune across several
+// tokens) reassemble correctly, converts the SentencePiece "▁" marker to a
+// space, and skips control tokens.
 func (t *Tokenizer) Decode(tokens []int32) string {
-	var sb strings.Builder
+	var buf []byte
 	for _, id := range tokens {
-		if id >= 0 && int(id) < len(t.vocab) {
-			s := t.vocab[id]
-			// Skip special tokens
-			if s == "" || id == t.BOS || id == t.EOS || id == t.PAD {
-				continue
-			}
-			// Remove the Ġ space marker (SentencePiece)
-			s = strings.ReplaceAll(s, "Ġ", " ")
-			sb.WriteString(s)
+		if id < 0 || int(id) >= len(t.vocab) {
+			continue
 		}
+		if t.isControl(id) {
+			continue
+		}
+		s := t.vocab[id]
+		if s == "" {
+			continue
+		}
+		// Raw byte token <0xXX> → the single byte it names.
+		if b, ok := parseByteToken(s); ok {
+			buf = append(buf, b)
+			continue
+		}
+		// Normal piece: U+2581 marker → space, then append its UTF-8 bytes.
+		buf = append(buf, strings.ReplaceAll(s, spaceMarker, " ")...)
 	}
-	return sb.String()
+	return string(buf)
 }
 
-// findToken searches for a token string in the vocab using longest prefix.
-func (t *Tokenizer) findToken(s string) (int32, bool) {
-	// Direct map lookup
-	for i, v := range t.vocab {
-		if v == s {
-			return int32(i), true
+// parseByteToken parses a "<0xXX>" SentencePiece byte token into its byte value.
+func parseByteToken(s string) (byte, bool) {
+	if len(s) == 6 && s[0] == '<' && s[1] == '0' && s[2] == 'x' && s[5] == '>' {
+		hi, ok1 := hexNibble(s[3])
+		lo, ok2 := hexNibble(s[4])
+		if ok1 && ok2 {
+			return hi<<4 | lo, true
 		}
 	}
+	return 0, false
+}
 
-	// Check with SentencePiece prefix (Ġ for space)
-	if len(s) > 0 && s[0] != ' ' {
-		for i, v := range t.vocab {
-			if v == "Ġ"+s {
-				return int32(i), true
-			}
-		}
+func hexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
 	}
-
 	return 0, false
 }
 
@@ -421,21 +477,6 @@ func (t *Tokenizer) TokenStr(id int32) string {
 		return t.vocab[id]
 	}
 	return ""
-}
-
-// Generate the tokenizer trie for efficient encoding.
-// This is a simplified version; production should use
-// the full SentencePiece model from the GGUF tokenizer.ggml.model data.
-func (t *Tokenizer) buildTrie() {
-	// Build a sorted list of token strings for binary search
-	// For production: build actual trie data structure
-	sort.Slice(t.vocab, func(i, j int) bool {
-		// Sort by length descending, then alphabetically
-		if len(t.vocab[i]) != len(t.vocab[j]) {
-			return len(t.vocab[i]) > len(t.vocab[j])
-		}
-		return t.vocab[i] < t.vocab[j]
-	})
 }
 
 // GetVocab returns the vocabulary slice.

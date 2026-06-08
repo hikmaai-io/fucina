@@ -15,10 +15,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -27,6 +29,14 @@ import (
 	gemserver "github.com/mauromedda/gem4d/internal/server"
 	"github.com/mauromedda/gem4d/internal/tokenizer"
 )
+
+// newRNG builds the sampler RNG, mapping seed -1 to a time-based seed.
+func newRNG(seed int64) *rand.Rand {
+	if seed < 0 {
+		seed = time.Now().UnixNano()
+	}
+	return rand.New(rand.NewSource(seed))
+}
 
 // ─── Command-line flags (llama.cpp style) ─────────────────────────
 
@@ -299,7 +309,7 @@ func main() {
 		log.Printf("gem4d: prefill %d tokens in %.2fs (%.1f tok/s)",
 			len(tokens), prefillElapsed.Seconds(), prefillTPS)
 
-		rng := rand.New(rand.NewSource(args.Seed))
+		rng := newRNG(args.Seed)
 		nToGenerate := args.Predict
 		if nToGenerate < 0 {
 			nToGenerate = 1 << 20
@@ -313,7 +323,7 @@ func main() {
 				break
 			}
 			token, err := sample(logits, args, rng, nil)
-			if err != nil || token == tok.EOS {
+			if err != nil || tok.IsStop(token) {
 				break
 			}
 			fmt.Print(tok.Decode([]int32{token}))
@@ -356,31 +366,37 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	var history []turn
 
 	kv  := gemserver.NewKVCache(eng)
-	rng := rand.New(rand.NewSource(args.Seed))
+	rng := newRNG(args.Seed)
 
 	nToGenerate := args.Predict
 	if nToGenerate <= 0 {
 		nToGenerate = 1 << 20
 	}
 
-	// Gemma 4 chat template
+	// Gemma 4 chat template. The real gemma-4 vocab has NO <start_of_turn>/
+	// <end_of_turn> tokens — turns are delimited by <|turn> (105) / <turn|>
+	// (106), and an empty thought channel <|channel>thought\n<channel|> is
+	// pre-filled after the model turn opener when thinking is disabled (default),
+	// otherwise the model opens a thought channel and leaks its reasoning.
+	const modelOpen = "<|turn>model\n<|channel>thought\n<channel|>"
 	buildPrompt := func(turns []turn) string {
 		var sb strings.Builder
 		for i, t := range turns {
 			switch t.role {
-			case "system", "user":
-				fmt.Fprintf(&sb, "<start_of_turn>user\n%s<end_of_turn>\n", t.content)
+			case "system":
+				fmt.Fprintf(&sb, "<|turn>system\n%s<turn|>\n", t.content)
+			case "user":
+				fmt.Fprintf(&sb, "<|turn>user\n%s<turn|>\n", t.content)
 			case "assistant":
 				if i == len(turns)-1 {
-					// open assistant turn — model fills this in
-					fmt.Fprintf(&sb, "<start_of_turn>model\n")
+					sb.WriteString(modelOpen) // open turn — model fills this in
 				} else {
-					fmt.Fprintf(&sb, "<start_of_turn>model\n%s<end_of_turn>\n", t.content)
+					fmt.Fprintf(&sb, "<|turn>model\n%s<turn|>\n", t.content)
 				}
 			}
 		}
 		if len(turns) == 0 || turns[len(turns)-1].role != "assistant" {
-			sb.WriteString("<start_of_turn>model\n")
+			sb.WriteString(modelOpen)
 		}
 		return sb.String()
 	}
@@ -480,21 +496,12 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 				break
 			}
 			token, err := sample(logits, args, rng, nil)
-			if err != nil || token == tok.EOS {
+			// Stop on EOS or end-of-turn (<turn|>); these are control tokens
+			// and must not be rendered.
+			if err != nil || tok.IsStop(token) {
 				break
 			}
 			piece := tok.Decode([]int32{token})
-			// Stop on Gemma end-of-turn marker.
-			if strings.Contains(replyBuf.String()+piece, "<end_of_turn>") {
-				// strip the marker itself from output
-				clean := strings.TrimSuffix(
-					replyBuf.String()+piece, "<end_of_turn>")
-				clean = strings.TrimRight(clean, "\n")
-				// reprint clean reply (we already printed incrementally,
-				// but the marker needs to be erased — simplest: flush here)
-				_ = clean
-				break
-			}
 			fmt.Print(piece)
 			replyBuf.WriteString(piece)
 			kv.AppendDecoded(token)
@@ -519,17 +526,120 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 
 		// Add completed assistant reply to history so the NEXT turn's prompt
 		// includes it verbatim and the KVCache can reuse the whole sequence.
-		reply := strings.TrimSuffix(replyBuf.String(), "<end_of_turn>")
-		history = append(history, turn{"assistant", strings.TrimSpace(reply)})
+		history = append(history, turn{"assistant", strings.TrimSpace(replyBuf.String())})
 	}
 }
 
 // ─── Prompt sampling ──────────────────────────────────────────────
 
+// sample draws the next token from logits applying the configured pipeline:
+// repeat-penalty → temperature → top-k → top-p → min-p → multinomial.
+// Temperature <= 0 forces greedy argmax (deterministic).
 func sample(logits []float32, args CLIArgs, rng *rand.Rand, pastTokens []int32) (int32, error) {
-	_ = pastTokens
-	// Simplified: argmax for now
-	return int32(cuda.Argmax(logits)), nil
+	if args.Temperature <= 0 {
+		return int32(cuda.Argmax(logits)), nil
+	}
+
+	// Work on a copy so callers keep raw logits.
+	l := make([]float32, len(logits))
+	copy(l, logits)
+
+	// Repeat penalty on raw logits (llama.cpp applies before temperature).
+	if args.RepeatPenalty != 1.0 && len(pastTokens) > 0 {
+		rp := float32(args.RepeatPenalty)
+		for _, id := range pastTokens {
+			if id < 0 || int(id) >= len(l) {
+				continue
+			}
+			if l[id] > 0 {
+				l[id] /= rp
+			} else {
+				l[id] *= rp
+			}
+		}
+	}
+
+	// Temperature.
+	invT := float32(1.0 / args.Temperature)
+	for i := range l {
+		l[i] *= invT
+	}
+
+	// Build (id, logit) candidates.
+	type cand struct {
+		id int32
+		lg float32
+	}
+	cands := make([]cand, len(l))
+	for i := range l {
+		cands[i] = cand{int32(i), l[i]}
+	}
+	sort.Slice(cands, func(a, b int) bool { return cands[a].lg > cands[b].lg })
+
+	// Top-k.
+	if args.TopK > 0 && args.TopK < len(cands) {
+		cands = cands[:args.TopK]
+	}
+
+	// Softmax over the (sorted, truncated) candidates.
+	maxLg := cands[0].lg
+	var sum float64
+	probs := make([]float64, len(cands))
+	for i, c := range cands {
+		p := math.Exp(float64(c.lg - maxLg))
+		probs[i] = p
+		sum += p
+	}
+	for i := range probs {
+		probs[i] /= sum
+	}
+
+	// Top-p (nucleus): keep the smallest prefix whose cumulative prob >= TopP.
+	if args.TopP > 0 && args.TopP < 1.0 {
+		var cum float64
+		cut := len(probs)
+		for i := range probs {
+			cum += probs[i]
+			if cum >= args.TopP {
+				cut = i + 1
+				break
+			}
+		}
+		cands = cands[:cut]
+		probs = probs[:cut]
+	}
+
+	// Min-p: drop candidates below MinP * max_prob.
+	if args.MinP > 0 {
+		thresh := args.MinP * probs[0]
+		keep := 0
+		for i := range probs {
+			if probs[i] >= thresh {
+				keep = i + 1
+			} else {
+				break
+			}
+		}
+		if keep > 0 {
+			cands = cands[:keep]
+			probs = probs[:keep]
+		}
+	}
+
+	// Renormalize and draw.
+	var z float64
+	for _, p := range probs {
+		z += p
+	}
+	r := rng.Float64() * z
+	var acc float64
+	for i, p := range probs {
+		acc += p
+		if r <= acc {
+			return cands[i].id, nil
+		}
+	}
+	return cands[len(cands)-1].id, nil
 }
 
 // ─── Test stubs ───────────────────────────────────────────────────
@@ -552,7 +662,7 @@ func runTestVectors(path string) int {
 // ─── Usage ────────────────────────────────────────────────────────
 
 func printUsage() {
-	fmt.Println(`gem4d - Gemma 4 12B inference engine for DGX Spark GB10
+	fmt.Print(`gem4d - Gemma 4 12B inference engine for DGX Spark GB10
 
 Usage:
   gem4d -m model.gguf [options]                  # Server mode (default)

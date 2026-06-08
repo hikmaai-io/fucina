@@ -36,10 +36,20 @@ cuda/libgem4d.a: cuda/gemma4_kernels.o cuda/gemma4_kernels_link.o
 	ar rcs $@ $^
 
 # ─── Go Binary ──────────────────────────────────────────────────────────
+# IMPORTANT: cgo does NOT hash the contents of the `-lgem4d` static archive, so
+# a plain `go build` happily relinks a STALE binary against an updated
+# libgem4d.a (this caused weights to be read over unified memory → a ~4s cold
+# page-fault charged to prefill). Force a relink every time: remove the old
+# binary and rebuild the cgo package with -a. Verify with `strings gem4d | grep
+# uploading` (must print the device-upload banner).
 gem4d: cuda/libgem4d.a
+	rm -f $@
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	$(GO) build -ldflags="-s -w" -o $@ ./cmd/gem4d/
+	$(GO) build -a -ldflags="-s -w" -o $@ ./cmd/gem4d/
+	@strings $@ | grep -q "uploading.*weights to device" \
+		&& echo "gem4d: OK — device weight-upload path linked" \
+		|| { echo "gem4d: ERROR — stale link, upload path missing"; exit 1; }
 
 # ─── Standalone CUDA Test (without Go) ──────────────────────────────────
 cuda/test_engine: cuda/test_engine.cu cuda/libgem4d.a
