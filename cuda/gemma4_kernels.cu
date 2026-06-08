@@ -1330,6 +1330,13 @@ struct gemma4_engine {
     float  *d_rope_freqs;      // [GEMMA4_GLOBAL_HEAD_DIM/2] freq_factors for global RoPE
     float  *d_head_norm_w;     // [GEMMA4_GLOBAL_HEAD_DIM] scratch for per-head norm weights
 
+    // Engine-resident batched-decode (speculative) scratch, sized for GEMMA4_SPEC_MAX
+    // rows and allocated once (lazily). Reused every decode_batched call so probe /
+    // re-probe steps pay no per-call cudaMalloc/free — d_sb[12] holds, in order:
+    // tok, x, norm, inf, q, k, v, attn, o, gate, up, logitsK.
+    float  *d_sb[12];
+    int     sb_ready;
+
     // Suppressed token ids (tokenizer.ggml.suppress_tokens) masked to -inf
     int32_t *d_suppress;
     int      n_suppress;
@@ -2096,6 +2103,8 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_weights);
     for (int p = 0; p < 7; p++)
         CUDA_FREE(eng->d_bf16_layer[p]);
+    for (int p = 0; p < 12; p++)
+        CUDA_FREE(eng->d_sb[p]);
     #undef CUDA_FREE
 
     // LoRA cleanup
@@ -2970,6 +2979,29 @@ int gemma4_engine_decode(
 // =========================================================================
 // ─── Batched Decode (one weight pass over K tokens) ─────────────────────
 // =========================================================================
+
+// Lazily allocate the engine-resident batched-decode scratch (sized for the max
+// draft width GEMMA4_SPEC_MAX), so decode_batched does no per-call cudaMalloc. d_sb
+// order: tok, x, norm, inf, q, k, v, attn, o, gate, up, logitsK.
+static int ensure_spec_scratch(gemma4_engine_t *eng)
+{
+    if (eng->sb_ready) return 0;
+    const size_t M = GEMMA4_SPEC_MAX;
+    const size_t H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE, V = GEMMA4_VOCAB_SIZE;
+    const size_t OQ = (size_t)GEMMA4_HEADS*GEMMA4_GLOBAL_HEAD_DIM;
+    const size_t OKV = (size_t)GEMMA4_KV_HEADS*GEMMA4_HEAD_DIM;
+    size_t elems[12] = { M, M*H, M*H, M*I, M*OQ, M*OKV, M*OKV, M*OQ, M*H, M*I, M*I, M*V };
+    for (int i = 0; i < 12; i++) {
+        if (cudaMalloc(&eng->d_sb[i], elems[i]*sizeof(float)) != cudaSuccess) {
+            for (int j = 0; j < i; j++) { cudaFree(eng->d_sb[j]); eng->d_sb[j] = NULL; }
+            cudaGetLastError();
+            return -1;
+        }
+    }
+    eng->sb_ready = 1;
+    return 0;
+}
+
 // Forward K tokens [pos .. pos+K-1] CONTINUING the current sequence, reading each
 // weight matrix ONCE for all K (the projection/FFN GEMMs are the 12.65 GB/token
 // bandwidth cost). This is the engine primitive that makes speculative decoding
@@ -2993,38 +3025,22 @@ int gemma4_engine_decode_batched(
     const int HD2 = 32 * sizeof(float);
     const int HEADS = GEMMA4_HEADS;
     const int pos = eng->global_n_tokens;            // captured; advanced only at end
-    const int OQ_MAX  = GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM; // 8192
-    const int OKV_MAX = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;     // 2048
 
     cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0, stream);
 
-    // Scratch (token-major, K rows — tiny since K ≤ GEMMA4_SPEC_MAX). All fp32:
-    // the batched GEMV reads Q8_0 weights directly (no BF16 dequant), so K tokens
-    // cost ~one token's weight bandwidth.
-    int32_t *d_tok=0;
-    float *d_x=0,*d_norm=0,*d_inf=0,*d_q=0,*d_k=0,*d_v=0,*d_attn=0,*d_o=0,*d_gate=0,*d_up=0;
-    int ok = 1;
-    #define DALLOC(p,bytes) do{ if(cudaMalloc(&(p),(size_t)(bytes))!=cudaSuccess) ok=0; }while(0)
-    DALLOC(d_tok,  (size_t)K*sizeof(int32_t));
-    DALLOC(d_x,    (size_t)K*H*sizeof(float));
-    DALLOC(d_norm, (size_t)K*H*sizeof(float));
-    DALLOC(d_inf,  (size_t)K*I*sizeof(float));    // normed input / FFN intermediate
-    DALLOC(d_q,    (size_t)K*OQ_MAX*sizeof(float));
-    DALLOC(d_k,    (size_t)K*OKV_MAX*sizeof(float));
-    DALLOC(d_v,    (size_t)K*OKV_MAX*sizeof(float));
-    DALLOC(d_attn, (size_t)K*OQ_MAX*sizeof(float));
-    DALLOC(d_o,    (size_t)K*H*sizeof(float));
-    DALLOC(d_gate, (size_t)K*I*sizeof(float));
-    DALLOC(d_up,   (size_t)K*I*sizeof(float));
-    #undef DALLOC
-    float *fb[] = {d_x,d_norm,d_inf,d_q,d_k,d_v,d_attn,d_o,d_gate,d_up};
-    if (!ok) {
-        for (float *p : fb) if(p) cudaFree(p);
-        if(d_tok) cudaFree(d_tok);
-        cudaGetLastError();
+    // Engine-resident scratch (allocated once, sized for GEMMA4_SPEC_MAX rows), so
+    // repeated/probe calls pay no per-call cudaMalloc/free. All fp32: the batched
+    // GEMV reads Q8_0 directly (no BF16 dequant), K tokens cost ~one token's weight BW.
+    if (ensure_spec_scratch(eng) != 0) {
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
         return -1;
     }
+    int32_t *d_tok  = (int32_t*)eng->d_sb[0];
+    float *d_x   = eng->d_sb[1],  *d_norm = eng->d_sb[2], *d_inf = eng->d_sb[3];
+    float *d_q   = eng->d_sb[4],  *d_k    = eng->d_sb[5], *d_v   = eng->d_sb[6];
+    float *d_attn= eng->d_sb[7],  *d_o    = eng->d_sb[8], *d_gate= eng->d_sb[9];
+    float *d_up  = eng->d_sb[10], *d_logitsK = eng->d_sb[11];
 
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
 
@@ -3119,13 +3135,6 @@ int gemma4_engine_decode_batched(
     // Output norm (batched) + LM head as ONE batched GEMV (tied LM head read once
     // for all K) + softcap + suppress, then D2H all K logit rows.
     int vocab = GEMMA4_VOCAB_SIZE;
-    float *d_logitsK = NULL;
-    if (cudaMalloc(&d_logitsK, (size_t)K*vocab*sizeof(float)) != cudaSuccess) {
-        cudaGetLastError();
-        for (float *p : fb) cudaFree(p);
-        cudaFree(d_tok);
-        return -1;
-    }
     rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, K, GEMMA4_RMS_EPS);
     gemv_batched_w(eng, d_logitsK, weight_fp8(eng, eng->tensors.output_weight),
                    d_norm, H, vocab, K, stream);
@@ -3146,9 +3155,6 @@ int gemma4_engine_decode_batched(
     eng->decode_time_ms += ms;
     eng->n_decode_tokens += K;
     cudaEventDestroy(t0); cudaEventDestroy(t1);
-
-    for (float *p : fb) cudaFree(p);
-    cudaFree(d_logitsK); cudaFree(d_tok);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
