@@ -41,8 +41,11 @@ type GenerationParams struct {
 }
 
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
 }
 
 type ChatRequest struct {
@@ -56,6 +59,8 @@ type ChatRequest struct {
 	Seed        *int64        `json:"seed"`
 	Stream      bool          `json:"stream"`
 	Stop        []string      `json:"stop"`
+	Tools       []Tool        `json:"tools,omitempty"`
+	ToolChoice  interface{}   `json:"tool_choice,omitempty"`
 }
 
 type ChatResponse struct {
@@ -168,11 +173,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
 		return
 	}
-	prompt := s.renderChatTemplate(req.Messages)
+	prompt := s.renderChatTemplate(req.Messages, req.Tools)
 	if prompt == "" {
 		http.Error(w, "empty prompt", http.StatusBadRequest)
 		return
 	}
+	wantTools := len(req.Tools) > 0 && !isToolChoiceNone(req.ToolChoice)
 	tokens := s.tokenizer.Encode(prompt, true, false)
 	if len(tokens) == 0 {
 		http.Error(w, "tokenization failed", http.StatusInternalServerError)
@@ -227,7 +233,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if params.Stream {
 		s.streamResponse(w, params, promptTokens, logits)
 	} else {
-		s.generateResponse(w, params, promptTokens, logits)
+		s.generateResponse(w, params, promptTokens, logits, wantTools)
 	}
 }
 
@@ -267,19 +273,46 @@ const modelTurnOpen = "<|turn>model\n<|channel>thought\n<channel|>"
 
 // renderChatTemplate builds the gemma-4 prompt. The real vocab uses <|turn> /
 // <turn|> delimiters (NOT <start_of_turn>/<end_of_turn>, which are not tokens).
-func (s *Server) renderChatTemplate(messages []ChatMessage) string {
+// When tools are present they are declared in the (forced) system turn as
+// <|tool>…<tool|> blocks; role:tool messages render as <|tool_response>… blocks.
+func (s *Server) renderChatTemplate(messages []ChatMessage, tools []Tool) string {
 	var sb strings.Builder
-	for i, msg := range messages {
+
+	// System turn: merge an explicit system message (if first) with tool decls.
+	sysContent := ""
+	start := 0
+	if len(messages) > 0 && messages[0].Role == "system" {
+		sysContent = messages[0].Content
+		start = 1
+	}
+	if sysContent != "" || len(tools) > 0 {
+		sb.WriteString("<|turn>system\n")
+		sb.WriteString(sysContent)
+		if len(tools) > 0 {
+			sb.WriteString(renderToolDeclarations(tools))
+		}
+		sb.WriteString("<turn|>\n")
+	}
+
+	for i := start; i < len(messages); i++ {
+		msg := messages[i]
 		switch msg.Role {
 		case "system":
 			fmt.Fprintf(&sb, "<|turn>system\n%s<turn|>\n", msg.Content)
 		case "user":
 			fmt.Fprintf(&sb, "<|turn>user\n%s<turn|>\n", msg.Content)
+		case "tool":
+			sb.WriteString(renderToolResponse(msg.Name, msg.Content))
 		case "assistant":
-			if i == len(messages)-1 {
+			if i == len(messages)-1 && len(msg.ToolCalls) == 0 && msg.Content == "" {
 				sb.WriteString(modelTurnOpen)
 			} else {
-				fmt.Fprintf(&sb, "<|turn>model\n%s<turn|>\n", msg.Content)
+				sb.WriteString("<|turn>model\n")
+				sb.WriteString(msg.Content)
+				if len(msg.ToolCalls) > 0 {
+					sb.WriteString(renderAssistantToolCalls(msg.ToolCalls))
+				}
+				sb.WriteString("<turn|>\n")
 			}
 		}
 	}
@@ -291,12 +324,13 @@ func (s *Server) renderChatTemplate(messages []ChatMessage) string {
 
 // generateResponse runs non-streaming generation. It assumes the caller holds
 // s.kv.Lock() (acquired in the handler); it releases it when generation ends.
-func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32) {
+func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools bool) {
 	defer s.kv.Unlock()
 
 	generated := 0
-	var text strings.Builder
+	var toks []int32
 	rng := rand.New(rand.NewSource(params.Seed))
+	tcEnd := s.tokenizer.ToolCallEnd
 
 	genStart := time.Now()
 	for generated < params.MaxTokens {
@@ -307,19 +341,34 @@ func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams
 		if err != nil || s.tokenizer.IsStop(token) {
 			break
 		}
-		tokenStr := s.tokenizer.Decode([]int32{token})
-		text.WriteString(tokenStr)
+		toks = append(toks, token)
+		s.kv.AppendDecoded(token)
+		generated++
+		// A tool call ends with <tool_call|>: stop the turn there so we can parse it.
+		if wantTools && tcEnd >= 0 && token == tcEnd {
+			break
+		}
 		var err2 error
 		logits, err2 = s.engine.Decode(token)
 		if err2 != nil {
 			break
 		}
-		// Keep the cache token list in sync so this token (and the whole
-		// reply) can be reused as a prefix by the next request.
-		s.kv.AppendDecoded(token)
-		generated++
 	}
 	logGenSpeed(genStart, generated)
+
+	finish := "stop"
+	msg := ChatMessage{Role: "assistant"}
+	if wantTools {
+		// Parse the raw (markers-preserved) output into content + tool calls.
+		content, calls := parseToolCalls(s.tokenizer.DecodeRaw(toks))
+		msg.Content = content
+		if len(calls) > 0 {
+			msg.ToolCalls = calls
+			finish = "tool_calls"
+		}
+	} else {
+		msg.Content = s.tokenizer.Decode(toks)
+	}
 
 	writeJSON(w, http.StatusOK, ChatResponse{
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
@@ -327,7 +376,7 @@ func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams
 		Created: time.Now().Unix(),
 		Model:   s.modelName,
 		Choices: []Choice{{
-			Index: 0, Message: ChatMessage{Role: "assistant", Content: text.String()}, FinishReason: "stop",
+			Index: 0, Message: msg, FinishReason: finish,
 		}},
 		Usage: Usage{
 			PromptTokens: promptTokens, CompletionTokens: generated,

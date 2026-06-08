@@ -45,6 +45,15 @@ type Tokenizer struct {
 	EndOfTurn   int32 // <turn|>   = 106
 	ChannelOpen int32 // <|channel> = 100
 	ChannelEnd  int32 // <channel|> = 101
+
+	// Gemma-4 tool-calling tokens (-1 if absent). See internal/server tool support.
+	ToolOpen     int32 // <|tool>          (tool declaration open)
+	ToolEnd      int32 // <tool|>
+	ToolCallOpen int32 // <|tool_call>     (model emits a call)
+	ToolCallEnd  int32 // <tool_call|>
+	ToolRespOpen int32 // <|tool_response> (tool result back to the model)
+	ToolRespEnd  int32 // <tool_response|>
+	StringDelim  int32 // <|"|>            (string value delimiter in the dict syntax)
 }
 
 // Score represents a token candidate during decoding.
@@ -337,8 +346,37 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 	t.EndOfTurn = lookup("<turn|>", 106)
 	t.ChannelOpen = lookup("<|channel>", 100)
 	t.ChannelEnd = lookup("<channel|>", 101)
+	t.ToolOpen = lookup("<|tool>", -1)
+	t.ToolEnd = lookup("<tool|>", -1)
+	t.ToolCallOpen = lookup("<|tool_call>", -1)
+	t.ToolCallEnd = lookup("<tool_call|>", -1)
+	t.ToolRespOpen = lookup("<|tool_response>", -1)
+	t.ToolRespEnd = lookup("<tool_response|>", -1)
+	t.StringDelim = lookup(`<|"|>`, -1)
 
 	return t, nil
+}
+
+// DecodeRaw is like Decode but does NOT skip control/special tokens — it emits each
+// token's literal vocab string (channel/tool/turn markers stay visible). The server
+// uses it so the gemma-4 tool-call structure survives decoding for parsing.
+func (t *Tokenizer) DecodeRaw(tokens []int32) string {
+	var buf []byte
+	for _, id := range tokens {
+		if id < 0 || int(id) >= len(t.vocab) {
+			continue
+		}
+		s := t.vocab[id]
+		if s == "" {
+			continue
+		}
+		if b, ok := parseByteToken(s); ok {
+			buf = append(buf, b)
+			continue
+		}
+		buf = append(buf, strings.ReplaceAll(s, spaceMarker, " ")...)
+	}
+	return string(buf)
 }
 
 // IsStop reports whether a token id terminates generation (EOS or end-of-turn).
