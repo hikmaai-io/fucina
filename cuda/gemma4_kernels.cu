@@ -506,6 +506,67 @@ __global__ void rms_norm_rows_kernel(
 // shared mem = 32 * sizeof(float).
 // ────────────────────────────────────────────────────────────────
 
+// ─── dp4a MMVQ for Q8_0 (llama.cpp-parity decode bandwidth) ─────────────
+// The per-element gemv reads weights with scalar byte loads (~125-139 GB/s ceiling
+// on GB10). MMVQ instead quantizes the activation to int8 and uses __dp4a (4 int8
+// MACs / instruction) with wider int loads, reaching ~peak — the same path
+// llama.cpp uses for q8_0. Q8_0 is symmetric (zero mean) so no Q8_1 sum-correction
+// term is needed: out = Σ_block d_w·d_x · Σ __dp4a(qw, qx).
+
+// Read 4 packed int8 as one int, tolerating the 2-byte alignment of a Q8_0 block's
+// qs (it starts at byte offset 2 within the 34-byte block).
+static __device__ __forceinline__ int q8_get_int_b2(const void *p, int i32) {
+    const uint16_t *x16 = (const uint16_t *)p;
+    return (int)x16[2*i32] | ((int)x16[2*i32 + 1] << 16);
+}
+
+// Quantize x[in_dim] to symmetric per-32-block int8 + per-block scale. qx[in_dim]
+// is 4-byte aligned at every block boundary (32 | offset); dx[in_dim/32]. One warp
+// per block. in_dim is a multiple of 32 for every gemma4 projection.
+__global__ void quantize_q8_1_kernel(
+    const float *x, int8_t *qx, float *dx, int in_dim)
+{
+    int b = blockIdx.x, lane = threadIdx.x;     // 32 threads = one block
+    int i = b*32 + lane;
+    float v = (i < in_dim) ? x[i] : 0.0f;
+    float a = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, o));
+    float d  = a / 127.0f;
+    float id = (d > 0.0f) ? 1.0f / d : 0.0f;
+    int q = __float2int_rn(v * id);
+    q = max(-127, min(127, q));
+    if (i < in_dim) qx[i] = (int8_t)q;
+    if (lane == 0) dx[b] = d;
+}
+
+// MMVQ: out[idx] = Σ_block d_w_b · d_x_b · Σ_k __dp4a(weight_qs[k], act_qs[k]).
+__global__ void mmvq_q8_0_kernel(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
+    int in_dim, int out_dim)
+{
+    extern __shared__ float smem[];
+    int idx = blockIdx.x;
+    if (idx >= out_dim) return;
+    int nb = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)nb * 34;
+    float acc = 0.0f;
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+        const uint8_t *blk = wrow + (size_t)b * 34;
+        __half_raw hr; hr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        float dw = __half2float(__half(hr));
+        const void *wqs = blk + 2;                       // weight int8 (2-byte aligned)
+        const int  *xqs = (const int *)(qx + (size_t)b * 32);  // act int8 (4-byte aligned)
+        int sumi = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            sumi = __dp4a(q8_get_int_b2(wqs, k), xqs[k], sumi);
+        acc += dw * dx[b] * (float)sumi;
+    }
+    acc = block_reduce_sum(acc, smem);
+    if (threadIdx.x == 0) out[idx] = acc;
+}
+
 // Single-output GEMV: out[j] = sum_i W[j,i] * x[i]
 __global__ void gemv_kernel(
     float          *out,
@@ -1337,6 +1398,8 @@ struct gemma4_engine {
     float  *d_sb[12];
     int     sb_ready;
     int    *d_sample_id;       // 4-byte device scratch for GPU-side sampled token id
+    int8_t *d_qx;              // [GEMMA4_INTERMEDIATE] int8 activation for dp4a MMVQ
+    float  *d_dx;              // [GEMMA4_INTERMEDIATE/32] per-block activation scales
 
     // Suppressed token ids (tokenizer.ggml.suppress_tokens) masked to -inf
     int32_t *d_suppress;
@@ -1871,6 +1934,11 @@ gemma4_engine_t* gemma4_engine_create(
 
     cudaMalloc(&eng->d_head_norm_w, GEMMA4_GLOBAL_HEAD_DIM * sizeof(float));
 
+    // dp4a MMVQ activation-quant scratch (widest in_dim = intermediate).
+    eng->d_qx = NULL; eng->d_dx = NULL;
+    cudaMalloc(&eng->d_qx, (size_t)GEMMA4_INTERMEDIATE * sizeof(int8_t));
+    cudaMalloc(&eng->d_dx, (size_t)(GEMMA4_INTERMEDIATE/32) * sizeof(float));
+
     // Load rope_freqs.weight into device buffer for global-layer RoPE.
     {
         uint64_t rf_off = 0, rf_n = 0;
@@ -2107,6 +2175,8 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     for (int p = 0; p < 12; p++)
         CUDA_FREE(eng->d_sb[p]);
     CUDA_FREE(eng->d_sample_id);
+    CUDA_FREE(eng->d_qx);
+    CUDA_FREE(eng->d_dx);
     #undef CUDA_FREE
 
     // LoRA cleanup
@@ -2163,8 +2233,15 @@ static inline void gemv_w(
     float *out, const uint8_t *weight, const float *x,
     int in_dim, int out_dim, cudaStream_t stream)
 {
-    gemv_kernel<<<out_dim, 256, 32*sizeof(float), stream>>>(
-        out, weight, x, in_dim, out_dim, FMT(eng));
+    if (FMT(eng) == 1 /*Q8_0*/ && eng->d_qx) {
+        // Quantize the activation to int8 then dp4a MMVQ (llama.cpp-parity bandwidth).
+        quantize_q8_1_kernel<<<in_dim/32, 32, 0, stream>>>(x, eng->d_qx, eng->d_dx, in_dim);
+        mmvq_q8_0_kernel<<<out_dim, 256, 32*sizeof(float), stream>>>(
+            out, weight, eng->d_qx, eng->d_dx, in_dim, out_dim);
+    } else {
+        gemv_kernel<<<out_dim, 256, 32*sizeof(float), stream>>>(
+            out, weight, x, in_dim, out_dim, FMT(eng));
+    }
 }
 
 // Batched GEMV: Y[K][out_dim] = X[K][in_dim] · weightᵀ, weight read once for all K.
@@ -2419,6 +2496,16 @@ static int decode_layer(
             eng->d_norm, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE,
             lg->active ? lg->rank : 0, lu->active ? lu->rank : 0,
             eng->lora_scale, FMT(eng));
+    } else if (eng->format == FORMAT_Q8_0 && eng->d_qx) {
+        // dp4a MMVQ: quantize the shared FFN-norm activation once, run gate + up.
+        quantize_q8_1_kernel<<<GEMMA4_HIDDEN_SIZE/32, 32, 0, stream>>>(
+            eng->d_norm, eng->d_qx, eng->d_dx, GEMMA4_HIDDEN_SIZE);
+        mmvq_q8_0_kernel<<<GEMMA4_INTERMEDIATE, 256, smem32, stream>>>(
+            eng->d_ffn_gate, weight_fp8(eng, eng->tensors.layers[layer].ffn_gate),
+            eng->d_qx, eng->d_dx, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE);
+        mmvq_q8_0_kernel<<<GEMMA4_INTERMEDIATE, 256, smem32, stream>>>(
+            eng->d_ffn_up, weight_fp8(eng, eng->tensors.layers[layer].ffn_up),
+            eng->d_qx, eng->d_dx, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE);
     } else if (eng->format == FORMAT_Q8_0) {
         gemv_kernel<<<GEMMA4_INTERMEDIATE, block, smem32, stream>>>(
             eng->d_ffn_gate, weight_fp8(eng, eng->tensors.layers[layer].ffn_gate), eng->d_norm, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE, FMT(eng));
