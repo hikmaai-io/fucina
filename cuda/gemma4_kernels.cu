@@ -1938,6 +1938,7 @@ struct gemma4_engine {
     float  *d_sb[12];
     int     sb_ready;
     int    *d_sample_id;       // 4-byte device scratch for GPU-side sampled token id
+    float  *d_sample_p;        // 4-byte device scratch: drafter top-1 softmax prob
 
     // ── Gemma-4 MTP assistant drafter (llama.cpp PR #23398 equivalent) ──
     // The official ~423M assistant head: 4 Q-only layers (no K/V projections — they
@@ -2884,6 +2885,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
     }
     CUDA_FREE(eng->d_sample_id);
+    CUDA_FREE(eng->d_sample_p);
     CUDA_FREE(eng->d_qx);
     CUDA_FREE(eng->d_dx);
     CUDA_FREE(eng->d_sx);
@@ -4240,6 +4242,8 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
     ok &= cudaMalloc(&eng->d_mtp_ffb,  GEMMA4_MTP_FFN       * sizeof(float)) == cudaSuccess;
     if (!eng->d_sample_id)
         ok &= cudaMalloc(&eng->d_sample_id, sizeof(int)) == cudaSuccess;
+    if (!eng->d_sample_p)
+        ok &= cudaMalloc(&eng->d_sample_p, sizeof(float)) == cudaSuccess;
 
     munmap(host, fsize);
     if (!ok) {
@@ -4343,14 +4347,60 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr, cudaStream
            AH, GEMMA4_HIDDEN_SIZE, stream, FORMAT_Q8_0);
 }
 
-// Defined later in the file (sampling section); used here for the greedy draft argmax.
-__global__ void sample_logits_kernel(
-    const float *logits, int V, float temp, int top_k, float top_p, float min_p,
-    float rnd, int *out_id);
+// Fused argmax + top-1 softmax probability of the drafter's logits in ONE pass:
+// p(top1) = 1 / Σ_i exp(l_i − l_max) (online max/sum, no second sweep). The prob
+// feeds ONLY the drafter's confidence gate — verification still samples every
+// position from the TARGET distribution, so output exactness never depends on it.
+// Tie-break may differ from gemma4_sample_argmax on bit-equal logits; harmless
+// for a draft (any proposal is checked).
+__global__ void mtp_argmax_conf_kernel(
+    const float *logits, int V, int *out_id, float *out_p)
+{
+    const int T = blockDim.x, tid = threadIdx.x;
+    float m = -INFINITY, s = 0.0f; int id = -1;
+    for (int i = tid; i < V; i += T) {
+        float v = logits[i];
+        if (v > m) { s = s * __expf(m - v) + 1.0f; m = v; id = i; }
+        else        s += __expf(v - m);
+    }
+    __shared__ float sm[1024], ss[1024];
+    __shared__ int   sid[1024];
+    sm[tid] = m; ss[tid] = s; sid[tid] = id;
+    __syncthreads();
+    for (int off = T / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            float m2 = sm[tid + off], s2 = ss[tid + off];
+            if (m2 > sm[tid]) {
+                ss[tid] = ss[tid] * __expf(sm[tid] - m2) + s2;
+                sm[tid] = m2; sid[tid] = sid[tid + off];
+            } else {
+                ss[tid] += s2 * __expf(m2 - sm[tid]);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) { *out_id = sid[0]; *out_p = 1.0f / ss[0]; }
+}
+
+// Drafter confidence gate (llama.cpp common/speculative.cpp "only collect very
+// high-confidence draft tokens", --draft-p-min). Measured here on chat-template
+// text (the REPL/server workload) the assistant's blind argmax chain accepted
+// only ~55% of proposed tokens — each rejected slot still costs ~0.23x a decode
+// in the batched verify plus a full ~444MB assistant pass, which capped spec at
+// ~1.1-1.2x over plain decode. (The historical "84-94% acceptance" numbers came
+// from RAW one-shot prompts, where the instruction-tuned QAT model degenerates
+// into trivially-predictable repetition.) Cutting the draft at the first low-
+// confidence position keeps only the high-acceptance subset. Measured (greedy
+// chat-template essay, 400 tok): acceptance 55%→77%, 20.3→22.4 tok/s = 1.35x the
+// plain-decode REPL baseline (16.6); the easy prose/code regimes IMPROVE slightly
+// (90→95%, 31.2→31.9 tok/s) since confidence stays high there and the gate only
+// trims the bad tails. Threshold swept 0.60/0.75/0.85 → 21.7/22.4/22.0 tok/s.
+#define GEMMA4_MTP_PMIN 0.75f
 
 // Draft up to max_draft tokens with the assistant; returns the count proposed.
-// Requires a valid recurrent h (eng->mtp_h_valid, paired with g). Greedy argmax draft —
-// the verify's accept rule is what preserves the target distribution.
+// Requires a valid recurrent h (eng->mtp_h_valid, paired with g). Greedy argmax
+// draft, cut at the first token whose draft prob < GEMMA4_MTP_PMIN — the verify's
+// accept rule is what preserves the target distribution.
 static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int max_draft)
 {
     if (!eng->mtp.loaded || !eng->mtp_h_valid || max_draft <= 0) return 0;
@@ -4361,11 +4411,13 @@ static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int ma
     int32_t tok = g, produced = 0;
     for (int j = 0; j < max_draft; j++) {
         mtp_forward(eng, &tok, stream);
-        sample_logits_kernel<<<1, 1024, 0, stream>>>(
-            eng->d_logits, GEMMA4_VOCAB_SIZE, 0.0f, 0, 0.0f, 0.0f, 0.0f, eng->d_sample_id);
-        int32_t next = -1;
+        mtp_argmax_conf_kernel<<<1, 1024, 0, stream>>>(
+            eng->d_logits, GEMMA4_VOCAB_SIZE, eng->d_sample_id, eng->d_sample_p);
+        int32_t next = -1; float conf = 0.0f;
         cudaMemcpyAsync(&next, eng->d_sample_id, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(&conf, eng->d_sample_p, sizeof(float), cudaMemcpyDeviceToHost, stream);
         if (cudaStreamSynchronize(stream) != cudaSuccess || next < 0) break;
+        if (conf < GEMMA4_MTP_PMIN) break;   // low confidence → stop drafting here
         local[produced++] = next;
         tok = next;
     }
@@ -4417,11 +4469,11 @@ static int prompt_lookup_draft(const int32_t *hist, int n, int32_t *draft,
         // below only guards nocc==1). nocc/2+1 demands at least one OTHER occurrence
         // agree: nocc 2→2, 3→2, 4→3, 5→3; still 1 when nocc==1 (plain lookup + ng cap).
         int thresh = nocc / 2 + 1;
-        // Confidence cap: a single occurrence is only trusted as far ahead as the
-        // matched context is long (a 5-gram match → up to 5 tokens; a lone 2-gram → 2).
-        // Multiple agreeing occurrences are trusted to the full draft budget.
+        // Confidence cap: one or two occurrences are only trusted as far ahead as
+        // the matched context is long (a 5-gram match → up to 5 tokens; a 2-gram
+        // → 2). Three or more agreeing occurrences are trusted to the full budget.
         int cap = max_d;
-        if (nocc == 1 && cap > ng) cap = ng;
+        if (nocc <= 2 && cap > ng) cap = ng;
         int d = 0;
         for (int dd = 0; dd < cap; dd++) {
             int p0 = occ[0] + dd;               // most-recent occurrence's continuation
@@ -4560,7 +4612,11 @@ static int run_spec_loop(
         // lookup drafts. If MTP declines to draft, fall back to whatever lookup found; and
         // without an assistant, today's behavior stands — lookup keeps any draft it found,
         // partial included. The first step after a fresh prefill single-decodes once to
-        // establish the recurrent h.
+        // establish the recurrent h. The MTP budget stays EMA-clamped on purpose: an A/B
+        // with the full draft_k budget (confidence-gate-only truncation) measured WORSE
+        // (20.8 vs 22.4 tok/s on chat text) — each drafted token costs a full ~444MB
+        // assistant pass + a stream sync, so medium-confidence tokens the gate admits
+        // past the recent accepted run don't pay for themselves.
         int lk_ng = 0, lk_nocc = 0;
         int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k, &lk_ng, &lk_nocc);
         if (D > 0) { lk_calls++; lk_drafted += D; }   // counted at draft time, like mtp

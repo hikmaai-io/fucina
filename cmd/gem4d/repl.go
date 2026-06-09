@@ -21,13 +21,16 @@ import (
 //  1. Build the full Gemma chat-template prompt from conversation history.
 //  2. Ask KVCache.Prefill — which reuses the shared prefix from last turn
 //     (the entire prior conversation) and only computes the new user message.
-//  3. Stream tokens to stdout as they are sampled.
+//  3. Generate: speculative decoding (MTP/prompt-lookup, one blocking engine
+//     call, reply rendered as a block) when eligible, else stream tokens
+//     one-by-one with the host sampler.
 //  4. Append the completed reply to history so the NEXT turn can reuse it.
 func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	var history []chat.Message
 
 	kv := gemserver.NewKVCache(eng)
 	rng := newRNG(args.Seed)
+	specTurn := uint64(0) // per-session turn counter for spec seed derivation
 
 	nToGenerate := args.Predict
 	if nToGenerate <= 0 {
@@ -120,35 +123,99 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			"\033[2mgem4d: prefill %d tokens (%d cached, %d new) %.2fs %.1f tok/s\033[0m\n",
 			pf.PromptTokens, pf.ReusedTokens, pf.NewTokens, pfElapsed.Seconds(), pfTPS)
 
-		// Stream generation token-by-token.
-		var replyBuf strings.Builder
-		logits := pf.Logits
+		// The speculative fast-path is a single blocking engine call: one weight
+		// pass per [g, draft...] with MTP/prompt-lookup drafting on-device, same
+		// output distribution as plain decode, and no 1 MiB logits D2H copy +
+		// O(262k) host top-k per token. The REPL has no text stop-strings and
+		// needs no mid-flight cancellation, so eligibility is just spec-on + no
+		// repeat penalty (the spec kernel cannot apply it; mirrors
+		// server.generateResponse). Otherwise fall back to the per-token loop.
+		useSpec := args.Spec && args.RepeatPenalty == 1.0
+
+		var reply string
 		genStart := time.Now()
 		generated := 0
+		specStats := "" // extra spec diagnostics appended to the stats line
 
 		// Print assistant prefix so the reply is visually distinct.
 		fmt.Fprint(os.Stdout, "\033[1;34mAssistant:\033[0m ")
 
-		for i := 0; i < nToGenerate; i++ {
-			if logits == nil {
-				break
+		if useSpec {
+			stops := []int32{tok.EOS, tok.EndOfTurn}
+			// Per-turn seed: random when --seed < 0; otherwise derived from
+			// --seed but DISTINCT per turn (reusing the seed verbatim would
+			// replay the same sampling stream every turn). The golden-ratio
+			// gamma is the splitmix64 stream increment — deterministic,
+			// well-separated streams, reproducible from --seed.
+			seed := uint64(time.Now().UnixNano())
+			if args.Seed >= 0 {
+				seed = uint64(args.Seed) + specTurn*0x9e3779b97f4a7c15
 			}
-			token, err := sampler.Sample(logits, samplerParams(args), rng, nil)
-			// Stop on EOS or end-of-turn (<turn|>); these are control tokens
-			// and must not be rendered.
-			if err != nil || tok.IsStop(token) {
-				break
-			}
-			piece := tok.Decode([]int32{token})
-			fmt.Print(piece)
-			replyBuf.WriteString(piece)
-			kv.AppendDecoded(token)
+			specTurn++
 
-			logits, err = eng.Decode(token)
+			cacheToks := kv.CurrentTokens() // full cached sequence, under kv lock
+			toks, nAccepted, err := eng.GenerateSpecContinue(cacheToks, pf.Logits,
+				nToGenerate, stops, args.DraftK, float32(args.Temperature),
+				args.TopK, float32(args.TopP), float32(args.MinP), seed)
 			if err != nil {
-				break
+				kv.Unlock()
+				fmt.Println()
+				fmt.Fprintf(os.Stderr, "gem4d: spec generate error: %v\n", err)
+				history = history[:len(history)-1] // undo user turn
+				continue
 			}
-			generated++
+			// Sync the prefix cache with the tokens actually committed to the
+			// engine KV (a trailing stop token may be emitted but not forwarded)
+			// so the NEXT turn's prefill reuses this whole turn.
+			committed := eng.NTokens() - pf.PromptTokens
+			for i := 0; i < committed && i < len(toks); i++ {
+				kv.AppendDecoded(toks[i])
+			}
+			generated = len(toks)
+
+			// Render up to the first stop token — EOS/<turn|> are control tokens
+			// and must not appear in the transcript. The reply appears as one
+			// block instead of token-by-token: accepted trade-off for the single
+			// blocking spec call (~40% faster than the streaming loop).
+			cut := len(toks)
+			for i, t := range toks {
+				if tok.IsStop(t) {
+					cut = i
+					break
+				}
+			}
+			reply = tok.Decode(toks[:cut])
+			fmt.Print(reply)
+			specStats = fmt.Sprintf(", %d drafts accepted (avg %.2f tokens/step, draft-k=%d)",
+				nAccepted, float64(len(toks))/float64(max(1, len(toks)-nAccepted)), args.DraftK)
+		} else {
+			// Per-token decode loop with the host sampler: required for
+			// repeat-penalty (it edits logits using the token history) or when
+			// --spec=false. Streams tokens to stdout as they are sampled.
+			var replyBuf strings.Builder
+			logits := pf.Logits
+			for i := 0; i < nToGenerate; i++ {
+				if logits == nil {
+					break
+				}
+				token, err := sampler.Sample(logits, samplerParams(args), rng, nil)
+				// Stop on EOS or end-of-turn (<turn|>); these are control tokens
+				// and must not be rendered.
+				if err != nil || tok.IsStop(token) {
+					break
+				}
+				piece := tok.Decode([]int32{token})
+				fmt.Print(piece)
+				replyBuf.WriteString(piece)
+				kv.AppendDecoded(token)
+
+				logits, err = eng.Decode(token)
+				if err != nil {
+					break
+				}
+				generated++
+			}
+			reply = replyBuf.String()
 		}
 		kv.Unlock()
 
@@ -159,11 +226,11 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		}
 		fmt.Println() // newline after reply
 		fmt.Fprintf(os.Stderr,
-			"\033[2mgem4d: generated %d tokens %.2fs %.1f tok/s\033[0m\n\n",
-			generated, genElapsed.Seconds(), genTPS)
+			"\033[2mgem4d: generated %d tokens %.2fs %.1f tok/s%s\033[0m\n\n",
+			generated, genElapsed.Seconds(), genTPS, specStats)
 
 		// Add completed assistant reply to history so the NEXT turn's prompt
 		// includes it verbatim and the KVCache can reuse the whole sequence.
-		history = append(history, chat.Message{Role: "assistant", Content: strings.TrimSpace(replyBuf.String())})
+		history = append(history, chat.Message{Role: "assistant", Content: strings.TrimSpace(reply)})
 	}
 }
