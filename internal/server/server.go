@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ type Server struct {
 	modelName       string
 	genParams       GenerationParams
 	thinkingDefault bool // startup default for the gemma-4 reasoning channel
+	debug           bool // dump full request bodies + rendered prompts
 	httpServer      *http.Server
 }
 
@@ -319,6 +321,14 @@ func (s *Server) SetModelName(name string) {
 // Per-request reasoning_effort / thinking / enable_thinking overrides it.
 func (s *Server) SetThinkingDefault(on bool) { s.thinkingDefault = on }
 
+// SetDebug enables verbose request logging: each chat request's full body and the
+// rendered gemma-4 prompt are appended to debugDumpPath (and the per-request
+// summary is logged). Use to inspect exactly what a client like pi sends.
+func (s *Server) SetDebug(on bool) { s.debug = on }
+
+// debugDumpPath is where SetDebug(true) appends request/prompt dumps.
+const debugDumpPath = "/tmp/gem4d_debug.log"
+
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	h := func(f http.HandlerFunc) http.HandlerFunc { return logRequest(f) }
 	mux.HandleFunc("/v1/models", h(s.handleModels))
@@ -406,6 +416,27 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if len(tokens) == 0 {
 		http.Error(w, "tokenization failed", http.StatusInternalServerError)
 		return
+	}
+
+	// Per-request summary so the client's real footprint is visible (system-prompt
+	// size, tool count, thinking, streaming). GEM4D_DEBUG=1 also dumps the full
+	// request body + rendered prompt to /tmp for inspecting exactly what a client
+	// (e.g. pi) sends.
+	sysChars := 0
+	if len(req.Messages) > 0 && req.Messages[0].Role == "system" {
+		sysChars = len(req.Messages[0].Content)
+	}
+	log.Printf("gem4d: chat: %d msgs, %d tools, sys=%dch, %d prompt-tok, thinking=%v, stream=%v",
+		len(req.Messages), len(req.Tools), sysChars, len(tokens), enableThinking, req.Stream)
+	if s.debug || os.Getenv("GEM4D_DEBUG") == "1" {
+		dump := fmt.Sprintf("\n========== %s  %d msgs / %d tools / %d tok / thinking=%v / stream=%v ==========\n"+
+			"--- REQUEST BODY ---\n%s\n--- RENDERED PROMPT ---\n%s\n",
+			time.Now().Format("15:04:05"), len(req.Messages), len(req.Tools), len(tokens),
+			enableThinking, req.Stream, string(body), prompt)
+		if f, err := os.OpenFile(debugDumpPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			f.WriteString(dump)
+			f.Close()
+		}
 	}
 
 	params := s.genParams
@@ -726,13 +757,14 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	inChannel := false          // currently inside a <|channel> … <channel|> reasoning span
 	channelLabel := false       // still skipping the "thought" label at a channel's start
 
-	// GPU-side sampling (when no repeat penalty): pick each token on the device and
-	// advance with DecodeNoCopy — only a 4-byte id crosses to host instead of the
-	// 262k-float logits copy + Go allocation + CPU sort every token. This is what
-	// makes streamed decode as fast as the CLI's fast path (~2× the host-sampler
-	// loop). Repeat penalty edits logits from history, so it still needs the host
-	// sampler. The first token samples from the prefill's resident GPU logits.
-	gpuSample := params.RepeatPenalty == 1.0
+	// GPU-side sampling (4-byte id back, no 262k logits copy) — used ONLY for greedy
+	// (temp<=0, device argmax), which is fast and verified clean. The device kernel's
+	// temperature/top-k/top-p path (sample_logits_kernel, temp>0) produces degenerate
+	// output, so for temp>0 we fall back to the host sampler (the same one the
+	// non-streaming spec path uses correctly at temp 1.0). Repeat penalty also needs
+	// the host sampler. TODO: fix the GPU temp>0 sampler to restore fast sampled
+	// streaming. The first greedy token samples from the prefill's resident logits.
+	gpuSample := params.RepeatPenalty == 1.0 && params.Temperature <= 0.0
 	temp := float32(params.Temperature)
 	for generated < params.MaxTokens {
 		// Honor client cancellation ("steering"): if pi aborts the request, stop

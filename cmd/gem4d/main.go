@@ -86,6 +86,8 @@ type CLIArgs struct {
 	Timings  bool
 	DeviceID int
 	Memory   string
+	Debug    bool
+	LogLevel string
 
 	// Mode
 	Interactive bool
@@ -144,6 +146,8 @@ func parseFlags() CLIArgs {
 	flag.BoolVar(&a.Verbose, "v", false, "Verbose output")
 	flag.BoolVar(&a.Verbose, "verbose", false, "Verbose output")
 	flag.BoolVar(&a.Timings, "timings", false, "Show timing information")
+	flag.BoolVar(&a.Debug, "debug", false, "Dump full request bodies + rendered prompts to "+"/tmp/gem4d_debug.log")
+	flag.StringVar(&a.LogLevel, "log-level", "info", "Log level: info|debug (debug also dumps requests)")
 	flag.IntVar(&a.DeviceID, "cuda-device", 0, "CUDA device ID")
 	flag.StringVar(&a.Memory, "mlock", "", "mlock model in memory (unused on CUDA)")
 
@@ -263,6 +267,11 @@ func main() {
 		srv.SetModelName(strings.TrimSuffix(filepath.Base(args.ModelPath), ".gguf"))
 		// Startup default for the reasoning channel; per-request reasoning_effort wins.
 		srv.SetThinkingDefault(gemserver.ParseThinkingLevel(args.Thinking))
+		// Debug request dumping: --debug or --log-level debug.
+		if args.Debug || strings.EqualFold(args.LogLevel, "debug") {
+			srv.SetDebug(true)
+			log.Printf("gem4d: debug logging ON — request dumps -> /tmp/gem4d_debug.log")
+		}
 
 		// Handle graceful shutdown
 		sigCh := make(chan os.Signal, 1)
