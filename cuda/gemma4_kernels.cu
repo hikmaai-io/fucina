@@ -4384,15 +4384,19 @@ static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int ma
 // Consensus prompt-lookup draft. Finds the longest suffix of `hist` (length
 // max_ng..min_ng) that recurs earlier, then drafts its continuation — but only as
 // far as the recent occurrences AGREE. A draft token is emitted only when it is the
-// continuation in a (weak-)majority of the most-recent matches; the draft is cut at
+// continuation in a strict majority of the most-recent matches; the draft is cut at
 // the first low-consensus position. This raises acceptance precision (fewer wasted
 // draft tokens, hence higher effective tok/s) on structured/repetitive text, and
 // degrades exactly to plain prompt-lookup when only one match exists (thresh==1).
 // Verify still samples each position from the exact target distribution, so accuracy
-// is unchanged regardless of draft quality. Returns draft length.
+// is unchanged regardless of draft quality. Reports the matched n-gram length and
+// occurrence count via out_ng/out_nocc (both 0 when no draft) so the caller's drafter
+// policy can judge how trustworthy the draft is. Returns draft length.
 static int prompt_lookup_draft(const int32_t *hist, int n, int32_t *draft,
-                               int max_d, int min_ng, int max_ng)
+                               int max_d, int min_ng, int max_ng,
+                               int *out_ng, int *out_nocc)
 {
+    *out_ng = 0; *out_nocc = 0;
     if (max_d <= 0) return 0;
     enum { MAX_OCC = 16 };
     int occ[MAX_OCC];
@@ -4407,7 +4411,12 @@ static int prompt_lookup_draft(const int32_t *hist, int n, int32_t *draft,
             if (match) occ[nocc++] = i + ng;   // position right after the matched context
         }
         if (nocc == 0) continue;
-        int thresh = (nocc + 1) / 2;            // weak majority; ==1 when nocc==1
+        // Strict majority. occ[0] is the draft source and trivially agrees with itself,
+        // so the old weak-majority thresh (nocc+1)/2 == 1 at nocc==2 let an n-gram seen
+        // exactly TWICE draft full-length with zero real corroboration (and the ng cap
+        // below only guards nocc==1). nocc/2+1 demands at least one OTHER occurrence
+        // agree: nocc 2→2, 3→2, 4→3, 5→3; still 1 when nocc==1 (plain lookup + ng cap).
+        int thresh = nocc / 2 + 1;
         // Confidence cap: a single occurrence is only trusted as far ahead as the
         // matched context is long (a 5-gram match → up to 5 tokens; a lone 2-gram → 2).
         // Multiple agreeing occurrences are trusted to the full draft budget.
@@ -4425,7 +4434,7 @@ static int prompt_lookup_draft(const int32_t *hist, int n, int32_t *draft,
             if (agree < thresh) break;          // low consensus → stop drafting here
             draft[d++] = cand;
         }
-        if (d > 0) return d;
+        if (d > 0) { *out_ng = ng; *out_nocc = nocc; return d; }
     }
     return 0;
 }
@@ -4498,8 +4507,17 @@ static int run_spec_loop(
 
     uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
     long mtp_calls = 0, mtp_drafted = 0, mtp_accepted = 0;   // drafter diagnostics
+    long lk_calls  = 0, lk_drafted  = 0, lk_accepted  = 0, lk_displaced = 0;
+    // Cold counter stays SHARED across drafters: a fully-rejected step says the local
+    // text is hostile to speculation whichever drafter produced it, and sharing keeps a
+    // hard cap on consecutive wasted verifies — per-drafter counters would let the two
+    // drafters alternate total rejections and never trip the one-step backoff.
     int cold = 0;             // consecutive fully-rejected draft attempts (light backoff)
-    float ema_a = (float)draft_k;   // EMA of accepted tokens/step; starts optimistic
+    // Per-drafter acceptance EMAs (accepted tokens/step; both start optimistic at
+    // draft_k). A single shared EMA conflated the drafters' quality: low LOOKUP
+    // acceptance shrank maxd to its floor of 2, which then throttled the 85-94%-
+    // acceptance MTP drafter too, locking long chats into cheap ~1.0x lookup drafts.
+    float ema_lookup = (float)draft_k, ema_mtp = (float)draft_k;
 
 
     int g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
@@ -4520,24 +4538,38 @@ static int run_spec_loop(
         // run (+1 probe token): verbatim/repetitive text grows it to draft_k for a big
         // win; novel text shrinks it toward the floor so a rejected draft stays cheap.
         // Light backoff: after a short run of total rejections, skip one step, then retry.
-        int maxd = (int)(ema_a + 1.5f);
+        // The budget comes from the drafter we'd PREFER this step (MTP when loaded with a
+        // valid recurrent h, lookup otherwise). Budgeting from ema_mtp while MTP is
+        // preferred also keeps the displacement bar honest: a shrunken ema_lookup must
+        // not lower the full-length requirement lookup has to clear to displace MTP.
+        int mtp_ready = eng->mtp.loaded && eng->mtp_h_valid;
+        int maxd = (int)((mtp_ready ? ema_mtp : ema_lookup) + 1.5f);
         if (maxd > draft_k) maxd = draft_k;
         if (maxd < 2)       maxd = 2;
         if (cold >= 4) { maxd = 0; cold = 0; }
         if (maxd > room) maxd = room; if (maxd < 0) maxd = 0;
         if (generated + 1 >= max_new) maxd = 0;
 
-        // Drafter policy (one config): consensus prompt-lookup is FREE, so use it when it
-        // is CONFIDENT (a full maxd-length draft — verbatim/structured text); otherwise the
-        // official MTP assistant head drafts (the llama.cpp draft-mtp config — measured 84-94%
-        // draft acceptance on novel prose/code where lookup gets almost nothing). Without an
-        // assistant, lookup keeps any partial draft it found. The first step after a fresh
-        // prefill single-decodes once to establish the recurrent h.
-        int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k);
+        // Drafter policy (one config): consensus prompt-lookup is FREE, but when the MTP
+        // assistant is available it may displace MTP only when its draft is genuinely
+        // STRONG — full budget length AND a >=3-gram match corroborated by >=2 occurrences
+        // (under the strict majority in prompt_lookup_draft). Previously ANY full-length
+        // lookup draft starved MTP (the llama.cpp draft-mtp config — measured 84-94% draft
+        // acceptance on novel prose/code where lookup gets almost nothing), and long chats
+        // fed a feedback loop: more history => more spurious bigram matches => more ~1.0x
+        // lookup drafts. If MTP declines to draft, fall back to whatever lookup found; and
+        // without an assistant, today's behavior stands — lookup keeps any draft it found,
+        // partial included. The first step after a fresh prefill single-decodes once to
+        // establish the recurrent h.
+        int lk_ng = 0, lk_nocc = 0;
+        int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k, &lk_ng, &lk_nocc);
+        if (D > 0) { lk_calls++; lk_drafted += D; }   // counted at draft time, like mtp
         int from_mtp = 0;
-        if (D < maxd && eng->mtp.loaded && eng->mtp_h_valid && maxd > 0) {
-            int Dm = mtp_draft(eng, g, batch+1, maxd);
-            if (Dm > 0) {
+        int lookup_strong = (D > 0 && D == maxd && lk_ng >= 3 && lk_nocc >= 2);
+        if (mtp_ready && maxd > 0 && !lookup_strong) {
+            int Dm = mtp_draft(eng, g, batch+1, maxd);   // drafts into a local buf; on 0 the
+            if (Dm > 0) {                                // lookup draft in batch+1 is intact
+                if (D > 0) lk_displaced++;               // weak lookup draft lost to MTP
                 D = Dm; from_mtp = 1;
                 mtp_calls++; mtp_drafted += Dm;
             }
@@ -4561,8 +4593,10 @@ static int run_spec_loop(
             else { rejected = s; break; }
         }
         total_accepted += a;
-        if (from_mtp) mtp_accepted += a;
-        ema_a = 0.5f*ema_a + 0.5f*(float)a;
+        // Update ONLY the EMA of the drafter that actually drafted this step — the other
+        // drafter's track record is untouched evidence about ITS quality, not this one's.
+        if (from_mtp) { mtp_accepted += a; ema_mtp    = 0.5f*ema_mtp    + 0.5f*(float)a; }
+        else          { lk_accepted  += a; ema_lookup = 0.5f*ema_lookup + 0.5f*(float)a; }
         cold = (a == 0) ? cold + 1 : 0;
         // MTP recurrent h: the next g comes from logits row a (reject) or row D (all
         // accepted) — stash that row's output-normed hidden (d_sb[2]) as the next h.
@@ -4597,6 +4631,13 @@ static int run_spec_loop(
         fprintf(stderr, "gem4d: [mtp] %ld draft calls, %ld proposed, %ld accepted (%.0f%%)\n",
                 mtp_calls, mtp_drafted, mtp_accepted,
                 100.0 * mtp_accepted / (double)(mtp_drafted > 0 ? mtp_drafted : 1));
+    // Lookup symmetric to [mtp], plus the count of weak drafts the policy handed to MTP
+    // instead — that displacement rate IS the new policy, so it must be visible here.
+    if (lk_calls > 0)
+        fprintf(stderr, "gem4d: [lookup] %ld draft calls, %ld proposed, %ld accepted (%.0f%%), %ld displaced by mtp\n",
+                lk_calls, lk_drafted, lk_accepted,
+                100.0 * lk_accepted / (double)(lk_drafted > 0 ? lk_drafted : 1),
+                lk_displaced);
     if (n_accepted_out) *n_accepted_out = total_accepted;
     return generated;
 }
