@@ -3,9 +3,17 @@ package server
 import (
 	"log"
 	"sync"
-
-	"github.com/mauromedda/gem4d/internal/engine/cuda"
 )
+
+// kvEngine is the consumer-side view of the inference engine that KVCache
+// depends on. It is declared here (where it is used) rather than in the cuda
+// package, per Go best practice. *cuda.Engine satisfies this interface.
+type kvEngine interface {
+	Prefill(tokens []int32) ([]float32, error)
+	NTokens() int
+	Reset()
+	Rewind(nKeep int) bool
+}
 
 // KVCache implements prefix-reuse on top of the engine's append-only KV cache.
 //
@@ -30,8 +38,14 @@ import (
 // This matches the engine's single-slot design (--n-slots 1) and keeps the KV
 // state consistent. Multi-slot paged attention is future work; the bookkeeping
 // here is structured so it can be extended to multiple sequences later.
+//
+// Lock ordering: KVCache.mu MUST be acquired BEFORE Engine.mu. Engine methods
+// lock Engine.mu internally, so a KVCache method that calls the engine while
+// holding KVCache.mu observes the order KVCache.mu → Engine.mu. To keep this
+// ordering total and deadlock-free, never call KVCache methods from inside
+// engine code (the engine must not reach back up into the cache).
 type KVCache struct {
-	engine *cuda.Engine
+	engine kvEngine
 
 	mu           sync.Mutex
 	cachedTokens []int32 // exact tokens currently in the engine KV cache
@@ -44,7 +58,7 @@ type KVCache struct {
 }
 
 // NewKVCache creates a prefix-reuse manager bound to an engine.
-func NewKVCache(engine *cuda.Engine) *KVCache {
+func NewKVCache(engine kvEngine) *KVCache {
 	return &KVCache{engine: engine}
 }
 
@@ -128,11 +142,14 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 	return res, nil
 }
 
-// CurrentTokens returns the token sequence currently held in the engine KV
-// cache (prompt + tokens generated so far this request). The caller must hold
-// Lock(); the returned slice must not be retained past Unlock.
+// CurrentTokens returns a COPY of the token sequence currently held in the
+// engine KV cache (prompt + tokens generated so far this request). The caller
+// must hold Lock(). A copy is returned so the returned slice is safe to retain
+// or read after Unlock without aliasing the cache's internal backing array.
 func (c *KVCache) CurrentTokens() []int32 {
-	return c.cachedTokens
+	out := make([]int32, len(c.cachedTokens))
+	copy(out, c.cachedTokens)
+	return out
 }
 
 // AppendDecoded records a token that was produced by Decode and therefore is

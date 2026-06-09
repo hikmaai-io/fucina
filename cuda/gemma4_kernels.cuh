@@ -8,8 +8,7 @@
 //   FFN: GeGLU (gelu_pytorch_tanh), intermediate=15360
 //   Output: logit softcapping at 30.0
 //
-// Formats:      FP8 E4M3 (primary), Q8_0 (fallback)
-// Adapters:     LoRA scaled (GGUF format)
+// Formats: Q4_0 (QAT, Q6_K tied head) and Q8_0 — auto-detected from the GGUF.
 
 #ifndef GEMMA4_KERNELS_CUH
 #define GEMMA4_KERNELS_CUH
@@ -42,16 +41,12 @@
 #define GEMMA4_MAX_CTX           262144
 #define GEMMA4_SOFTCAP           30.0f
 #define GEMMA4_RMS_EPS           1e-6f
-#define GEMMA4_MAX_LORA_RANK     64
 #define GEMMA4_SPEC_MAX          16      // max draft length per batched-decode pass
 // GQA-broadcast global flash-decode split-K (DECODE-30-35 Step 1): the global context is
 // split into ≤MAX_SPLITS blocks of ~SPLIT_CHUNK timesteps so the single global KV head still
 // saturates bandwidth across SMs while being read only ONCE per token (not n_heads× = 16×).
 #define GEMMA4_GLOBAL_MAX_SPLITS 128
 #define GEMMA4_GLOBAL_SPLIT_CHUNK 256
-// Self-spec layer-skip drafter (DECODE-30-35 Steps 6/7): the vocab-trim draft head considers at
-// most this many candidate tokens (the unique most-recent history tokens) per draft step.
-#define GEMMA4_SELFSPEC_CANDS    512
 
 // Special tokens
 #define GEMMA4_BOS_ID  2
@@ -61,8 +56,7 @@
 // ─── Tensor format flags ───────────────────────────────────────────────
 
 typedef enum {
-    FORMAT_FP8   = 0,  // CUDA_R_8F_E4M3 (primary, native Blackwell)
-    FORMAT_Q8_0  = 1,  // GGML Q8_0 blocks (fallback)
+    FORMAT_Q8_0  = 1,  // GGML Q8_0 blocks
     FORMAT_Q4_0  = 2,  // GGML Q4_0 blocks (QAT 4-bit; layers Q4_0, token_embd→Q8_0)
     FORMAT_Q6_K  = 3,  // GGML Q6_K super-blocks (used only as a wfmt override for the native
                        // QAT tied LM head — DECODE-30-35 Step 8; not a whole-model format)
@@ -88,30 +82,6 @@ typedef enum {
     LAYER_GLOBAL  = 1,
 } layer_type_t;
 
-// ─── LoRA adapter descriptor ──────────────────────────────────────────
-
-typedef struct {
-    float  *d_a;             // LoRA A matrix [in_dim × rank] on device
-    float  *d_b;             // LoRA B matrix [rank × out_dim] on device
-    float   scale;           // scale = alpha / rank
-    int     rank;            // LoRA rank
-    int     input_dim;       // input dimension
-    int     output_dim;      // output dimension
-    int     active;          // 1 if this adapter is loaded
-} lora_adapter_t;
-
-// ─── Per-weight LoRA set ──────────────────────────────────────────────
-
-typedef struct {
-    lora_adapter_t q;        // attention Q projection
-    lora_adapter_t k;        // attention K projection
-    lora_adapter_t v;        // attention V projection
-    lora_adapter_t o;        // attention output projection
-    lora_adapter_t gate;     // FFN gate projection
-    lora_adapter_t up;       // FFN up projection
-    lora_adapter_t down;     // FFN down projection
-} layer_lora_set_t;
-
 // ─── Engine state (opaque, passed to Go via CGO) ──────────────────────
 
 #ifdef __cplusplus
@@ -124,27 +94,12 @@ typedef struct gemma4_engine gemma4_engine_t;
 
 gemma4_engine_t* gemma4_engine_create(
     const char *model_path,     // path to GGUF file
-    tensor_format_t format,     // FP8 or Q8_0
+    tensor_format_t format,     // hint only — the real format is auto-detected from the GGUF
     uint32_t context_size,      // max context tokens
     int device_id               // CUDA device (0 for DGX Spark)
 );
 
 void gemma4_engine_destroy(gemma4_engine_t *eng);
-
-// ─── LoRA adapter loading ─────────────────────────────────────────────
-
-// Load a LoRA scaled adapter from a GGUF file
-// The GGUF contains lora.{layer}.{weight}.weight_a/b tensors
-// and lora.{layer}.{weight}.alpha metadata
-// Returns 0 on success, -1 on error
-int gemma4_engine_load_lora(
-    gemma4_engine_t *eng,
-    const char      *lora_path,     // path to LoRA GGUF file
-    float            scale          // additional scale multiplier (use 1.0f normally)
-);
-
-// Remove all loaded LoRA adapters (restore base model)
-void gemma4_engine_unload_lora(gemma4_engine_t *eng);
 
 // ─── Core inference ──────────────────────────────────────────────────
 
@@ -198,22 +153,9 @@ int gemma4_engine_generate_spec_continue(
     float temp, int top_k, float top_p, float min_p, uint64_t seed,
     int             *n_accepted_out);
 
-// Speculative verify batch: verify K draft tokens in parallel
-// Returns number of accepted tokens (0..K)
-int gemma4_engine_verify_batch(
-    gemma4_engine_t *eng,
-    const int32_t   *draft_tokens,  // [K] draft tokens
-    int              K,
-    const int32_t   *positions,     // [K] positions in context
-    float           *logits_out     // [K × VOCAB_SIZE] or NULL
-);
-
 // ─── Sampling ─────────────────────────────────────────────────────────
 
 int gemma4_sample_argmax(const float *logits, int vocab_size);
-
-// Diagnostic: measure CUDA-graph launch-overhead win on the decode step.
-int gemma4_engine_bench_graph(gemma4_engine_t *eng, int reps);
 
 // GPU-side sampling over the engine's resident logits (eng->d_logits): temp<=0 →
 // argmax, else temperature → top-k → softmax → top-p → min-p → multinomial(rnd).
@@ -221,19 +163,12 @@ int gemma4_engine_bench_graph(gemma4_engine_t *eng, int reps);
 int gemma4_engine_sample_device(
     gemma4_engine_t *eng, float temp, int top_k, float top_p, float min_p, float rnd);
 
-// ─── Session save/restore ────────────────────────────────────────────
-
-int gemma4_engine_save_session(
-    gemma4_engine_t *eng,
-    uint8_t         *buffer,     // output buffer, or NULL for size query
-    uint64_t        *size        // in/out: buffer size / required size
-);
-
-int gemma4_engine_load_session(
-    gemma4_engine_t *eng,
-    const uint8_t   *buffer,
-    uint64_t         size
-);
+// Load the official Gemma-4 MTP assistant GGUF (~423M draft head, Q8_0). When loaded,
+// the speculative loop drafts novel text with it (recursive multi-token prediction over
+// the shared target KV cache) instead of falling back to single-token decode — the
+// llama.cpp `--spec-type draft-mtp` equivalent (>2x dense decode at ~0.59 acceptance).
+// Call once after create. Returns 0 on success; failure leaves drafting disabled.
+int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path);
 
 // Batched prefill: process the whole prompt in one BF16 tensor-core pass instead
 // of token-by-token GEMV. Requires a fresh sequence (n_tokens in KV cache == 0);
@@ -255,7 +190,6 @@ void gemma4_engine_print_info(const gemma4_engine_t *eng);
 void gemma4_engine_print_timing(const gemma4_engine_t *eng);
 int  gemma4_engine_get_n_layers(const gemma4_engine_t *eng);
 int  gemma4_engine_get_context_size(const gemma4_engine_t *eng);
-int  gemma4_engine_has_lora(const gemma4_engine_t *eng);
 
 // Timing accessors for speed logging
 float gemma4_engine_prefill_ms(const gemma4_engine_t *eng);

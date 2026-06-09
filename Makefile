@@ -1,6 +1,5 @@
 # gem4d - Gemma 4 12B inference engine for DGX Spark GB10
-# Only FP8 and Q8_0 formats, only CUDA (sm_121 Blackwell GB10)
-# LoRA adapter support via --lora-scaled
+# Q4_0 (QAT) and Q8_0 GGUFs, CUDA only (sm_121 Blackwell GB10)
 
 # ─── Toolchain ─────────────────────────────────────────────────────────
 # DGX Spark GB10: CUDA 13.0, CUDA arch sm_121, /usr/local/cuda-13
@@ -19,9 +18,18 @@ NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo --use_fast_math \
 CGO_CFLAGS   := -I$(CUDA_HOME)/include
 CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcuda -lpthread -lstdc++ -lm
 
-.PHONY: all clean test cuda lib gem4d smoke profile
+.PHONY: all clean test cuda lib gem4d smoke profile \
+        go-test go-test-race go-test-cgo vet lint check
+
+# `make` with no arguments builds everything (CUDA archive + Go binary).
+.DEFAULT_GOAL := all
 
 all: lib gem4d
+
+# lib builds the CUDA static archive explicitly (also a prerequisite of gem4d,
+# but exposed so `make all` / `make lib` always produce cuda/libgem4d.a even
+# if the Go link step is skipped or fails).
+lib: cuda/libgem4d.a
 
 # ─── CUDA Kernel Library ───────────────────────────────────────────────
 # Two-step compilation: device code + link
@@ -56,7 +64,9 @@ cuda/test_engine: cuda/test_engine.cu cuda/libgem4d.a
 	$(NVCC) $(NVCCFLAGS) -o $@ $< cuda/libgem4d.a -lcudart -lcublas
 
 # ─── Testing ────────────────────────────────────────────────────────────
-test: gem4d
+# Full test suite: pure-Go unit tests, cgo-dependent tests (needs the CUDA
+# archive), then the binary's built-in self-tests on the GPU.
+test: gem4d go-test go-test-cgo
 	./gem4d --test-parser
 	CUDA_VISIBLE_DEVICES=0 ./gem4d --test-cuda
 
@@ -76,6 +86,45 @@ lora-smoke: gem4d
 profile: gem4d
 	nsys profile -o gem4d_profile -t cuda,nvtx ./gem4d \
 		--prompt "Write a haiku about CUDA." --predict 128 --temp 0
+
+# ─── Go quality / unit tests (no CUDA required) ───────────────────────────
+# NOTE: ./internal/engine/cuda and ./cmd/... are intentionally excluded from
+# the pure-Go targets below — the cgo engine package links against
+# cuda/libgem4d.a, so `go test`/`go vet` there fails to build/link unless the
+# CUDA archive has been compiled with nvcc on a GB10 box. The server,
+# tokenizer, sampler and chat packages are pure Go and run anywhere.
+GO_TEST_PKGS := ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+
+# cgo-dependent Go tests (cmd/gem4d: CLI parsing tests). Requires
+# cuda/libgem4d.a to link, hence the `lib` prerequisite.
+GO_TEST_CGO_PKGS := ./cmd/...
+
+go-test-cgo: lib
+	CGO_CFLAGS="$(CGO_CFLAGS)" \
+	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
+	$(GO) test $(GO_TEST_CGO_PKGS) -count=1
+
+go-test:
+	$(GO) test $(GO_TEST_PKGS) -count=1
+
+go-test-race:
+	$(GO) test $(GO_TEST_PKGS) -race -count=1
+
+# vet: restricted to non-cgo packages. `go vet ./cmd/...` is avoided because
+# cmd/gem4d pulls in the cgo engine package which cannot link without
+# libgem4d.a; vetting it here would fail on a CUDA-less machine.
+vet:
+	$(GO) vet $(GO_TEST_PKGS)
+
+lint:
+	@if command -v golangci-lint >/dev/null 2>&1; then \
+		golangci-lint run $(GO_TEST_PKGS); \
+	else \
+		echo "lint: golangci-lint not installed — skipping"; \
+	fi
+
+# Convenience: static analysis + unit tests in one shot.
+check: vet go-test
 
 # ─── Clean ──────────────────────────────────────────────────────────────
 clean:

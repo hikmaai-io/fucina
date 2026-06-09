@@ -6,41 +6,93 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"math/rand"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/mauromedda/gem4d/internal/engine/cuda"
+	"github.com/mauromedda/gem4d/internal/chat"
+	"github.com/mauromedda/gem4d/internal/sampler"
 	"github.com/mauromedda/gem4d/internal/tokenizer"
 )
+
+// ─── Engine interface ──────────────────────────────────────────────
+
+// serverEngine is the consumer-side view of the inference engine that the HTTP
+// handlers depend on. It is declared here (where it is used) rather than in the
+// cuda package, per Go best practice, so the server can be tested with a fake
+// engine and no GPU. *cuda.Engine satisfies this interface.
+//
+// It is a strict superset of kvEngine (kvcache.go), so a serverEngine can be
+// passed straight to NewKVCache.
+type serverEngine interface {
+	Prefill(tokens []int32) ([]float32, error)
+	Decode(token int32) ([]float32, error)
+	DecodeNoCopy(token int32) error
+	SampleDevice(temp float32, topK int, topP, minP, rnd float32) (int32, error)
+	GenerateSpecContinue(history []int32, firstLogits []float32, maxNew int, stops []int32, draftK int, temp float32, topK int, topP, minP float32, seed uint64) ([]int32, int, error)
+	NTokens() int
+	Reset()
+	Rewind(nKeep int) bool
+	ContextSize() uint32
+}
 
 // ─── Types ─────────────────────────────────────────────────────────
 
 type Server struct {
-	engine    *cuda.Engine
-	tokenizer *tokenizer.Tokenizer
+	engine          serverEngine
+	tokenizer       *tokenizer.Tokenizer
 	kv              *KVCache
 	modelName       string
 	genParams       GenerationParams
-	thinkingDefault bool // startup default for the gemma-4 reasoning channel
-	debug           bool // dump full request bodies + rendered prompts
+	thinkingDefault bool         // startup default for the gemma-4 reasoning channel
+	debug           bool         // dump full request bodies + rendered prompts
+	logLevel        atomic.Int32 // gates per-request access logs (see logLevelT)
 	metrics         Metrics
 	httpServer      *http.Server
 }
 
+// logLevelT is a tiny leveled-logging knob for the server package (no external
+// deps). Higher = quieter. Per-request access logs are emitted at Info; setting
+// the level to Warn silences them while leaving error/warn lines intact.
+type logLevelT int32
+
+const (
+	logLevelDebug logLevelT = iota
+	logLevelInfo
+	logLevelWarn
+)
+
+// SetLogLevel sets the server's log verbosity from a string: "debug", "info"
+// (default), or "warn"/"warning"/"error" (silences per-request access logs).
+// Unknown values leave the level unchanged.
+func (s *Server) SetLogLevel(level string) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		s.logLevel.Store(int32(logLevelDebug))
+	case "info", "":
+		s.logLevel.Store(int32(logLevelInfo))
+	case "warn", "warning", "error":
+		s.logLevel.Store(int32(logLevelWarn))
+	}
+}
+
+// logEnabled reports whether a message at the given level should be emitted.
+func (s *Server) logEnabled(level logLevelT) bool {
+	return int32(level) >= s.logLevel.Load()
+}
+
 type GenerationParams struct {
-	Temperature      float64 `json:"temperature"`
-	TopP             float64 `json:"top_p"`
-	TopK             int     `json:"top_k"`
-	MinP             float64 `json:"min_p"`
-	Seed             int64   `json:"seed"`
-	RepeatPenalty    float64 `json:"repeat_penalty"`
-	FrequencyPenalty float64 `json:"frequency_penalty"`
-	PresencePenalty  float64 `json:"presence_penalty"`
+	Temperature      float64  `json:"temperature"`
+	TopP             float64  `json:"top_p"`
+	TopK             int      `json:"top_k"`
+	MinP             float64  `json:"min_p"`
+	Seed             int64    `json:"seed"`
+	RepeatPenalty    float64  `json:"repeat_penalty"`
+	FrequencyPenalty float64  `json:"frequency_penalty"`
+	PresencePenalty  float64  `json:"presence_penalty"`
 	MaxTokens        int      `json:"max_tokens"`
 	Stream           bool     `json:"stream"`
 	Stop             []string `json:"stop,omitempty"`
@@ -231,6 +283,39 @@ type Choice struct {
 	FinishReason string      `json:"finish_reason"`
 }
 
+// CompletionResponse is the legacy /v1/completions (text_completion) shape:
+// choices carry `text` instead of a chat `message`.
+type CompletionResponse struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []CompletionChoice `json:"choices"`
+	Usage   Usage              `json:"usage"`
+}
+
+type CompletionChoice struct {
+	Index        int    `json:"index"`
+	Text         string `json:"text"`
+	FinishReason string `json:"finish_reason"`
+}
+
+// CompletionStreamChoice is the streaming form of a legacy completion choice.
+type CompletionStreamChoice struct {
+	Index        int    `json:"index"`
+	Text         string `json:"text"`
+	FinishReason string `json:"finish_reason,omitempty"`
+}
+
+type CompletionStreamResponse struct {
+	ID      string                   `json:"id"`
+	Object  string                   `json:"object"`
+	Created int64                    `json:"created"`
+	Model   string                   `json:"model"`
+	Choices []CompletionStreamChoice `json:"choices"`
+	Usage   *Usage                   `json:"usage,omitempty"`
+}
+
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
@@ -277,7 +362,7 @@ type ModelsResponse struct {
 type ModelInfo struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
-	Created int64  `json:"created"`         // unix seconds (OpenAI clients type this as int)
+	Created int64  `json:"created"` // unix seconds (OpenAI clients type this as int)
 	OwnedBy string `json:"owned_by"`
 }
 
@@ -286,14 +371,14 @@ func DefaultParams() GenerationParams {
 	// the GGUF general.sampling.*): temperature 1.0, top_p 0.95, top_k 64, no min-p
 	// or repeat penalty.
 	return GenerationParams{
-		Temperature:     1.0,
-		TopP:            0.95,
-		TopK:            64,
-		MinP:            0.0,
-		Seed:            0,
-		RepeatPenalty:   1.0,
+		Temperature:      1.0,
+		TopP:             0.95,
+		TopK:             64,
+		MinP:             0.0,
+		Seed:             0,
+		RepeatPenalty:    1.0,
 		FrequencyPenalty: 0.0,
-		PresencePenalty: 0.0,
+		PresencePenalty:  0.0,
 		// Generous completion cap for when a client omits max_tokens (pi does): the
 		// model stops at EOS/end-of-turn on its own; 512 truncated agent turns
 		// (reasoning + answer) mid-output. This is only a safety bound on runaways.
@@ -302,14 +387,16 @@ func DefaultParams() GenerationParams {
 	}
 }
 
-func New(eng *cuda.Engine, tok *tokenizer.Tokenizer) *Server {
-	return &Server{
+func New(eng serverEngine, tok *tokenizer.Tokenizer) *Server {
+	s := &Server{
 		engine:    eng,
 		tokenizer: tok,
 		kv:        NewKVCache(eng),
 		modelName: "gemma-4-12b-it",
 		genParams: DefaultParams(),
 	}
+	s.logLevel.Store(int32(logLevelInfo))
+	return s
 }
 
 // SetModelName overrides the id reported by /v1/models and echoed in responses.
@@ -334,7 +421,7 @@ func (s *Server) SetDebug(on bool) { s.debug = on }
 const debugDumpPath = "/tmp/gem4d_debug.log"
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	h := func(f http.HandlerFunc) http.HandlerFunc { return logRequest(f) }
+	h := func(f http.HandlerFunc) http.HandlerFunc { return s.logRequest(f) }
 	mux.HandleFunc("/v1/models", h(s.handleModels))
 	mux.HandleFunc("/v1/chat/completions", h(s.handleChatCompletions))
 	mux.HandleFunc("/v1/completions", h(s.handleCompletions))
@@ -382,13 +469,15 @@ func (r *statusRecorder) Flush() {
 // logRequest logs each HTTP request's method, path, status, and duration so that
 // client failures (4xx/5xx from clients like pi) are visible — the handlers return
 // errors via http.Error without logging, which otherwise leaves silent failures.
-func logRequest(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: 200}
 		start := time.Now()
 		next(rec, r)
-		log.Printf("gem4d: %s %s -> %d (%.0fms)",
-			r.Method, r.URL.Path, rec.status, float64(time.Since(start).Microseconds())/1000.0)
+		if s.logEnabled(logLevelInfo) {
+			log.Printf("gem4d: %s %s -> %d (%.0fms)",
+				r.Method, r.URL.Path, rec.status, float64(time.Since(start).Microseconds())/1000.0)
+		}
 	}
 }
 
@@ -402,6 +491,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	s.serveCompletions(w, r, false)
+}
+
+// serveCompletions backs both /v1/chat/completions (legacy=false, chat format)
+// and /v1/completions (legacy=true, text_completion format). Apart from the
+// response shape both paths share the same prompt/prefill/generation machinery.
+func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy bool) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -427,8 +523,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		enableThinking = *t
 	}
 	var prompt string
-	if legacy := req.legacyPrompt(); legacy != "" {
-		prompt = legacy
+	if lp := req.legacyPrompt(); lp != "" {
+		prompt = lp
+		legacy = true     // a `prompt` field forces legacy text_completion output
 		wantTools = false // raw-completions mode never emits structured tool calls
 	} else {
 		prompt = s.renderChatTemplate(req.Messages, req.Tools, enableThinking)
@@ -514,8 +611,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Acquire the single physical KV cache for the whole request (prefill +
-	// generation). Released inside the response helpers.
+	// generation). The handler is the lock OWNER: it holds the lock for the
+	// entire prefill+generation span and releases it here via defer. The
+	// response helpers run while this lock is held and must NOT unlock it.
 	s.kv.Lock()
+	defer s.kv.Unlock()
 
 	// Cache-aware prefill: reuse the longest cached prefix and compute only the
 	// divergent suffix. The returned logits are for the final prompt token, so
@@ -523,7 +623,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	prefillStart := time.Now()
 	pf, err := s.kv.Prefill(tokens)
 	if err != nil {
-		s.kv.Unlock()
 		http.Error(w, fmt.Sprintf("prefill failed: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -542,14 +641,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	logits := pf.Logits
 
 	if params.Stream {
-		s.streamResponse(r.Context(), w, params, promptTokens, logits, wantTools)
+		s.streamResponse(r.Context(), w, params, promptTokens, logits, wantTools, legacy)
 	} else {
-		s.generateResponse(r.Context(), w, params, promptTokens, logits, wantTools)
+		s.generateResponse(r.Context(), w, params, promptTokens, logits, wantTools, legacy)
 	}
 }
 
 func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
-	s.handleChatCompletions(w, r)
+	s.serveCompletions(w, r, true)
 }
 
 func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
@@ -565,11 +664,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status": "ok",
 		"kv_cache": map[string]interface{}{
-			"prefix_hits":     hits,
-			"prefix_misses":   misses,
-			"token_hit_rate":  hitRate,
-			"cached_tokens":   s.engine.NTokens(),
-			"context_size":    s.engine.ContextSize(),
+			"prefix_hits":    hits,
+			"prefix_misses":  misses,
+			"token_hit_rate": hitRate,
+			"cached_tokens":  s.engine.NTokens(),
+			"context_size":   s.engine.ContextSize(),
 		},
 	})
 }
@@ -578,79 +677,50 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 }
 
-// modelTurnOpenNoThink opens an assistant turn and pre-fills an empty thought
-// channel (thinking OFF), so the model skips reasoning and answers directly.
-// modelTurnOpenThink opens the turn WITHOUT closing the thought channel, so the
-// model produces its own <|channel>thought…<channel|> reasoning then the answer.
-const modelTurnOpenNoThink = "<|turn>model\n<|channel>thought\n<channel|>"
-const modelTurnOpenThink = "<|turn>model\n"
-
 // renderChatTemplate builds the gemma-4 prompt. The real vocab uses <|turn> /
 // <turn|> delimiters (NOT <start_of_turn>/<end_of_turn>, which are not tokens).
 // When tools are present they are declared in the (forced) system turn as
 // <|tool>…<tool|> blocks; role:tool messages render as <|tool_response>… blocks.
 // enableThinking gates the gemma-4 reasoning channel (see ChatRequest.resolveThinking).
+//
+// The turn structure lives in internal/chat; this method only injects the
+// tool-specific syntax (declarations, tool_calls re-rendering, tool responses)
+// through the chat.Renderer hooks, keeping all tool logic in this package.
 func (s *Server) renderChatTemplate(messages []ChatMessage, tools []Tool, enableThinking bool) string {
-	var sb strings.Builder
-	modelTurnOpen := modelTurnOpenNoThink
-	if enableThinking {
-		modelTurnOpen = modelTurnOpenThink
+	msgs := make([]chat.Message, len(messages))
+	for i, m := range messages {
+		msgs[i] = chat.Message{Role: m.Role, Content: m.Content}
 	}
 
-	// System turn: merge an explicit system message (if first) with tool decls.
-	// When thinking is on, the gemma-4 template injects a <|think|> marker at the
-	// very top of the (forced) system turn.
-	sysContent := ""
-	start := 0
-	if len(messages) > 0 && messages[0].Role == "system" {
-		sysContent = messages[0].Content
-		start = 1
-	}
-	if sysContent != "" || len(tools) > 0 || enableThinking {
-		sb.WriteString("<|turn>system\n")
-		if enableThinking {
-			sb.WriteString("<|think|>\n")
-		}
-		sb.WriteString(sysContent)
-		if len(tools) > 0 {
-			sb.WriteString(renderToolDeclarations(tools))
-		}
-		sb.WriteString("<turn|>\n")
+	// Tool declarations go inside the forced system turn.
+	sysExtra := ""
+	if len(tools) > 0 {
+		sysExtra = renderToolDeclarations(tools)
 	}
 
-	for i := start; i < len(messages); i++ {
-		msg := messages[i]
-		switch msg.Role {
-		case "system":
-			fmt.Fprintf(&sb, "<|turn>system\n%s<turn|>\n", msg.Content)
-		case "user":
-			fmt.Fprintf(&sb, "<|turn>user\n%s<turn|>\n", msg.Content)
-		case "tool":
-			sb.WriteString(renderToolResponse(msg.Name, msg.Content))
-		case "assistant":
-			if i == len(messages)-1 && len(msg.ToolCalls) == 0 && msg.Content == "" {
-				sb.WriteString(modelTurnOpen)
-			} else {
-				sb.WriteString("<|turn>model\n")
-				sb.WriteString(msg.Content)
-				if len(msg.ToolCalls) > 0 {
-					sb.WriteString(renderAssistantToolCalls(msg.ToolCalls))
-				}
-				sb.WriteString("<turn|>\n")
+	r := chat.Renderer{
+		EnableThinking: enableThinking,
+		SystemExtra:    sysExtra,
+		// Assistant tool_calls are re-rendered inside the model turn.
+		TurnExtra: func(i int) string {
+			if len(messages[i].ToolCalls) > 0 {
+				return renderAssistantToolCalls(messages[i].ToolCalls)
 			}
-		}
+			return ""
+		},
+		// role:"tool" messages render as <|tool_response>… blocks.
+		ToolResponse: func(i int) string {
+			return renderToolResponse(messages[i].Name, messages[i].Content)
+		},
 	}
-	if len(messages) > 0 && messages[len(messages)-1].Role != "assistant" {
-		sb.WriteString(modelTurnOpen)
-	}
-	return sb.String()
+	return r.Render(msgs)
 }
 
-// generateResponse runs non-streaming generation. It assumes the caller holds
-// s.kv.Lock() (acquired in the handler); it releases it when generation ends.
-func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools bool) {
-	defer s.kv.Unlock()
-
+// generateResponse runs non-streaming generation. The caller (handler) is the
+// lock OWNER and holds s.kv.Lock() for the whole request; this function runs
+// under that lock and must NOT release it. When legacy is true it emits the
+// /v1/completions text_completion shape instead of the chat.completion shape.
+func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools, legacy bool) {
 	generated := 0
 	var toks []int32
 	tcEnd := s.tokenizer.ToolCallEnd
@@ -743,6 +813,28 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 		msg.Content = strings.TrimSpace(stripMarkers(rest))
 	}
 
+	if legacy {
+		// Legacy /v1/completions: flatten reasoning + content into the text field.
+		text := msg.Content
+		if msg.ReasoningContent != "" {
+			text = msg.ReasoningContent + text
+		}
+		writeJSON(w, http.StatusOK, CompletionResponse{
+			ID:      fmt.Sprintf("cmpl-%d", time.Now().UnixNano()),
+			Object:  "text_completion",
+			Created: time.Now().Unix(),
+			Model:   s.modelName,
+			Choices: []CompletionChoice{{
+				Index: 0, Text: text, FinishReason: finish,
+			}},
+			Usage: Usage{
+				PromptTokens: promptTokens, CompletionTokens: generated,
+				TotalTokens: promptTokens + generated,
+			},
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, ChatResponse{
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
 		Object:  "chat.completion",
@@ -758,7 +850,12 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 	})
 }
 
-func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools bool) {
+// streamResponse runs streaming generation. The caller (handler) is the lock
+// OWNER and holds s.kv.Lock() for the whole request; this function runs under
+// that lock and must NOT release it. When legacy is true it emits the
+// /v1/completions text_completion stream shape (choices[].text) instead of the
+// chat.completion.chunk shape (choices[].delta).
+func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools, legacy bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -768,20 +865,43 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	defer s.kv.Unlock()
-
 	rng := rand.New(rand.NewSource(params.Seed))
 	generated := 0
-	completionID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	object := "chat.completion.chunk"
+	idPrefix := "chatcmpl"
+	if legacy {
+		object = "text_completion"
+		idPrefix = "cmpl"
+	}
+	completionID := fmt.Sprintf("%s-%d", idPrefix, time.Now().UnixNano())
 	created := time.Now().Unix()
 	genStart := time.Now()
 
-	// Role delta
-	writeSSE(w, StreamResponse{
-		ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
-		Choices: []StreamChoice{{Index: 0, Delta: Delta{Role: "assistant"}}},
-	})
-	flusher.Flush()
+	// emitContent streams a piece of visible text in the right wire shape for the
+	// active endpoint (chat delta vs legacy text).
+	emitContent := func(text string) {
+		if legacy {
+			writeSSE(w, CompletionStreamResponse{
+				ID: completionID, Object: object, Created: created, Model: s.modelName,
+				Choices: []CompletionStreamChoice{{Index: 0, Text: text}},
+			})
+		} else {
+			writeSSE(w, StreamResponse{
+				ID: completionID, Object: object, Created: created, Model: s.modelName,
+				Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: text}}},
+			})
+		}
+		flusher.Flush()
+	}
+
+	// Role delta (chat only; legacy text_completion has no role).
+	if !legacy {
+		writeSSE(w, StreamResponse{
+			ID: completionID, Object: object, Created: created, Model: s.modelName,
+			Choices: []StreamChoice{{Index: 0, Delta: Delta{Role: "assistant"}}},
+		})
+		flusher.Flush()
+	}
 
 	tcOpen := s.tokenizer.ToolCallOpen
 	tcEnd := s.tokenizer.ToolCallEnd
@@ -878,11 +998,16 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 				}
 			}
 			if rtext != "" {
-				writeSSE(w, StreamResponse{
-					ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
-					Choices: []StreamChoice{{Index: 0, Delta: Delta{ReasoningContent: rtext}}},
-				})
-				flusher.Flush()
+				if legacy {
+					// Legacy text_completion has no reasoning channel; fold it into text.
+					emitContent(rtext)
+				} else {
+					writeSSE(w, StreamResponse{
+						ID: completionID, Object: object, Created: created, Model: s.modelName,
+						Choices: []StreamChoice{{Index: 0, Delta: Delta{ReasoningContent: rtext}}},
+					})
+					flusher.Flush()
+				}
 			}
 			if err = advance(); err != nil {
 				break
@@ -905,11 +1030,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 		if len(params.Stop) > 0 {
 			if hit, trimmed := stopHit(emitted.String()+tokenStr, params.Stop); hit {
 				if tail := strings.TrimPrefix(trimmed, emitted.String()); tail != "" {
-					writeSSE(w, StreamResponse{
-						ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
-						Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: tail}}},
-					})
-					flusher.Flush()
+					emitContent(tail)
 				}
 				break
 			}
@@ -917,11 +1038,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 
 		if tokenStr != "" {
 			emitted.WriteString(tokenStr)
-			writeSSE(w, StreamResponse{
-				ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
-				Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: tokenStr}}},
-			})
-			flusher.Flush()
+			emitContent(tokenStr)
 		}
 
 		if err = advance(); err != nil {
@@ -950,15 +1067,24 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	// Final chunk carries finish_reason AND usage so the client can track context
 	// consumption (prompt + completion tokens) on streamed responses, matching the
 	// non-streaming path. OpenAI sends usage on the terminal chunk.
-	writeSSE(w, StreamResponse{
-		ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
-		Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: finish}},
-		Usage: &Usage{
-			PromptTokens:     promptTokens,
-			CompletionTokens: generated,
-			TotalTokens:      promptTokens + generated,
-		},
-	})
+	usage := &Usage{
+		PromptTokens:     promptTokens,
+		CompletionTokens: generated,
+		TotalTokens:      promptTokens + generated,
+	}
+	if legacy {
+		writeSSE(w, CompletionStreamResponse{
+			ID: completionID, Object: object, Created: created, Model: s.modelName,
+			Choices: []CompletionStreamChoice{{Index: 0, Text: "", FinishReason: finish}},
+			Usage:   usage,
+		})
+	} else {
+		writeSSE(w, StreamResponse{
+			ID: completionID, Object: object, Created: created, Model: s.modelName,
+			Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: finish}},
+			Usage:   usage,
+		})
+	}
 	writeDONE(w)
 	flusher.Flush()
 }
@@ -976,146 +1102,22 @@ func (s *Server) logGenSpeed(start time.Time, generated int) {
 }
 
 // sampleToken applies repeat-penalty → temperature → top-k → top-p → min-p →
-// multinomial. Temperature 0 is greedy argmax. The previous implementation used
-// two O(n²) bubble sorts over the full 262144-token vocab per token (~7e10 ops);
-// this sorts once with sort.Slice (O(n log n)) and truncates.
-// topKIndices returns the indices of the k largest values, sorted descending, via
-// a bounded size-k min-heap (single O(V) pass). k<=0 or k>=len → all indices sorted.
-func topKIndices(vals []float64, k int) []int {
-	n := len(vals)
-	if k <= 0 || k >= n {
-		idx := make([]int, n)
-		for i := range idx {
-			idx[i] = i
-		}
-		sort.Slice(idx, func(a, b int) bool { return vals[idx[a]] > vals[idx[b]] })
-		return idx
-	}
-	h := make([]int, 0, k) // min-heap of indices keyed by vals[idx]
-	for i := 0; i < n; i++ {
-		if len(h) < k {
-			h = append(h, i)
-			for j := len(h) - 1; j > 0; {
-				p := (j - 1) / 2
-				if vals[h[p]] <= vals[h[j]] {
-					break
-				}
-				h[p], h[j] = h[j], h[p]
-				j = p
-			}
-		} else if vals[i] > vals[h[0]] {
-			h[0] = i
-			for j := 0; ; {
-				l, r, sm := 2*j+1, 2*j+2, j
-				if l < k && vals[h[l]] < vals[h[sm]] {
-					sm = l
-				}
-				if r < k && vals[h[r]] < vals[h[sm]] {
-					sm = r
-				}
-				if sm == j {
-					break
-				}
-				h[j], h[sm] = h[sm], h[j]
-				j = sm
-			}
-		}
-	}
-	sort.Slice(h, func(a, b int) bool { return vals[h[a]] > vals[h[b]] })
-	return h
-}
-
+// multinomial via the shared sampler package. Temperature 0 is greedy argmax.
+// The repeat penalty operates on the RAW logits BEFORE temperature (llama.cpp
+// semantics); pastTokens are supplied ONLY when a penalty is active. The kv lock
+// is held for the whole request, so CurrentTokens is safe to read here.
 func (s *Server) sampleToken(logits []float32, params GenerationParams, rng *rand.Rand) (int32, error) {
-	if len(logits) == 0 {
-		return 0, fmt.Errorf("empty logits")
-	}
-	if params.Temperature == 0 {
-		return int32(cuda.Argmax(logits)), nil
-	}
-	n := len(logits)
-
-	scaled := make([]float64, n)
-	for i, v := range logits {
-		scaled[i] = float64(v) / params.Temperature
-	}
+	var pastTokens []int32
 	if params.RepeatPenalty != 1.0 {
-		// kv lock is held for the whole request, so CurrentTokens is safe.
-		for _, past := range s.kv.CurrentTokens() {
-			if int(past) >= 0 && int(past) < n {
-				if scaled[past] < 0 {
-					scaled[past] *= params.RepeatPenalty
-				} else {
-					scaled[past] /= params.RepeatPenalty
-				}
-			}
-		}
+		pastTokens = s.kv.CurrentTokens()
 	}
-
-	type cand struct {
-		id int32
-		p  float64
-	}
-
-	// Select the top-k by scaled logit (temperature is monotonic) with a bounded
-	// min-heap — one O(V) pass instead of sorting/allocating over all 262k logits
-	// every token (~30 ms/token otherwise). Top-k disabled → full sort fallback.
-	idx := topKIndices(scaled, params.TopK)
-	maxLogit := scaled[idx[0]] // idx is sorted descending by scaled value
-	cands := make([]cand, len(idx))
-	for i, id := range idx {
-		cands[i] = cand{int32(id), math.Exp(scaled[id] - maxLogit)}
-	}
-
-	// Normalize the (sorted, truncated) candidates.
-	var sum float64
-	for _, c := range cands {
-		sum += c.p
-	}
-	if sum <= 0 {
-		return int32(cuda.Argmax(logits)), nil
-	}
-
-	// Top-p: smallest prefix whose cumulative prob >= TopP.
-	if params.TopP > 0 && params.TopP < 1.0 {
-		cum, cut := 0.0, len(cands)
-		for i := range cands {
-			cum += cands[i].p / sum
-			if cum >= params.TopP {
-				cut = i + 1
-				break
-			}
-		}
-		cands = cands[:cut]
-	}
-
-	// Min-p: drop candidates below MinP * max_prob (cands[0] is the max).
-	if params.MinP > 0 {
-		thresh := params.MinP * cands[0].p
-		keep := 1
-		for i := 1; i < len(cands); i++ {
-			if cands[i].p >= thresh {
-				keep = i + 1
-			} else {
-				break
-			}
-		}
-		cands = cands[:keep]
-	}
-
-	// Draw from the surviving candidates.
-	var z float64
-	for _, c := range cands {
-		z += c.p
-	}
-	r := rng.Float64() * z
-	var acc float64
-	for _, c := range cands {
-		acc += c.p
-		if r <= acc {
-			return c.id, nil
-		}
-	}
-	return cands[len(cands)-1].id, nil
+	return sampler.Sample(logits, sampler.Params{
+		Temperature:   params.Temperature,
+		TopK:          params.TopK,
+		TopP:          params.TopP,
+		MinP:          params.MinP,
+		RepeatPenalty: params.RepeatPenalty,
+	}, rng, pastTokens)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -1161,8 +1163,17 @@ func (s *Server) Start(addr string) error {
 	return s.httpServer.ListenAndServe()
 }
 
+// Stop gracefully shuts the HTTP server down, allowing in-flight requests up to
+// ~10s to finish before forcing connections closed. On timeout or shutdown
+// error it falls back to an immediate Close.
 func (s *Server) Stop() {
-	if s.httpServer != nil {
+	if s.httpServer == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.httpServer.Shutdown(ctx); err != nil {
+		log.Printf("gem4d: graceful shutdown failed (%v), forcing close", err)
 		s.httpServer.Close()
 	}
 }

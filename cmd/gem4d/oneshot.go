@@ -1,0 +1,148 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/mauromedda/gem4d/internal/engine/cuda"
+	"github.com/mauromedda/gem4d/internal/sampler"
+	"github.com/mauromedda/gem4d/internal/tokenizer"
+)
+
+// ─── One-shot prompt ───────────────────────────────────────────────
+
+// runOneShot runs the single-prompt generation path: it resolves the prompt
+// (from -p or -f, optionally prefixed with the system prompt), tokenizes it,
+// and either runs prompt-lookup speculative decode or a plain prefill+decode
+// loop, streaming the result to stdout.
+func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
+	prompt := args.Prompt
+	if args.PromptFile != "" {
+		data, err := os.ReadFile(args.PromptFile)
+		if err != nil {
+			log.Fatalf("gem4d: cannot read prompt file: %v", err)
+		}
+		prompt = string(data)
+	}
+	if prompt == "" {
+		log.Fatalf("gem4d: empty prompt. Use -p or -f")
+	}
+	if args.System != "" {
+		prompt = fmt.Sprintf("System: %s\n\n%s", args.System, prompt)
+	}
+	if tok == nil {
+		log.Fatalf("gem4d: tokenizer not available")
+	}
+
+	// Tokenize
+	tokens := tok.Encode(prompt, true, false)
+	log.Printf("gem4d: prompt has %d tokens", len(tokens))
+
+	// Spec enabled (and no repeat penalty, which the spec path can't apply) →
+	// prompt-lookup speculative decode. Works for greedy AND sampling; the output
+	// distribution is identical to plain decode at the same temperature.
+	if args.Spec && args.RepeatPenalty == 1.0 {
+		nToGen := args.Predict
+		if nToGen < 0 {
+			nToGen = 512
+		}
+		seed := uint64(args.Seed)
+		if args.Seed < 0 {
+			seed = uint64(time.Now().UnixNano())
+		}
+		stops := []int32{tok.EOS, tok.EndOfTurn}
+		genStart := time.Now()
+		out, nAccepted, err := eng.GenerateSpec(tokens, nToGen, stops, args.DraftK,
+			float32(args.Temperature), args.TopK, float32(args.TopP), float32(args.MinP), seed)
+		if err != nil {
+			log.Fatalf("gem4d: spec generate failed: %v", err)
+		}
+		genElapsed := time.Since(genStart)
+		fmt.Print(prompt)
+		for _, t := range out {
+			if tok.IsStop(t) {
+				break
+			}
+			fmt.Print(tok.Decode([]int32{t}))
+		}
+		fmt.Println()
+		genTPS := float64(len(out)) / genElapsed.Seconds()
+		log.Printf("gem4d: [spec] generated %d tokens in %.2fs (%.1f tok/s), "+
+			"%d drafts accepted (avg %.2f tokens/step, draft-k=%d)",
+			len(out), genElapsed.Seconds(), genTPS, nAccepted,
+			float64(len(out))/float64(max(1, len(out)-nAccepted)), args.DraftK)
+		return
+	}
+
+	// Prefill directly (bypass KVCache to isolate any cache bugs)
+	prefillStart := time.Now()
+	logits, err := eng.Prefill(tokens)
+	if err != nil {
+		log.Fatalf("gem4d: prefill failed: %v", err)
+	}
+	prefillElapsed := time.Since(prefillStart)
+	prefillTPS := float64(len(tokens)) / prefillElapsed.Seconds()
+	log.Printf("gem4d: prefill %d tokens in %.2fs (%.1f tok/s)",
+		len(tokens), prefillElapsed.Seconds(), prefillTPS)
+
+	rng := newRNG(args.Seed)
+	nToGenerate := args.Predict
+	if nToGenerate < 0 {
+		nToGenerate = 1 << 20
+	}
+
+	// GPU-side sampling: when no repeat penalty is configured, select each token
+	// on the device and decode without copying the 262k logits to host (4-byte id
+	// instead of 1 MB per token, and no CPU sampling round-trip). Repeat penalty
+	// still needs the host sampler (it edits logits using the token history).
+	gpuSample := args.RepeatPenalty == 1.0
+	temp := float32(args.Temperature)
+
+	fmt.Print(prompt)
+	genStart := time.Now()
+	generated := 0
+	for i := 0; i < nToGenerate; i++ {
+		var token int32
+		var err error
+		if gpuSample {
+			token, err = eng.SampleDevice(temp, args.TopK,
+				float32(args.TopP), float32(args.MinP), float32(rng.Float64()))
+		} else {
+			if logits == nil {
+				break
+			}
+			token, err = sampler.Sample(logits, samplerParams(args), rng, nil)
+		}
+		if err != nil || tok.IsStop(token) {
+			break
+		}
+		fmt.Print(tok.Decode([]int32{token}))
+		if gpuSample {
+			err = eng.DecodeNoCopy(token)
+		} else {
+			logits, err = eng.Decode(token)
+		}
+		if err != nil {
+			break
+		}
+		generated++
+	}
+	genElapsed := time.Since(genStart)
+	fmt.Println()
+
+	genTPS := 0.0
+	if genElapsed.Seconds() > 0 {
+		genTPS = float64(generated) / genElapsed.Seconds()
+	}
+	log.Printf("gem4d: generated %d tokens in %.2fs (%.1f tok/s)",
+		generated, genElapsed.Seconds(), genTPS)
+
+	if args.Timings {
+		eng.PrintTiming()
+		ts := eng.Timing()
+		log.Printf("gem4d: [GPU] prefill %.1f tok/s, decode %.1f tok/s",
+			ts.PrefillTokensPerSec(), ts.DecodeTokensPerSec())
+	}
+}

@@ -1,0 +1,192 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+)
+
+// ─── Command-line flags (llama.cpp style) ─────────────────────────
+
+type CLIArgs struct {
+	// Model
+	ModelPath     string
+	AssistantPath string // Gemma-4 MTP assistant GGUF (official draft head)
+
+	// Inference
+	ContextSize int
+	BatchSize   int
+	Threads     int
+
+	// Sampling
+	Temperature      float64
+	TopK             int
+	TopP             float64
+	MinP             float64
+	Seed             int64
+	RepeatPenalty    float64
+	FrequencyPenalty float64
+	PresencePenalty  float64
+
+	// Generation
+	Prompt     string
+	PromptFile string
+	Predict    int
+	Keep       int
+	NoDisplay  bool
+	Spec       bool
+	DraftK     int
+
+	// Server
+	Host     string
+	Port     int
+	Timeout  int
+	Slots    int
+	Thinking string // gemma-4 reasoning channel default: off/on/low/mid/high/xhigh
+
+	// System
+	System   string
+	Verbose  bool
+	Timings  bool
+	DeviceID int
+	Memory   string
+	Debug    bool
+	LogLevel string
+
+	// Mode
+	Interactive bool
+	Multiline   bool
+	Color       bool
+	Help        bool
+}
+
+// testFlags holds the test-only dispatch flags (--test-parser, --test-cuda,
+// --test-vectors). They live outside CLIArgs because they trigger immediate
+// exit-and-run behavior rather than configuring a normal run.
+type testFlags struct {
+	parser  bool
+	cuda    bool
+	vectors string
+}
+
+// parseArgs is the testable core of flag parsing: it registers every flag on
+// the provided FlagSet and parses argv. It does NOT call os.Exit, does NOT do
+// default-model lookup, and does NOT dispatch test commands — those side
+// effects live in the parseFlags() wrapper. This lets tests drive a fresh
+// FlagSet (e.g. with ContinueOnError) and inspect the result.
+func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
+	var a CLIArgs
+	var t testFlags
+
+	// Defaults matching llama.cpp
+	fs.StringVar(&a.ModelPath, "m", "", "Path to GGUF model file")
+	fs.StringVar(&a.ModelPath, "model", "", "Path to GGUF model file")
+	fs.StringVar(&a.AssistantPath, "assistant", "",
+		"Path to the Gemma-4 MTP assistant GGUF (official draft head; enables draft-mtp speculation)")
+
+	fs.IntVar(&a.ContextSize, "ctx", 4096, "Context size in tokens")
+	fs.IntVar(&a.ContextSize, "c", 4096, "Context size (short)")
+	fs.IntVar(&a.BatchSize, "batch-size", 2048, "Logical maximum batch size")
+	fs.IntVar(&a.Threads, "threads", 8, "Number of CPU threads for preprocessing")
+
+	fs.BoolVar(&a.Spec, "spec", true, "Prompt-lookup speculative decoding (greedy/temp=0 only)")
+	fs.IntVar(&a.DraftK, "draft-k", 6, "Max speculative draft length per step")
+	// Defaults follow the google/gemma-4-12B model card's standardized sampling
+	// configuration (temperature 1.0, top_p 0.95, top_k 64; no min-p). The GGUF
+	// embeds the same values in general.sampling.{temp,top_k,top_p}.
+	fs.Float64Var(&a.Temperature, "temp", 1.0, "Sampling temperature (gemma-4 default 1.0)")
+	fs.IntVar(&a.TopK, "top-k", 64, "Top-K sampling (gemma-4 default 64)")
+	fs.Float64Var(&a.TopP, "top-p", 0.95, "Top-P sampling (gemma-4 default 0.95)")
+	fs.Float64Var(&a.MinP, "min-p", 0.0, "Min-P sampling (gemma-4 default off)")
+	fs.Int64Var(&a.Seed, "seed", -1, "Random seed (-1 = random)")
+	fs.Float64Var(&a.RepeatPenalty, "repeat-penalty", 1.0, "Repeat penalty (gemma-4 default: off)")
+	fs.Float64Var(&a.FrequencyPenalty, "frequency-penalty", 0.0, "Frequency penalty")
+	fs.Float64Var(&a.PresencePenalty, "presence-penalty", 0.0, "Presence penalty")
+
+	fs.StringVar(&a.Prompt, "p", "", "Prompt string")
+	fs.StringVar(&a.Prompt, "prompt", "", "Prompt string")
+	fs.StringVar(&a.PromptFile, "f", "", "Prompt file")
+	fs.StringVar(&a.PromptFile, "file", "", "Prompt file")
+	fs.IntVar(&a.Predict, "n", 512, "Number of tokens to predict (-1 = infinite)")
+	fs.IntVar(&a.Predict, "predict", 512, "Number of tokens to predict")
+
+	fs.StringVar(&a.Host, "host", "127.0.0.1", "Server listen address")
+	fs.IntVar(&a.Port, "port", 8080, "Server port")
+	fs.IntVar(&a.Timeout, "timeout", 600, "Request timeout in seconds")
+	fs.IntVar(&a.Slots, "n-slots", 1, "Number of processing slots")
+	fs.StringVar(&a.Thinking, "thinking", "off",
+		"Default gemma-4 reasoning channel: off|on|low|mid|high|xhigh (per-request reasoning_effort overrides)")
+
+	fs.StringVar(&a.System, "s", "", "System prompt")
+	fs.StringVar(&a.System, "system", "", "System prompt")
+	fs.BoolVar(&a.Verbose, "v", false, "Verbose output")
+	fs.BoolVar(&a.Verbose, "verbose", false, "Verbose output")
+	fs.BoolVar(&a.Timings, "timings", false, "Show timing information")
+	fs.BoolVar(&a.Debug, "debug", false, "Dump full request bodies + rendered prompts to "+"/tmp/gem4d_debug.log")
+	fs.StringVar(&a.LogLevel, "log-level", "info", "Log level: info|debug (debug also dumps requests)")
+	fs.IntVar(&a.DeviceID, "cuda-device", 0, "CUDA device ID")
+	fs.StringVar(&a.Memory, "mlock", "", "mlock model in memory (unused on CUDA)")
+
+	fs.BoolVar(&a.Interactive, "interactive-first", false, "Force interactive mode")
+	fs.BoolVar(&a.Interactive, "interactive", false, "Force interactive mode")
+	fs.BoolVar(&a.Color, "color", false, "Color output")
+
+	fs.BoolVar(&a.Help, "h", false, "Show help")
+	fs.BoolVar(&a.Help, "help", false, "Show help")
+
+	// Test flags
+	fs.BoolVar(&t.parser, "test-parser", false, "Run tokenizer tests and exit")
+	fs.BoolVar(&t.cuda, "test-cuda", false, "Run CUDA tests and exit")
+	fs.StringVar(&t.vectors, "test-vectors", "", "Run test vectors from file")
+
+	if err := fs.Parse(argv); err != nil {
+		return a, t, err
+	}
+	return a, t, nil
+}
+
+// parseFlags preserves the exact original behavior: it parses os.Args using the
+// global flag.CommandLine (ExitOnError), then performs --help exit, default
+// model lookup, and test-flag dispatch — all of which may call os.Exit.
+func parseFlags() CLIArgs {
+	a, t, err := parseArgs(flag.CommandLine, os.Args[1:])
+	if err != nil {
+		// flag.CommandLine uses ExitOnError, so a parse error already exited;
+		// this guard only fires if that policy ever changes.
+		os.Exit(2)
+	}
+
+	if a.Help {
+		printUsage()
+		os.Exit(0)
+	}
+
+	// Model is required unless running tests
+	if a.ModelPath == "" && !t.parser && !t.cuda && t.vectors == "" {
+		// Check default locations
+		for _, p := range []string{"./gemma-4-12b-it.gguf", "./model.gguf", "./gguf/model.gguf"} {
+			if _, err := os.Stat(p); err == nil {
+				a.ModelPath = p
+				break
+			}
+		}
+		if a.ModelPath == "" {
+			fmt.Fprintf(os.Stderr, "error: no model specified. Use -m <model.gguf>\n\n")
+			printUsage()
+			os.Exit(1)
+		}
+	}
+
+	// Handle test flags
+	if t.parser {
+		os.Exit(runTestParser())
+	}
+	if t.cuda {
+		os.Exit(runTestCUDA())
+	}
+	if t.vectors != "" {
+		os.Exit(runTestVectors(t.vectors))
+	}
+
+	return a
+}

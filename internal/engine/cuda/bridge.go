@@ -19,31 +19,20 @@ import (
 	"unsafe"
 )
 
-// TensorFormat represents the weight storage format (C enum).
-type TensorFormat int
-
-const (
-	FormatFP8  TensorFormat = 0 // C.FORMAT_FP8
-	FormatQ8_0 TensorFormat = 1 // C.FORMAT_Q8_0
-)
-
 // Engine wraps the C inference engine.
 type Engine struct {
 	mu   sync.Mutex
 	ptr  *C.gemma4_engine_t
 	ctx  uint32
 	path string
-	fmt  TensorFormat
 }
 
-// Config holds engine configuration matching llama.cpp-style CLI flags.
+// Config holds engine configuration. The weight format (Q4_0-QAT or Q8_0) is
+// auto-detected from the GGUF tensor table; other formats are rejected at load.
 type Config struct {
-	ModelPath   string       // -m, --model
-	LoraPath    string       // --lora-scaled
-	LoraScale   float64      // optional scale for LoRA
-	Format      TensorFormat // --memory-format (fp8 or q8_0)
-	ContextSize uint32       // --ctx
-	DeviceID    int          // --cuda-device
+	ModelPath   string // -m, --model
+	ContextSize uint32 // --ctx
+	DeviceID    int    // --cuda-device
 }
 
 // NewEngine creates and initializes the CUDA inference engine.
@@ -62,7 +51,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 
 	ptr := C.gemma4_engine_create(
 		cPath,
-		(C.tensor_format_t)(cfg.Format), // cast tensor_format_t enum
+		C.FORMAT_Q8_0, // placeholder — the engine auto-detects Q4_0/Q8_0 from the GGUF
 		C.uint32_t(ctxSize),
 		C.int(cfg.DeviceID),
 	)
@@ -74,25 +63,23 @@ func NewEngine(cfg Config) (*Engine, error) {
 		ptr:  ptr,
 		ctx:  ctxSize,
 		path: cfg.ModelPath,
-		fmt:  cfg.Format,
-	}
-
-	// Load LoRA if specified
-	if cfg.LoraPath != "" {
-		scale := float32(cfg.LoraScale)
-		if scale == 0 {
-			scale = 1.0
-		}
-		cLora := C.CString(cfg.LoraPath)
-		ret := C.gemma4_engine_load_lora(ptr, cLora, C.float(scale))
-		C.free(unsafe.Pointer(cLora))
-		if ret != 0 {
-			eng.Close()
-			return nil, fmt.Errorf("gem4d: LoRA loading failed for %s", cfg.LoraPath)
-		}
 	}
 
 	return eng, nil
+}
+
+// LoadAssistant loads the official Gemma-4 MTP assistant GGUF (~423M draft head).
+// When loaded, speculative decoding drafts novel text with it (multi-token prediction
+// over the shared target KV cache) — the llama.cpp --spec-type draft-mtp equivalent.
+func (e *Engine) LoadAssistant(path string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	if C.gemma4_engine_load_assistant(e.ptr, cPath) != 0 {
+		return fmt.Errorf("gem4d: assistant load failed for %s", path)
+	}
+	return nil
 }
 
 // Close destroys the engine and frees all GPU resources.
@@ -107,8 +94,7 @@ func (e *Engine) Close() {
 
 // Info returns a formatted string with engine information.
 func (e *Engine) Info() string {
-	return fmt.Sprintf("%s (%d ctx, format=%d, device=%d)",
-		e.path, e.ctx, e.fmt, 0)
+	return fmt.Sprintf("%s (%d ctx, device=%d)", e.path, e.ctx, 0)
 }
 
 // PrintInfo prints engine configuration to stderr.
@@ -123,13 +109,6 @@ func (e *Engine) PrintTiming() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	C.gemma4_engine_print_timing(e.ptr)
-}
-
-// HasLoRA reports whether the engine has loaded LoRA adapters.
-func (e *Engine) HasLoRA() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return C.gemma4_engine_has_lora(e.ptr) != 0
 }
 
 // Prefill processes a batch of tokens (sequential) and fills the KV cache.

@@ -1,0 +1,30 @@
+# ─── gem4d build artifacts ───────────────────────────────────────────────
+# Compiled binary (built via `make gem4d`)
+/gem4d
+
+# CUDA object / archive artifacts (built via `make lib`)
+cuda/*.o
+cuda/*.a
+cuda/test_engine
+
+# ─── Profiling output ─────────────────────────────────────────────────────
+# nsys / Nsight Systems profiles
+*.nsys-rep
+*.qdrep
+gem4d_profile*
+
+# ─── Test scratch ─────────────────────────────────────────────────────────
+tests/vectors/tmp/
+tests/test_parser
+
+# ─── Standard Go cruft ────────────────────────────────────────────────────
+*.test
+*.out
+*.prof
+*.exe
+*.dll
+*.so
+*.dylib
+coverage.out
+coverage.html
+__debug_bin*
