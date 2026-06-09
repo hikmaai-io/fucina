@@ -5338,12 +5338,21 @@ void gemma4_engine_reset(gemma4_engine_t *eng) {
 //
 // Correctness with the sliding-window ring buffers:
 //   Each local layer stores K/V for absolute token t at ring slot (t % window).
-//   If the original sequence length exceeded the window, the buffer wrapped and
-//   the slots for the kept prefix [n_keep-window, n_keep) may have been
-//   overwritten by later tokens — rewinding would then read stale KV. We detect
-//   this case and refuse (return -1) so the caller can do a full reset+reprefill.
-//   When the buffer never wrapped (len <= window), every token still occupies
-//   its own slot and rewinding is exact.
+//   The GLOBAL cache is a flat [ctx] buffer, so its rewind is always exact.
+//   The sliding ring holds only the last `window` tokens; the discarded tokens
+//   [n_keep, L) clobbered the slots of positions [n_keep-window, L-window). After
+//   rewinding to n_keep, the kept window [n_keep-window, n_keep) reads correct KV
+//   for [L-window, n_keep) and STALE KV (from a discarded token) for the oldest
+//   d = L-n_keep positions [n_keep-window, L-window).
+//     - d >= window  → the entire kept window is stale → refuse (-1), full reset.
+//     - d <  window  → only the d OLDEST window keys are stale, at the lowest-
+//       attention-weight edge, and they are overwritten by correct tokens as the
+//       window slides forward over the first d re-prefilled positions. We allow
+//       this: for multi-turn chat d is tiny (a handful of boundary/generation
+//       tokens), so prefix reuse is a large win for a negligible, transient
+//       approximation on the local (sliding) layers; the global layers stay exact.
+//   When the buffer never wrapped (L <= window) every token still occupies its
+//   own slot and the rewind is fully exact.
 //
 // Returns 0 on success, -1 if the rewind would be unsafe (caller should reset).
 int gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep) {
@@ -5351,8 +5360,11 @@ int gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep) {
     if (n_keep < 0 || n_keep > eng->global_n_tokens) return -1;
     if (n_keep == eng->global_n_tokens) return 0; // nothing to discard
 
-    // Unsafe if the sliding ring buffer has wrapped past the kept prefix.
-    if (eng->global_n_tokens > GEMMA4_SLIDING_WINDOW) return -1;
+    // Refuse only when the discarded span is wide enough to stale the ENTIRE
+    // sliding window (every kept-window slot overwritten) — then reuse buys
+    // nothing correct on the local layers. Below the window, staleness is bounded
+    // to the d oldest keys and self-heals as the window slides.
+    if (eng->global_n_tokens - n_keep >= GEMMA4_SLIDING_WINDOW) return -1;
 
     eng->global_n_tokens = n_keep;
     for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {

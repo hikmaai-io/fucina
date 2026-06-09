@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -254,6 +255,9 @@ func main() {
 		// Server mode
 		addr := fmt.Sprintf("%s:%d", args.Host, args.Port)
 		srv := gemserver.New(eng, tok)
+		// Report a quantization-aware model id (GGUF basename minus extension), e.g.
+		// gemma-4-12b-it-qat-q4_0, so clients can see which build/quant they hit.
+		srv.SetModelName(strings.TrimSuffix(filepath.Base(args.ModelPath), ".gguf"))
 
 		// Handle graceful shutdown
 		sigCh := make(chan os.Signal, 1)

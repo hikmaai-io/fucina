@@ -200,6 +200,7 @@ type StreamResponse struct {
 	Created int64          `json:"created"`
 	Model   string         `json:"model"`
 	Choices []StreamChoice `json:"choices"`
+	Usage   *Usage         `json:"usage,omitempty"` // sent on the final chunk for context tracking
 }
 
 type ModelsResponse struct {
@@ -208,9 +209,10 @@ type ModelsResponse struct {
 }
 
 type ModelInfo struct {
-	ID     string `json:"id"`
-	Object string `json:"object"`
-	Owner  string `json:"created"`
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`         // unix seconds (OpenAI clients type this as int)
+	OwnedBy string `json:"owned_by"`
 }
 
 func DefaultParams() GenerationParams {
@@ -241,19 +243,59 @@ func New(eng *cuda.Engine, tok *tokenizer.Tokenizer) *Server {
 	}
 }
 
+// SetModelName overrides the id reported by /v1/models and echoed in responses.
+// Callers pass a quantization-aware id (e.g. derived from the GGUF filename) so
+// clients can tell which build they are talking to.
+func (s *Server) SetModelName(name string) {
+	if name != "" {
+		s.modelName = name
+	}
+}
+
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/v1/models", s.handleModels)
-	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
-	mux.HandleFunc("/v1/completions", s.handleCompletions)
-	mux.HandleFunc("/v1/embeddings", s.handleEmbeddings)
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/", s.handleNotFound)
+	h := func(f http.HandlerFunc) http.HandlerFunc { return logRequest(f) }
+	mux.HandleFunc("/v1/models", h(s.handleModels))
+	mux.HandleFunc("/v1/chat/completions", h(s.handleChatCompletions))
+	mux.HandleFunc("/v1/completions", h(s.handleCompletions))
+	mux.HandleFunc("/v1/embeddings", h(s.handleEmbeddings))
+	mux.HandleFunc("/health", h(s.handleHealth))
+	mux.HandleFunc("/", h(s.handleNotFound))
+}
+
+// statusRecorder captures the response status so the access log can report it.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) { r.status = code; r.ResponseWriter.WriteHeader(code) }
+
+// Flush/Hijack are needed because the streaming handler type-asserts http.Flusher.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// logRequest logs each HTTP request's method, path, status, and duration so that
+// client failures (4xx/5xx from clients like pi) are visible — the handlers return
+// errors via http.Error without logging, which otherwise leaves silent failures.
+func logRequest(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: 200}
+		start := time.Now()
+		next(rec, r)
+		log.Printf("gem4d: %s %s -> %d (%.0fms)",
+			r.Method, r.URL.Path, rec.status, float64(time.Since(start).Microseconds())/1000.0)
+	}
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ModelsResponse{
 		Object: "list",
-		Data:   []ModelInfo{{ID: s.modelName, Object: "model", Owner: "google"}},
+		Data: []ModelInfo{{
+			ID: s.modelName, Object: "model", Created: time.Now().Unix(), OwnedBy: "google",
+		}},
 	})
 }
 
@@ -590,23 +632,48 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	var rawToks []int32         // ALL generated ids (markers included) for tool parsing
 	inTool := false             // currently inside a <|tool_call> … <tool_call|> span
 	inChannel := false          // currently inside a <|channel> … <channel|> reasoning span
+
+	// GPU-side sampling (when no repeat penalty): pick each token on the device and
+	// advance with DecodeNoCopy — only a 4-byte id crosses to host instead of the
+	// 262k-float logits copy + Go allocation + CPU sort every token. This is what
+	// makes streamed decode as fast as the CLI's fast path (~2× the host-sampler
+	// loop). Repeat penalty edits logits from history, so it still needs the host
+	// sampler. The first token samples from the prefill's resident GPU logits.
+	gpuSample := params.RepeatPenalty == 1.0
+	temp := float32(params.Temperature)
 	for generated < params.MaxTokens {
-		if logits == nil {
-			break
-		}
 		// Honor client cancellation ("steering"): if pi aborts the request, stop
 		// generating immediately and release the KV lock for the next turn.
 		if ctx.Err() != nil {
 			finish = "cancelled"
 			break
 		}
-		token, err := s.sampleToken(logits, params, rng)
+		var token int32
+		var err error
+		if gpuSample {
+			token, err = s.engine.SampleDevice(temp, params.TopK,
+				float32(params.TopP), float32(params.MinP), float32(rng.Float64()))
+		} else {
+			if logits == nil {
+				break
+			}
+			token, err = s.sampleToken(logits, params, rng)
+		}
 		if err != nil || s.tokenizer.IsStop(token) {
 			break
 		}
 		rawToks = append(rawToks, token)
 		s.kv.AppendDecoded(token)
 		generated++
+
+		// advance steps to the next token (GPU: leave logits on device; CPU: copy).
+		advance := func() error {
+			if gpuSample {
+				return s.engine.DecodeNoCopy(token)
+			}
+			logits, err = s.engine.Decode(token)
+			return err
+		}
 
 		// Tool-call handling: when the model opens a call, stop streaming content
 		// and buffer until the call closes — we emit it as a structured tool_calls
@@ -618,7 +685,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 			if tcEnd >= 0 && token == tcEnd {
 				break // complete tool call captured
 			}
-			if logits, err = s.engine.Decode(token); err != nil {
+			if err = advance(); err != nil {
 				break
 			}
 			continue
@@ -633,7 +700,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 			if chEnd >= 0 && token == chEnd {
 				inChannel = false
 			}
-			if logits, err = s.engine.Decode(token); err != nil {
+			if err = advance(); err != nil {
 				break
 			}
 			continue
@@ -641,7 +708,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 
 		// Never stream the gemma tool/string markers to the client as visible text.
 		if s.tokenizer.IsToolMarker(token) {
-			if logits, err = s.engine.Decode(token); err != nil {
+			if err = advance(); err != nil {
 				break
 			}
 			continue
@@ -673,7 +740,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 			flusher.Flush()
 		}
 
-		if logits, err = s.engine.Decode(token); err != nil {
+		if err = advance(); err != nil {
 			break
 		}
 	}
@@ -696,9 +763,17 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 
 	logGenSpeed(genStart, generated)
 
+	// Final chunk carries finish_reason AND usage so the client can track context
+	// consumption (prompt + completion tokens) on streamed responses, matching the
+	// non-streaming path. OpenAI sends usage on the terminal chunk.
 	writeSSE(w, StreamResponse{
 		ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
 		Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: finish}},
+		Usage: &Usage{
+			PromptTokens:     promptTokens,
+			CompletionTokens: generated,
+			TotalTokens:      promptTokens + generated,
+		},
 	})
 	writeDONE(w)
 	flusher.Flush()
