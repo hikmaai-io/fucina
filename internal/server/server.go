@@ -293,8 +293,11 @@ func DefaultParams() GenerationParams {
 		RepeatPenalty:   1.0,
 		FrequencyPenalty: 0.0,
 		PresencePenalty: 0.0,
-		MaxTokens:       512,
-		Stream:          false,
+		// Generous completion cap for when a client omits max_tokens (pi does): the
+		// model stops at EOS/end-of-turn on its own; 512 truncated agent turns
+		// (reasoning + answer) mid-output. This is only a safety bound on runaways.
+		MaxTokens: 8192,
+		Stream:    false,
 	}
 }
 
@@ -455,8 +458,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.Seed != nil {
 		params.Seed = *req.Seed
 	}
+	ctx := int(s.engine.ContextSize())
 	if req.MaxTokens > 0 {
-		params.MaxTokens = req.MaxTokens
+		params.MaxTokens = req.MaxTokens // explicit client cap
+	} else {
+		// No client cap (pi omits max_tokens): generate until EOS or the context
+		// fills — matching llama.cpp (n_predict = -1, "no limit") and vLLM (defaults
+		// max_tokens to max_model_len - prompt_tokens). Cap to the space left after
+		// the prompt; the model stops at end-of-turn on its own well before this.
+		params.MaxTokens = ctx - len(tokens)
+		if params.MaxTokens < 1 {
+			params.MaxTokens = 1
+		}
 	}
 	params.Stream = req.Stream
 	params.Stop = req.Stop
@@ -466,7 +479,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// by trimming the OLDEST prompt tokens when the two together would overflow.
 	// We keep the most recent tokens (the live turn) which is what matters for a
 	// coding agent; a leading BOS is preserved so the sequence stays well-formed.
-	ctx := int(s.engine.ContextSize())
 	if budget := ctx - params.MaxTokens; budget > 0 && len(tokens) > budget {
 		dropped := len(tokens) - budget
 		kept := tokens[dropped:]
@@ -757,14 +769,11 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	inChannel := false          // currently inside a <|channel> … <channel|> reasoning span
 	channelLabel := false       // still skipping the "thought" label at a channel's start
 
-	// GPU-side sampling (4-byte id back, no 262k logits copy) — used ONLY for greedy
-	// (temp<=0, device argmax), which is fast and verified clean. The device kernel's
-	// temperature/top-k/top-p path (sample_logits_kernel, temp>0) produces degenerate
-	// output, so for temp>0 we fall back to the host sampler (the same one the
-	// non-streaming spec path uses correctly at temp 1.0). Repeat penalty also needs
-	// the host sampler. TODO: fix the GPU temp>0 sampler to restore fast sampled
-	// streaming. The first greedy token samples from the prefill's resident logits.
-	gpuSample := params.RepeatPenalty == 1.0 && params.Temperature <= 0.0
+	// GPU-side sampling (4-byte id back, no 262k logits copy).  Used whenever repeat
+	// penalty is off (the GPU sampler cannot apply it).  The device sampler handles
+	// temp=0 (argmax) and temp>0 (temperature / top-k / top-p / min-p / multinomial)
+	// correctly — the binary-search threshold bug was fixed (sHi instead of sLo).
+	gpuSample := params.RepeatPenalty == 1.0
 	temp := float32(params.Temperature)
 	for generated < params.MaxTokens {
 		// Honor client cancellation ("steering"): if pi aborts the request, stop

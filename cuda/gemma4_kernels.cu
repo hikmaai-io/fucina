@@ -4934,7 +4934,10 @@ __global__ void sample_logits_kernel(
             if (tid == 0) { if ((int)cf > top_k) sLo = mid; else sHi = mid; }
             __syncthreads();
         }
-        if (tid == 0) sThr = sLo;
+        // sHi guarantees count ≤ top_k (≤ SAMP_MAXK), so every candidate fits
+        // in the gather buffer — no random truncation.  sLo would admit MORE than
+        // top_k, risking loss of true top-K tokens when count >> SAMP_MAXK.
+        if (tid == 0) sThr = sHi;
     } else if (tid == 0) sThr = -INFINITY;
     __syncthreads();
     float thr = sThr;
