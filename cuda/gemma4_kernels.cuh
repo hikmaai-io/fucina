@@ -44,6 +44,14 @@
 #define GEMMA4_RMS_EPS           1e-6f
 #define GEMMA4_MAX_LORA_RANK     64
 #define GEMMA4_SPEC_MAX          16      // max draft length per batched-decode pass
+// GQA-broadcast global flash-decode split-K (DECODE-30-35 Step 1): the global context is
+// split into ≤MAX_SPLITS blocks of ~SPLIT_CHUNK timesteps so the single global KV head still
+// saturates bandwidth across SMs while being read only ONCE per token (not n_heads× = 16×).
+#define GEMMA4_GLOBAL_MAX_SPLITS 128
+#define GEMMA4_GLOBAL_SPLIT_CHUNK 256
+// Self-spec layer-skip drafter (DECODE-30-35 Steps 6/7): the vocab-trim draft head considers at
+// most this many candidate tokens (the unique most-recent history tokens) per draft step.
+#define GEMMA4_SELFSPEC_CANDS    512
 
 // Special tokens
 #define GEMMA4_BOS_ID  2
@@ -56,6 +64,8 @@ typedef enum {
     FORMAT_FP8   = 0,  // CUDA_R_8F_E4M3 (primary, native Blackwell)
     FORMAT_Q8_0  = 1,  // GGML Q8_0 blocks (fallback)
     FORMAT_Q4_0  = 2,  // GGML Q4_0 blocks (QAT 4-bit; layers Q4_0, token_embd→Q8_0)
+    FORMAT_Q6_K  = 3,  // GGML Q6_K super-blocks (used only as a wfmt override for the native
+                       // QAT tied LM head — DECODE-30-35 Step 8; not a whole-model format)
 } tensor_format_t;
 
 // ─── GGML Q8_0 block ──────────────────────────────────────────────────
