@@ -279,6 +279,58 @@ func parseOneCall(body string) (ToolCall, bool) {
 	}, true
 }
 
+// markerStripper removes the gemma-4 control-marker literals that DecodeRaw emits
+// (it keeps them so tool/channel structure survives parsing). Applied to plain
+// answer text after reasoning + tool calls have been extracted.
+var markerStripper = strings.NewReplacer(
+	"<|turn>", "", "<turn|>", "",
+	"<|channel>", "", "<channel|>", "",
+	"<|tool>", "", "<tool|>", "",
+	"<|tool_call>", "", "<tool_call|>", "",
+	"<|tool_response>", "", "<tool_response|>", "",
+	"<|think|>", "", `<|"|>`, "",
+)
+
+func stripMarkers(s string) string { return markerStripper.Replace(s) }
+
+// splitReasoning separates the gemma-4 thought channel from the answer in RAW
+// decoded output (markers intact). It returns (reasoning, rest): reasoning is the
+// concatenated <|channel>thought…<channel|> payloads with the leading channel
+// label ("thought\n") stripped; rest is everything outside the channels (the
+// answer, still containing any tool-call markers for the caller to parse). An
+// unterminated channel (generation hit the token limit mid-thought) contributes
+// its partial payload to reasoning and leaves rest empty.
+func splitReasoning(s string) (reasoning, rest string) {
+	var rsb, osb strings.Builder
+	for {
+		o := strings.Index(s, "<|channel>")
+		if o < 0 {
+			osb.WriteString(s)
+			break
+		}
+		osb.WriteString(s[:o])
+		s = s[o+len("<|channel>"):]
+		e := strings.Index(s, "<channel|>")
+		var payload string
+		if e < 0 { // unterminated: rest of output is reasoning
+			payload = s
+			s = ""
+		} else {
+			payload = s[:e]
+			s = s[e+len("<channel|>"):]
+		}
+		// Drop the channel label (e.g. "thought\n") — the text up to the first newline.
+		if nl := strings.IndexByte(payload, '\n'); nl >= 0 {
+			payload = payload[nl+1:]
+		}
+		rsb.WriteString(payload)
+		if e < 0 {
+			break
+		}
+	}
+	return strings.TrimSpace(rsb.String()), osb.String()
+}
+
 // stripChannels removes complete <|channel>…<channel|> blocks and any stray
 // <channel|> markers from the text.
 func stripChannels(s string) string {

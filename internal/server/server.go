@@ -22,10 +22,11 @@ import (
 type Server struct {
 	engine    *cuda.Engine
 	tokenizer *tokenizer.Tokenizer
-	kv           *KVCache
-	modelName    string
-	genParams    GenerationParams
-	httpServer   *http.Server
+	kv              *KVCache
+	modelName       string
+	genParams       GenerationParams
+	thinkingDefault bool // startup default for the gemma-4 reasoning channel
+	httpServer      *http.Server
 }
 
 type GenerationParams struct {
@@ -43,11 +44,12 @@ type GenerationParams struct {
 }
 
 type ChatMessage struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"` // gemma-4 thought channel
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Name             string     `json:"name,omitempty"`
 }
 
 // contentPart is one element of the OpenAI "content parts" array form, e.g.
@@ -111,6 +113,66 @@ type ChatRequest struct {
 	Stop        StopField       `json:"stop,omitempty"`
 	Tools       []Tool          `json:"tools,omitempty"`
 	ToolChoice  interface{}     `json:"tool_choice,omitempty"`
+
+	// Thinking / reasoning control. gemma-4 gates a reasoning channel: when
+	// enabled the model emits a <|channel>thought…<channel|> block before its
+	// answer; when disabled the template pre-closes an empty thought channel so
+	// the model answers directly. Accepted forms (first non-empty wins):
+	//   reasoning_effort: OpenAI standard string — "none"/"minimal" → off,
+	//                     "low"/"medium"/"high" → on.
+	//   thinking / enable_thinking: explicit bool.
+	//   chat_template_kwargs.enable_thinking: bool (HF/vLLM convention, what pi sends).
+	ReasoningEffort  string          `json:"reasoning_effort,omitempty"`
+	Thinking         *bool           `json:"thinking,omitempty"`
+	EnableThinking   *bool           `json:"enable_thinking,omitempty"`
+	ChatTemplateArgs json.RawMessage `json:"chat_template_kwargs,omitempty"`
+}
+
+// resolveThinking decides whether the gemma-4 reasoning channel is enabled for
+// THIS request. Precedence: explicit bools > chat_template_kwargs.enable_thinking
+// > reasoning_effort string. Returns nil when the request says nothing about
+// thinking, so the caller falls back to the server's startup default.
+//
+// gemma-4's native reasoning control is binary (enable_thinking on/off), so the
+// graded effort levels collapse to on/off: "none"/"minimal"/"off" → off, and
+// "low"/"medium"/"high"/"xhigh"/"max"/"on" → on.
+func (r *ChatRequest) resolveThinking() *bool {
+	if r.Thinking != nil {
+		return r.Thinking
+	}
+	if r.EnableThinking != nil {
+		return r.EnableThinking
+	}
+	if len(r.ChatTemplateArgs) > 0 {
+		var kw struct {
+			EnableThinking *bool `json:"enable_thinking"`
+		}
+		if json.Unmarshal(r.ChatTemplateArgs, &kw) == nil && kw.EnableThinking != nil {
+			return kw.EnableThinking
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(r.ReasoningEffort)) {
+	case "none", "minimal", "off", "false", "no":
+		return boolPtr(false)
+	case "low", "medium", "mid", "high", "xhigh", "max", "on", "true", "yes":
+		return boolPtr(true)
+	}
+	return nil // unspecified → use the server default
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// ParseThinkingLevel maps a startup/CLI thinking level to the binary gemma-4
+// enable_thinking flag. Accepts off/on plus the graded aliases (which collapse to
+// on, since the model's native control is binary). Unknown → off.
+func ParseThinkingLevel(level string) bool {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "", "none", "minimal", "off", "false", "no", "0":
+		return false
+	case "low", "medium", "mid", "high", "xhigh", "max", "on", "true", "yes", "1":
+		return true
+	}
+	return false
 }
 
 // StopField accepts the OpenAI `stop` parameter in either form: a single string
@@ -173,9 +235,10 @@ type Usage struct {
 }
 
 type Delta struct {
-	Role      string          `json:"role,omitempty"`
-	Content   string          `json:"content,omitempty"`
-	ToolCalls []DeltaToolCall `json:"tool_calls,omitempty"`
+	Role             string          `json:"role,omitempty"`
+	Content          string          `json:"content,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"` // gemma-4 thought channel
+	ToolCalls        []DeltaToolCall `json:"tool_calls,omitempty"`
 }
 
 // DeltaToolCall is the streaming form of a tool call. It carries the array
@@ -252,6 +315,10 @@ func (s *Server) SetModelName(name string) {
 	}
 }
 
+// SetThinkingDefault sets the startup default for the gemma-4 reasoning channel.
+// Per-request reasoning_effort / thinking / enable_thinking overrides it.
+func (s *Server) SetThinkingDefault(on bool) { s.thinkingDefault = on }
+
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	h := func(f http.HandlerFunc) http.HandlerFunc { return logRequest(f) }
 	mux.HandleFunc("/v1/models", h(s.handleModels))
@@ -318,12 +385,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Build the prompt. /v1/completions sends a raw `prompt`; /v1/chat/completions
 	// sends `messages` that we render into the gemma-4 chat template.
 	wantTools := len(req.Tools) > 0 && !isToolChoiceNone(req.ToolChoice)
+	// Thinking: per-request override (reasoning_effort/thinking/enable_thinking)
+	// falls back to the server's startup default when the request is silent.
+	enableThinking := s.thinkingDefault
+	if t := req.resolveThinking(); t != nil {
+		enableThinking = *t
+	}
 	var prompt string
 	if legacy := req.legacyPrompt(); legacy != "" {
 		prompt = legacy
 		wantTools = false // raw-completions mode never emits structured tool calls
 	} else {
-		prompt = s.renderChatTemplate(req.Messages, req.Tools)
+		prompt = s.renderChatTemplate(req.Messages, req.Tools, enableThinking)
 	}
 	if prompt == "" {
 		http.Error(w, "empty prompt", http.StatusBadRequest)
@@ -437,26 +510,39 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 }
 
-// modelTurnOpen opens an assistant turn and pre-fills an empty thought channel
-// (thinking disabled by default), so the model does not stream its reasoning.
-const modelTurnOpen = "<|turn>model\n<|channel>thought\n<channel|>"
+// modelTurnOpenNoThink opens an assistant turn and pre-fills an empty thought
+// channel (thinking OFF), so the model skips reasoning and answers directly.
+// modelTurnOpenThink opens the turn WITHOUT closing the thought channel, so the
+// model produces its own <|channel>thought…<channel|> reasoning then the answer.
+const modelTurnOpenNoThink = "<|turn>model\n<|channel>thought\n<channel|>"
+const modelTurnOpenThink = "<|turn>model\n"
 
 // renderChatTemplate builds the gemma-4 prompt. The real vocab uses <|turn> /
 // <turn|> delimiters (NOT <start_of_turn>/<end_of_turn>, which are not tokens).
 // When tools are present they are declared in the (forced) system turn as
 // <|tool>…<tool|> blocks; role:tool messages render as <|tool_response>… blocks.
-func (s *Server) renderChatTemplate(messages []ChatMessage, tools []Tool) string {
+// enableThinking gates the gemma-4 reasoning channel (see ChatRequest.resolveThinking).
+func (s *Server) renderChatTemplate(messages []ChatMessage, tools []Tool, enableThinking bool) string {
 	var sb strings.Builder
+	modelTurnOpen := modelTurnOpenNoThink
+	if enableThinking {
+		modelTurnOpen = modelTurnOpenThink
+	}
 
 	// System turn: merge an explicit system message (if first) with tool decls.
+	// When thinking is on, the gemma-4 template injects a <|think|> marker at the
+	// very top of the (forced) system turn.
 	sysContent := ""
 	start := 0
 	if len(messages) > 0 && messages[0].Role == "system" {
 		sysContent = messages[0].Content
 		start = 1
 	}
-	if sysContent != "" || len(tools) > 0 {
+	if sysContent != "" || len(tools) > 0 || enableThinking {
 		sb.WriteString("<|turn>system\n")
+		if enableThinking {
+			sb.WriteString("<|think|>\n")
+		}
 		sb.WriteString(sysContent)
 		if len(tools) > 0 {
 			sb.WriteString(renderToolDeclarations(tools))
@@ -571,16 +657,22 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 	logGenSpeed(genStart, generated)
 
 	msg := ChatMessage{Role: "assistant"}
+	// Separate the gemma-4 thought channel into reasoning_content; the rest is the
+	// answer (and any tool-call markers). Done for BOTH paths so reasoning never
+	// leaks into content when thinking is enabled.
+	reasoning, rest := splitReasoning(s.tokenizer.DecodeRaw(toks))
+	msg.ReasoningContent = reasoning
 	if wantTools {
-		// Parse the raw (markers-preserved) output into content + tool calls.
-		content, calls := parseToolCalls(s.tokenizer.DecodeRaw(toks))
+		content, calls := parseToolCalls(rest)
 		msg.Content = content
 		if len(calls) > 0 {
 			msg.ToolCalls = calls
 			finish = "tool_calls"
 		}
 	} else {
-		msg.Content = s.tokenizer.Decode(toks)
+		// rest still carries control markers as literal strings (DecodeRaw); strip
+		// them to plain text the way Decode would.
+		msg.Content = strings.TrimSpace(stripMarkers(rest))
 	}
 
 	writeJSON(w, http.StatusOK, ChatResponse{
@@ -632,6 +724,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	var rawToks []int32         // ALL generated ids (markers included) for tool parsing
 	inTool := false             // currently inside a <|tool_call> … <tool_call|> span
 	inChannel := false          // currently inside a <|channel> … <channel|> reasoning span
+	channelLabel := false       // still skipping the "thought" label at a channel's start
 
 	// GPU-side sampling (when no repeat penalty): pick each token on the device and
 	// advance with DecodeNoCopy — only a 4-byte id crosses to host instead of the
@@ -691,14 +784,39 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 			continue
 		}
 
-		// Suppress reasoning channels: don't stream <|channel> … <channel|> thought
-		// content to the client (parity with the non-streaming stripChannels path).
+		// Reasoning channel: stream <|channel>thought … <channel|> as reasoning_content
+		// (not content), so the client can show/hide the thinking block separately.
 		if chOpen >= 0 && token == chOpen {
 			inChannel = true
+			channelLabel = true // next text token is the "thought" label — skip it
+			if err = advance(); err != nil {
+				break
+			}
+			continue
 		}
 		if inChannel {
 			if chEnd >= 0 && token == chEnd {
 				inChannel = false
+				if err = advance(); err != nil {
+					break
+				}
+				continue
+			}
+			rtext := s.tokenizer.Decode([]int32{token})
+			if channelLabel { // drop the leading "thought\n" channel label
+				if i := strings.IndexByte(rtext, '\n'); i >= 0 {
+					rtext = rtext[i+1:]
+					channelLabel = false
+				} else {
+					rtext = "" // still inside the label line
+				}
+			}
+			if rtext != "" {
+				writeSSE(w, StreamResponse{
+					ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
+					Choices: []StreamChoice{{Index: 0, Delta: Delta{ReasoningContent: rtext}}},
+				})
+				flusher.Flush()
 			}
 			if err = advance(); err != nil {
 				break

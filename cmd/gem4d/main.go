@@ -74,10 +74,11 @@ type CLIArgs struct {
 	DraftK      int
 
 	// Server
-	Host    string
-	Port    int
-	Timeout int
-	Slots   int
+	Host     string
+	Port     int
+	Timeout  int
+	Slots    int
+	Thinking string // gemma-4 reasoning channel default: off/on/low/mid/high/xhigh
 
 	// System
 	System   string
@@ -135,6 +136,8 @@ func parseFlags() CLIArgs {
 	flag.IntVar(&a.Port, "port", 8080, "Server port")
 	flag.IntVar(&a.Timeout, "timeout", 600, "Request timeout in seconds")
 	flag.IntVar(&a.Slots, "n-slots", 1, "Number of processing slots")
+	flag.StringVar(&a.Thinking, "thinking", "off",
+		"Default gemma-4 reasoning channel: off|on|low|mid|high|xhigh (per-request reasoning_effort overrides)")
 
 	flag.StringVar(&a.System, "s", "", "System prompt")
 	flag.StringVar(&a.System, "system", "", "System prompt")
@@ -258,6 +261,8 @@ func main() {
 		// Report a quantization-aware model id (GGUF basename minus extension), e.g.
 		// gemma-4-12b-it-qat-q4_0, so clients can see which build/quant they hit.
 		srv.SetModelName(strings.TrimSuffix(filepath.Base(args.ModelPath), ".gguf"))
+		// Startup default for the reasoning channel; per-request reasoning_effort wins.
+		srv.SetThinkingDefault(gemserver.ParseThinkingLevel(args.Thinking))
 
 		// Handle graceful shutdown
 		sigCh := make(chan os.Signal, 1)
