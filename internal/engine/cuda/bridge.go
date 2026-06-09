@@ -145,22 +145,18 @@ func (e *Engine) Prefill(tokens []int32) ([]float32, error) {
 	logits := make([]float32, 262144)
 
 	// Fast path: batched BF16 tensor-core prefill (one weight pass for the whole
-	// prompt). Returns -2 when not applicable (e.g. the KV cache is not empty), in
-	// which case we fall back to the proven token-by-token path. Both produce the
-	// same last-token logits (parity-verified).
-	ret := C.gemma4_engine_prefill_batched(
-		e.ptr,
-		(*C.int32_t)(unsafe.Pointer(&tokens[0])),
-		C.int(len(tokens)),
-		(*C.float)(unsafe.Pointer(&logits[0])),
-	)
+	// prompt). It defers (-2) for very large prompts (the [HEADS][N×N] score buffer
+	// would OOM) → chunked FLASH prefill (O(chunk+KV) memory, 256k+ capable) → and
+	// finally the proven token-by-token path. All produce the same last-token logits.
+	tokPtr := (*C.int32_t)(unsafe.Pointer(&tokens[0]))
+	logPtr := (*C.float)(unsafe.Pointer(&logits[0]))
+	n := C.int(len(tokens))
+	ret := C.gemma4_engine_prefill_batched(e.ptr, tokPtr, n, logPtr)
 	if ret == -2 {
-		ret = C.gemma4_engine_prefill(
-			e.ptr,
-			(*C.int32_t)(unsafe.Pointer(&tokens[0])),
-			C.int(len(tokens)),
-			(*C.float)(unsafe.Pointer(&logits[0])),
-		)
+		ret = C.gemma4_engine_prefill_flash(e.ptr, tokPtr, n, logPtr)
+	}
+	if ret == -2 {
+		ret = C.gemma4_engine_prefill(e.ptr, tokPtr, n, logPtr)
 	}
 	if ret != 0 {
 		return nil, fmt.Errorf("gem4d: prefill failed")

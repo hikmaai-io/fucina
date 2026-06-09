@@ -1090,6 +1090,93 @@ __global__ void global_tree_attn_kernel(
 }
 
 // =========================================================================
+// ─── Flash PREFILL attention (chunked, online-softmax, no N² scratch) ───
+// =========================================================================
+// Each chunk query attends the FROZEN history KV cache (FP8) plus the current
+// chunk's own keys (fp32 scratch, causal within the chunk). Online-softmax, so
+// shared memory is a constant 32 floats — NO [HEADS][N×N] score buffer. This is
+// what unlocks 256k-context prefill (the GEMM path OOMs at ~30k). Scale 1.0.
+// One block per (chunk-query, head); block = head_dim threads.
+
+__global__ void flash_prefill_sliding_kernel(
+    float *out, const float *q,
+    const kv_t *kc, const kv_t *vc,          // ring history (frozen at chunk entry)
+    int n_heads, int n_kv_heads, int head_dim, int window,
+    int hist_cursor, int hist_filled,
+    const float *ck, const float *cv,        // this chunk's keys/values, fp32 [cn][okv]
+    int cn, int q_base, int okv)
+{
+    extern __shared__ float smem[];
+    int qi = blockIdx.x, head = blockIdx.y, tid = threadIdx.x;
+    if (qi >= cn) return;
+    int kv_head = head / (n_heads / n_kv_heads);
+    int pos = q_base + qi, oq = n_heads * head_dim;
+    float q_d = (tid < head_dim) ? q[(size_t)qi*oq + head*head_dim + tid] : 0.0f;
+    float acc = 0.0f, m = -INFINITY, l = 0.0f;
+
+    // History ring: absolute positions [q_base-hist_filled .. q_base-1] (all < pos).
+    for (int t = 0; t < hist_filled; t++) {
+        int ap = q_base - hist_filled + t;
+        if (ap < pos - window + 1) continue;          // outside sliding window
+        int ring_idx = (hist_cursor - hist_filled + t + window) % window;
+        float k_d = (tid < head_dim)
+            ? fp8_to_float(kc[(ring_idx * n_kv_heads + kv_head) * head_dim + tid]) : 0.0f;
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l * al + p;
+        float v_d = (tid < head_dim)
+            ? fp8_to_float(vc[(ring_idx * n_kv_heads + kv_head) * head_dim + tid]) : 0.0f;
+        acc = acc * al + p * v_d; m = mn;
+    }
+    // Chunk keys: causal j ≤ qi, sliding lower bound j ≥ qi-window+1.
+    int jlo = qi - window + 1; if (jlo < 0) jlo = 0;
+    for (int j = jlo; j <= qi; j++) {
+        float k_d = (tid < head_dim) ? ck[(size_t)j*okv + kv_head*head_dim + tid] : 0.0f;
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l * al + p;
+        float v_d = (tid < head_dim) ? cv[(size_t)j*okv + kv_head*head_dim + tid] : 0.0f;
+        acc = acc * al + p * v_d; m = mn;
+    }
+    if (tid < head_dim)
+        out[(size_t)qi*oq + head*head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
+}
+
+__global__ void flash_prefill_global_kernel(
+    float *out, const float *q,
+    const kv_t *kc, const kv_t *vc,          // linear history [hist_len][head_dim] (frozen)
+    int n_heads, int head_dim, int hist_len,
+    const float *ck, const float *cv,        // this chunk's keys/values fp32 [cn][head_dim]
+    int cn, int q_base, int okv)
+{
+    extern __shared__ float smem[];
+    int qi = blockIdx.x, head = blockIdx.y, tid = threadIdx.x;
+    if (qi >= cn) return;
+    int oq = n_heads * head_dim;             // n_kv_heads == 1
+    float q_d = (tid < head_dim) ? q[(size_t)qi*oq + head*head_dim + tid] : 0.0f;
+    float acc = 0.0f, m = -INFINITY, l = 0.0f;
+
+    for (int t = 0; t < hist_len; t++) {                 // all history is causal
+        float k_d = (tid < head_dim) ? fp8_to_float(kc[(size_t)t*head_dim + tid]) : 0.0f;
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l * al + p;
+        float v_d = (tid < head_dim) ? fp8_to_float(vc[(size_t)t*head_dim + tid]) : 0.0f;
+        acc = acc * al + p * v_d; m = mn;
+    }
+    for (int j = 0; j <= qi; j++) {                      // chunk keys, causal j ≤ qi
+        float k_d = (tid < head_dim) ? ck[(size_t)j*okv + tid] : 0.0f;
+        float s = block_reduce_sum(q_d * k_d, smem);
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l * al + p;
+        float v_d = (tid < head_dim) ? cv[(size_t)j*okv + tid] : 0.0f;
+        acc = acc * al + p * v_d; m = mn;
+    }
+    if (tid < head_dim)
+        out[(size_t)qi*oq + head*head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
+}
+
+// =========================================================================
 // ─── Batched-prefill kernels (Step 2 Phase 2 + Step 3 attention) ────────
 // =========================================================================
 // Token-major "rows" variants of decode_layer's elementwise steps, plus a
@@ -2850,7 +2937,7 @@ int gemma4_engine_prefill_batched(
     if (!eng->loaded || n_tokens <= 0) return -1;
     if (eng->global_n_tokens != 0) return -2;             // need fresh sequence
     if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
-    if (n_tokens > 65535) return -2;                      // grid.y bound
+    if (n_tokens > 20480) return -2;                      // [HEADS][N×N] (~40GB) too big — use flash
     if (build_bf16_weights(eng) != 0) return -1;
 
     cudaStream_t stream = eng->stream;
@@ -3046,6 +3133,161 @@ int gemma4_engine_prefill_batched(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "gem4d: batched-prefill CUDA error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Chunked FLASH prefill: process the prompt in bounded chunks, each attending the
+// frozen KV cache (history) + its own keys via the online-softmax flash kernels — no
+// [HEADS][N×N] score buffer, so memory is O(chunk + KV) and arbitrary context (256k+)
+// is possible (the GEMM batched path OOMs past ~25k). Projections still use BF16
+// tensor-core GEMMs per chunk. Same fresh-sequence contract & logits_out as
+// prefill_batched. Returns 0 / -2 (defer) / -1.
+int gemma4_engine_prefill_flash(
+    gemma4_engine_t *eng, const int32_t *tokens, int n_tokens, float *logits_out)
+{
+    if (!eng->loaded || n_tokens <= 0) return -1;
+    if (eng->global_n_tokens != 0) return -2;             // need fresh sequence
+    if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
+    if (build_bf16_weights(eng) != 0) return -1;
+
+    cudaStream_t stream = eng->stream;
+    const int H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE, HD2 = 32*sizeof(float);
+    const int HEADS = GEMMA4_HEADS, N = n_tokens;
+    const int C = (N < 8192) ? N : 8192;                  // chunk size (amortizes weight re-reads)
+    const int OQ_MAX = HEADS*GEMMA4_GLOBAL_HEAD_DIM, OKV_MAX = GEMMA4_KV_HEADS*GEMMA4_HEAD_DIM;
+
+    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0, stream);
+
+    float *d_x=0,*d_norm=0,*d_q=0,*d_k=0,*d_v=0,*d_attn=0,*d_gate=0,*d_up=0;
+    __nv_bfloat16 *d_inb=0;
+    int ok = 1;
+    #define PALLOC(p,elems) do{ if(cudaMalloc(&(p),(size_t)(elems))!=cudaSuccess){ok=0;} }while(0)
+    PALLOC(d_x,(size_t)C*H*sizeof(float));   PALLOC(d_norm,(size_t)C*H*sizeof(float));
+    PALLOC(d_q,(size_t)C*OQ_MAX*sizeof(float)); PALLOC(d_k,(size_t)C*OKV_MAX*sizeof(float));
+    PALLOC(d_v,(size_t)C*OKV_MAX*sizeof(float)); PALLOC(d_attn,(size_t)C*OQ_MAX*sizeof(float));
+    PALLOC(d_gate,(size_t)C*I*sizeof(float)); PALLOC(d_up,(size_t)C*I*sizeof(float));
+    PALLOC(d_inb,(size_t)C*I*sizeof(__nv_bfloat16));
+    #undef PALLOC
+    float *fbufs[] = {d_x,d_norm,d_q,d_k,d_v,d_attn,d_gate,d_up};
+    if (!ok) {
+        fprintf(stderr, "gem4d: flash-prefill scratch alloc failed (C=%d) — fallback\n", C);
+        cudaGetLastError();
+        for (float *p : fbufs) if(p) cudaFree(p);
+        if (d_inb) cudaFree(d_inb);
+        return -2;
+    }
+    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+    auto gemm_proj = [&](int p, int in_dim, int out_dim, float *dst, int rows){
+        gemm_bf16(eng, eng->d_bf16_layer[p], d_inb, dst, in_dim, out_dim, rows);
+    };
+
+    for (int c0 = 0; c0 < N; c0 += C) {
+        int cn = (N - c0 < C) ? (N - c0) : C;
+        embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), tokens + c0, cn, H, stream);
+        scale_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, cn*H, sqrtf((float)H));
+
+        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+            layer_type_t lt = eng->layer_types[l];
+            int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+            int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+            int oq  = HEADS*hd, okv = nkv*hd, kvhd = okv;
+            const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
+            const float *w_post_a = eng->d_w_post_attn_norm + (size_t)l*H;
+            const float *w_ffn    = eng->d_w_ffn_norm       + (size_t)l*H;
+            const float *w_post_f = eng->d_w_post_ffn_norm  + (size_t)l*H;
+            const float *w_qn     = eng->d_w_q_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+            const float *w_kn     = eng->d_w_k_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+
+            dequant_layer_bf16(eng, l, stream);
+            rms_norm_rows_bf16_kernel<<<cn,256,HD2,stream>>>(d_inb, d_x, w_attn, H, cn, GEMMA4_RMS_EPS);
+            gemm_proj(PJ_Q, H, oq, d_q, cn);
+            per_head_rms_norm_rows_kernel<<<dim3(HEADS,cn),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, cn, GEMMA4_RMS_EPS);
+            gemm_proj(PJ_K, H, okv, d_k, cn);
+            if (lt == LAYER_SLIDING) {
+                gemm_proj(PJ_V, H, okv, d_v, cn);
+            } else {
+                cudaMemcpyAsync(d_v, d_k, (size_t)cn*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            }
+            per_head_rms_norm_rows_kernel<<<dim3(nkv,cn),hd,HD2,stream>>>(d_v, NULL, nkv, hd, cn, GEMMA4_RMS_EPS);
+            per_head_rms_norm_rows_kernel<<<dim3(nkv,cn),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, cn, GEMMA4_RMS_EPS);
+
+            float theta = (lt==LAYER_SLIDING)? 10000.0f : 1000000.0f;
+            const float *ff = (lt==LAYER_SLIDING)? NULL : eng->d_rope_freqs;
+            rope_rows_kernel<<<dim3(HEADS,cn),hd/2,0,stream>>>(d_q, d_k, c0, HEADS, nkv, hd, cn, theta, ff);
+
+            // Flash attention: chunk queries vs frozen history (cache) + chunk keys.
+            const int smemA = 32*(int)sizeof(float);
+            if (lt == LAYER_SLIDING) {
+                size_t lstride = (size_t)GEMMA4_SLIDING_WINDOW * kvhd;
+                kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
+                kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
+                flash_prefill_sliding_kernel<<<dim3(cn,HEADS),hd,smemA,stream>>>(
+                    d_attn, d_q, kc, vc, HEADS, nkv, hd, GEMMA4_SLIDING_WINDOW,
+                    eng->sliding_cursor[l], eng->sliding_filled[l], d_k, d_v, cn, c0, okv);
+                int cnt = (cn < GEMMA4_SLIDING_WINDOW)? cn : GEMMA4_SLIDING_WINDOW;
+                kv_write_sliding_kernel<<<dim3(grid1d(kvhd),cnt),256,0,stream>>>(
+                    kc, vc, d_k, d_v, c0, cn - cnt, cnt, kvhd, GEMMA4_SLIDING_WINDOW);
+                eng->sliding_cursor[l] = (c0 + cn) % GEMMA4_SLIDING_WINDOW;
+                eng->sliding_filled[l] = (c0 + cn < GEMMA4_SLIDING_WINDOW)? c0+cn : GEMMA4_SLIDING_WINDOW;
+            } else {
+                int slot = eng->global_slot[l];
+                size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+                kv_t *kc = eng->d_global_k + (size_t)slot*stride;
+                kv_t *vc = eng->d_global_v + (size_t)slot*stride;
+                flash_prefill_global_kernel<<<dim3(cn,HEADS),hd,smemA,stream>>>(
+                    d_attn, d_q, kc, vc, HEADS, hd, c0, d_k, d_v, cn, c0, okv);
+                kv_write_global_kernel<<<dim3(grid1d(hd),cn),256,0,stream>>>(
+                    kc, vc, d_k, d_v, c0, cn, hd);
+            }
+
+            f32_to_bf16_kernel<<<grid1d((size_t)cn*oq),256,0,stream>>>(d_inb, d_attn, (size_t)cn*oq);
+            gemm_proj(PJ_O, oq, H, d_q, cn);
+            rms_norm_rows_kernel<<<cn,256,HD2,stream>>>(d_norm, d_q, w_post_a, H, cn, GEMMA4_RMS_EPS);
+            residual_add_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, d_norm, cn*H);
+
+            rms_norm_rows_bf16_kernel<<<cn,256,HD2,stream>>>(d_inb, d_x, w_ffn, H, cn, GEMMA4_RMS_EPS);
+            gemm_proj(PJ_GATE, H, I, d_gate, cn);
+            gemm_proj(PJ_UP,   H, I, d_up,   cn);
+            geglu_bf16_kernel<<<grid1d((size_t)cn*I),256,0,stream>>>(d_inb, d_gate, d_up, cn*I);
+            gemm_proj(PJ_DOWN, I, H, d_q, cn);
+            rms_norm_rows_kernel<<<cn,256,HD2,stream>>>(d_norm, d_q, w_post_f, H, cn, GEMMA4_RMS_EPS);
+            residual_add_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, d_norm, cn*H);
+            if (eng->h_out_scale[l] != 1.0f)
+                scale_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, cn*H, eng->h_out_scale[l]);
+        }
+
+        if (c0 + cn >= N) {                               // last chunk: logits of last token
+            float *x_last = d_x + (size_t)(cn-1)*H;
+            rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
+            gemv_w(eng, eng->d_logits, weight_fp8(eng, eng->tensors.output_weight),
+                   eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream);
+            logit_softcap_kernel<<<grid1d(GEMMA4_VOCAB_SIZE),256,0,stream>>>(
+                eng->d_logits, GEMMA4_SOFTCAP, GEMMA4_VOCAB_SIZE);
+            if (eng->n_suppress > 0)
+                suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
+                    eng->d_logits, eng->d_suppress, eng->n_suppress, GEMMA4_VOCAB_SIZE);
+            if (logits_out)
+                cudaMemcpyAsync(logits_out, eng->d_logits, GEMMA4_VOCAB_SIZE*sizeof(float),
+                                cudaMemcpyDeviceToHost, stream);
+        }
+        cudaStreamSynchronize(stream);                    // chunk boundary (cache state advanced)
+    }
+    eng->global_n_tokens = N;
+
+    cudaEventRecord(t1, stream);
+    cudaEventSynchronize(t1);
+    float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
+    eng->prefill_time_ms += ms; eng->n_prefill_tokens += N;
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+
+    for (float *p : fbufs) cudaFree(p);
+    cudaFree(d_inb);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gem4d: flash-prefill CUDA error: %s\n", cudaGetErrorString(err));
         return -1;
     }
     return 0;
@@ -4108,7 +4350,16 @@ int gemma4_engine_generate_spec(
     // BATCHED prefill (one weight pass over the whole prompt, ~900 tok/s); fall back
     // to token-by-token only if it declines (non-fresh sequence). The token-by-token
     // path would otherwise prefill the entire prompt at decode speed (~15 tok/s).
-    int prc = gemma4_engine_prefill_batched(eng, prompt, n_prompt, logits);
+    const char *pf = getenv("GEM4D_PREFILL");
+    int prc;
+    if (pf && pf[0]=='t')                                  // GEM4D_PREFILL=token forces gold path
+        prc = gemma4_engine_prefill(eng, prompt, n_prompt, logits);
+    else if (pf && pf[0]=='f')                             // GEM4D_PREFILL=flash forces it
+        prc = gemma4_engine_prefill_flash(eng, prompt, n_prompt, logits);
+    else {
+        prc = gemma4_engine_prefill_batched(eng, prompt, n_prompt, logits);
+        if (prc == -2) prc = gemma4_engine_prefill_flash(eng, prompt, n_prompt, logits);
+    }
     if (prc == -2) prc = gemma4_engine_prefill(eng, prompt, n_prompt, logits);
     if (prc != 0) {
         free(hist); free(logits); return -1;

@@ -231,6 +231,13 @@ int gemma4_engine_load_session(
 int gemma4_engine_prefill_batched(
     gemma4_engine_t *eng, const int32_t *tokens, int n_tokens, float *logits_out);
 
+// Chunked FLASH prefill: bounded per-chunk memory (O(chunk + KV), no [HEADS][N×N]
+// score buffer), so it handles arbitrary context (256k+) where the batched GEMM path
+// OOMs. BF16 tensor-core projections, online-softmax flash attention. Same
+// fresh-sequence contract & logits_out as prefill_batched. 0 / -2 (defer) / -1.
+int gemma4_engine_prefill_flash(
+    gemma4_engine_t *eng, const int32_t *tokens, int n_tokens, float *logits_out);
+
 // ─── Diagnostics ─────────────────────────────────────────────────────
 
 void gemma4_engine_print_info(const gemma4_engine_t *eng);
