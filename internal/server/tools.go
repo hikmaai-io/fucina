@@ -243,6 +243,9 @@ func parseToolCalls(raw string) (string, []ToolCall) {
 			rest = rest[end+len("<tool_call|>"):]
 		}
 		if tc, ok := parseOneCall(body); ok {
+			// Unique id per call so clients can map multiple tool results back to
+			// the right call (two calls to the same function must not collide).
+			tc.ID = fmt.Sprintf("call_%s_%d", tc.Function.Name, len(calls))
 			calls = append(calls, tc)
 		}
 		if end < 0 {
@@ -270,7 +273,7 @@ func parseOneCall(body string) (ToolCall, bool) {
 		argsJSON = []byte("{}")
 	}
 	return ToolCall{
-		ID:       "call_" + name,
+		ID:       "call_" + name, // overwritten with a unique id by parseToolCalls
 		Type:     "function",
 		Function: ToolCallFunction{Name: name, Arguments: string(argsJSON)},
 	}, true

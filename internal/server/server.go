@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,8 +37,9 @@ type GenerationParams struct {
 	RepeatPenalty    float64 `json:"repeat_penalty"`
 	FrequencyPenalty float64 `json:"frequency_penalty"`
 	PresencePenalty  float64 `json:"presence_penalty"`
-	MaxTokens        int     `json:"max_tokens"`
-	Stream           bool    `json:"stream"`
+	MaxTokens        int      `json:"max_tokens"`
+	Stream           bool     `json:"stream"`
+	Stop             []string `json:"stop,omitempty"`
 }
 
 type ChatMessage struct {
@@ -48,19 +50,105 @@ type ChatMessage struct {
 	Name       string     `json:"name,omitempty"`
 }
 
+// contentPart is one element of the OpenAI "content parts" array form, e.g.
+// {"type":"text","text":"hello"}. Only text parts contribute to the prompt;
+// non-text parts (images, etc.) are ignored.
+type contentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// UnmarshalJSON accepts `content` either as a plain string (legacy/OpenAI
+// simple form) or as an array of typed parts (OpenAI vision/multipart form,
+// which clients such as `pi` send). Array parts are flattened to text so the
+// rest of the server can keep treating Content as a string.
+func (m *ChatMessage) UnmarshalJSON(data []byte) error {
+	// Alias avoids infinite recursion into this method.
+	type alias ChatMessage
+	aux := &struct {
+		Content json.RawMessage `json:"content"`
+		*alias
+	}{alias: (*alias)(m)}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if len(aux.Content) == 0 || string(aux.Content) == "null" {
+		m.Content = ""
+		return nil
+	}
+	// Try plain string first.
+	var s string
+	if err := json.Unmarshal(aux.Content, &s); err == nil {
+		m.Content = s
+		return nil
+	}
+	// Fall back to the array-of-parts form.
+	var parts []contentPart
+	if err := json.Unmarshal(aux.Content, &parts); err != nil {
+		return fmt.Errorf("content must be a string or an array of content parts: %w", err)
+	}
+	var sb strings.Builder
+	for _, p := range parts {
+		if p.Type == "" || p.Type == "text" {
+			sb.WriteString(p.Text)
+		}
+	}
+	m.Content = sb.String()
+	return nil
+}
+
 type ChatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens"`
-	Temperature *float64      `json:"temperature"`
-	TopP        *float64      `json:"top_p"`
-	TopK        *int          `json:"top_k"`
-	MinP        *float64      `json:"min_p"`
-	Seed        *int64        `json:"seed"`
-	Stream      bool          `json:"stream"`
-	Stop        []string      `json:"stop"`
-	Tools       []Tool        `json:"tools,omitempty"`
-	ToolChoice  interface{}   `json:"tool_choice,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []ChatMessage   `json:"messages"`
+	Prompt      json.RawMessage `json:"prompt,omitempty"` // legacy /v1/completions
+	MaxTokens   int             `json:"max_tokens"`
+	Temperature *float64        `json:"temperature"`
+	TopP        *float64        `json:"top_p"`
+	TopK        *int            `json:"top_k"`
+	MinP        *float64        `json:"min_p"`
+	Seed        *int64          `json:"seed"`
+	Stream      bool            `json:"stream"`
+	Stop        StopField       `json:"stop,omitempty"`
+	Tools       []Tool          `json:"tools,omitempty"`
+	ToolChoice  interface{}     `json:"tool_choice,omitempty"`
+}
+
+// StopField accepts the OpenAI `stop` parameter in either form: a single string
+// or an array of strings. Both decode to []string.
+type StopField []string
+
+func (s *StopField) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(data, &one); err == nil {
+		*s = []string{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(data, &many); err != nil {
+		return fmt.Errorf("stop must be a string or array of strings: %w", err)
+	}
+	*s = many
+	return nil
+}
+
+// legacyPrompt extracts the prompt text from the /v1/completions `prompt`
+// field, which may be a string or an array of strings (joined with newlines).
+func (r *ChatRequest) legacyPrompt() string {
+	if len(r.Prompt) == 0 {
+		return ""
+	}
+	var one string
+	if json.Unmarshal(r.Prompt, &one) == nil {
+		return one
+	}
+	var many []string
+	if json.Unmarshal(r.Prompt, &many) == nil {
+		return strings.Join(many, "\n")
+	}
+	return ""
 }
 
 type ChatResponse struct {
@@ -85,8 +173,19 @@ type Usage struct {
 }
 
 type Delta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	ToolCalls []DeltaToolCall `json:"tool_calls,omitempty"`
+}
+
+// DeltaToolCall is the streaming form of a tool call. It carries the array
+// `index` that OpenAI clients use to reassemble streamed tool calls (we emit
+// each call whole in a single chunk, so name+arguments arrive together).
+type DeltaToolCall struct {
+	Index    int              `json:"index"`
+	ID       string           `json:"id,omitempty"`
+	Type     string           `json:"type,omitempty"`
+	Function ToolCallFunction `json:"function"`
 }
 
 type StreamChoice struct {
@@ -173,17 +272,27 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
 		return
 	}
-	prompt := s.renderChatTemplate(req.Messages, req.Tools)
+
+	// Build the prompt. /v1/completions sends a raw `prompt`; /v1/chat/completions
+	// sends `messages` that we render into the gemma-4 chat template.
+	wantTools := len(req.Tools) > 0 && !isToolChoiceNone(req.ToolChoice)
+	var prompt string
+	if legacy := req.legacyPrompt(); legacy != "" {
+		prompt = legacy
+		wantTools = false // raw-completions mode never emits structured tool calls
+	} else {
+		prompt = s.renderChatTemplate(req.Messages, req.Tools)
+	}
 	if prompt == "" {
 		http.Error(w, "empty prompt", http.StatusBadRequest)
 		return
 	}
-	wantTools := len(req.Tools) > 0 && !isToolChoiceNone(req.ToolChoice)
 	tokens := s.tokenizer.Encode(prompt, true, false)
 	if len(tokens) == 0 {
 		http.Error(w, "tokenization failed", http.StatusInternalServerError)
 		return
 	}
+
 	params := s.genParams
 	if req.Temperature != nil {
 		params.Temperature = *req.Temperature
@@ -204,6 +313,25 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		params.MaxTokens = req.MaxTokens
 	}
 	params.Stream = req.Stream
+	params.Stop = req.Stop
+
+	// Context budgeting ("compaction"): the engine holds a fixed KV window
+	// (ContextSize). Guarantee room for the prompt AND the requested completion
+	// by trimming the OLDEST prompt tokens when the two together would overflow.
+	// We keep the most recent tokens (the live turn) which is what matters for a
+	// coding agent; a leading BOS is preserved so the sequence stays well-formed.
+	ctx := int(s.engine.ContextSize())
+	if budget := ctx - params.MaxTokens; budget > 0 && len(tokens) > budget {
+		dropped := len(tokens) - budget
+		kept := tokens[dropped:]
+		if len(tokens) > 0 && tokens[0] == s.tokenizer.BOS &&
+			(len(kept) == 0 || kept[0] != s.tokenizer.BOS) {
+			kept = append([]int32{s.tokenizer.BOS}, kept...)
+		}
+		log.Printf("gem4d: context compaction: prompt %d + max_tokens %d > ctx %d; dropped %d oldest tokens",
+			len(tokens), params.MaxTokens, ctx, dropped)
+		tokens = kept
+	}
 
 	// Acquire the single physical KV cache for the whole request (prefill +
 	// generation). Released inside the response helpers.
@@ -231,9 +359,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	logits := pf.Logits
 
 	if params.Stream {
-		s.streamResponse(w, params, promptTokens, logits)
+		s.streamResponse(r.Context(), w, params, promptTokens, logits, wantTools)
 	} else {
-		s.generateResponse(w, params, promptTokens, logits, wantTools)
+		s.generateResponse(r.Context(), w, params, promptTokens, logits, wantTools)
 	}
 }
 
@@ -324,15 +452,21 @@ func (s *Server) renderChatTemplate(messages []ChatMessage, tools []Tool) string
 
 // generateResponse runs non-streaming generation. It assumes the caller holds
 // s.kv.Lock() (acquired in the handler); it releases it when generation ends.
-func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools bool) {
+func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools bool) {
 	defer s.kv.Unlock()
 
 	generated := 0
 	var toks []int32
 	tcEnd := s.tokenizer.ToolCallEnd
 	genStart := time.Now()
+	finish := "stop"
 
-	if params.RepeatPenalty == 1.0 {
+	// The speculative fast-path is a single blocking engine call: it cannot check
+	// text stop-strings or honor mid-flight cancellation. Use it only when neither
+	// is needed; otherwise fall back to the per-token CPU loop.
+	useSpec := params.RepeatPenalty == 1.0 && len(params.Stop) == 0
+
+	if useSpec {
 		// Speculative decoding (default): one weight pass per [g, draft...], same
 		// output distribution as plain decode. Continues from the prefilled state.
 		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
@@ -360,11 +494,15 @@ func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams
 		}
 		generated = len(toks)
 	} else {
-		// Repeat-penalty path: the host sampler can't be expressed in spec, so use
-		// the plain per-token decode loop with the CPU sampler.
+		// Per-token decode loop with the CPU sampler: required for repeat-penalty,
+		// text stop-sequences, and cancellation ("steering").
 		rng := rand.New(rand.NewSource(params.Seed))
 		for generated < params.MaxTokens {
 			if logits == nil {
+				break
+			}
+			if ctx.Err() != nil { // client aborted / steered away
+				finish = "cancelled"
 				break
 			}
 			token, err := s.sampleToken(logits, params, rng)
@@ -377,6 +515,10 @@ func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams
 			if wantTools && tcEnd >= 0 && token == tcEnd {
 				break
 			}
+			if hit, trimmed := stopHit(s.tokenizer.Decode(toks), params.Stop); hit {
+				toks = s.tokenizer.Encode(trimmed, false, false)
+				break
+			}
 			var err2 error
 			logits, err2 = s.engine.Decode(token)
 			if err2 != nil {
@@ -386,7 +528,6 @@ func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams
 	}
 	logGenSpeed(genStart, generated)
 
-	finish := "stop"
 	msg := ChatMessage{Role: "assistant"}
 	if wantTools {
 		// Parse the raw (markers-preserved) output into content + tool calls.
@@ -415,7 +556,7 @@ func (s *Server) generateResponse(w http.ResponseWriter, params GenerationParams
 	})
 }
 
-func (s *Server) streamResponse(w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32) {
+func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -440,35 +581,126 @@ func (s *Server) streamResponse(w http.ResponseWriter, params GenerationParams, 
 	})
 	flusher.Flush()
 
+	tcOpen := s.tokenizer.ToolCallOpen
+	tcEnd := s.tokenizer.ToolCallEnd
+	chOpen := s.tokenizer.ChannelOpen
+	chEnd := s.tokenizer.ChannelEnd
+	finish := "stop"
+	var emitted strings.Builder // accumulated visible text, for stop-string detection
+	var rawToks []int32         // ALL generated ids (markers included) for tool parsing
+	inTool := false             // currently inside a <|tool_call> … <tool_call|> span
+	inChannel := false          // currently inside a <|channel> … <channel|> reasoning span
 	for generated < params.MaxTokens {
 		if logits == nil {
+			break
+		}
+		// Honor client cancellation ("steering"): if pi aborts the request, stop
+		// generating immediately and release the KV lock for the next turn.
+		if ctx.Err() != nil {
+			finish = "cancelled"
 			break
 		}
 		token, err := s.sampleToken(logits, params, rng)
 		if err != nil || s.tokenizer.IsStop(token) {
 			break
 		}
-		tokenStr := s.tokenizer.Decode([]int32{token})
-		writeSSE(w, StreamResponse{
-			ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
-			Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: tokenStr}}},
-		})
-		flusher.Flush()
-
-		logits, err = s.engine.Decode(token)
-		if err != nil {
-			break
-		}
+		rawToks = append(rawToks, token)
 		s.kv.AppendDecoded(token)
 		generated++
+
+		// Tool-call handling: when the model opens a call, stop streaming content
+		// and buffer until the call closes — we emit it as a structured tool_calls
+		// delta after the loop. Mirrors the non-streaming spec path (one call/turn).
+		if wantTools && tcOpen >= 0 && token == tcOpen {
+			inTool = true
+		}
+		if inTool {
+			if tcEnd >= 0 && token == tcEnd {
+				break // complete tool call captured
+			}
+			if logits, err = s.engine.Decode(token); err != nil {
+				break
+			}
+			continue
+		}
+
+		// Suppress reasoning channels: don't stream <|channel> … <channel|> thought
+		// content to the client (parity with the non-streaming stripChannels path).
+		if chOpen >= 0 && token == chOpen {
+			inChannel = true
+		}
+		if inChannel {
+			if chEnd >= 0 && token == chEnd {
+				inChannel = false
+			}
+			if logits, err = s.engine.Decode(token); err != nil {
+				break
+			}
+			continue
+		}
+
+		// Never stream the gemma tool/string markers to the client as visible text.
+		if s.tokenizer.IsToolMarker(token) {
+			if logits, err = s.engine.Decode(token); err != nil {
+				break
+			}
+			continue
+		}
+
+		tokenStr := s.tokenizer.Decode([]int32{token})
+
+		// Stop-sequence handling: if appending this piece completes a stop string,
+		// emit only the text up to the stop and finish.
+		if len(params.Stop) > 0 {
+			if hit, trimmed := stopHit(emitted.String()+tokenStr, params.Stop); hit {
+				if tail := strings.TrimPrefix(trimmed, emitted.String()); tail != "" {
+					writeSSE(w, StreamResponse{
+						ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
+						Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: tail}}},
+					})
+					flusher.Flush()
+				}
+				break
+			}
+		}
+
+		if tokenStr != "" {
+			emitted.WriteString(tokenStr)
+			writeSSE(w, StreamResponse{
+				ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
+				Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: tokenStr}}},
+			})
+			flusher.Flush()
+		}
+
+		if logits, err = s.engine.Decode(token); err != nil {
+			break
+		}
+	}
+
+	// Emit any captured tool call(s) as a structured delta before the final chunk.
+	if wantTools {
+		if _, calls := parseToolCalls(s.tokenizer.DecodeRaw(rawToks)); len(calls) > 0 {
+			deltas := make([]DeltaToolCall, len(calls))
+			for i, c := range calls {
+				deltas[i] = DeltaToolCall{Index: i, ID: c.ID, Type: c.Type, Function: c.Function}
+			}
+			writeSSE(w, StreamResponse{
+				ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
+				Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: deltas}}},
+			})
+			flusher.Flush()
+			finish = "tool_calls"
+		}
 	}
 
 	logGenSpeed(genStart, generated)
 
 	writeSSE(w, StreamResponse{
 		ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
-		Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: "stop"}},
+		Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: finish}},
 	})
+	writeDONE(w)
 	flusher.Flush()
 }
 
@@ -635,6 +867,30 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 func writeSSE(w http.ResponseWriter, v interface{}) {
 	data, _ := json.Marshal(v)
 	fmt.Fprintf(w, "data: %s\n\n", data)
+}
+
+// writeDONE writes the terminal SSE sentinel that OpenAI-style clients expect.
+func writeDONE(w http.ResponseWriter) {
+	fmt.Fprint(w, "data: [DONE]\n\n")
+}
+
+// stopHit reports whether `text` contains any of the stop strings. If so it
+// returns the text truncated at the FIRST stop occurrence (the stop string
+// itself is removed), matching OpenAI semantics.
+func stopHit(text string, stops []string) (bool, string) {
+	cut := -1
+	for _, s := range stops {
+		if s == "" {
+			continue
+		}
+		if i := strings.Index(text, s); i >= 0 && (cut < 0 || i < cut) {
+			cut = i
+		}
+	}
+	if cut < 0 {
+		return false, text
+	}
+	return true, text[:cut]
 }
 
 func (s *Server) Start(addr string) error {

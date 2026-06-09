@@ -760,6 +760,128 @@ __global__ void gemv_batched_kernel_t(
     }
 }
 
+// Batched MMVQ for Q4_0 weights: the dp4a analogue of gemv_batched_kernel_t. Reads each
+// weight ROW once (12.65 GB / pass), decodes the 32 nibbles once, then reuses them across
+// all NK quantized activation vectors via dp4a — so NK spec-draft tokens cost ~one token's
+// weight bandwidth AT dp4a speed (~207 GB/s), not the scalar byte-load ceiling (~125 GB/s)
+// that decode_weight hits. qx/dx are token-major: qx[n*in_dim + i], dx[n*(in_dim/32) + b],
+// matching quantize_q8_1_kernel run over the whole [NK × in_dim] activation block at once.
+// Per-block correction mirrors mmvq_q4_0_kernel: out = Σ_b dw·dx·(Σ nibble·qx − 8·Σ qx).
+template<int NK>
+__global__ void mmvq_q4_0_batched_kernel(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
+    int in_dim, int out_dim)
+{
+    extern __shared__ float smem[];
+    int idx = blockIdx.x;
+    if (idx >= out_dim) return;
+    int nb = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)nb * 18;
+    float acc[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+        const uint8_t *blk = wrow + (size_t)b * 18;
+        __half_raw hr; hr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        float dw = __half2float(__half(hr));
+        const void *wqs = blk + 2;                       // 16 nibble-bytes (2-byte aligned)
+        int wv[8];                                       // decode the 32 nibbles ONCE
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int w = q8_get_int_b2(wqs, k);
+            wv[2*k]   =  w        & 0x0F0F0F0F;          // elems 4k..4k+3   (low nibble)
+            wv[2*k+1] = (w >> 4)  & 0x0F0F0F0F;          // elems 4k+16..4k+19 (high nibble)
+        }
+        #pragma unroll
+        for (int n = 0; n < NK; n++) {
+            const int *xqs = (const int *)(qx + (size_t)n*in_dim + (size_t)b*32);
+            int sumi = 0, sumq = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                sumi = __dp4a(wv[2*k],   xqs[k],     sumi);
+                sumi = __dp4a(wv[2*k+1], xqs[k + 4], sumi);
+            }
+            #pragma unroll
+            for (int k = 0; k < 8; k++)
+                sumq = __dp4a(0x01010101, xqs[k], sumq);
+            acc[n] += dw * dx[(size_t)n*nb + b] * (float)(sumi - 8*sumq);
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) {
+        float s = block_reduce_sum(acc[n], smem);
+        if (threadIdx.x == 0) out[(size_t)n*out_dim + idx] = s;
+    }
+}
+
+// Batched MMVQ for Q8_0 weights — same weight-row-reuse idea, no nibble unpack / -8 term.
+template<int NK>
+__global__ void mmvq_q8_0_batched_kernel(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
+    int in_dim, int out_dim)
+{
+    extern __shared__ float smem[];
+    int idx = blockIdx.x;
+    if (idx >= out_dim) return;
+    int nb = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)nb * 34;
+    float acc[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+        const uint8_t *blk = wrow + (size_t)b * 34;
+        __half_raw hr; hr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        float dw = __half2float(__half(hr));
+        const void *wqs = blk + 2;                       // 32 weight int8 (2-byte aligned)
+        int wv[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) wv[k] = q8_get_int_b2(wqs, k);
+        #pragma unroll
+        for (int n = 0; n < NK; n++) {
+            const int *xqs = (const int *)(qx + (size_t)n*in_dim + (size_t)b*32);
+            int sumi = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) sumi = __dp4a(wv[k], xqs[k], sumi);
+            acc[n] += dw * dx[(size_t)n*nb + b] * (float)sumi;
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) {
+        float s = block_reduce_sum(acc[n], smem);
+        if (threadIdx.x == 0) out[(size_t)n*out_dim + idx] = s;
+    }
+}
+
+// Dispatch the batched MMVQ (dp4a) to the compile-time-NK kernel. qx/dx must already hold
+// the NK quantized activation vectors (token-major). K ≤ 8 → one weight pass; K > 8 splits
+// into ≤8-wide chunks (each re-reads the weight, still far cheaper than K scalar decodes).
+static void mmvq_batched_launch(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
+    int in_dim, int out_dim, int K, int fmt, cudaStream_t stream)
+{
+    dim3 g(out_dim); int b = 256; size_t sm = 32*sizeof(float);
+    #define LAUNCH(NK)                                                                  \
+        do { if (fmt == 2)                                                              \
+            mmvq_q4_0_batched_kernel<NK><<<g,b,sm,stream>>>(out,weight,qx,dx,in_dim,out_dim); \
+        else                                                                           \
+            mmvq_q8_0_batched_kernel<NK><<<g,b,sm,stream>>>(out,weight,qx,dx,in_dim,out_dim); \
+        } while (0)
+    switch (K) {
+        case 1: LAUNCH(1); break;  case 2: LAUNCH(2); break;
+        case 3: LAUNCH(3); break;  case 4: LAUNCH(4); break;
+        case 5: LAUNCH(5); break;  case 6: LAUNCH(6); break;
+        case 7: LAUNCH(7); break;  case 8: LAUNCH(8); break;
+        default:
+            for (int o = 0; o < K; o += 8) {
+                int kk = (K - o < 8) ? (K - o) : 8;
+                mmvq_batched_launch(out + (size_t)o*out_dim, weight,
+                                    qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
+                                    in_dim, out_dim, kk, fmt, stream);
+            }
+    }
+    #undef LAUNCH
+}
+
 // Dispatch the batched GEMV to the compile-time-NK kernel. K ≤ 8 → one weight pass;
 // K > 8 is split into ≤8-wide chunks (each re-reads the weight, still far cheaper
 // than K separate decodes).
@@ -1827,6 +1949,8 @@ struct gemma4_engine {
     int    *d_sample_id;       // 4-byte device scratch for GPU-side sampled token id
     int8_t *d_qx;              // [GEMMA4_INTERMEDIATE] int8 activation for dp4a MMVQ
     float  *d_dx;              // [GEMMA4_INTERMEDIATE/32] per-block activation scales
+    int8_t *d_qx_b;            // [SPEC_MAX × INTERMEDIATE] int8 act for batched dp4a MMVQ
+    float  *d_dx_b;            // [SPEC_MAX × INTERMEDIATE/32] per-block act scales (batched)
     int     nvfp4_sim;         // 1 = simulate NVFP4 weight quant in prefill (accuracy spike)
 
     // Suppressed token ids (tokenizer.ggml.suppress_tokens) masked to -inf
@@ -2460,6 +2584,10 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_qx = NULL; eng->d_dx = NULL;
     cudaMalloc(&eng->d_qx, (size_t)GEMMA4_INTERMEDIATE * sizeof(int8_t));
     cudaMalloc(&eng->d_dx, (size_t)(GEMMA4_INTERMEDIATE/32) * sizeof(float));
+    // Batched (speculative-decode) variant: NK ≤ SPEC_MAX activation vectors at once.
+    eng->d_qx_b = NULL; eng->d_dx_b = NULL;
+    cudaMalloc(&eng->d_qx_b, (size_t)GEMMA4_SPEC_MAX * GEMMA4_INTERMEDIATE * sizeof(int8_t));
+    cudaMalloc(&eng->d_dx_b, (size_t)GEMMA4_SPEC_MAX * (GEMMA4_INTERMEDIATE/32) * sizeof(float));
 
     // Load rope_freqs.weight into device buffer for global-layer RoPE.
     {
@@ -2726,6 +2854,8 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_sample_id);
     CUDA_FREE(eng->d_qx);
     CUDA_FREE(eng->d_dx);
+    CUDA_FREE(eng->d_qx_b);
+    CUDA_FREE(eng->d_dx_b);
     #undef CUDA_FREE
 
     // LoRA cleanup
@@ -2805,13 +2935,27 @@ static inline void gemv_w(
 }
 
 // Batched GEMV: Y[K][out_dim] = X[K][in_dim] · weightᵀ, weight read once for all K.
+// For quantized weights (Q8_0/Q4_0) this routes through the batched dp4a MMVQ: one
+// activation-quant pass over the whole [K × in_dim] block, then weight-row-reuse dp4a —
+// lifting spec decode off the scalar decode_weight byte-load ceiling (~125 GB/s) up to
+// dp4a bandwidth (~207 GB/s). FP8 stays on the scalar path (no int8 dp4a form).
 static inline void gemv_batched_w(
     const gemma4_engine_t *eng,
     float *out, const uint8_t *weight, const float *x,
     int in_dim, int out_dim, int K, cudaStream_t stream, int wfmt = -1)
 {
-    gemv_batched_launch(out, weight, x, in_dim, out_dim, K,
-                        (wfmt < 0) ? FMT(eng) : wfmt, stream);
+    int fmt = (wfmt < 0) ? FMT(eng) : wfmt;
+    // Quantized weights → batched dp4a MMVQ (the standard fast path: +13% decode vs the
+    // legacy scalar decode_weight under load, strictly faster, bit-faithful enough for
+    // full spec acceptance). FP8 falls through to the scalar path (no int8 dp4a form).
+    if ((fmt == 1 /*Q8_0*/ || fmt == 2 /*Q4_0*/) && eng->d_qx_b && K <= GEMMA4_SPEC_MAX) {
+        quantize_q8_1_kernel<<<(K*in_dim)/32, 32, 0, stream>>>(
+            x, eng->d_qx_b, eng->d_dx_b, K*in_dim);
+        mmvq_batched_launch(out, weight, eng->d_qx_b, eng->d_dx_b,
+                            in_dim, out_dim, K, fmt, stream);
+    } else {
+        gemv_batched_launch(out, weight, x, in_dim, out_dim, K, fmt, stream);
+    }
 }
 
 static inline void embed_w(

@@ -384,6 +384,20 @@ func (t *Tokenizer) IsStop(id int32) bool {
 	return id == t.EOS || id == t.EndOfTurn
 }
 
+// IsToolMarker reports whether an id is one of the gemma-4 tool-protocol markers
+// (<|tool>, <tool|>, <|tool_call>, <tool_call|>, <|tool_response>, <tool_response|>,
+// or the <|"|> string delimiter). These must never be streamed to the client as
+// visible content — the server buffers them and parses structured tool_calls.
+func (t *Tokenizer) IsToolMarker(id int32) bool {
+	return (id == t.ToolOpen && t.ToolOpen >= 0) ||
+		(id == t.ToolEnd && t.ToolEnd >= 0) ||
+		(id == t.ToolCallOpen && t.ToolCallOpen >= 0) ||
+		(id == t.ToolCallEnd && t.ToolCallEnd >= 0) ||
+		(id == t.ToolRespOpen && t.ToolRespOpen >= 0) ||
+		(id == t.ToolRespEnd && t.ToolRespEnd >= 0) ||
+		(id == t.StringDelim && t.StringDelim >= 0)
+}
+
 // isControl reports whether an id is a special/control token that must not be
 // rendered into user-visible text.
 func (t *Tokenizer) isControl(id int32) bool {
