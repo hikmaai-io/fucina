@@ -1250,20 +1250,28 @@ __global__ void flash_decode_combine_kernel(
 // Per-(split, q_head) online-softmax partials are written in the [n_splits][NH][head_dim]
 // layout flash_decode_combine_kernel<NH> expects; an empty split (range exhausted, or
 // window_len == 0) writes m = -INFINITY which the combine pass skips.
-#define SL_SLICE_MAX 8   // head_dim/32 ≤ 256/32 (sliding layers only)
+//
+// HD is a TEMPLATE parameter, not a runtime arg, on purpose: the per-lane slice width
+// (HD/32) bounds every e-loop below, and ptxas only honors #pragma unroll — and only
+// keeps qreg/acc/kd/vd in registers — when that trip count is a compile-time constant.
+// With a runtime head_dim the dynamic indices demoted all four arrays to local memory
+// (192-byte stack frame, ~80 LDL/STL per key per warp in SASS), silently forfeiting the
+// register-slice design this kernel exists for. constexpr slice mirrors how
+// global_attn_splitk_kernel earns its 0-byte frame via the compile-time NH bound.
 
-template<int NH, int NKV>
+template<int NH, int NKV, int HD>
 __global__ void sliding_attn_splitk_kernel(
-    float *part_acc,                          // [n_splits][NH][head_dim] (unnormalized)
+    float *part_acc,                          // [n_splits][NH][HD] (unnormalized)
     float *part_m, float *part_l,             // [n_splits][NH]
-    const float *q,                           // [NH][head_dim]
-    const kv_t *k_cache, const kv_t *v_cache, // FLAT [capacity][NKV][head_dim] FP8
-    int head_dim, int window, int n_tokens, int n_splits)
+    const float *q,                           // [NH][HD]
+    const kv_t *k_cache, const kv_t *v_cache, // FLAT [capacity][NKV][HD] FP8
+    int window, int n_tokens, int n_splits)
 {
     constexpr int GQ = NH / NKV;              // query heads per KV head (GQA group) = 2
+    constexpr int slice = HD / 32;            // 8 floats/lane at HD 256
+    static_assert(HD % 32 == 0, "lane-strided slices require HD multiple of warp size");
     int kv_head = threadIdx.x >> 5;           // one warp per KV head
     int lane    = threadIdx.x & 31;
-    int slice   = head_dim >> 5;              // 8 floats/lane at head_dim 256
     int split   = blockIdx.x;
 
     int window_len = min(n_tokens, window);
@@ -1272,10 +1280,10 @@ __global__ void sliding_attn_splitk_kernel(
     int i0  = split * per;
     int i1  = min(i0 + per, window_len);
 
-    float qreg[GQ][SL_SLICE_MAX], acc[GQ][SL_SLICE_MAX], m[GQ], l[GQ];
+    float qreg[GQ][slice], acc[GQ][slice], m[GQ], l[GQ];
     #pragma unroll
     for (int g = 0; g < GQ; g++) {
-        const float *qp = q + (size_t)(kv_head*GQ + g)*head_dim;
+        const float *qp = q + (size_t)(kv_head*GQ + g)*HD;
         #pragma unroll
         for (int e = 0; e < slice; e++) { qreg[g][e] = qp[lane + 32*e]; acc[g][e] = 0.0f; }
         m[g] = -INFINITY; l[g] = 0.0f;
@@ -1283,9 +1291,9 @@ __global__ void sliding_attn_splitk_kernel(
 
     for (int i = i0; i < i1; i++) {
         size_t pos = (size_t)(lo + i);        // absolute position (flat, no wrap)
-        const kv_t *kp = k_cache + (pos*NKV + kv_head)*head_dim;
-        const kv_t *vp = v_cache + (pos*NKV + kv_head)*head_dim;
-        float kd[SL_SLICE_MAX], vd[SL_SLICE_MAX];
+        const kv_t *kp = k_cache + (pos*NKV + kv_head)*HD;
+        const kv_t *vp = v_cache + (pos*NKV + kv_head)*HD;
+        float kd[slice], vd[slice];
         #pragma unroll
         for (int e = 0; e < slice; e++) {     // K/V tile read ONCE, reused for all GQ heads
             kd[e] = fp8_to_float(kp[lane + 32*e]);
@@ -1308,7 +1316,7 @@ __global__ void sliding_attn_splitk_kernel(
     #pragma unroll
     for (int g = 0; g < GQ; g++) {
         int h = kv_head*GQ + g;               // same GQA mapping as q_head/(NH/NKV)
-        float *pa = part_acc + ((size_t)split*NH + h)*head_dim;
+        float *pa = part_acc + ((size_t)split*NH + h)*HD;
         #pragma unroll
         for (int e = 0; e < slice; e++) pa[lane + 32*e] = acc[g][e];
         if (lane == 0) { part_m[split*NH + h] = m[g]; part_l[split*NH + h] = l[g]; }
@@ -3024,7 +3032,8 @@ static inline void global_attn_decode_broadcast(
 // honored generically): same (out, q, kc, vc, n_heads, n_kv_heads, head_dim, window,
 // n_tokens) contract, but NO __syncthreads in the key loop (warp-owned register slices,
 // see sliding_attn_splitk_kernel) and the window split across blocks. n_heads must be
-// GEMMA4_HEADS and n_kv_heads GEMMA4_KV_HEADS (template-fixed, like the global wrapper).
+// GEMMA4_HEADS, n_kv_heads GEMMA4_KV_HEADS and head_dim GEMMA4_HEAD_DIM (all template-fixed:
+// head_dim too, so the per-lane slice loops unroll and stay in registers — see kernel note).
 //
 // SCRATCH REUSE (d_fa_acc/m/l, shared with the global path): the buffers hold
 // GEMMA4_GLOBAL_MAX_SPLITS(128) × GEMMA4_HEADS(16) × GEMMA4_GLOBAL_HEAD_DIM(512) floats.
@@ -3044,10 +3053,10 @@ static inline void sliding_attn_decode_broadcast(
     int splits = (window_len + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
     if (splits < 1) splits = 1;   // window_len==0 ⇒ one empty split ⇒ combine writes zeros
     if (splits > GEMMA4_GLOBAL_MAX_SPLITS) splits = GEMMA4_GLOBAL_MAX_SPLITS; // scratch cap
-    sliding_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS>
+    sliding_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
         <<<splits, GEMMA4_KV_HEADS * 32, 0, stream>>>(
             eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc,
-            head_dim, window, n_tokens, splits);
+            window, n_tokens, splits);
     flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
         out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
 }
