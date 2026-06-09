@@ -101,7 +101,9 @@ typedef enum {
 typedef enum {
     GGML_TYPE_F32  = 0,
     GGML_TYPE_F16  = 1,
+    GGML_TYPE_Q4_0 = 2,
     GGML_TYPE_Q8_0 = 8,
+    GGML_TYPE_Q6_K = 14,
 } ggml_type_t;
 
 #define GGUF_DEFAULT_ALIGNMENT 32
@@ -256,6 +258,18 @@ __device__ __forceinline__ float decode_weight(
 {
     if (fmt == 0 /*FORMAT_FP8*/) {
         return fp8_to_float((__nv_fp8_storage_t)base[i]);
+    } else if (fmt == 2 /*FORMAT_Q4_0*/) {
+        // Q4_0: block = 2-byte fp16 scale + 16 bytes of 32 nibbles (18 bytes).
+        // byte j holds elem[j] in the low nibble and elem[j+16] in the high nibble;
+        // value = scale * (nibble - 8).
+        int b   = i >> 5;                      // block index (i / 32)
+        int j   = i & 31;                      // lane in block (i % 32)
+        const uint8_t *blk = base + (size_t)b * 18;
+        __half_raw hr; hr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        float scale = __half2float(__half(hr));
+        uint8_t byte = blk[2 + (j & 15)];
+        int nib = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+        return scale * (float)(nib - 8);
     } else {
         // Q8_0: block = 2-byte fp16 scale + 32 int8 qs
         int b   = i >> 5;                      // block index  (i / 32)
@@ -265,6 +279,15 @@ __device__ __forceinline__ float decode_weight(
         float scale = __half2float(__half(hr));
         return scale * (float)((int8_t)blk[2 + j]);
     }
+}
+
+// Bytes per quantized weight ROW (out_dim rows of in_dim elements). FP8 = 1 B/elem,
+// Q8_0 = 34 B / 32-block, Q4_0 = 18 B / 32-block. Used everywhere a kernel steps from
+// one output row to the next — must match decode_weight's per-element block size.
+__device__ __forceinline__ size_t wrow_bytes(int fmt, int in_dim) {
+    if (fmt == 0 /*FP8*/)  return (size_t)in_dim;
+    if (fmt == 2 /*Q4_0*/) return (size_t)(in_dim/32) * 18;
+    return (size_t)(in_dim/32) * 34;   // Q8_0
 }
 
 // =========================================================================
@@ -615,6 +638,46 @@ __global__ void mmvq_q8_0_kernel(
     if (threadIdx.x == 0) out[idx] = acc;
 }
 
+// MMVQ for Q4_0 weights (the QAT 4-bit layers). Q4_0 block = fp16 scale + 16 bytes of
+// 32 nibbles; value = dw*(nibble-8). The -8 offset makes it asymmetric, so unlike Q8_0
+// we add a correction: out = dw·dx·(Σ nibble·qx − 8·Σ qx). The activation is the SAME
+// per-block int8 quantization as the Q8_0 path (quantize_q8_1_kernel); the block sum is
+// computed here from qx via dp4a(0x01010101,·). nibble layout matches llama.cpp
+// (byte j → elem j low, elem j+16 high), read 4-bytes-at-a-time (8 nibbles).
+__global__ void mmvq_q4_0_kernel(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
+    int in_dim, int out_dim)
+{
+    extern __shared__ float smem[];
+    int idx = blockIdx.x;
+    if (idx >= out_dim) return;
+    int nb = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)nb * 18;
+    float acc = 0.0f;
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+        const uint8_t *blk = wrow + (size_t)b * 18;
+        __half_raw hr; hr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        float dw = __half2float(__half(hr));
+        const void *wqs = blk + 2;                            // 16 nibble-bytes (2-byte aligned)
+        const int  *xqs = (const int *)(qx + (size_t)b * 32); // 32 act int8 (4-byte aligned)
+        int sumi = 0, sumq = 0;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int w   = q8_get_int_b2(wqs, k);     // 4 bytes = 8 nibbles
+            int vlo = w & 0x0F0F0F0F;            // elems 4k..4k+3   (raw nibble 0..15)
+            int vhi = (w >> 4) & 0x0F0F0F0F;     // elems 4k+16..4k+19
+            sumi = __dp4a(vlo, xqs[k],     sumi);
+            sumi = __dp4a(vhi, xqs[k + 4], sumi);
+        }
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            sumq = __dp4a(0x01010101, xqs[k], sumq);   // Σ of all 32 activation int8
+        acc += dw * dx[b] * (float)(sumi - 8 * sumq);
+    }
+    acc = block_reduce_sum(acc, smem);
+    if (threadIdx.x == 0) out[idx] = acc;
+}
+
 // Single-output GEMV: out[j] = sum_i W[j,i] * x[i]
 __global__ void gemv_kernel(
     float          *out,
@@ -627,7 +690,7 @@ __global__ void gemv_kernel(
     extern __shared__ float smem[];
     int idx = blockIdx.x;
     if (idx >= out_dim) return;
-    const uint8_t *row = weight + (size_t)idx * (fmt == 0 ? in_dim : (in_dim/32)*34);
+    const uint8_t *row = weight + (size_t)idx * wrow_bytes(fmt, in_dim);
     float sum = 0.0f;
     for (int i = threadIdx.x; i < in_dim; i += blockDim.x)
         sum += decode_weight(row, i, fmt) * x[i];
@@ -648,7 +711,7 @@ __global__ void gemv_pair_kernel(
 {
     extern __shared__ float smem[];    int idx = blockIdx.x;
     if (idx >= out_dim) return;
-    size_t row_bytes = fmt == 0 ? in_dim : (size_t)(in_dim/32)*34;
+    size_t row_bytes = wrow_bytes(fmt, in_dim);
     const uint8_t *rg = weight_gate + (size_t)idx * row_bytes;
     const uint8_t *ru = weight_up   + (size_t)idx * row_bytes;
     float sg = 0.0f, su = 0.0f;
@@ -681,7 +744,7 @@ __global__ void gemv_batched_kernel_t(
     extern __shared__ float smem[];
     int idx = blockIdx.x;
     if (idx >= out_dim) return;
-    const uint8_t *row = weight + (size_t)idx * (fmt == 0 ? in_dim : (size_t)(in_dim/32)*34);
+    const uint8_t *row = weight + (size_t)idx * wrow_bytes(fmt, in_dim);
     float acc[NK];
     #pragma unroll
     for (int k = 0; k < NK; k++) acc[k] = 0.0f;
@@ -742,7 +805,7 @@ __global__ void gemv_lora_kernel(
     int idx = blockIdx.x;
     if (idx >= out_dim) return;
 
-    size_t row_bytes = fmt == 0 ? (size_t)in_dim : (size_t)(in_dim/32)*34;
+    size_t row_bytes = wrow_bytes(fmt, in_dim);
     const uint8_t *row = weight + (size_t)idx * row_bytes;
 
     float base = 0.0f;
@@ -787,7 +850,7 @@ __global__ void gemv_lora_pair_kernel(
     int idx = blockIdx.x;
     if (idx >= out_dim) return;
 
-    size_t row_bytes = fmt == 0 ? (size_t)in_dim : (size_t)(in_dim/32)*34;
+    size_t row_bytes = wrow_bytes(fmt, in_dim);
     const uint8_t *rg = weight_gate + (size_t)idx * row_bytes;
     const uint8_t *ru = weight_up   + (size_t)idx * row_bytes;
 
@@ -1668,6 +1731,7 @@ struct gemma4_engine {
     // memory reads on every GEMV.
     uint8_t  *d_weights;
     uint64_t  tdata_start;   // file offset where tensor data begins
+    unsigned char *d_token_embd;  // QAT Q4_0 model: token_embd (Q6_K) converted to Q8_0
 
     // ROTATING per-layer BF16 dequant scratch for batched cuBLAS prefill (Step 2).
     // The 7 projection weights of the CURRENT layer only are dequantized Q8_0/FP8 →
@@ -2031,6 +2095,87 @@ cleanup:
     return rc;
 }
 
+// Explicit IEEE fp16<->fp32 (host) — avoid relying on __half host conversions.
+static inline float h2f_host(uint16_t h) {
+    uint32_t s = (uint32_t)(h & 0x8000) << 16;
+    uint32_t e = (h >> 10) & 0x1F, m = h & 0x3FF, f;
+    if (e == 0) {
+        if (m == 0) f = s;
+        else { int ee = -1; do { ee++; m <<= 1; } while (!(m & 0x400));
+               m &= 0x3FF; f = s | (uint32_t)((112 - ee) << 23) | (m << 13); }
+    } else if (e == 0x1F) f = s | 0x7F800000u | (m << 13);
+    else f = s | (uint32_t)((e + 112) << 23) | (m << 13);
+    float o; memcpy(&o, &f, 4); return o;
+}
+static inline uint16_t f2h_host(float x) {
+    uint32_t f; memcpy(&f, &x, 4);
+    uint16_t s = (uint16_t)((f >> 16) & 0x8000);
+    int32_t  e = (int32_t)((f >> 23) & 0xFF) - 112;   // 127 - 15
+    uint32_t m = f & 0x7FFFFF;
+    if (e >= 0x1F) return (uint16_t)(s | 0x7C00);
+    if (e <= 0) {
+        if (e < -10) return s;
+        m |= 0x800000; uint32_t sh = (uint32_t)(14 - e);
+        uint16_t hm = (uint16_t)(m >> sh);
+        if ((m >> (sh - 1)) & 1) hm++;
+        return (uint16_t)(s | hm);
+    }
+    uint16_t h = (uint16_t)(s | (uint16_t)(e << 10) | (uint16_t)(m >> 13));
+    if (m & 0x1000) h++;
+    return h;
+}
+
+// Convert a Q6_K tensor (token_embd in the QAT model) to Q8_0, host-side, once at load.
+// Q6_K super-block = 256 elems (ql[128] + qh[64] + scales[16](int8) + d(fp16) = 210 B);
+// we dequant to float then requantize each 32-subblock to Q8_0 (fp16 scale + 32 int8).
+// Returns a malloc'd Q8_0 buffer of (n_elem/32)*34 bytes, or NULL on error.
+static unsigned char* convert_q6k_to_q8_0(const unsigned char *src, int64_t n_elem)
+{
+    const int64_t n_super = n_elem / 256;
+    const int64_t n_q8blk = n_elem / 32;
+    unsigned char *dst = (unsigned char*)malloc((size_t)n_q8blk * 34);
+    if (!dst) return NULL;
+    for (int64_t s = 0; s < n_super; s++) {
+        const unsigned char *blk = src + (size_t)s * 210;
+        const unsigned char *ql0 = blk;
+        const unsigned char *qh0 = blk + 128;
+        const int8_t        *sc0 = (const int8_t*)(blk + 192);
+        uint16_t draw; memcpy(&draw, blk + 208, 2);
+        float d = h2f_host(draw);
+        float f[256];
+        for (int n = 0; n < 256; n += 128) {
+            const unsigned char *ql = ql0 + (n/128)*64;
+            const unsigned char *qh = qh0 + (n/128)*32;
+            const int8_t        *sc = sc0 + (n/128)*8;
+            for (int l = 0; l < 32; l++) {
+                int is = l/16;
+                int q1 = (int)((ql[l]    & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;
+                int q2 = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;
+                int q3 = (int)((ql[l]    >> 4)  | (((qh[l]>>4)&3)<<4)) - 32;
+                int q4 = (int)((ql[l+32] >> 4)  | (((qh[l]>>6)&3)<<4)) - 32;
+                f[n+l+ 0] = d * sc[is+0] * q1;
+                f[n+l+32] = d * sc[is+2] * q2;
+                f[n+l+64] = d * sc[is+4] * q3;
+                f[n+l+96] = d * sc[is+6] * q4;
+            }
+        }
+        for (int sb = 0; sb < 8; sb++) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(f[sb*32+j]));
+            float scale = amax / 127.0f, iscale = (scale > 0.0f) ? 1.0f/scale : 0.0f;
+            unsigned char *ob = dst + (size_t)(s*8 + sb) * 34;
+            uint16_t hb = f2h_host(scale);
+            ob[0] = (unsigned char)(hb & 0xFF); ob[1] = (unsigned char)(hb >> 8);
+            for (int j = 0; j < 32; j++) {
+                int q = (int)lrintf(f[sb*32+j] * iscale);
+                q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                ob[2+j] = (unsigned char)(int8_t)q;
+            }
+        }
+    }
+    return dst;
+}
+
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
     tensor_format_t format,
@@ -2110,21 +2255,33 @@ gemma4_engine_t* gemma4_engine_create(
     fprintf(stderr, "gem4d: loaded %s (%.2f GB)\n",
             model_path, eng->gguf_size / (1024.0 * 1024.0 * 1024.0));
 
-    // Auto-detect the weight format from the GGUF tensor table. Trusting the
-    // CLI flag is dangerous: decoding Q8_0 blocks as FP8 bytes yields NaNs.
+    // Auto-detect the weight format from the GGUF tensor table. Trusting the CLI flag
+    // is dangerous (decoding Q8_0 blocks as FP8 bytes yields NaNs). Detect from a LAYER
+    // tensor (ffn_down) — token_embd may be a different type (Q6_K in the QAT Q4_0 model).
+    int embd_is_q6k = 0;
     {
         uint64_t _off = 0, _n = 0; uint32_t gtype = 0;
-        if (gguf_find_tensor(eng->gguf_data, eng->gguf_size,
-                "token_embd.weight", &_off, &_n, &gtype) == 0) {
-            tensor_format_t detected =
-                (gtype == GGML_TYPE_Q8_0) ? FORMAT_Q8_0 : FORMAT_FP8;
-            if (detected != eng->format) {
-                fprintf(stderr, "gem4d: GGUF tensor type %u — overriding format "
-                                "%s -> %s\n", gtype,
-                        eng->format == FORMAT_FP8 ? "fp8" : "q8_0",
-                        detected     == FORMAT_FP8 ? "fp8" : "q8_0");
-                eng->format = detected;
+        const char *names[] = {"blk.0.ffn_down.weight", "blk.0.attn_q.weight"};
+        for (int t = 0; t < 2; t++) {
+            if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, names[t], &_off, &_n, &gtype) == 0) {
+                tensor_format_t detected =
+                    (gtype == GGML_TYPE_Q4_0) ? FORMAT_Q4_0 :
+                    (gtype == GGML_TYPE_Q8_0) ? FORMAT_Q8_0 : FORMAT_FP8;
+                if (detected != eng->format) {
+                    const char *nm[] = {"fp8","q8_0","q4_0"};
+                    fprintf(stderr, "gem4d: GGUF layer tensor type %u — format %s -> %s\n",
+                            gtype, nm[eng->format], nm[detected]);
+                    eng->format = detected;
+                }
+                break;
             }
+        }
+        // token_embd / tied LM head type (Q6_K in the QAT model → convert to Q8_0 at load)
+        uint32_t etype = 0;
+        if (gguf_find_tensor(eng->gguf_data, eng->gguf_size,
+                "token_embd.weight", &_off, &_n, &etype) == 0 && etype == GGML_TYPE_Q6_K) {
+            embd_is_q6k = 1;
+            fprintf(stderr, "gem4d: token_embd is Q6_K — will convert to Q8_0 at load\n");
         }
     }
 
@@ -2414,6 +2571,25 @@ gemma4_engine_t* gemma4_engine_create(
         }
     }
 
+    // QAT Q4_0 model: convert the Q6_K token_embd (= tied LM head) to a Q8_0 device
+    // buffer so the existing Q8_0 embed/LM-head kernels handle it (layers stay Q4_0).
+    eng->d_token_embd = NULL;
+    if (eng->format == FORMAT_Q4_0 && embd_is_q6k) {
+        int64_t n_elem = (int64_t)GEMMA4_VOCAB_SIZE * GEMMA4_HIDDEN_SIZE;
+        const unsigned char *q6 = (const unsigned char*)(eng->gguf_data + eng->tensors.token_embd);
+        unsigned char *q8 = convert_q6k_to_q8_0(q6, n_elem);
+        if (q8) {
+            size_t q8bytes = (size_t)(n_elem/32) * 34;
+            if (cudaMalloc(&eng->d_token_embd, q8bytes) == cudaSuccess)
+                cudaMemcpy(eng->d_token_embd, q8, q8bytes, cudaMemcpyHostToDevice);
+            free(q8);
+            fprintf(stderr, "gem4d: token_embd Q6_K->Q8_0 converted (%.2f GB)\n",
+                    q8bytes / (1024.0*1024.0*1024.0));
+        }
+        if (!eng->d_token_embd)
+            fprintf(stderr, "gem4d: WARNING token_embd conversion failed\n");
+    }
+
     // Build the absolute-id -> global-slot inverse map from global_layer_indices
     // (set by the layer-type detection above). Sliding layers map to -1.
     for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) eng->global_slot[l] = -1;
@@ -2535,6 +2711,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_w_k_norm);
     CUDA_FREE(eng->d_w_out_norm);
     CUDA_FREE(eng->d_weights);
+    CUDA_FREE(eng->d_token_embd);
     for (int p = 0; p < 7; p++)
         CUDA_FREE(eng->d_bf16_layer[p]);
     for (int p = 0; p < 12; p++)
@@ -2588,6 +2765,10 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
 static inline const unsigned char* weight_fp8(
     const gemma4_engine_t *eng, uint64_t tensor_offset)
 {
+    // QAT Q4_0 model: token_embd (and the tied LM head, same offset) live in the
+    // separately-converted Q8_0 buffer, not the in-blob Q6_K bytes.
+    if (eng->d_token_embd && tensor_offset == eng->tensors.token_embd)
+        return eng->d_token_embd;
     if (eng->d_weights)
         return (const unsigned char *)(eng->d_weights
                                        + (tensor_offset - eng->tdata_start));
@@ -2600,19 +2781,26 @@ static inline const unsigned char* weight_fp8(
 // Thin wrappers so call-sites stay readable.
 #define FMT(eng)  ((int)(eng)->format)
 
+// `wfmt` overrides the weight format (default −1 = engine format). The mixed QAT
+// model passes FORMAT_Q8_0 for the converted token_embd/LM-head while layers are Q4_0.
 static inline void gemv_w(
     const gemma4_engine_t *eng,
     float *out, const uint8_t *weight, const float *x,
-    int in_dim, int out_dim, cudaStream_t stream)
+    int in_dim, int out_dim, cudaStream_t stream, int wfmt = -1)
 {
-    if (FMT(eng) == 1 /*Q8_0*/ && eng->d_qx) {
+    int fmt = (wfmt < 0) ? FMT(eng) : wfmt;
+    if (fmt == 1 /*Q8_0*/ && eng->d_qx) {
         // Quantize the activation to int8 then dp4a MMVQ (llama.cpp-parity bandwidth).
         quantize_q8_1_kernel<<<in_dim/32, 32, 0, stream>>>(x, eng->d_qx, eng->d_dx, in_dim);
         mmvq_q8_0_kernel<<<out_dim, 256, 32*sizeof(float), stream>>>(
             out, weight, eng->d_qx, eng->d_dx, in_dim, out_dim);
+    } else if (fmt == 2 /*Q4_0*/ && eng->d_qx) {
+        quantize_q8_1_kernel<<<in_dim/32, 32, 0, stream>>>(x, eng->d_qx, eng->d_dx, in_dim);
+        mmvq_q4_0_kernel<<<out_dim, 256, 32*sizeof(float), stream>>>(
+            out, weight, eng->d_qx, eng->d_dx, in_dim, out_dim);
     } else {
         gemv_kernel<<<out_dim, 256, 32*sizeof(float), stream>>>(
-            out, weight, x, in_dim, out_dim, FMT(eng));
+            out, weight, x, in_dim, out_dim, fmt);
     }
 }
 
@@ -2620,22 +2808,30 @@ static inline void gemv_w(
 static inline void gemv_batched_w(
     const gemma4_engine_t *eng,
     float *out, const uint8_t *weight, const float *x,
-    int in_dim, int out_dim, int K, cudaStream_t stream)
+    int in_dim, int out_dim, int K, cudaStream_t stream, int wfmt = -1)
 {
-    gemv_batched_launch(out, weight, x, in_dim, out_dim, K, FMT(eng), stream);
+    gemv_batched_launch(out, weight, x, in_dim, out_dim, K,
+                        (wfmt < 0) ? FMT(eng) : wfmt, stream);
 }
 
 static inline void embed_w(
     const gemma4_engine_t *eng,
     float *out, const uint8_t *table, const int32_t *tokens,
-    int batch, int hidden_size, cudaStream_t stream)
+    int batch, int hidden_size, cudaStream_t stream, int efmt = -1)
 {
-    if (eng->format == FORMAT_Q8_0)
+    int fmt = (efmt < 0) ? FMT(eng) : efmt;
+    if (fmt == FORMAT_Q8_0 || fmt == FORMAT_Q4_0)  // Q4_0 model: token_embd converted to Q8_0
         embed_lookup_q8_0_kernel<<<batch, 256, 0, stream>>>(
             out, table, tokens, batch, hidden_size);
     else
         embed_lookup_kernel<<<batch, 256, 0, stream>>>(
             out, table, tokens, batch, hidden_size);
+}
+
+// The QAT Q4_0 model's tied token_embd / LM head is the converted Q8_0 buffer (the
+// pointer is redirected in weight_fp8); this returns the matching format for it.
+static inline int embd_fmt(const gemma4_engine_t *eng) {
+    return (eng->format == FORMAT_Q4_0 && eng->d_token_embd) ? (int)FORMAT_Q8_0 : FMT(eng);
 }
 
 // =========================================================================
@@ -3224,7 +3420,7 @@ int gemma4_engine_prefill_batched(
     float *x_last = d_x + (size_t)(N-1)*H;
     rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
     gemv_w(eng, eng->d_logits, weight_fp8(eng, eng->tensors.output_weight),
-           eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream);
+           eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream, embd_fmt(eng));
     logit_softcap_kernel<<<grid1d(GEMMA4_VOCAB_SIZE),256,0,stream>>>(
         eng->d_logits, GEMMA4_SOFTCAP, GEMMA4_VOCAB_SIZE);
     if (eng->n_suppress > 0)
@@ -3379,7 +3575,7 @@ int gemma4_engine_prefill_flash(
             float *x_last = d_x + (size_t)(cn-1)*H;
             rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
             gemv_w(eng, eng->d_logits, weight_fp8(eng, eng->tensors.output_weight),
-                   eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream);
+                   eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream, embd_fmt(eng));
             logit_softcap_kernel<<<grid1d(GEMMA4_VOCAB_SIZE),256,0,stream>>>(
                 eng->d_logits, GEMMA4_SOFTCAP, GEMMA4_VOCAB_SIZE);
             if (eng->n_suppress > 0)
@@ -3469,7 +3665,7 @@ int gemma4_engine_prefill(
         gemv_w(eng, eng->d_logits,
             weight_fp8(eng, eng->tensors.output_weight),
             eng->d_norm,
-            GEMMA4_HIDDEN_SIZE, vocab, stream);
+            GEMMA4_HIDDEN_SIZE, vocab, stream, embd_fmt(eng));
 
         // Logit softcap
         logit_softcap_kernel<<<(vocab + 255) / 256, 256, 0, stream>>>(
@@ -3530,7 +3726,7 @@ int gemma4_engine_bench_graph(gemma4_engine_t *eng, int reps)
         rms_norm_kernel<<<1,256,32*sizeof(float),stream>>>(
             eng->d_norm, eng->d_x, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
         gemv_w(eng, eng->d_logits, weight_fp8(eng, eng->tensors.output_weight),
-               eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream);
+               eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream, embd_fmt(eng));
     };
 
     body(); cudaStreamSynchronize(stream);  // warmup
@@ -3619,7 +3815,7 @@ int gemma4_engine_decode(
         gemv_w(eng, eng->d_logits,
             weight_fp8(eng, eng->tensors.output_weight),
             eng->d_norm,
-            GEMMA4_HIDDEN_SIZE, vocab, stream);
+            GEMMA4_HIDDEN_SIZE, vocab, stream, embd_fmt(eng));
     }
 
     logit_softcap_kernel<<<(vocab + 255) / 256, 256, 0, stream>>>(
@@ -3816,7 +4012,7 @@ int gemma4_engine_decode_batched(
     int vocab = GEMMA4_VOCAB_SIZE;
     rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, K, GEMMA4_RMS_EPS);
     gemv_batched_w(eng, d_logitsK, weight_fp8(eng, eng->tensors.output_weight),
-                   d_norm, H, vocab, K, stream);
+                   d_norm, H, vocab, K, stream, embd_fmt(eng));
     logit_softcap_kernel<<<grid1d((size_t)K*vocab),256,0,stream>>>(d_logitsK, GEMMA4_SOFTCAP, K*vocab);
     if (eng->n_suppress > 0)
         for (int i = 0; i < K; i++)
@@ -3974,7 +4170,7 @@ static int gemma4_engine_decode_tree(
 
     int vocab = GEMMA4_VOCAB_SIZE;
     rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, K, GEMMA4_RMS_EPS);
-    gemv_batched_w(eng, d_logitsK, weight_fp8(eng, eng->tensors.output_weight), d_norm, H, vocab, K, stream);
+    gemv_batched_w(eng, d_logitsK, weight_fp8(eng, eng->tensors.output_weight), d_norm, H, vocab, K, stream, embd_fmt(eng));
     logit_softcap_kernel<<<grid1d((size_t)K*vocab),256,0,stream>>>(d_logitsK, GEMMA4_SOFTCAP, K*vocab);
     if (eng->n_suppress > 0)
         for (int i = 0; i < K; i++)

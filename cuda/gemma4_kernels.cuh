@@ -55,6 +55,7 @@
 typedef enum {
     FORMAT_FP8   = 0,  // CUDA_R_8F_E4M3 (primary, native Blackwell)
     FORMAT_Q8_0  = 1,  // GGML Q8_0 blocks (fallback)
+    FORMAT_Q4_0  = 2,  // GGML Q4_0 blocks (QAT 4-bit; layers Q4_0, token_embd→Q8_0)
 } tensor_format_t;
 
 // ─── GGML Q8_0 block ──────────────────────────────────────────────────
