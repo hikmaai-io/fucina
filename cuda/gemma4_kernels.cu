@@ -3391,7 +3391,13 @@ int gemma4_engine_prefill_batched(
     if (!eng->loaded || n_tokens <= 0) return -1;
     if (eng->global_n_tokens != 0) return -2;             // need fresh sequence
     if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
-    if (n_tokens > 20480) return -2;                      // [HEADS][N×N] (~40GB) too big — use flash
+    // Batched attention materializes [HEADS][N×N] score buffers (fp32+bf16, ~6 B/elem)
+    // allocated/freed PER prefill. At large N that is many GB (e.g. ~14 GB @ 11.7k
+    // tokens) — the giant per-request cudaMalloc intermittently stalls or fails and
+    // falls back to the ~90× slower token-by-token path (the "stuck" prefills). Cap
+    // batched to a modest N (≤4096 ⇒ ~1.6 GB buffers); larger prompts use the
+    // constant-memory chunked FLASH prefill (bit-identical, ~700 t/s, no N² alloc).
+    if (n_tokens > 4096) return -2;
     if (build_bf16_weights(eng) != 0) return -1;
 
     cudaStream_t stream = eng->stream;
