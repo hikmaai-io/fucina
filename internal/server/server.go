@@ -28,6 +28,7 @@ type Server struct {
 	genParams       GenerationParams
 	thinkingDefault bool // startup default for the gemma-4 reasoning channel
 	debug           bool // dump full request bodies + rendered prompts
+	metrics         Metrics
 	httpServer      *http.Server
 }
 
@@ -339,7 +340,28 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/completions", h(s.handleCompletions))
 	mux.HandleFunc("/v1/embeddings", h(s.handleEmbeddings))
 	mux.HandleFunc("/health", h(s.handleHealth))
+	mux.HandleFunc("/metrics", h(s.handleMetrics))
 	mux.HandleFunc("/", h(s.handleNotFound))
+}
+
+// handleMetrics reports live KV/context utilization, prefix-cache hit rate, and
+// prefill/decode throughput (cumulative + last request). JSON for easy curl/pi use.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	ctxCap := int(s.engine.ContextSize())
+	s.kv.Lock()
+	used := s.engine.NTokens()
+	s.kv.Unlock()
+	hits, misses, reused, reqTok := s.kv.DetailedStats()
+
+	// gemma-4 KV memory (FP8, 1 byte/elem; K and V stored separately):
+	//   sliding: MAX_LAYERS(48) × KV_HEADS(8) × WINDOW(1024) × HEAD_DIM(256), fixed
+	//   global:  GLOBAL_LAYERS(8) × ctxCap × GLOBAL_HEAD_DIM(512), grows with ctx
+	const mib = 1024.0 * 1024.0
+	slidingMB := float64(48*8*1024*256) * 2 / mib
+	globalMB := float64(8*512) * float64(ctxCap) * 2 / mib
+
+	writeJSON(w, http.StatusOK, s.metrics.snapshot(
+		s.modelName, used, ctxCap, slidingMB, globalMB, hits, misses, reused, reqTok))
 }
 
 // statusRecorder captures the response status so the access log can report it.
@@ -511,8 +533,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if prefillElapsed.Seconds() > 0 && pf.NewTokens > 0 {
 		prefillTPS = float64(pf.NewTokens) / prefillElapsed.Seconds()
 	}
-	log.Printf("gem4d: prefill %d tokens (%d cached, %d new) in %.2fs (%.1f tok/s)",
-		promptTokens, pf.ReusedTokens, pf.NewTokens, prefillElapsed.Seconds(), prefillTPS)
+	s.metrics.recordPrefill(pf.NewTokens, prefillElapsed.Seconds())
+	used := s.engine.NTokens()
+	log.Printf("gem4d: prefill %d tokens (%d cached, %d new) in %.2fs (%.1f tok/s) | ctx %d/%d (%.0f%%)",
+		promptTokens, pf.ReusedTokens, pf.NewTokens, prefillElapsed.Seconds(), prefillTPS,
+		used, ctx, 100.0*float64(used)/float64(ctx))
 
 	logits := pf.Logits
 
@@ -697,7 +722,7 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			}
 		}
 	}
-	logGenSpeed(genStart, generated)
+	s.logGenSpeed(genStart, generated)
 
 	msg := ChatMessage{Role: "assistant"}
 	// Separate the gemma-4 thought channel into reasoning_content; the rest is the
@@ -920,7 +945,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 		}
 	}
 
-	logGenSpeed(genStart, generated)
+	s.logGenSpeed(genStart, generated)
 
 	// Final chunk carries finish_reason AND usage so the client can track context
 	// consumption (prompt + completion tokens) on streamed responses, matching the
@@ -938,13 +963,14 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	flusher.Flush()
 }
 
-// logGenSpeed logs generation throughput in tokens/second.
-func logGenSpeed(start time.Time, generated int) {
+// logGenSpeed logs generation throughput in tokens/second and records it for /metrics.
+func (s *Server) logGenSpeed(start time.Time, generated int) {
 	elapsed := time.Since(start)
 	tps := 0.0
 	if elapsed.Seconds() > 0 {
 		tps = float64(generated) / elapsed.Seconds()
 	}
+	s.metrics.recordDecode(generated, elapsed.Seconds())
 	log.Printf("gem4d: generated %d tokens in %.2fs (%.1f tok/s)",
 		generated, elapsed.Seconds(), tps)
 }

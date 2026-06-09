@@ -155,6 +155,13 @@ func (c *KVCache) Stats() (hits, misses int, hitRate float64) {
 	return
 }
 
+// DetailedStats returns the raw prefix-cache counters for /metrics.
+func (c *KVCache) DetailedStats() (hits, misses int, reusedTokens, reqTokens int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hits, c.misses, c.hitTokens, c.reqTokens
+}
+
 // longestCommonPrefix returns the length of the longest shared prefix of a, b.
 func longestCommonPrefix(a, b []int32) int {
 	n := len(a)
