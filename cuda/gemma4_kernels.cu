@@ -421,6 +421,14 @@ __global__ void softmax_kernel(float *x, int n) {
 // RMS Norm on a single vector of size n
 // Shared-memory warp-reduction helper (intra-block, all warps).
 // Requires a __shared__ float buf[32] visible to the caller.
+// Warp-level butterfly sum — the reduced value ends up in ALL 32 lanes (no smem,
+// no __syncthreads). Used by the tiled flash-prefill kernels (warp-per-query).
+__device__ __forceinline__ float warp_reduce_sum_all(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, o);
+    return v;
+}
+
 __device__ float block_reduce_sum(float val, float *smem) {
     int lane = threadIdx.x & 31;
     int wid  = threadIdx.x >> 5;
@@ -1174,6 +1182,112 @@ __global__ void flash_prefill_global_kernel(
     }
     if (tid < head_dim)
         out[(size_t)qi*oq + head*head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
+}
+
+// ─── Tiled flash prefill (warp-per-query) ───────────────────────────────
+// The naive kernels above do one query per BLOCK with a block_reduce_sum (a full
+// __syncthreads) PER KEY — the dominant cost at large N. These assign one query per
+// WARP: each lane owns head_dim/32 elements in registers, dot products reduce via
+// __shfl (no block sync), and a block packs (blockDim/32) queries. Same math/result.
+// Launch: <<<dim3(ceil(cn/warps_per_block), HEADS), warps_per_block*32>>>.
+#define FP_SLICE_MAX 16   // head_dim/32 ≤ 512/32
+
+__global__ void flash_prefill_global_tiled_kernel(
+    float *out, const float *q, const kv_t *kc, const kv_t *vc,
+    int n_heads, int head_dim, int hist_len,
+    const float *ck, const float *cv, int cn, int q_base, int okv)
+{
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int qi = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (qi >= cn) return;
+    int head = blockIdx.y, oq = n_heads * head_dim, slice = head_dim >> 5;
+    const float *qp = q + (size_t)qi*oq + head*head_dim;
+    float qreg[FP_SLICE_MAX], acc[FP_SLICE_MAX];
+    #pragma unroll
+    for (int e = 0; e < slice; e++) { qreg[e] = qp[lane + 32*e]; acc[e] = 0.0f; }
+    float m = -INFINITY, l = 0.0f;
+
+    for (int t = 0; t < hist_len; t++) {                 // history (all causal)
+        const kv_t *kp = kc + (size_t)t*head_dim;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
+        float s = warp_reduce_sum_all(dot);
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l*al + p;
+        const kv_t *vp = vc + (size_t)t*head_dim;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
+        m = mn;
+    }
+    for (int j = 0; j <= qi; j++) {                      // chunk keys, causal
+        const float *kp = ck + (size_t)j*okv;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) dot += qreg[e] * kp[lane + 32*e];
+        float s = warp_reduce_sum_all(dot);
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l*al + p;
+        const float *vp = cv + (size_t)j*okv;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*vp[lane + 32*e];
+        m = mn;
+    }
+    float *op = out + (size_t)qi*oq + head*head_dim;
+    #pragma unroll
+    for (int e = 0; e < slice; e++) op[lane + 32*e] = (l > 0.0f) ? acc[e]/l : 0.0f;
+}
+
+__global__ void flash_prefill_sliding_tiled_kernel(
+    float *out, const float *q, const kv_t *kc, const kv_t *vc,
+    int n_heads, int n_kv_heads, int head_dim, int window,
+    int hist_cursor, int hist_filled,
+    const float *ck, const float *cv, int cn, int q_base, int okv)
+{
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int qi = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (qi >= cn) return;
+    int head = blockIdx.y, kv_head = head / (n_heads / n_kv_heads);
+    int oq = n_heads * head_dim, slice = head_dim >> 5, pos = q_base + qi;
+    const float *qp = q + (size_t)qi*oq + head*head_dim;
+    float qreg[FP_SLICE_MAX], acc[FP_SLICE_MAX];
+    #pragma unroll
+    for (int e = 0; e < slice; e++) { qreg[e] = qp[lane + 32*e]; acc[e] = 0.0f; }
+    float m = -INFINITY, l = 0.0f;
+
+    for (int t = 0; t < hist_filled; t++) {              // ring history, masked to window
+        int ap = q_base - hist_filled + t;
+        if (ap < pos - window + 1) continue;
+        int ring = (hist_cursor - hist_filled + t + window) % window;
+        const kv_t *kp = kc + (size_t)(ring*n_kv_heads + kv_head)*head_dim;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
+        float s = warp_reduce_sum_all(dot);
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l*al + p;
+        const kv_t *vp = vc + (size_t)(ring*n_kv_heads + kv_head)*head_dim;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
+        m = mn;
+    }
+    int jlo = qi - window + 1; if (jlo < 0) jlo = 0;
+    for (int j = jlo; j <= qi; j++) {                    // chunk keys
+        const float *kp = ck + (size_t)j*okv + kv_head*head_dim;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) dot += qreg[e] * kp[lane + 32*e];
+        float s = warp_reduce_sum_all(dot);
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l*al + p;
+        const float *vp = cv + (size_t)j*okv + kv_head*head_dim;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*vp[lane + 32*e];
+        m = mn;
+    }
+    float *op = out + (size_t)qi*oq + head*head_dim;
+    #pragma unroll
+    for (int e = 0; e < slice; e++) op[lane + 32*e] = (l > 0.0f) ? acc[e]/l : 0.0f;
 }
 
 // =========================================================================
@@ -3218,13 +3332,15 @@ int gemma4_engine_prefill_flash(
             const float *ff = (lt==LAYER_SLIDING)? NULL : eng->d_rope_freqs;
             rope_rows_kernel<<<dim3(HEADS,cn),hd/2,0,stream>>>(d_q, d_k, c0, HEADS, nkv, hd, cn, theta, ff);
 
-            // Flash attention: chunk queries vs frozen history (cache) + chunk keys.
-            const int smemA = 32*(int)sizeof(float);
+            // Flash attention (tiled, warp-per-query): chunk queries vs frozen history
+            // (cache) + chunk keys. 8 warps/block → 8 queries/block, __shfl reductions.
+            const int WPB = 8;
+            dim3 fg((cn + WPB - 1) / WPB, HEADS);
             if (lt == LAYER_SLIDING) {
                 size_t lstride = (size_t)GEMMA4_SLIDING_WINDOW * kvhd;
                 kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
                 kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
-                flash_prefill_sliding_kernel<<<dim3(cn,HEADS),hd,smemA,stream>>>(
+                flash_prefill_sliding_tiled_kernel<<<fg, WPB*32, 0, stream>>>(
                     d_attn, d_q, kc, vc, HEADS, nkv, hd, GEMMA4_SLIDING_WINDOW,
                     eng->sliding_cursor[l], eng->sliding_filled[l], d_k, d_v, cn, c0, okv);
                 int cnt = (cn < GEMMA4_SLIDING_WINDOW)? cn : GEMMA4_SLIDING_WINDOW;
@@ -3237,7 +3353,7 @@ int gemma4_engine_prefill_flash(
                 size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
                 kv_t *kc = eng->d_global_k + (size_t)slot*stride;
                 kv_t *vc = eng->d_global_v + (size_t)slot*stride;
-                flash_prefill_global_kernel<<<dim3(cn,HEADS),hd,smemA,stream>>>(
+                flash_prefill_global_tiled_kernel<<<fg, WPB*32, 0, stream>>>(
                     d_attn, d_q, kc, vc, HEADS, hd, c0, d_k, d_v, cn, c0, okv);
                 kv_write_global_kernel<<<dim3(grid1d(hd),cn),256,0,stream>>>(
                     kc, vc, d_k, d_v, c0, cn, hd);
