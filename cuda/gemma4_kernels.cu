@@ -1013,6 +1013,9 @@ __global__ void rope_global_kernel(
 // rewind is exact (no eviction). n_tokens = tokens in this layer's cache (incl. the current
 // one, written before this call). Attend the window-bounded contiguous range
 // [max(0,n_tokens-window), n_tokens-1] — matches llama.cpp [i-window+1, i] (window keys).
+// REFERENCE ONLY: all live decode call sites use sliding_attn_decode_broadcast (split-K,
+// warp-per-KV-head — see sliding_attn_splitk_kernel), which kills the per-key
+// block_reduce_sum (two __syncthreads) this kernel pays ~window times per layer.
 __global__ void sliding_attn_decode_kernel(
     float       *output,       // [n_heads × head_dim]
     const float *q,            // [n_heads × head_dim]
@@ -1222,6 +1225,94 @@ __global__ void flash_decode_combine_kernel(
     }
     if (tid < head_dim)
         out[h*head_dim + tid] = (L > 0.0f) ? accv / L : 0.0f;
+}
+
+// =========================================================================
+// ─── Sliding-window split-K flash decode (warp-per-KV-head) ─────────────
+// =========================================================================
+// The naive sliding_attn_decode_kernel above pays a block_reduce_sum — TWO full
+// __syncthreads — PER KEY, launched as only <<<16 heads, 256 threads>>> (~1 block/SM,
+// nothing to hide the barrier latency behind). With 40 sliding layers back-to-back on
+// one stream that serial sync chain, not KV bandwidth, is what decays decode from
+// ~20 tok/s to ~10 as the 1024-token window fills (~1.24 µs/key/layer measured).
+// Same fix as the tiled prefill kernels (see flash_prefill_*_tiled): each lane owns
+// head_dim/32 elements in registers and dots reduce via warp_reduce_sum_all — NO
+// __syncthreads anywhere in the key loop — plus the global path's split-K so the
+// ≤1024-key window spreads across blocks/SMs instead of one serial scan.
+//
+// Geometry: one warp per KV HEAD (NKV=8 warps = 256 threads/block), each warp serving
+// its GQA group of GQ = NH/NKV = 2 query heads. Chosen over warp-per-query-head
+// (16 warps) because each K/V tile is then loaded exactly ONCE per block (the
+// GQA-broadcast principle of global_attn_splitk_kernel) for two extra register
+// slices per lane (qreg+acc: 2×8+2×8 = 32 floats — half the global kernel's 64).
+// blockIdx.x = split of the window range [n_tokens - window_len, n_tokens) over the
+// FLAT [capacity][n_kv_heads][head_dim] FP8 cache (absolute positions, scale 1.0).
+// Per-(split, q_head) online-softmax partials are written in the [n_splits][NH][head_dim]
+// layout flash_decode_combine_kernel<NH> expects; an empty split (range exhausted, or
+// window_len == 0) writes m = -INFINITY which the combine pass skips.
+#define SL_SLICE_MAX 8   // head_dim/32 ≤ 256/32 (sliding layers only)
+
+template<int NH, int NKV>
+__global__ void sliding_attn_splitk_kernel(
+    float *part_acc,                          // [n_splits][NH][head_dim] (unnormalized)
+    float *part_m, float *part_l,             // [n_splits][NH]
+    const float *q,                           // [NH][head_dim]
+    const kv_t *k_cache, const kv_t *v_cache, // FLAT [capacity][NKV][head_dim] FP8
+    int head_dim, int window, int n_tokens, int n_splits)
+{
+    constexpr int GQ = NH / NKV;              // query heads per KV head (GQA group) = 2
+    int kv_head = threadIdx.x >> 5;           // one warp per KV head
+    int lane    = threadIdx.x & 31;
+    int slice   = head_dim >> 5;              // 8 floats/lane at head_dim 256
+    int split   = blockIdx.x;
+
+    int window_len = min(n_tokens, window);
+    int lo  = n_tokens - window_len;          // first absolute position to attend
+    int per = (window_len + n_splits - 1) / n_splits;
+    int i0  = split * per;
+    int i1  = min(i0 + per, window_len);
+
+    float qreg[GQ][SL_SLICE_MAX], acc[GQ][SL_SLICE_MAX], m[GQ], l[GQ];
+    #pragma unroll
+    for (int g = 0; g < GQ; g++) {
+        const float *qp = q + (size_t)(kv_head*GQ + g)*head_dim;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) { qreg[g][e] = qp[lane + 32*e]; acc[g][e] = 0.0f; }
+        m[g] = -INFINITY; l[g] = 0.0f;
+    }
+
+    for (int i = i0; i < i1; i++) {
+        size_t pos = (size_t)(lo + i);        // absolute position (flat, no wrap)
+        const kv_t *kp = k_cache + (pos*NKV + kv_head)*head_dim;
+        const kv_t *vp = v_cache + (pos*NKV + kv_head)*head_dim;
+        float kd[SL_SLICE_MAX], vd[SL_SLICE_MAX];
+        #pragma unroll
+        for (int e = 0; e < slice; e++) {     // K/V tile read ONCE, reused for all GQ heads
+            kd[e] = fp8_to_float(kp[lane + 32*e]);
+            vd[e] = fp8_to_float(vp[lane + 32*e]);
+        }
+        #pragma unroll
+        for (int g = 0; g < GQ; g++) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < slice; e++) dot += qreg[g][e] * kd[e];
+            float s = warp_reduce_sum_all(dot);   // __shfl only — no block sync
+            float mn = fmaxf(m[g], s), al = __expf(m[g] - mn), p = __expf(s - mn);
+            l[g] = l[g]*al + p;
+            #pragma unroll
+            for (int e = 0; e < slice; e++) acc[g][e] = acc[g][e]*al + p*vd[e];
+            m[g] = mn;
+        }
+    }
+
+    #pragma unroll
+    for (int g = 0; g < GQ; g++) {
+        int h = kv_head*GQ + g;               // same GQA mapping as q_head/(NH/NKV)
+        float *pa = part_acc + ((size_t)split*NH + h)*head_dim;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) pa[lane + 32*e] = acc[g][e];
+        if (lane == 0) { part_m[split*NH + h] = m[g]; part_l[split*NH + h] = l[g]; }
+    }
 }
 
 // =========================================================================
@@ -2927,6 +3018,40 @@ static inline void global_attn_decode_broadcast(
         out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
 }
 
+// Split-K sliding flash-decode for a single query token. Drop-in replacement for
+// sliding_attn_decode_kernel<<<n_heads, head_dim>>> at all three decode launch sites
+// (decode_layer, spec-verify rows, MTP drafter — the latter passes window-1 / n_tokens=pos,
+// honored generically): same (out, q, kc, vc, n_heads, n_kv_heads, head_dim, window,
+// n_tokens) contract, but NO __syncthreads in the key loop (warp-owned register slices,
+// see sliding_attn_splitk_kernel) and the window split across blocks. n_heads must be
+// GEMMA4_HEADS and n_kv_heads GEMMA4_KV_HEADS (template-fixed, like the global wrapper).
+//
+// SCRATCH REUSE (d_fa_acc/m/l, shared with the global path): the buffers hold
+// GEMMA4_GLOBAL_MAX_SPLITS(128) × GEMMA4_HEADS(16) × GEMMA4_GLOBAL_HEAD_DIM(512) floats.
+// Sliding needs n_splits × 16 × head_dim(256); n_splits is clamped ≤ GEMMA4_GLOBAL_MAX_SPLITS
+// below, so even the degenerate clamp case uses ≤ half the acc buffer (m/l: identical
+// [splits][16] shape, capacity 128×16 ≥ n_splits×16). Sharing is race-free because every
+// attention call in the engine — decode_layer's per-layer calls, the spec-verify per-row
+// loop, and mtp_forward — issues on the SAME stream: each splitk+combine pair fully
+// consumes its partials before the next pair's splitk overwrites them.
+static inline void sliding_attn_decode_broadcast(
+    gemma4_engine_t *eng, float *out, const float *q,
+    const kv_t *kc, const kv_t *vc, int n_heads, int n_kv_heads, int head_dim,
+    int window, int n_tokens, cudaStream_t stream)
+{
+    (void)n_kv_heads;  // GEMMA4_KV_HEADS by contract (warps/block below)
+    int window_len = (n_tokens < window) ? n_tokens : window;
+    int splits = (window_len + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
+    if (splits < 1) splits = 1;   // window_len==0 ⇒ one empty split ⇒ combine writes zeros
+    if (splits > GEMMA4_GLOBAL_MAX_SPLITS) splits = GEMMA4_GLOBAL_MAX_SPLITS; // scratch cap
+    sliding_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS>
+        <<<splits, GEMMA4_KV_HEADS * 32, 0, stream>>>(
+            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc,
+            head_dim, window, n_tokens, splits);
+    flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
+        out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // =========================================================================
 // ─── Single Layer Forward (Decode, B=1) ─────────────────────────────────
@@ -3043,15 +3168,16 @@ static int decode_layer(
 
     // ── 7. Attention ─────────────────────────────────────────────────────
     if (ltype == LAYER_SLIDING) {
-        int smem_sl = 32 * (int)sizeof(float);   // flash: constant scratch
         size_t lstride = (size_t)eng->sliding_kv_capacity * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
-        sliding_attn_decode_kernel<<<n_heads, head_dim, smem_sl, stream>>>(
-                eng->d_attn_out, eng->d_attn_q,
+        // Split-K warp-per-KV-head (no per-key __syncthreads — see sliding_attn_splitk_kernel).
+        sliding_attn_decode_broadcast(
+                eng, eng->d_attn_out, eng->d_attn_q,
                 eng->d_sliding_k + (size_t)layer * lstride,
                 eng->d_sliding_v + (size_t)layer * lstride,
                 n_heads, n_kv_heads, head_dim,
                 GEMMA4_SLIDING_WINDOW,
-                pos + 1);                        // FLAT: n_tokens in cache (incl. this one)
+                pos + 1,                         // FLAT: n_tokens in cache (incl. this one)
+                stream);
     } else {
         // n_ctx = tokens already in cache + this one (written above).
         // Flash kernel uses a constant 32-float scratch, so there is no longer any
@@ -3902,7 +4028,6 @@ int gemma4_engine_decode_batched(
 
         // Attention: per token, write its K/V into the live cache then attend against
         // everything up to it (exact causality; reuses the flash decode kernels).
-        const int smemA = 32 * (int)sizeof(float);
         if (lt == LAYER_SLIDING) {
             // FLAT (Step 3): spec row i is the token at absolute position pos+i.
             size_t lstride = (size_t)eng->sliding_kv_capacity * okv;
@@ -3913,10 +4038,13 @@ int gemma4_engine_decode_batched(
                 kv_write_sliding_kernel<<<dim3(grid1d(okv),1),256,0,stream>>>(
                     kc, vc, d_k + (size_t)i*okv, d_v + (size_t)i*okv,
                     p, 0, 1, okv, GEMMA4_SLIDING_WINDOW);
-                sliding_attn_decode_kernel<<<HEADS, hd, smemA, stream>>>(
-                    d_attn + (size_t)i*oq, d_q + (size_t)i*oq, kc, vc,
+                // Split-K, no per-key __syncthreads. Per-row scratch reuse is safe —
+                // same stream, serialized (mirrors the global comment below).
+                sliding_attn_decode_broadcast(
+                    eng, d_attn + (size_t)i*oq, d_q + (size_t)i*oq, kc, vc,
                     HEADS, nkv, hd, GEMMA4_SLIDING_WINDOW,
-                    p + 1);                      // n_tokens in cache after writing row i
+                    p + 1,                       // n_tokens in cache after writing row i
+                    stream);
             }
         } else {
             int slot = eng->global_slot[l];
@@ -4165,11 +4293,13 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr, cudaStream
                 head_dim, 10000.0f);
             // target layer 46 = the LAST sliding layer (share(il)=n_layer-2)
             size_t lstride = (size_t)eng->sliding_kv_capacity * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
-            sliding_attn_decode_kernel<<<GEMMA4_HEADS, head_dim, smem32, stream>>>(
-                eng->d_mtp_attn, eng->d_mtp_q,
+            // Split-K (no per-key __syncthreads); drafter-specific window-1 / n_tokens=pos
+            // are passed through generically. Scratch reuse safe — same stream.
+            sliding_attn_decode_broadcast(eng, eng->d_mtp_attn, eng->d_mtp_q,
                 eng->d_sliding_k + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
                 eng->d_sliding_v + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
-                GEMMA4_HEADS, GEMMA4_KV_HEADS, head_dim, GEMMA4_SLIDING_WINDOW - 1, pos);
+                GEMMA4_HEADS, GEMMA4_KV_HEADS, head_dim, GEMMA4_SLIDING_WINDOW - 1, pos,
+                stream);
         }
         gemv_w(eng, eng->d_mtp_t1, mtp_w(eng, eng->mtp.wo[l]), eng->d_mtp_attn,
                qdim, AH, stream, FORMAT_Q8_0);

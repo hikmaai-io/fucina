@@ -47,6 +47,11 @@
 // saturates bandwidth across SMs while being read only ONCE per token (not n_heads× = 16×).
 #define GEMMA4_GLOBAL_MAX_SPLITS 128
 #define GEMMA4_GLOBAL_SPLIT_CHUNK 256
+// Sliding-decode split-K chunk: the window caps the attended range at ≤1024 keys, so 128-key
+// chunks give ≤8 splits — enough blocks to hide latency once the per-key __syncthreads is gone
+// (warp-per-KV-head kernel), while keeping the combine pass trivial. Shares the global path's
+// d_fa_acc/m/l scratch (splits clamped ≤ GEMMA4_GLOBAL_MAX_SPLITS; see wrapper for sizing proof).
+#define GEMMA4_SLIDING_SPLIT_CHUNK 128
 
 // Special tokens
 #define GEMMA4_BOS_ID  2
