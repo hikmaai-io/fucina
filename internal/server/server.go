@@ -776,7 +776,6 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 				break
 			}
 			toks = append(toks, token)
-			s.kv.AppendDecoded(token)
 			generated++
 			if wantTools && tcEnd >= 0 && token == tcEnd {
 				break
@@ -790,6 +789,13 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			if err2 != nil {
 				break
 			}
+			// Record the token in the prefix cache only AFTER Decode commits it
+			// to the engine KV. The tool-call-end and stop-sequence breaks above
+			// exit the loop WITHOUT decoding the final token; recording it
+			// before the commit left cachedTokens one token ahead of the engine
+			// on every stop-sequence request, and the next Prefill had to heal
+			// the skew (a warning plus one lost token of reuse).
+			s.kv.AppendDecoded(token)
 		}
 	}
 	s.logGenSpeed(genStart, generated)
@@ -942,16 +948,29 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 			break
 		}
 		rawToks = append(rawToks, token)
-		s.kv.AppendDecoded(token)
 		generated++
 
-		// advance steps to the next token (GPU: leave logits on device; CPU: copy).
+		// advance steps to the next token (GPU: leave logits on device; CPU:
+		// copy) and only then records the token in the prefix cache: the token
+		// enters the engine KV during this decode, not when it was sampled. The
+		// tool-call-end and stop-sequence breaks below exit the loop WITHOUT
+		// advancing, so recording before the commit left cachedTokens one token
+		// ahead of the engine on EVERY streaming tool call / stop-string hit
+		// (this path has no post-loop `committed` sync like the spec path), and
+		// the next request's Prefill had to heal the skew.
 		advance := func() error {
 			if gpuSample {
-				return s.engine.DecodeNoCopy(token)
+				if derr := s.engine.DecodeNoCopy(token); derr != nil {
+					return derr
+				}
+			} else {
+				logits, err = s.engine.Decode(token)
+				if err != nil {
+					return err
+				}
 			}
-			logits, err = s.engine.Decode(token)
-			return err
+			s.kv.AppendDecoded(token)
+			return nil
 		}
 
 		// Tool-call handling: when the model opens a call, stop streaming content

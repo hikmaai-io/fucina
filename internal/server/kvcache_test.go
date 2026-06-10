@@ -227,6 +227,162 @@ func TestAppendDecodedEnablesNextTurnReuse(t *testing.T) {
 	}
 }
 
+// TestExternalEngineResetNotReused covers the defense-in-depth desync check:
+// if a caller resets the engine directly (bypassing KVCache.Reset), the stale
+// cachedTokens must NOT yield any prefix reuse — Prefill must detect that the
+// engine is behind the bookkeeping and run the FULL prompt from a clean
+// engine. This is the exact REPL /reset bug: stale bookkeeping matched the
+// shared chat-template prefix, only the suffix was prefilled into an EMPTY
+// engine at wrong positions, and the model produced word salad.
+func TestExternalEngineResetNotReused(t *testing.T) {
+	f := &fakeEngine{window: 1024}
+	kv := NewKVCache(f)
+
+	prefillReal(t, kv, []int32{1, 2, 3, 4, 5})
+
+	// Reset the engine BEHIND the cache's back (the bug scenario).
+	f.Reset()
+
+	// New prompt shares prefix [1 2 3] with the STALE bookkeeping.
+	res := prefillReal(t, kv, []int32{1, 2, 3, 9})
+	if res.ReusedTokens != 0 || res.NewTokens != 4 {
+		t.Fatalf("desync: reused=%d new=%d want 0,4", res.ReusedTokens, res.NewTokens)
+	}
+	// The FULL prompt must have been prefilled, not just the suffix.
+	last := f.prefillLog[len(f.prefillLog)-1]
+	if len(last) != 4 || last[0] != 1 || last[1] != 2 || last[2] != 3 || last[3] != 9 {
+		t.Fatalf("desync prefill = %v, want [1 2 3 9]", last)
+	}
+	// Bookkeeping and engine must agree again.
+	kv.Lock()
+	cached := kv.CurrentTokens()
+	kv.Unlock()
+	if len(cached) != 4 || f.NTokens() != 4 {
+		t.Fatalf("post-heal: cached=%v engineTokens=%d want 4 tokens each", cached, f.NTokens())
+	}
+}
+
+// TestCachedAheadOfEngineKeepsCommittedPrefix pins the heal for the COMMON
+// direction of skew: cachedTokens recorded a token (via AppendDecoded) that
+// was never committed to the engine. The server's generation loops used to
+// produce exactly this on every stop-sequence / streaming tool-call request
+// (record-then-break-without-decode); a decode error after recording can
+// still produce it. The first n engine tokens remain a faithful prefix of the
+// bookkeeping, so Prefill must truncate cachedTokens to n and KEEP the
+// n-token hit — dropping all bookkeeping here would full-re-prefill the
+// entire conversation on every agentic round trip.
+func TestCachedAheadOfEngineKeepsCommittedPrefix(t *testing.T) {
+	f := &fakeEngine{window: 1024}
+	kv := NewKVCache(f)
+
+	prefillReal(t, kv, []int32{1, 2, 3, 4})
+
+	// Record a token in the bookkeeping WITHOUT mirroring it into the fake
+	// engine: the engine never decoded it (cachedTokens = engine + 1).
+	kv.Lock()
+	kv.AppendDecoded(50)
+	kv.Unlock()
+
+	// Next turn extends the committed context (the orphaned token 50 reappears
+	// in the prompt text, as an assistant reply does, but it is NOT in the
+	// engine KV). Exactly the 4 committed tokens must be reused; 50 and 60 are
+	// prefilled fresh.
+	res := prefillReal(t, kv, []int32{1, 2, 3, 4, 50, 60})
+	if res.ReusedTokens != 4 || res.NewTokens != 2 {
+		t.Fatalf("cached-ahead: reused=%d new=%d want 4,2", res.ReusedTokens, res.NewTokens)
+	}
+	last := f.prefillLog[len(f.prefillLog)-1]
+	if len(last) != 2 || last[0] != 50 || last[1] != 60 {
+		t.Fatalf("cached-ahead prefill suffix=%v want [50 60]", last)
+	}
+	// Bookkeeping and engine must agree again, holding the full new prompt.
+	if got := f.NTokens(); got != 6 {
+		t.Fatalf("engine tokens=%d want 6", got)
+	}
+	kv.Lock()
+	cached := kv.CurrentTokens()
+	kv.Unlock()
+	if len(cached) != 6 {
+		t.Fatalf("cached=%v want the 6-token prompt", cached)
+	}
+}
+
+// TestResetClearsBothSides exercises KVCache.Reset: engine KV and cachedTokens
+// must be cleared together so the next Prefill is a clean full miss. This is
+// what the REPL /reset handler relies on. Cumulative stats must survive the
+// reset (they describe the process lifetime, not one conversation).
+func TestResetClearsBothSides(t *testing.T) {
+	f := &fakeEngine{window: 1024}
+	kv := NewKVCache(f)
+
+	prefillReal(t, kv, []int32{1, 2, 3})
+	kv.Lock()
+	kv.AppendDecoded(4)
+	kv.Unlock()
+	f.tokens = append(f.tokens, 4)
+
+	hitsBefore, missesBefore, _ := kv.Stats()
+
+	kv.Lock()
+	kv.Reset()
+	kv.Unlock()
+
+	if got := f.NTokens(); got != 0 {
+		t.Fatalf("engine tokens=%d want 0 after Reset", got)
+	}
+	kv.Lock()
+	cached := kv.CurrentTokens()
+	kv.Unlock()
+	if len(cached) != 0 {
+		t.Fatalf("cachedTokens=%v want empty after Reset", cached)
+	}
+
+	// Next Prefill of a prompt sharing the old prefix must be a FULL miss.
+	res := prefillReal(t, kv, []int32{1, 2, 3, 4, 5})
+	if res.ReusedTokens != 0 || res.NewTokens != 5 {
+		t.Fatalf("post-reset: reused=%d new=%d want 0,5", res.ReusedTokens, res.NewTokens)
+	}
+	last := f.prefillLog[len(f.prefillLog)-1]
+	if len(last) != 5 {
+		t.Fatalf("post-reset prefill = %v, want the full 5-token prompt", last)
+	}
+
+	// Stats stay sane: counters are cumulative; the post-reset prefill
+	// registers as one more miss and no new hit.
+	hits, misses, _ := kv.Stats()
+	if hits != hitsBefore || misses != missesBefore+1 {
+		t.Fatalf("stats after reset: hits=%d misses=%d want %d,%d",
+			hits, misses, hitsBefore, missesBefore+1)
+	}
+}
+
+// TestEngineAheadOfCacheStillReusesPrefix documents why the desync check is
+// one-directional: speculative decoding can COMMIT accepted draft tokens to
+// the engine KV past the emitted stop token (see the `committed` sync in
+// server.generateResponse), leaving the engine AHEAD of cachedTokens. The
+// cached prefix is still genuine, so Prefill must keep reusing it — rewinding
+// the extra token away — rather than full-resetting and losing the hit.
+func TestEngineAheadOfCacheStillReusesPrefix(t *testing.T) {
+	f := &fakeEngine{window: 1024}
+	kv := NewKVCache(f)
+
+	prefillReal(t, kv, []int32{1, 2, 3})
+	// Engine committed an extra token the cache never saw.
+	f.tokens = append(f.tokens, 99)
+
+	res := prefillReal(t, kv, []int32{1, 2, 3, 4})
+	if res.ReusedTokens != 3 || res.NewTokens != 1 {
+		t.Fatalf("engine-ahead: reused=%d new=%d want 3,1", res.ReusedTokens, res.NewTokens)
+	}
+	last := f.prefillLog[len(f.prefillLog)-1]
+	if len(last) != 1 || last[0] != 4 {
+		t.Fatalf("engine-ahead prefill suffix=%v want [4]", last)
+	}
+	if got := f.NTokens(); got != 4 {
+		t.Fatalf("engine tokens=%d want 4 (extra token rewound away)", got)
+	}
+}
+
 func TestStatsCounters(t *testing.T) {
 	f := &fakeEngine{window: 1024}
 	kv := NewKVCache(f)

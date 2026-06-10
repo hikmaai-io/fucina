@@ -76,6 +76,20 @@ type PrefillResult struct {
 func (c *KVCache) Lock()   { c.mu.Lock() }
 func (c *KVCache) Unlock() { c.mu.Unlock() }
 
+// Reset clears the engine KV cache AND cachedTokens together, keeping the two
+// in lockstep. This is the ONLY correct way to start a fresh conversation on a
+// live KVCache: calling engine.Reset() directly leaves cachedTokens claiming
+// tokens the engine no longer holds, and the next Prefill would then "reuse" a
+// prefix that does not exist in the KV cache — the suffix gets prefilled at
+// wrong positions and attention over the missing prefix produces garbage
+// (observed as word-salad replies after the REPL's /reset). Cumulative stats
+// are intentionally preserved: they describe the process lifetime, not one
+// conversation. The caller must hold Lock().
+func (c *KVCache) Reset() {
+	c.engine.Reset()
+	c.cachedTokens = c.cachedTokens[:0]
+}
+
 // Prefill prepares the engine KV cache to hold exactly `prompt`, reusing the
 // longest cached prefix and computing only the divergent suffix. The caller
 // must already hold Lock().
@@ -85,6 +99,41 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 	res := &PrefillResult{PromptTokens: len(prompt)}
 	if len(prompt) == 0 {
 		return res, nil
+	}
+
+	// Defense in depth: cachedTokens must only ever claim tokens that actually
+	// exist in the engine KV cache. The bookkeeping can end up AHEAD of the
+	// engine in two ways: a caller reset or rewound the engine directly
+	// (bypassing KVCache.Reset/this Prefill), or a token was recorded via
+	// AppendDecoded but its Decode never happened or failed (the generation
+	// loops record only after a successful commit precisely to avoid this; see
+	// AppendDecoded). Any prefix "reuse" computed from the stale tail would
+	// attend over tokens that are not there — the suffix gets prefilled at
+	// wrong positions and the model emits garbage.
+	//
+	// Heal by truncating the bookkeeping to the engine's length, NOT by
+	// dropping it entirely. The engine KV is append-only and its first n
+	// tokens were always placed from cachedTokens' own record (Prefill
+	// suffixes plus committed AppendDecoded tokens), so cachedTokens[:n] is
+	// still a faithful description of the engine contents for every producer
+	// of this skew: an external Reset gives n == 0 (truncate == drop, full
+	// re-prefill slow path); an external Rewind keeps the surviving prefix;
+	// an AppendDecoded overrun keeps everything but the uncommitted tail.
+	// Truncation therefore preserves the genuine n-token prefix hit — dropping
+	// it all would force a full re-prefill of the entire conversation, the
+	// exact multi-second cost at large context that this cache exists to
+	// avoid.
+	//
+	// The OPPOSITE skew — engine holding MORE tokens than cachedTokens — is a
+	// normal post-generation state (speculative decoding can commit accepted
+	// draft tokens past the emitted stop token; see the `committed` sync in
+	// server.generateResponse) and is already healed by the branch chain
+	// below: lcp ≤ len(cachedTokens) < engineTokens always takes the
+	// rewind-or-reset path. So we deliberately do not warn or truncate for it,
+	// preserving prefix reuse across such requests.
+	if n := c.engine.NTokens(); len(c.cachedTokens) > n {
+		log.Printf("gem4d: kvcache: engine KV (%d tokens) is behind cache bookkeeping (%d); truncating bookkeeping to the engine's length", n, len(c.cachedTokens))
+		c.cachedTokens = c.cachedTokens[:n]
 	}
 
 	lcp := longestCommonPrefix(c.cachedTokens, prompt)
@@ -152,11 +201,17 @@ func (c *KVCache) CurrentTokens() []int32 {
 	return out
 }
 
-// AppendDecoded records a token that was produced by Decode and therefore is
-// now present in the engine KV cache. Keeping cachedTokens in sync with the
-// engine is what lets the NEXT request reuse this generation as a prefix
-// (important for multi-turn chat where the assistant reply becomes context).
-// The caller must hold Lock().
+// AppendDecoded records a token that the engine has COMMITTED to its KV cache
+// (i.e. a successful Decode/DecodeNoCopy of that token has completed). Keeping
+// cachedTokens in sync with the engine is what lets the NEXT request reuse
+// this generation as a prefix (important for multi-turn chat where the
+// assistant reply becomes context).
+//
+// Contract: call this only AFTER the commit, never before. The generation
+// loops break on tool-call-end / stop-sequence tokens WITHOUT decoding them;
+// recording such a token first would leave cachedTokens one ahead of the
+// engine on every such request, and the next Prefill would have to heal the
+// skew (see the truncation guard there). The caller must hold Lock().
 func (c *KVCache) AppendDecoded(token int32) {
 	c.cachedTokens = append(c.cachedTokens, token)
 }

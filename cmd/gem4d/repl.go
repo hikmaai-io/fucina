@@ -79,8 +79,15 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			if args.System != "" {
 				history = append(history, chat.Message{Role: "system", Content: args.System})
 			}
+			// Reset through the KVCache so the engine KV and the cache's prefix
+			// bookkeeping are cleared in LOCKSTEP. Calling eng.Reset() directly
+			// here is exactly the bug this replaces: cachedTokens kept the old
+			// conversation, the next turn's Prefill "reused" the shared
+			// chat-template prefix that no longer existed in the empty engine,
+			// prefilled only the suffix at wrong positions, and the model
+			// replied with word salad.
 			kv.Lock()
-			eng.Reset()
+			kv.Reset()
 			kv.Unlock()
 			fmt.Fprintln(os.Stderr, "gem4d: conversation cleared")
 			continue
@@ -207,12 +214,16 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 				piece := tok.Decode([]int32{token})
 				fmt.Print(piece)
 				replyBuf.WriteString(piece)
-				kv.AppendDecoded(token)
 
 				logits, err = eng.Decode(token)
 				if err != nil {
 					break
 				}
+				// Record the token in the prefix cache only AFTER Decode commits
+				// it to the engine KV (AppendDecoded's contract): if Decode fails,
+				// the token never made it into the engine and recording it first
+				// would leave the bookkeeping one token ahead of the engine.
+				kv.AppendDecoded(token)
 				generated++
 			}
 			reply = replyBuf.String()
