@@ -1321,6 +1321,173 @@ __global__ void sliding_attn_splitk_kernel(
 }
 
 // =========================================================================
+// ─── Row-batched spec-verify flash decode (one causal launch for K rows) ─
+// =========================================================================
+// The spec-verify in decode_batched forwards K=D+1 tokens; each row i attends the
+// cache up to its own causal bound n_tokens0+i. The original loop launched K
+// (splitk + combine) pairs per layer, serialized on the shared d_fa_* scratch —
+// 3K launches/layer and zero row overlap. These kernels run ALL rows in one grid
+// (blockIdx.y = row): row r owns scratch slots [r*GEMMA4_GLOBAL_MAX_SPLITS, ...)
+// and recomputes splits_r with the EXACT formula of its single-row launcher, so
+// every row's split partition, per-warp geometry, and combine merge order are
+// BIT-IDENTICAL to the per-row launches they replace.
+
+// Per-row split count, replicating global_attn_decode_broadcast / sliding_attn_
+// decode_broadcast clamps (chunk is 64 for both; len ≥ 1 in every verify row).
+static __device__ __forceinline__ int attn_row_splits(int len, int chunk) {
+    int s = (len + chunk - 1) / chunk;
+    if (s < 1) s = 1;
+    if (s > GEMMA4_GLOBAL_MAX_SPLITS) s = GEMMA4_GLOBAL_MAX_SPLITS;
+    if (s > len && len > 0) s = len;
+    return s;
+}
+
+template<int NH, int HD>
+__global__ void global_attn_splitk_rows_kernel(
+    float *part_acc, float *part_m, float *part_l,   // slot r*MAX_SPLITS+split
+    const float *q,                                  // [K][NH*HD] (row-major)
+    const kv_t *k_cache, const kv_t *v_cache,        // [capacity][HD]
+    int n_tokens0)                                   // row r attends n_tokens0 + r keys
+{
+    constexpr int slice = HD / 32;
+    int r = blockIdx.y;
+    int ctx_len = n_tokens0 + r;
+    int n_splits = attn_row_splits(ctx_len, GEMMA4_GLOBAL_SPLIT_CHUNK);
+    int split = blockIdx.x;
+    if (split >= n_splits) return;                   // tail blocks of shorter rows
+    int h    = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int per = (ctx_len + n_splits - 1) / n_splits;
+    int t0  = split * per;
+    int t1  = min(t0 + per, ctx_len);
+
+    float qreg[slice], acc[slice], m = -INFINITY, l = 0.0f;
+    const float *qp = q + (size_t)r * NH * HD + (size_t)h * HD;
+    #pragma unroll
+    for (int e = 0; e < slice; e++) { qreg[e] = qp[lane + 32*e]; acc[e] = 0.0f; }
+
+    for (int t = t0; t < t1; t++) {
+        const kv_t *kp = k_cache + (size_t)t * HD;
+        const kv_t *vp = v_cache + (size_t)t * HD;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
+        float s = warp_reduce_sum_all(dot);
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l*al + p;
+        #pragma unroll
+        for (int e = 0; e < slice; e++)
+            acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
+        m = mn;
+    }
+
+    size_t slot = (size_t)r * GEMMA4_GLOBAL_MAX_SPLITS + split;
+    float *pa = part_acc + (slot*NH + h)*HD;
+    #pragma unroll
+    for (int e = 0; e < slice; e++) pa[lane + 32*e] = acc[e];
+    if (lane == 0) { part_m[slot*NH + h] = m; part_l[slot*NH + h] = l; }
+}
+
+template<int NH, int NKV, int HD>
+__global__ void sliding_attn_splitk_rows_kernel(
+    float *part_acc, float *part_m, float *part_l,   // slot r*MAX_SPLITS+split
+    const float *q,                                  // [K][NH*HD]
+    const kv_t *k_cache, const kv_t *v_cache,        // FLAT [capacity][NKV][HD]
+    int window, int n_tokens0)
+{
+    constexpr int GQ = NH / NKV;
+    constexpr int slice = HD / 32;
+    int r = blockIdx.y;
+    int n_tokens = n_tokens0 + r;
+    int window_len = min(n_tokens, window);
+    int n_splits = attn_row_splits(window_len, GEMMA4_SLIDING_SPLIT_CHUNK);
+    int split = blockIdx.x;
+    if (split >= n_splits) return;
+    int kv_head = threadIdx.x >> 5;
+    int lane    = threadIdx.x & 31;
+
+    int lo  = n_tokens - window_len;
+    int per = (window_len + n_splits - 1) / n_splits;
+    int i0  = split * per;
+    int i1  = min(i0 + per, window_len);
+
+    float qreg[GQ][slice], acc[GQ][slice], m[GQ], l[GQ];
+    #pragma unroll
+    for (int g = 0; g < GQ; g++) {
+        const float *qp = q + (size_t)r * NH * HD + (size_t)(kv_head*GQ + g)*HD;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) { qreg[g][e] = qp[lane + 32*e]; acc[g][e] = 0.0f; }
+        m[g] = -INFINITY; l[g] = 0.0f;
+    }
+
+    for (int i = i0; i < i1; i++) {
+        size_t pos = (size_t)(lo + i);
+        const kv_t *kp = k_cache + (pos*NKV + kv_head)*HD;
+        const kv_t *vp = v_cache + (pos*NKV + kv_head)*HD;
+        float kd[slice], vd[slice];
+        #pragma unroll
+        for (int e = 0; e < slice; e++) {
+            kd[e] = fp8_to_float(kp[lane + 32*e]);
+            vd[e] = fp8_to_float(vp[lane + 32*e]);
+        }
+        #pragma unroll
+        for (int g = 0; g < GQ; g++) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < slice; e++) dot += qreg[g][e] * kd[e];
+            float s = warp_reduce_sum_all(dot);
+            float mn = fmaxf(m[g], s), al = __expf(m[g] - mn), p = __expf(s - mn);
+            l[g] = l[g]*al + p;
+            #pragma unroll
+            for (int e = 0; e < slice; e++) acc[g][e] = acc[g][e]*al + p*vd[e];
+            m[g] = mn;
+        }
+    }
+
+    size_t slot = (size_t)r * GEMMA4_GLOBAL_MAX_SPLITS + split;
+    #pragma unroll
+    for (int g = 0; g < GQ; g++) {
+        int h = kv_head*GQ + g;
+        float *pa = part_acc + (slot*NH + h)*HD;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) pa[lane + 32*e] = acc[g][e];
+        if (lane == 0) { part_m[slot*NH + h] = m[g]; part_l[slot*NH + h] = l[g]; }
+    }
+}
+
+// Merge each row's partials. window > 0 → sliding row length min(n_tokens0+r, window)
+// (chunk GEMMA4_SLIDING_SPLIT_CHUNK); window == 0 → global (len = n_tokens0+r, chunk
+// GEMMA4_GLOBAL_SPLIT_CHUNK). Merge order s = 0..splits_r-1 matches the single-row
+// flash_decode_combine_kernel exactly.
+template<int NH>
+__global__ void flash_decode_combine_rows_kernel(
+    float *out,                                      // [K][out_stride]
+    const float *part_acc, const float *part_m, const float *part_l,
+    int head_dim, int window, int n_tokens0, int out_stride)
+{
+    int r   = blockIdx.y;
+    int h   = blockIdx.x;
+    int tid = threadIdx.x;
+    int len = n_tokens0 + r;
+    int chunk = GEMMA4_GLOBAL_SPLIT_CHUNK;
+    if (window > 0) { len = min(len, window); chunk = GEMMA4_SLIDING_SPLIT_CHUNK; }
+    int n_splits = attn_row_splits(len, chunk);
+    size_t base = (size_t)r * GEMMA4_GLOBAL_MAX_SPLITS;
+    float M = -INFINITY;
+    for (int s = 0; s < n_splits; s++) M = fmaxf(M, part_m[(base + s)*NH + h]);
+    float L = 0.0f, accv = 0.0f;
+    for (int s = 0; s < n_splits; s++) {
+        float ms = part_m[(base + s)*NH + h];
+        if (ms == -INFINITY) continue;
+        float scale = __expf(ms - M);
+        L    += part_l[(base + s)*NH + h] * scale;
+        accv += part_acc[((base + s)*NH + h)*head_dim + tid] * scale;
+    }
+    if (tid < head_dim)
+        out[(size_t)r*out_stride + h*head_dim + tid] = (L > 0.0f) ? accv / L : 0.0f;
+}
+
+// =========================================================================
 // ─── Flash PREFILL attention (chunked, online-softmax, no N² scratch) ───
 // =========================================================================
 // Each chunk query attends the FROZEN history KV cache (FP8) plus the current
@@ -2636,11 +2803,17 @@ gemma4_engine_t* gemma4_engine_create(
     cudaMalloc(&eng->d_attn_v,     max_kv * sizeof(float));
     cudaMalloc(&eng->d_attn_out,   max_q  * sizeof(float));  // attention output, NOT hidden_size
     // GQA-broadcast global flash-decode split-K scratch (DECODE-30-35 Step 1).
+    // Sized for GEMMA4_SPEC_MAX rows of GEMMA4_GLOBAL_MAX_SPLITS slots each (~64 MB):
+    // the batched spec-verify attention runs all K rows' splits in ONE launch, row r
+    // owning slot range [r*MAX_SPLITS, r*MAX_SPLITS + splits_r). Single-token paths
+    // (decode_layer, MTP) keep using row-0's slot range unchanged.
     eng->d_fa_acc = NULL; eng->d_fa_m = NULL; eng->d_fa_l = NULL;
-    cudaMalloc(&eng->d_fa_acc, (size_t)GEMMA4_GLOBAL_MAX_SPLITS * GEMMA4_HEADS
-                                * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float));
-    cudaMalloc(&eng->d_fa_m,   (size_t)GEMMA4_GLOBAL_MAX_SPLITS * GEMMA4_HEADS * sizeof(float));
-    cudaMalloc(&eng->d_fa_l,   (size_t)GEMMA4_GLOBAL_MAX_SPLITS * GEMMA4_HEADS * sizeof(float));
+    cudaMalloc(&eng->d_fa_acc, (size_t)GEMMA4_SPEC_MAX * GEMMA4_GLOBAL_MAX_SPLITS
+                                * GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float));
+    cudaMalloc(&eng->d_fa_m,   (size_t)GEMMA4_SPEC_MAX * GEMMA4_GLOBAL_MAX_SPLITS
+                                * GEMMA4_HEADS * sizeof(float));
+    cudaMalloc(&eng->d_fa_l,   (size_t)GEMMA4_SPEC_MAX * GEMMA4_GLOBAL_MAX_SPLITS
+                                * GEMMA4_HEADS * sizeof(float));
     cudaMalloc(&eng->d_ffn_out,    GEMMA4_INTERMEDIATE * sizeof(float));
     cudaMalloc(&eng->d_ffn_gate,   GEMMA4_INTERMEDIATE * sizeof(float));
     cudaMalloc(&eng->d_ffn_up,     GEMMA4_INTERMEDIATE * sizeof(float));
@@ -4153,41 +4326,47 @@ static int decode_batched_dev(
         else
             rope_rows_kernel<<<dim3(HEADS,K),hd/2,0,stream>>>(d_q, d_k, pos, HEADS, nkv, hd, K, 1000000.0f, eng->d_rope_freqs);
 
-        // Attention: per token, write its K/V into the live cache then attend against
-        // everything up to it (exact causality; reuses the flash decode kernels).
+        // Attention, all K rows in ONE causal launch (row-batched): first scatter the
+        // K rows' K/V to their absolute positions pos..pos+K-1 (one write launch —
+        // row i's reads are bounded by n_tokens0+i, so later rows' entries are never
+        // visible to earlier rows), then run every row's split-K attention in a single
+        // grid (blockIdx.y = row) and merge per-row partials in a single combine.
+        // Replaces 3K serialized launches/layer with 3; each row's split partition and
+        // merge order replicate its old per-row launch exactly (bit-identical output).
         if (lt == LAYER_SLIDING) {
             // FLAT (Step 3): spec row i is the token at absolute position pos+i.
             size_t lstride = (size_t)eng->sliding_kv_capacity * okv;
             kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
             kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
-            for (int i = 0; i < K; i++) {
-                int p = pos + i;                 // absolute position of this spec row
-                kv_write_sliding_kernel<<<dim3(grid1d(okv),1),256,0,stream>>>(
-                    kc, vc, d_k + (size_t)i*okv, d_v + (size_t)i*okv,
-                    p, 0, 1, okv, GEMMA4_SLIDING_WINDOW);
-                // Split-K, no per-key __syncthreads. Per-row scratch reuse is safe —
-                // same stream, serialized (mirrors the global comment below).
-                sliding_attn_decode_broadcast(
-                    eng, d_attn + (size_t)i*oq, d_q + (size_t)i*oq, kc, vc,
-                    HEADS, nkv, hd, GEMMA4_SLIDING_WINDOW,
-                    p + 1,                       // n_tokens in cache after writing row i
-                    stream);
-            }
+            kv_write_sliding_kernel<<<dim3(grid1d(okv),K),256,0,stream>>>(
+                kc, vc, d_k, d_v, pos, 0, K, okv, GEMMA4_SLIDING_WINDOW);
+            int max_len = pos + K; if (max_len > GEMMA4_SLIDING_WINDOW) max_len = GEMMA4_SLIDING_WINDOW;
+            int max_splits = (max_len + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
+            if (max_splits < 1) max_splits = 1;
+            if (max_splits > GEMMA4_GLOBAL_MAX_SPLITS) max_splits = GEMMA4_GLOBAL_MAX_SPLITS;
+            sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
+                <<<dim3(max_splits, K), GEMMA4_KV_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc,
+                    GEMMA4_SLIDING_WINDOW, pos + 1);
+            flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
+                d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                hd, GEMMA4_SLIDING_WINDOW, pos + 1, oq);
         } else {
             int slot = eng->global_slot[l];
             size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
             kv_t *kc = eng->d_global_k + (size_t)slot*lstride;
             kv_t *vc = eng->d_global_v + (size_t)slot*lstride;
-            for (int i = 0; i < K; i++) {
-                int gpos = pos + i;
-                kv_write_global_kernel<<<dim3(grid1d(hd),1),256,0,stream>>>(
-                    kc, vc, d_k + (size_t)i*okv, d_v + (size_t)i*okv, gpos, 1, hd);
-                // GQA-broadcast split-K (Step 1): each spec-verify row reads global K/V ONCE
-                // (was 16×). The per-row scratch is reused safely — same stream, serialized.
-                global_attn_decode_broadcast(
-                    eng, d_attn + (size_t)i*oq, d_q + (size_t)i*oq, kc, vc,
-                    HEADS, hd, gpos + 1, stream);
-            }
+            kv_write_global_kernel<<<dim3(grid1d(hd),K),256,0,stream>>>(
+                kc, vc, d_k, d_v, pos, K, hd);
+            int max_splits = (pos + K + GEMMA4_GLOBAL_SPLIT_CHUNK - 1) / GEMMA4_GLOBAL_SPLIT_CHUNK;
+            if (max_splits < 1) max_splits = 1;
+            if (max_splits > GEMMA4_GLOBAL_MAX_SPLITS) max_splits = GEMMA4_GLOBAL_MAX_SPLITS;
+            global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
+                <<<dim3(max_splits, K), GEMMA4_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1);
+            flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
+                d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                hd, /*window=*/0, pos + 1, oq);
         }
 
         // O projection (input d_attn is already fp32) → d_o; post-attn norm; residual.
