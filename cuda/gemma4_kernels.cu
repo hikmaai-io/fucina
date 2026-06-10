@@ -924,6 +924,7 @@ __global__ void rope_sliding_kernel(
     float *q,           // [n_heads × head_dim]
     float *k,           // [n_kv_heads × head_dim]
     int    pos,
+    const int *pos_ptr, // non-NULL: device-resident position overrides pos (CUDA-graph path)
     int    n_heads,
     int    n_kv_heads,
     int    head_dim,
@@ -933,6 +934,7 @@ __global__ void rope_sliding_kernel(
     int idx = blockIdx.x;           // head index
     int half = head_dim / 2;
     if (d >= half) return;
+    if (pos_ptr) pos = *pos_ptr;
 
     float theta   = powf(theta_base, -2.0f * d / head_dim);
     float cos_val = cosf(pos * theta);
@@ -962,6 +964,7 @@ __global__ void rope_global_kernel(
     float       *q,             // [n_heads × head_dim]
     float       *k,             // [n_kv_heads × head_dim]
     int          pos,
+    const int   *pos_ptr,       // non-NULL: device-resident position overrides pos
     int          context_len,
     int          n_heads,
     int          n_kv_heads,
@@ -973,6 +976,7 @@ __global__ void rope_global_kernel(
     int idx = blockIdx.x;
     int half = head_dim / 2;
     if (d >= half) return;
+    if (pos_ptr) pos = *pos_ptr;
     (void)context_len;
 
     // Matches ggml_rope_ext NEOX (llama.cpp gemma4): theta = pos * base^(-2d/n) / ff.
@@ -1347,10 +1351,12 @@ __global__ void global_attn_splitk_rows_kernel(
     float *part_acc, float *part_m, float *part_l,   // slot r*MAX_SPLITS+split
     const float *q,                                  // [K][NH*HD] (row-major)
     const kv_t *k_cache, const kv_t *v_cache,        // [capacity][HD]
-    int n_tokens0)                                   // row r attends n_tokens0 + r keys
+    int n_tokens0,                                   // row r attends n_tokens0 + r keys
+    const int *n_tokens0_ptr)                        // non-NULL: device override (graph path)
 {
     constexpr int slice = HD / 32;
     int r = blockIdx.y;
+    if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
     int ctx_len = n_tokens0 + r;
     int n_splits = attn_row_splits(ctx_len, GEMMA4_GLOBAL_SPLIT_CHUNK);
     int split = blockIdx.x;
@@ -1393,11 +1399,13 @@ __global__ void sliding_attn_splitk_rows_kernel(
     float *part_acc, float *part_m, float *part_l,   // slot r*MAX_SPLITS+split
     const float *q,                                  // [K][NH*HD]
     const kv_t *k_cache, const kv_t *v_cache,        // FLAT [capacity][NKV][HD]
-    int window, int n_tokens0)
+    int window, int n_tokens0,
+    const int *n_tokens0_ptr)                        // non-NULL: device override (graph path)
 {
     constexpr int GQ = NH / NKV;
     constexpr int slice = HD / 32;
     int r = blockIdx.y;
+    if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
     int n_tokens = n_tokens0 + r;
     int window_len = min(n_tokens, window);
     int n_splits = attn_row_splits(window_len, GEMMA4_SLIDING_SPLIT_CHUNK);
@@ -1463,11 +1471,12 @@ template<int NH>
 __global__ void flash_decode_combine_rows_kernel(
     float *out,                                      // [K][out_stride]
     const float *part_acc, const float *part_m, const float *part_l,
-    int head_dim, int window, int n_tokens0, int out_stride)
+    int head_dim, int window, int n_tokens0, const int *n_tokens0_ptr, int out_stride)
 {
     int r   = blockIdx.y;
     int h   = blockIdx.x;
     int tid = threadIdx.x;
+    if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
     int len = n_tokens0 + r;
     int chunk = GEMMA4_GLOBAL_SPLIT_CHUNK;
     if (window > 0) { len = min(len, window); chunk = GEMMA4_SLIDING_SPLIT_CHUNK; }
@@ -2150,6 +2159,14 @@ struct gemma4_engine {
     // Device-chained MTP draft (b): maxd ids + confidences read back in ONE sync.
     int    *d_mtp_ids;         // [SPEC_MAX] chained draft ids
     float  *d_mtp_conf;        // [SPEC_MAX] per-draft top-1 confidence (PMIN gate)
+    // CUDA-graph MTP forward (c): the ~57-launch assistant pass captured once and
+    // replayed per drafted token. All per-call state is device-resident: the input
+    // token (d_mtp_tok, fed by mtp_argmax_conf_kernel for chained tokens) and the
+    // RoPE/attention position (d_mtp_pos, one 4-byte H2D per draft call).
+    int32_t *d_mtp_tok;        // [1] current draft input token
+    int     *d_mtp_pos;        // [1] n_past for this draft chain
+    cudaGraphExec_t mtp_graph; // instantiated forward graph (NULL until captured)
+    int     mtp_graph_failed;  // capture failed once → use the launch-per-kernel path
 
     // ── Gemma-4 MTP assistant drafter (llama.cpp PR #23398 equivalent) ──
     // The official ~423M assistant head: 4 Q-only layers (no K/V projections — they
@@ -3110,6 +3127,9 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_spec_rnd);
     CUDA_FREE(eng->d_mtp_ids);
     CUDA_FREE(eng->d_mtp_conf);
+    CUDA_FREE(eng->d_mtp_tok);
+    CUDA_FREE(eng->d_mtp_pos);
+    if (eng->mtp_graph) { cudaGraphExecDestroy(eng->mtp_graph); eng->mtp_graph = NULL; }
     CUDA_FREE(eng->d_qx);
     CUDA_FREE(eng->d_dx);
     CUDA_FREE(eng->d_sx);
@@ -3378,11 +3398,11 @@ static int decode_layer(
     if (ltype == LAYER_SLIDING) {
         rope_sliding_kernel<<<n_heads, head_dim/2, 0, stream>>>(
                 eng->d_attn_q, eng->d_attn_k,
-                pos, n_heads, n_kv_heads, head_dim, 10000.0f);
+                pos, NULL, n_heads, n_kv_heads, head_dim, 10000.0f);
     } else {
         rope_global_kernel<<<n_heads, head_dim/2, 0, stream>>>(
                 eng->d_attn_q, eng->d_attn_k,
-                pos, context_len, n_heads, n_kv_heads, head_dim,
+                pos, NULL, context_len, n_heads, n_kv_heads, head_dim,
                 1000000.0f, eng->d_rope_freqs);
     }
 
@@ -4347,10 +4367,10 @@ static int decode_batched_dev(
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(max_splits, K), GEMMA4_KV_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc,
-                    GEMMA4_SLIDING_WINDOW, pos + 1);
+                    GEMMA4_SLIDING_WINDOW, pos + 1, NULL);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
                 d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
-                hd, GEMMA4_SLIDING_WINDOW, pos + 1, oq);
+                hd, GEMMA4_SLIDING_WINDOW, pos + 1, NULL, oq);
         } else {
             int slot = eng->global_slot[l];
             size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
@@ -4363,10 +4383,10 @@ static int decode_batched_dev(
             if (max_splits > GEMMA4_GLOBAL_MAX_SPLITS) max_splits = GEMMA4_GLOBAL_MAX_SPLITS;
             global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(max_splits, K), GEMMA4_HEADS*32, 0, stream>>>(
-                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1);
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, NULL);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
                 d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
-                hd, /*window=*/0, pos + 1, oq);
+                hd, /*window=*/0, pos + 1, NULL, oq);
         }
 
         // O projection (input d_attn is already fp32) → d_o; post-attn norm; residual.
@@ -4557,6 +4577,11 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
         ok &= cudaMalloc(&eng->d_mtp_ids, GEMMA4_SPEC_MAX*sizeof(int)) == cudaSuccess;
     if (!eng->d_mtp_conf)
         ok &= cudaMalloc(&eng->d_mtp_conf, GEMMA4_SPEC_MAX*sizeof(float)) == cudaSuccess;
+    // CUDA-graph draft scratch (c): device-resident input token + chain position.
+    if (!eng->d_mtp_tok)
+        ok &= cudaMalloc(&eng->d_mtp_tok, sizeof(int32_t)) == cudaSuccess;
+    if (!eng->d_mtp_pos)
+        ok &= cudaMalloc(&eng->d_mtp_pos, sizeof(int)) == cudaSuccess;
 
     munmap(host, fsize);
     if (!ok) {
@@ -4573,15 +4598,21 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
 
 // One assistant forward: (tok, d_mtp_h) → logits in eng->d_logits + next h in d_mtp_h.
 // All draft tokens use RoPE position n_past and attend the frozen committed target KV.
-static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr, cudaStream_t stream)
+//
+// (c) CUDA-graph form: ALL per-call state is read from DEVICE memory — the input
+// token from tok_ptr (eng->d_mtp_tok, refreshed by mtp_argmax_conf_kernel between
+// chained tokens) and the position from pos_ptr (eng->d_mtp_pos, one 4-byte H2D per
+// draft call) — so the ~57-kernel launch sequence is capturable ONCE and replayed
+// for every drafted token of every spec step. The attention launches use the
+// rows-kernels' device-n_tokens override with a FIXED MAX_SPLITS grid (blocks past
+// the in-kernel split count exit immediately), since a graph cannot change grids.
+static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
+                        const int *pos_ptr, cudaStream_t stream)
 {
     const int H = GEMMA4_HIDDEN_SIZE, AH = GEMMA4_MTP_HIDDEN, FF = GEMMA4_MTP_FFN;
-    const int pos = eng->global_n_tokens;     // n_past: same for every draft token
     const int smem32 = 32 * (int)sizeof(float);
 
     // x = target_embd(tok)·√3840  ‖  h   → pre_projection → cur [1024]
-    // tok_ptr must outlive the async launch (it lives in mtp_draft's frame, which
-    // syncs each iteration before mutating it — same host-pointer pattern as decode).
     embed_lookup_q8_0_kernel<<<1, 256, 0, stream>>>(
         eng->d_mtp_xh, weight_fp8(eng, eng->tensors.token_embd), tok_ptr, 1, H);
     scale_kernel<<<(H+255)/256, 256, 0, stream>>>(eng->d_mtp_xh, H, sqrtf((float)H));
@@ -4604,28 +4635,40 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr, cudaStream
             eng->d_mtp_q, mtp_f32(eng, eng->mtp.q_norm[l]), head_dim, GEMMA4_RMS_EPS);
         if (is_g) {
             rope_global_kernel<<<GEMMA4_HEADS, head_dim/2, 0, stream>>>(
-                eng->d_mtp_q, eng->d_mtp_q, pos, pos, GEMMA4_HEADS, /*n_kv_heads=*/0,
+                eng->d_mtp_q, eng->d_mtp_q, 0, pos_ptr, 0, GEMMA4_HEADS, /*n_kv_heads=*/0,
                 head_dim, 1000000.0f, mtp_f32(eng, eng->mtp.rope_freqs));
-            // target layer 47 = the LAST global layer (llama.cpp share(il)=n_layer-1)
+            // target layer 47 = the LAST global layer (llama.cpp share(il)=n_layer-1).
+            // Fixed-grid split-K with device n_tokens (= *pos_ptr): same split formula
+            // as global_attn_decode_broadcast, so the math is bit-identical to it.
             int slot = eng->global_slot[GEMMA4_MAX_LAYERS - 1];
             size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
-            global_attn_decode_broadcast(eng, eng->d_mtp_attn, eng->d_mtp_q,
-                eng->d_global_k + (size_t)slot * lstride,
-                eng->d_global_v + (size_t)slot * lstride,
-                GEMMA4_HEADS, head_dim, pos, stream);
+            global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
+                <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
+                    eng->d_global_k + (size_t)slot * lstride,
+                    eng->d_global_v + (size_t)slot * lstride,
+                    0, pos_ptr);
+            flash_decode_combine_rows_kernel<GEMMA4_HEADS>
+                <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                    eng->d_mtp_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                    head_dim, /*window=*/0, 0, pos_ptr, GEMMA4_HEADS*head_dim);
         } else {
             rope_sliding_kernel<<<GEMMA4_HEADS, head_dim/2, 0, stream>>>(
-                eng->d_mtp_q, eng->d_mtp_q, pos, GEMMA4_HEADS, /*n_kv_heads=*/0,
+                eng->d_mtp_q, eng->d_mtp_q, 0, pos_ptr, GEMMA4_HEADS, /*n_kv_heads=*/0,
                 head_dim, 10000.0f);
-            // target layer 46 = the LAST sliding layer (share(il)=n_layer-2)
+            // target layer 46 = the LAST sliding layer (share(il)=n_layer-2); the
+            // drafter attends window-1 keys of the frozen cache at n_tokens = *pos_ptr.
             size_t lstride = (size_t)eng->sliding_kv_capacity * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
-            // Split-K (no per-key __syncthreads); drafter-specific window-1 / n_tokens=pos
-            // are passed through generically. Scratch reuse safe — same stream.
-            sliding_attn_decode_broadcast(eng, eng->d_mtp_attn, eng->d_mtp_q,
-                eng->d_sliding_k + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
-                eng->d_sliding_v + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
-                GEMMA4_HEADS, GEMMA4_KV_HEADS, head_dim, GEMMA4_SLIDING_WINDOW - 1, pos,
-                stream);
+            sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
+                <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
+                    eng->d_sliding_k + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
+                    eng->d_sliding_v + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
+                    GEMMA4_SLIDING_WINDOW - 1, 0, pos_ptr);
+            flash_decode_combine_rows_kernel<GEMMA4_HEADS>
+                <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                    eng->d_mtp_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                    head_dim, GEMMA4_SLIDING_WINDOW - 1, 0, pos_ptr, GEMMA4_HEADS*head_dim);
         }
         gemv_w(eng, eng->d_mtp_t1, mtp_w(eng, eng->mtp.wo[l]), eng->d_mtp_attn,
                qdim, AH, stream, FORMAT_Q8_0);
@@ -4667,7 +4710,7 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr, cudaStream
 // Tie-break may differ from gemma4_sample_argmax on bit-equal logits; harmless
 // for a draft (any proposal is checked).
 __global__ void mtp_argmax_conf_kernel(
-    const float *logits, int V, int *out_id, float *out_p)
+    const float *logits, int V, int *out_id, float *out_p, int32_t *out_tok)
 {
     const int T = blockDim.x, tid = threadIdx.x;
     float m = -INFINITY, s = 0.0f; int id = -1;
@@ -4692,7 +4735,11 @@ __global__ void mtp_argmax_conf_kernel(
         }
         __syncthreads();
     }
-    if (tid == 0) { *out_id = sid[0]; *out_p = 1.0f / ss[0]; }
+    if (tid == 0) {
+        *out_id = sid[0];
+        *out_p  = 1.0f / ss[0];
+        if (out_tok) *out_tok = sid[0];   // feeds the next graph replay's embed
+    }
 }
 
 // Drafter confidence gate (llama.cpp common/speculative.cpp "only collect very
@@ -4724,20 +4771,63 @@ __global__ void mtp_argmax_conf_kernel(
 // forwards past the confidence cut cost MORE than the saved syncs on this GPU
 // (37.5 vs 38.4 tok/s). Keeping the early-stop, but the id no longer crosses the
 // bus (only the 4-byte confidence does) and the next embed reads the device id.
+// Lazy one-time capture of the assistant forward into a CUDA graph. The forward's
+// per-call state is device-resident (d_mtp_tok / d_mtp_pos), so a single captured
+// graph replays for every drafted token of every spec step: ~57 kernel launches
+// collapse to one cudaGraphLaunch between the per-token confidence syncs. On any
+// capture/instantiate failure the per-kernel launch path stays in service.
+static int mtp_graph_ensure(gemma4_engine_t *eng)
+{
+    if (eng->mtp_graph) return 0;
+    if (eng->mtp_graph_failed) return -1;
+    cudaStream_t cs = NULL;
+    cudaGraph_t  g  = NULL;
+    int ok = cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) == cudaSuccess;
+    if (ok && cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+        mtp_forward(eng, eng->d_mtp_tok, eng->d_mtp_pos, cs);
+        ok = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != NULL;
+    } else {
+        ok = 0;
+    }
+    if (ok) ok = cudaGraphInstantiate(&eng->mtp_graph, g, 0) == cudaSuccess;
+    if (g)  cudaGraphDestroy(g);
+    if (cs) cudaStreamDestroy(cs);
+    if (!ok || !eng->mtp_graph) {
+        eng->mtp_graph = NULL;
+        eng->mtp_graph_failed = 1;
+        cudaGetLastError();   // clear any capture-path error state
+        fprintf(stderr, "gem4d: MTP forward graph capture failed — using per-kernel launches\n");
+        return -1;
+    }
+    return 0;
+}
+
 static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int max_draft)
 {
     if (!eng->mtp.loaded || !eng->mtp_h_valid || max_draft <= 0) return 0;
     if (eng->global_n_tokens <= 0) return 0;
     if (max_draft > GEMMA4_SPEC_MAX - 1) max_draft = GEMMA4_SPEC_MAX - 1;
     if (!eng->d_mtp_ids || !eng->d_mtp_conf) return 0;
+    if (!eng->d_mtp_tok || !eng->d_mtp_pos) return 0;
     cudaStream_t stream = eng->stream;
-    int32_t tok = g;                  // j==0 source (host int, coherent-readable)
+    // Per-call device state: the chain position (n_past, same for every draft token)
+    // and the first input token. Chained tokens are written into d_mtp_tok on-device
+    // by mtp_argmax_conf_kernel — no id ever crosses the bus mid-chain.
+    int posv = eng->global_n_tokens;
+    cudaMemcpyAsync(eng->d_mtp_pos, &posv, sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(eng->d_mtp_tok, &g, sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+    int use_graph = (mtp_graph_ensure(eng) == 0);
     int produced = 0;
     for (int j = 0; j < max_draft; j++) {
-        const int32_t *tok_ptr = (j == 0) ? &tok : (const int32_t *)(eng->d_mtp_ids + (j - 1));
-        mtp_forward(eng, tok_ptr, stream);
+        if (use_graph && cudaGraphLaunch(eng->mtp_graph, stream) != cudaSuccess) {
+            use_graph = 0;                    // replay failed → per-kernel for the rest
+            cudaGetLastError();
+        }
+        if (!use_graph)
+            mtp_forward(eng, eng->d_mtp_tok, eng->d_mtp_pos, stream);
         mtp_argmax_conf_kernel<<<1, 1024, 0, stream>>>(
-            eng->d_logits, GEMMA4_VOCAB_SIZE, eng->d_mtp_ids + j, eng->d_mtp_conf + j);
+            eng->d_logits, GEMMA4_VOCAB_SIZE, eng->d_mtp_ids + j, eng->d_mtp_conf + j,
+            eng->d_mtp_tok);
         float conf = 0.0f;
         cudaMemcpyAsync(&conf, eng->d_mtp_conf + j, sizeof(float),
                         cudaMemcpyDeviceToHost, stream);
