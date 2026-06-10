@@ -9,8 +9,10 @@ CUDA_HOME := /usr/local/cuda-13
 GO     := /usr/local/go/bin/go
 
 # ─── Architecture ──────────────────────────────────────────────────────
-# sm_121 = Blackwell GB10 (DGX Spark specific compute capability)
-CUDA_ARCH := sm_121
+# sm_121a = Blackwell GB10 (DGX Spark) with arch-specific features enabled
+# (FP8/NVFP4 block-scaled MMA, tcgen05). Superset of sm_121; this project is
+# GB10-only so the arch-specific cubin is strictly better.
+CUDA_ARCH := sm_121a
 NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo --use_fast_math \
              -Xcompiler -O3 -Xcompiler -pthread \
              --threads 8
@@ -33,15 +35,25 @@ lib: cuda/libgem4d.a
 
 # ─── CUDA Kernel Library ───────────────────────────────────────────────
 # Two-step compilation: device code + link
+#
+# The objects depend on the Makefile itself: an arch/flag change (e.g.
+# sm_121 → sm_121a) MUST force a recompile, otherwise `ar rcs` would bundle
+# a stale cubin built with the old flags into libgem4d.a.
 
-cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh
+cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
 
-cuda/gemma4_kernels_link.o: cuda/gemma4_kernels.o
+cuda/gemma4_kernels_link.o: cuda/gemma4_kernels.o Makefile
 	$(NVCC) $(NVCCFLAGS) -dlink -o $@ $<
 
 cuda/libgem4d.a: cuda/gemma4_kernels.o cuda/gemma4_kernels_link.o
 	ar rcs $@ $^
+	@arches="$$($(CUDA_HOME)/bin/cuobjdump --list-elf $@ 2>/dev/null | sed -n 's/.*\.\(sm_[0-9a-z]*\)\.cubin/\1/p' | sort -u)"; \
+	echo "libgem4d.a cubin arch(es): $$arches"; \
+	if [ "$$arches" != "$(CUDA_ARCH)" ]; then \
+		echo "libgem4d.a: ERROR — expected only $(CUDA_ARCH) cubin, got: $$arches (stale object?)"; \
+		exit 1; \
+	fi
 
 # ─── Go Binary ──────────────────────────────────────────────────────────
 # IMPORTANT: cgo does NOT hash the contents of the `-lgem4d` static archive, so

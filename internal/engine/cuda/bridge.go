@@ -10,6 +10,15 @@ package cuda
 //
 // #include "gemma4_kernels.cuh"
 // #include <stdlib.h>
+//
+// // Thin C wrappers for CGO compatibility with graph API
+// static inline void _gem4d_set_graph_mode(struct gemma4_engine *eng, int mode) {
+//     gemma4_engine_set_graph_mode(eng, mode);
+// }
+// static inline void _gem4d_graph_stats(const struct gemma4_engine *eng,
+//     int *hits, int *misses, int *captures, int *launches) {
+//     gemma4_engine_graph_stats(eng, hits, misses, captures, launches);
+// }
 import "C"
 
 import (
@@ -329,6 +338,24 @@ func (e *Engine) Timing() TimingStats {
 		DecodeTokens:  int(C.gemma4_engine_decode_tokens(e.ptr)),
 		DecodeMS:      float64(C.gemma4_engine_decode_ms(e.ptr)),
 	}
+}
+
+// SetGraphMode enables (1) or disables (0) CUDA graph support.
+// When enabled, allocates persistent prefill scratch buffers and
+// prepares for future graph capture of prefill_batched.
+func (e *Engine) SetGraphMode(mode int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	C._gem4d_set_graph_mode(e.ptr, C.int(mode))
+}
+
+// GraphStats returns CUDA graph statistics.
+func (e *Engine) GraphStats() (hits, misses, captures, launches int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var h, m, c, l C.int
+	C._gem4d_graph_stats(e.ptr, &h, &m, &c, &l)
+	return int(h), int(m), int(c), int(l)
 }
 
 // ensure CGO runs on the main thread for CUDA compatibility

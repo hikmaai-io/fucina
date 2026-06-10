@@ -1151,57 +1151,54 @@ __device__ __forceinline__ void block_reduce_sum_vec(float *val, float *smem) {
     __syncthreads();   // back-to-back call guard (see block_reduce_sum)
 }
 
-// Phase 1: one block per sequence split. blockDim.x = head_dim; thread tid owns output
-// dim tid for ALL NH heads. Each K[t]/V[t] is read once and dotted against all NH heads.
-template<int NH>
+// Phase 1: one block per sequence split, one WARP per query head (NH warps/block).
+// Each lane owns HD/32 elements in registers; per-key dots reduce via __shfl only —
+// NO __syncthreads in the key loop. (The old one-thread-per-dim variant paid TWO
+// block-wide barriers PER KEY in block_reduce_sum_vec — nsys showed it at ~322 µs for
+// a ~250-token context, 12% of generation GPU time. Same fix as the sliding split-K
+// kernel.) Every warp re-reads the K/V tile, but all NH warps of a block hit the
+// same lines in L1/L2 — DRAM traffic stays ~1× per block.
+template<int NH, int HD>
 __global__ void global_attn_splitk_kernel(
-    float *part_acc,                          // [n_splits][NH][head_dim] (unnormalized)
+    float *part_acc,                          // [n_splits][NH][HD] (unnormalized)
     float *part_m, float *part_l,             // [n_splits][NH]
-    const float *q,                           // [NH][head_dim]
-    const kv_t *k_cache, const kv_t *v_cache, // [ctx_len][head_dim]
+    const float *q,                           // [NH][HD]
+    const kv_t *k_cache, const kv_t *v_cache, // [ctx_len][HD]
     int head_dim, int ctx_len, int n_splits)
 {
-    extern __shared__ float smem[];
+    constexpr int slice = HD / 32;            // 16 floats/lane at HD 512
+    static_assert(HD % 32 == 0, "lane-strided slices require HD multiple of warp size");
+    int h    = threadIdx.x >> 5;              // warp = query head
+    int lane = threadIdx.x & 31;
     int split = blockIdx.x;
-    int tid   = threadIdx.x;
     int per = (ctx_len + n_splits - 1) / n_splits;
     int t0  = split * per;
     int t1  = min(t0 + per, ctx_len);
 
-    float qd[NH], acc[NH], m[NH], l[NH];
+    float qreg[slice], acc[slice], m = -INFINITY, l = 0.0f;
+    const float *qp = q + (size_t)h * HD;
     #pragma unroll
-    for (int h = 0; h < NH; h++) {
-        qd[h] = (tid < head_dim) ? q[h*head_dim + tid] : 0.0f;
-        acc[h] = 0.0f; m[h] = -INFINITY; l[h] = 0.0f;
-    }
+    for (int e = 0; e < slice; e++) { qreg[e] = qp[lane + 32*e]; acc[e] = 0.0f; }
 
     for (int t = t0; t < t1; t++) {
-        float kd = (tid < head_dim) ? fp8_to_float(k_cache[(size_t)t*head_dim + tid]) : 0.0f;
-        float s[NH];
+        const kv_t *kp = k_cache + (size_t)t * HD;
+        const kv_t *vp = v_cache + (size_t)t * HD;
+        float dot = 0.0f;
         #pragma unroll
-        for (int h = 0; h < NH; h++) s[h] = qd[h] * kd;
-        block_reduce_sum_vec<NH>(s, smem);          // s[h] = full dot for head h (all threads)
-        float vd = (tid < head_dim) ? fp8_to_float(v_cache[(size_t)t*head_dim + tid]) : 0.0f;
+        for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
+        float s = warp_reduce_sum_all(dot);   // __shfl only — no block sync
+        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+        l = l*al + p;
         #pragma unroll
-        for (int h = 0; h < NH; h++) {
-            float mn = fmaxf(m[h], s[h]);
-            float al = __expf(m[h] - mn);
-            float p  = __expf(s[h] - mn);
-            l[h]   = l[h]*al + p;
-            acc[h] = acc[h]*al + p*vd;
-            m[h]   = mn;
-        }
+        for (int e = 0; e < slice; e++)
+            acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
+        m = mn;
     }
 
-    if (tid < head_dim) {
-        #pragma unroll
-        for (int h = 0; h < NH; h++)
-            part_acc[((size_t)split*NH + h)*head_dim + tid] = acc[h];
-    }
-    if (tid == 0) {
-        #pragma unroll
-        for (int h = 0; h < NH; h++) { part_m[split*NH + h] = m[h]; part_l[split*NH + h] = l[h]; }
-    }
+    float *pa = part_acc + ((size_t)split*NH + h)*HD;
+    #pragma unroll
+    for (int e = 0; e < slice; e++) pa[lane + 32*e] = acc[e];
+    if (lane == 0) { part_m[split*NH + h] = m; part_l[split*NH + h] = l; }
 }
 
 // Phase 2: one block per head merges that head's n_splits online-softmax partials.
@@ -1809,6 +1806,36 @@ __global__ void embed_lookup_q8_0_kernel(
 // ─── Residual Add ───────────────────────────────────────────────────────
 // =========================================================================
 
+
+// Fused rms_norm_rows + residual_add: norm the sub-block output and fold
+// it into the residual stream in ONE pass. Saves 2 kernel launches per layer.
+__global__ void rms_norm_residual_add_kernel(
+    float       *residual, // [rows*n] in/out
+    const float *x,        // [rows*n] sub-block output to norm
+    const float *weight,   // [n] RMSNorm weights
+    int          n, int rows, float eps)
+{
+    extern __shared__ float smem[];
+    int row = blockIdx.x, tid = threadIdx.x;
+    float sum_sq = 0.0f;
+    for (int j = tid; j < n; j += blockDim.x) {
+        float v = x[(size_t)row * n + j];
+        sum_sq += v * v;
+    }
+    smem[tid] = sum_sq; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    float rms = __frsqrt_rn(smem[0] / (float)n + eps);
+    __syncthreads();
+    for (int j = tid; j < n; j += blockDim.x) {
+        float v = x[(size_t)row * n + j];
+        float w = weight ? weight[j] : 1.0f;
+        residual[(size_t)row * n + j] += v * w * rms;
+    }
+}
+
 __global__ void residual_add_kernel(
     float       *x,        // [n] in/out
     const float *residual, // [n]
@@ -1858,6 +1885,16 @@ struct gemma4_engine {
     // 4=gate 5=up 6=down (global layers have no separate V → d_bf16_layer[2] NULL).
     __nv_bfloat16 *d_bf16_layer[7];     // [out_dim×in_dim] per projection, max-sized
     int            bf16_ready;          // 1 once the scratch is allocated
+
+    // ── Persistent prefill scratch (CUDA-graph safe) ─────────────────
+    int    pf_scratch_ready;
+    float  *d_pf_x, *d_pf_norm, *d_pf_q, *d_pf_k, *d_pf_v;
+    float  *d_pf_attn, *d_pf_gate, *d_pf_up, *d_pf_scores;
+    __nv_bfloat16 *d_pf_inb, *d_pf_qb, *d_pf_kb, *d_pf_vb;
+    __nv_bfloat16 *d_pf_kbx, *d_pf_vbx, *d_pf_pb;
+    // CUDA Graph state
+    int graph_mode;
+    struct { cudaGraph_t g; cudaGraphExec_t e; int N, hits, misses; } graph;
 
     // Tensor offsets within mapped file (from start of tensor_data section)
     // All weights are stored in FP8 (or Q8_0)
@@ -2366,12 +2403,17 @@ gemma4_engine_t* gemma4_engine_create(
     cublasCreate(&eng->cublas);
     cublasSetStream(eng->cublas, eng->stream);
     {
-        int math_mode = CUBLAS_DEFAULT_MATH;
-#if defined(CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)
-        // FP8 path uses default math
-#endif
-        cublasSetMathMode(eng->cublas, (cublasMath_t)math_mode);
+        cublasSetMathMode(eng->cublas, CUBLAS_TENSOR_OP_MATH);
     }
+
+    // CUDA Graph + persistent scratch init
+    eng->graph_mode = 0; eng->graph.g = NULL; eng->graph.e = NULL;
+    eng->graph.N = 0; eng->graph.hits = eng->graph.misses = 0;
+    eng->pf_scratch_ready = 0;
+    eng->d_pf_x = eng->d_pf_norm = eng->d_pf_q = eng->d_pf_k = eng->d_pf_v = NULL;
+    eng->d_pf_attn = eng->d_pf_gate = eng->d_pf_up = eng->d_pf_scores = NULL;
+    eng->d_pf_inb = eng->d_pf_qb = eng->d_pf_kb = eng->d_pf_vb = NULL;
+    eng->d_pf_kbx = eng->d_pf_vbx = eng->d_pf_pb = NULL;
 
     // Open and mmap the GGUF file
     eng->gguf_fd = open(model_path, O_RDONLY);
@@ -2746,20 +2788,18 @@ gemma4_engine_t* gemma4_engine_create(
             fprintf(stderr, "gem4d: WARNING token_embd conversion failed\n");
     }
 
-    // Step 8: keep the tied LM head NATIVE Q6_K — point at the raw Q6_K bytes in the device
-    // weight blob so the output projection reads 0.82 B/elem (vs the Q8_0 upconvert's 1.06).
-    // The Q8_0 d_token_embd above is retained ONLY for the (cheap, one-row) embedding lookup.
+    // Step 8 REVERTED after nsys profiling on GB10: the native-Q6_K head kernel is
+    // COMPUTE-bound (scalar 6-bit unpack + fp32 FMA per element — no dp4a), reaching only
+    // ~76 GB/s effective (10.9 ms single-token), and the "batched" spec-verify variant
+    // scaled ~10 ms PER ROW (28/43/52 ms at K=3/4/5) — 32% of ALL generation GPU time.
+    // The Q8_0 dp4a path reads 1.06 GB at ~207 GB/s ≈ 5.3 ms and its batched kernel
+    // reads the head ONCE for all K verify rows, so despite +0.24 GB/token of traffic it
+    // is ~2x faster single-token and up to ~10x faster in the verify. The head therefore
+    // uses the Q8_0-converted token_embd (d_token_embd); the Q6_K kernels remain for
+    // reference/other-quant use.
     eng->d_lmhead_q6k = NULL; eng->lmhead_q6k = 0;
-    // output_tied REQUIRED: embd_is_q6k is detected from token_embd's type, but d_lmhead_q6k
-    // points at output_weight. Only when the head is TIED (output_weight==token_embd) is that
-    // the Q6_K tensor. An untied checkpoint with an explicit non-Q6_K output.weight must fall
-    // back to the Q8_0 path, else it'd be misread as 210-byte Q6_K super-blocks. (Review fix.)
-    if (eng->format == FORMAT_Q4_0 && embd_is_q6k && eng->output_tied && eng->d_weights) {
-        eng->d_lmhead_q6k = (unsigned char *)(eng->d_weights
-            + (eng->tensors.output_weight - eng->tdata_start));
-        eng->lmhead_q6k = 1;
-        fprintf(stderr, "gem4d: LM head kept native Q6_K (-0.24 GB/token output read)\n");
-    }
+    if (eng->format == FORMAT_Q4_0 && embd_is_q6k && eng->output_tied && eng->d_token_embd)
+        fprintf(stderr, "gem4d: LM head using Q8_0 dp4a (Q6_K native path is compute-bound)\n");
 
     // Build the absolute-id -> global-slot inverse map from global_layer_indices
     // (set by the layer-type detection above). Sliding layers map to -1.
@@ -2908,6 +2948,15 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     if (eng->d_mtp_attn) cudaFree(eng->d_mtp_attn);
     if (eng->d_mtp_ffa) cudaFree(eng->d_mtp_ffa);
     if (eng->d_mtp_ffb) cudaFree(eng->d_mtp_ffb);
+    if (eng->graph.e) cudaGraphExecDestroy(eng->graph.e);
+    if (eng->graph.g) cudaGraphDestroy(eng->graph.g);
+    cudaFree(eng->d_pf_x); cudaFree(eng->d_pf_norm);
+    cudaFree(eng->d_pf_q); cudaFree(eng->d_pf_k); cudaFree(eng->d_pf_v);
+    cudaFree(eng->d_pf_attn); cudaFree(eng->d_pf_gate); cudaFree(eng->d_pf_up);
+    cudaFree(eng->d_pf_scores);
+    cudaFree(eng->d_pf_inb); cudaFree(eng->d_pf_qb);
+    cudaFree(eng->d_pf_kb); cudaFree(eng->d_pf_vb);
+    cudaFree(eng->d_pf_kbx); cudaFree(eng->d_pf_vbx); cudaFree(eng->d_pf_pb);
     if (eng->stream) cudaStreamDestroy(eng->stream);
 
     free(eng);
@@ -3010,19 +3059,15 @@ static inline void global_attn_decode_broadcast(
     const kv_t *kc, const kv_t *vc, int n_heads, int head_dim, int ctx_len,
     cudaStream_t stream)
 {
-    // INVARIANT: blockDim.x == head_dim (a multiple of 32) and ALL threads take identical
-    // t-loop bounds — the per-t block_reduce_sum_vec __syncthreads would deadlock otherwise.
-    // OCCUPANCY NOTE (clean-GPU profiling gate): the split-K kernel holds 4×NH=64 floats/thread
-    // (qd/acc/m/l); at head_dim=512 that is register-heavy and may cap occupancy. If profiling
-    // shows it register-bound, switch to the "tile 2×8" fallback (8 heads/block, grid.y=2 head
-    // tiles → 2× KV reads but better occupancy; still far below the old 16×). (DECODE-30-35 #1.)
+    // Warp-per-head kernel: NH warps/block (512 threads at NH=16), head_dim is the
+    // compile-time HD template param (global layers are always GEMMA4_GLOBAL_HEAD_DIM).
+    // No shared memory, no __syncthreads — see kernel comment.
     int splits = (ctx_len + GEMMA4_GLOBAL_SPLIT_CHUNK - 1) / GEMMA4_GLOBAL_SPLIT_CHUNK;
     if (splits < 1) splits = 1;
     if (splits > GEMMA4_GLOBAL_MAX_SPLITS) splits = GEMMA4_GLOBAL_MAX_SPLITS;
     if (splits > ctx_len) splits = ctx_len;       // never launch an empty split
-    int n_warps = (head_dim + 31) >> 5;
-    size_t sm = (size_t)n_warps * GEMMA4_HEADS * sizeof(float);
-    global_attn_splitk_kernel<GEMMA4_HEADS><<<splits, head_dim, sm, stream>>>(
+    global_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
+        <<<splits, GEMMA4_HEADS*32, 0, stream>>>(
         eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, head_dim, ctx_len, splits);
     flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
         out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
@@ -3378,12 +3423,13 @@ static cublasStatus_t gemm_bf16(
         X, CUDA_R_16BF, in_dim,
         &beta,
         Y, CUDA_R_32F, out_dim,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 
 // =========================================================================
 // ─── Batched Prefill (Step 2 Phase 2 + Step 3) ──────────────────────────
+static int alloc_prefill_scratch(gemma4_engine_t *eng);   // fwd decl (defined below)
 // =========================================================================
 // Process the WHOLE prompt in one weight pass: per layer, one cuBLAS BF16 GEMM
 // per projection over all N tokens (tensor-core bound) instead of N token-by-
@@ -3399,13 +3445,18 @@ int gemma4_engine_prefill_batched(
     if (!eng->loaded || n_tokens <= 0) return -1;
     if (eng->global_n_tokens != 0) return -2;             // need fresh sequence
     if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
-    // Batched attention materializes [HEADS][N×N] score buffers (fp32+bf16, ~6 B/elem)
-    // allocated/freed PER prefill. At large N that is many GB (e.g. ~14 GB @ 11.7k
-    // tokens) — the giant per-request cudaMalloc intermittently stalls or fails and
-    // falls back to the ~90× slower token-by-token path (the "stuck" prefills). Cap
-    // batched to a modest N (≤4096 ⇒ ~1.6 GB buffers); larger prompts use the
-    // constant-memory chunked FLASH prefill (bit-identical, ~700 t/s, no N² alloc).
-    if (n_tokens > 4096) return -2;
+    // Batched attention materializes [HEADS][N×N] score buffers (fp32+bf16, ~6 B/elem).
+    // At large N that is many GB (e.g. ~14 GB @ 11.7k tokens) — the giant per-request
+    // cudaMalloc intermittently stalled or failed (the "stuck" prefills), so commit
+    // 5fc80c9 routed everything >128 to the scalar FLASH path. But nsys showed flash
+    // attention is ~70% of prefill wall time at 2k ctx (scalar fp8 loads, no tensor
+    // cores: 615 tok/s vs llama.cpp's ~1200). Fix the ALLOC problem instead of avoiding
+    // the fast path: N ≤ 4096 uses the PERSISTENT prefill scratch (~2 GB, allocated
+    // once, no per-request cudaMalloc — no fragmentation), tensor-core GEMM attention
+    // throughout. Larger prompts still use the chunked FLASH prefill (O(chunk+KV) mem).
+    if (n_tokens > 4096) return -2;  // flash prefill beyond the persistent scratch size
+    if (!eng->pf_scratch_ready && alloc_prefill_scratch(eng) != 0)
+        return -2;                   // scratch alloc failed → flash fallback
     if (build_bf16_weights(eng) != 0) return -1;
 
     cudaStream_t stream = eng->stream;
@@ -3418,13 +3469,33 @@ int gemma4_engine_prefill_batched(
     cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0, stream);
 
+    const bool use_graph = (eng->graph_mode >= 1 && eng->pf_scratch_ready);
+    bool graph_replay = false;
+    if (use_graph && eng->graph.N == N && eng->graph.e) {
+        graph_replay = true; eng->graph.hits++;
+    } else if (use_graph) {
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        eng->graph.misses++;
+    }
+
     // ── Scratch (token-major). Sized to the widest dim each can take. ──
     const int OQ_MAX = GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM; // 8192
     const int OKV_MAX = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;    // 2048
+    const int HEADS = GEMMA4_HEADS;
     float *d_x=0,*d_norm=0,*d_q=0,*d_k=0,*d_v=0,*d_attn=0,*d_gate=0,*d_up=0,*d_scores=0;
     __nv_bfloat16 *d_inb=0,*d_qb=0,*d_kb=0,*d_vb=0,*d_kbx=0,*d_vbx=0,*d_pb=0;
-    const int HEADS = GEMMA4_HEADS;
-    int ok = 1;
+    bool own_bufs = false;
+
+    if (eng->pf_scratch_ready && N <= 4096) {
+        d_x = eng->d_pf_x; d_norm = eng->d_pf_norm; d_q = eng->d_pf_q;
+        d_k = eng->d_pf_k; d_v = eng->d_pf_v; d_attn = eng->d_pf_attn;
+        d_gate = eng->d_pf_gate; d_up = eng->d_pf_up; d_scores = eng->d_pf_scores;
+        d_inb = eng->d_pf_inb; d_qb = eng->d_pf_qb; d_kb = eng->d_pf_kb;
+        d_vb = eng->d_pf_vb; d_kbx = eng->d_pf_kbx; d_vbx = eng->d_pf_vbx;
+        d_pb = eng->d_pf_pb;
+    } else {
+        own_bufs = true;
+        int ok = 1;
     #define PALLOC(p,elems) do{ if(cudaMalloc(&(p),(size_t)(elems))!=cudaSuccess){ok=0;} }while(0)
     PALLOC(d_x,    (size_t)N*H*sizeof(float));
     PALLOC(d_norm, (size_t)N*H*sizeof(float));
@@ -3454,8 +3525,10 @@ int gemma4_engine_prefill_batched(
         for (__nv_bfloat16 *p : bbufs) if(p) cudaFree(p);
         return -2;
     }
+    } // else (own_bufs)
 
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+    if (!graph_replay) {
     // One projection GEMM: bf16 normed input d_inb → fp32 token-major [N][out].
     // Weight comes from the rotating per-layer scratch (dequant'd at layer top).
     auto gemm_proj = [&](int l, int p, int in_dim, int out_dim, float *dst){
@@ -3525,14 +3598,14 @@ int gemma4_engine_prefill_batched(
                 &a1, d_qb,  CUDA_R_16BF, oq, (long long)hd,
                      d_kbx, CUDA_R_16BF, oq, (long long)hd,
                 &b0, d_scores, CUDA_R_32F, N, sNN,
-                GEMMA4_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                GEMMA4_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             attn_softmax_batched_kernel<<<dim3(N,GEMMA4_HEADS),256,HD2,stream>>>(d_scores, d_pb, N, window);
             // O[h] = V[h]·P[h]ᵀ  (m=hd,n=N,k=N → C col-major [hd×N] ld=oq stride=hd)
             cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_N, CUBLAS_OP_T, hd, N, N,
                 &a1, d_vbx, CUDA_R_16BF, oq, (long long)hd,
                      d_pb,  CUDA_R_16BF, N,  sNN,
                 &b0, d_attn, CUDA_R_32F, oq, (long long)hd,
-                GEMMA4_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                GEMMA4_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         }
 
         // Write final K/V into the persistent cache for decode continuation.
@@ -3556,8 +3629,7 @@ int gemma4_engine_prefill_batched(
         // O projection → temp d_q ; post-attn norm ; fold into residual d_x
         f32_to_bf16_kernel<<<grid1d((size_t)N*oq),256,0,stream>>>(d_inb, d_attn, (size_t)N*oq);
         gemm_proj(l, PJ_O, oq, H, d_q);
-        rms_norm_rows_kernel<<<N,256,HD2,stream>>>(d_norm, d_q, w_post_a, H, N, GEMMA4_RMS_EPS);
-        residual_add_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, d_norm, N*H);
+        rms_norm_residual_add_kernel<<<N,256,256*sizeof(float),stream>>>(d_x, d_q, w_post_a, H, N, GEMMA4_RMS_EPS);
 
         // FFN: pre-norm (d_x is now the post-attn hidden = FFN residual) → bf16
         // input (reused by gate+up), GeGLU, down → temp d_q, fold into d_x.
@@ -3566,14 +3638,16 @@ int gemma4_engine_prefill_batched(
         gemm_proj(l, PJ_UP,   H, I, d_up);
         geglu_bf16_kernel<<<grid1d((size_t)N*I),256,0,stream>>>(d_inb, d_gate, d_up, N*I);
         gemm_proj(l, PJ_DOWN, I, H, d_q);
-        rms_norm_rows_kernel<<<N,256,HD2,stream>>>(d_norm, d_q, w_post_f, H, N, GEMMA4_RMS_EPS);
-        residual_add_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, d_norm, N*H);
+        rms_norm_residual_add_kernel<<<N,256,256*sizeof(float),stream>>>(d_x, d_q, w_post_f, H, N, GEMMA4_RMS_EPS);
         if (eng->h_out_scale[l] != 1.0f)
             scale_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, N*H, eng->h_out_scale[l]);
     }
 
+    } // if (!graph_replay)
+
     eng->global_n_tokens += N;
 
+    if (!graph_replay) {
     // ── Output norm + LM head + softcap on the LAST token only ──
     float *x_last = d_x + (size_t)(N-1)*H;
     rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
@@ -3587,6 +3661,23 @@ int gemma4_engine_prefill_batched(
     if (logits_out)
         cudaMemcpyAsync(logits_out, eng->d_logits, GEMMA4_VOCAB_SIZE*sizeof(float),
                         cudaMemcpyDeviceToHost, stream);
+    } // if (!graph_replay)
+
+    // D2H copy always needed (graph captures everything except host copy)
+    if (graph_replay && logits_out)
+        cudaMemcpyAsync(logits_out, eng->d_logits, GEMMA4_VOCAB_SIZE*sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+
+    if (use_graph && !graph_replay) {
+        cudaGraph_t g;
+        cudaStreamEndCapture(stream, &g);
+        cudaGraphInstantiate(&eng->graph.e, g, NULL, NULL, 0);
+        if (eng->graph.g) cudaGraphDestroy(eng->graph.g);
+        eng->graph.g = g; eng->graph.N = N;
+        cudaGraphLaunch(eng->graph.e, stream);
+    } else if (graph_replay) {
+        cudaGraphLaunch(eng->graph.e, stream);
+    }
 
     cudaEventRecord(t1, stream);
     cudaEventSynchronize(t1);
@@ -3595,8 +3686,12 @@ int gemma4_engine_prefill_batched(
     eng->n_prefill_tokens += N;
     cudaEventDestroy(t0); cudaEventDestroy(t1);
 
-    for (float *p : fbufs) cudaFree(p);
-    for (__nv_bfloat16 *p : bbufs) cudaFree(p);
+    if (own_bufs) {
+        float *fb[]={d_x,d_norm,d_q,d_k,d_v,d_attn,d_gate,d_up,d_scores};
+        __nv_bfloat16 *bb[]={d_inb,d_qb,d_kb,d_vb,d_kbx,d_vbx,d_pb};
+        for (float *p : fb) if(p) cudaFree(p);
+        for (__nv_bfloat16 *p : bb) if(p) cudaFree(p);
+    }
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -3716,16 +3811,14 @@ int gemma4_engine_prefill_flash(
 
             f32_to_bf16_kernel<<<grid1d((size_t)cn*oq),256,0,stream>>>(d_inb, d_attn, (size_t)cn*oq);
             gemm_proj(PJ_O, oq, H, d_q, cn);
-            rms_norm_rows_kernel<<<cn,256,HD2,stream>>>(d_norm, d_q, w_post_a, H, cn, GEMMA4_RMS_EPS);
-            residual_add_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, d_norm, cn*H);
+            rms_norm_residual_add_kernel<<<cn,256,256*sizeof(float),stream>>>(d_x, d_q, w_post_a, H, cn, GEMMA4_RMS_EPS);
 
             rms_norm_rows_bf16_kernel<<<cn,256,HD2,stream>>>(d_inb, d_x, w_ffn, H, cn, GEMMA4_RMS_EPS);
             gemm_proj(PJ_GATE, H, I, d_gate, cn);
             gemm_proj(PJ_UP,   H, I, d_up,   cn);
             geglu_bf16_kernel<<<grid1d((size_t)cn*I),256,0,stream>>>(d_inb, d_gate, d_up, cn*I);
             gemm_proj(PJ_DOWN, I, H, d_q, cn);
-            rms_norm_rows_kernel<<<cn,256,HD2,stream>>>(d_norm, d_q, w_post_f, H, cn, GEMMA4_RMS_EPS);
-            residual_add_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, d_norm, cn*H);
+        rms_norm_residual_add_kernel<<<cn,256,256*sizeof(float),stream>>>(d_x, d_q, w_post_f, H, cn, GEMMA4_RMS_EPS);
             if (eng->h_out_scale[l] != 1.0f)
                 scale_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, cn*H, eng->h_out_scale[l]);
         }
@@ -5048,4 +5141,52 @@ int gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep) {
     return 0;
 }
 
+// ─── Persistent prefill scratch allocator ───────────────────────────
+static int alloc_prefill_scratch(gemma4_engine_t *eng) {
+    if (eng->pf_scratch_ready) return 0;
+    const int NC = 4096, H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE;
+    const int OQ = GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM;
+    const int OK = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
+    const int HE = GEMMA4_HEADS;
+    cudaError_t ok = cudaSuccess;
+    #define A(p,sz) if(ok==cudaSuccess) ok=cudaMalloc(&(p),(size_t)(sz))
+    A(eng->d_pf_x, (size_t)NC*H*sizeof(float));
+    A(eng->d_pf_norm, (size_t)NC*H*sizeof(float));
+    A(eng->d_pf_q, (size_t)NC*OQ*sizeof(float));
+    A(eng->d_pf_k, (size_t)NC*OK*sizeof(float));
+    A(eng->d_pf_v, (size_t)NC*OK*sizeof(float));
+    A(eng->d_pf_attn, (size_t)NC*OQ*sizeof(float));
+    A(eng->d_pf_gate, (size_t)NC*I*sizeof(float));
+    A(eng->d_pf_up, (size_t)NC*I*sizeof(float));
+    A(eng->d_pf_scores, (size_t)HE*NC*NC*sizeof(float));
+    A(eng->d_pf_inb, (size_t)NC*I*sizeof(__nv_bfloat16));
+    A(eng->d_pf_qb, (size_t)NC*OQ*sizeof(__nv_bfloat16));
+    A(eng->d_pf_kb, (size_t)NC*OK*sizeof(__nv_bfloat16));
+    A(eng->d_pf_vb, (size_t)NC*OK*sizeof(__nv_bfloat16));
+    A(eng->d_pf_kbx, (size_t)NC*OQ*sizeof(__nv_bfloat16));
+    A(eng->d_pf_vbx, (size_t)NC*OQ*sizeof(__nv_bfloat16));
+    A(eng->d_pf_pb, (size_t)HE*NC*NC*sizeof(__nv_bfloat16));
+    #undef A
+    if (ok != cudaSuccess) { cudaGetLastError(); return -1; }
+    eng->pf_scratch_ready = 1;
+    fprintf(stderr, "gem4d: persistent prefill scratch (N<=%d)\n", NC);
+    return 0;
+}
+
+void gemma4_engine_set_graph_mode(gemma4_engine_t *eng, int mode) {
+    if (!eng) return;
+    if (mode == 1 && !eng->pf_scratch_ready) {
+        if (alloc_prefill_scratch(eng) != 0) { eng->graph_mode = 0; return; }
+    }
+    eng->graph_mode = (mode >= 0 && mode <= 1) ? mode : 0;
+}
+
+void gemma4_engine_graph_stats(const gemma4_engine_t *eng,
+    int *hits, int *misses, int *captures, int *launches) {
+    if (!eng) return;
+    if (hits) *hits = eng->graph.hits;
+    if (misses) *misses = eng->graph.misses;
+    if (captures) *captures = eng->graph.N > 0 ? 1 : 0;
+    if (launches) *launches = eng->graph.hits;
+}
 

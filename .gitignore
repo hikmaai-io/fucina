@@ -28,3 +28,4 @@ tests/test_parser
 coverage.out
 coverage.html
 __debug_bin*
+*.gguf

@@ -36,6 +36,7 @@ type CLIArgs struct {
 	NoDisplay  bool
 	Spec       bool
 	DraftK     int
+	CudaGraphs bool // --cuda-graphs (experimental, off by default)
 
 	// Server
 	Host     string
@@ -91,6 +92,7 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 
 	fs.BoolVar(&a.Spec, "spec", true, "Prompt-lookup speculative decoding (greedy/temp=0 only)")
 	fs.IntVar(&a.DraftK, "draft-k", 6, "Max speculative draft length per step")
+	fs.BoolVar(&a.CudaGraphs, "cuda-graphs", false, "Enable CUDA graph support (experimental, allocates persistent prefill scratch)")
 	// Defaults follow the google/gemma-4-12B model card's standardized sampling
 	// configuration (temperature 1.0, top_p 0.95, top_k 64; no min-p). The GGUF
 	// embeds the same values in general.sampling.{temp,top_k,top_p}.

@@ -76,6 +76,12 @@ func main() {
 		}
 	}
 
+	// CUDA graphs: off by default, --cuda-graphs enables persistent scratch.
+	if args.CudaGraphs {
+		eng.SetGraphMode(1)
+		log.Printf("gem4d: CUDA graph mode = prefill")
+	}
+
 	if args.Verbose {
 		eng.PrintInfo()
 	}
