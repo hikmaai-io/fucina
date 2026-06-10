@@ -1976,6 +1976,13 @@ struct gemma4_engine {
     int     sb_ready;
     int    *d_sample_id;       // 4-byte device scratch for GPU-side sampled token id
     float  *d_sample_p;        // 4-byte device scratch: drafter top-1 softmax prob
+    // GPU-side spec verify (a): K sampled ids + K host draws stay on device, only the
+    // K ids cross to host (vs the old K×262144 logit D2H + K CPU vocab scans).
+    int    *d_spec_ids;        // [SPEC_MAX] per-row sampled token id
+    float  *d_spec_rnd;        // [SPEC_MAX] per-row uniform draw (H2D once/step)
+    // Device-chained MTP draft (b): maxd ids + confidences read back in ONE sync.
+    int    *d_mtp_ids;         // [SPEC_MAX] chained draft ids
+    float  *d_mtp_conf;        // [SPEC_MAX] per-draft top-1 confidence (PMIN gate)
 
     // ── Gemma-4 MTP assistant drafter (llama.cpp PR #23398 equivalent) ──
     // The official ~423M assistant head: 4 Q-only layers (no K/V projections — they
@@ -2926,6 +2933,10 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     }
     CUDA_FREE(eng->d_sample_id);
     CUDA_FREE(eng->d_sample_p);
+    CUDA_FREE(eng->d_spec_ids);
+    CUDA_FREE(eng->d_spec_rnd);
+    CUDA_FREE(eng->d_mtp_ids);
+    CUDA_FREE(eng->d_mtp_conf);
     CUDA_FREE(eng->d_qx);
     CUDA_FREE(eng->d_dx);
     CUDA_FREE(eng->d_sx);
@@ -4049,6 +4060,15 @@ static int ensure_spec_scratch(gemma4_engine_t *eng)
             return -1;
         }
     }
+    // GPU-side verify scratch (a): K ids + K draws. d_sample_id is also used by the
+    // cold/no-draft single-row device sample — allocate it here too (load_assistant
+    // also allocates it, but lookup-only spec has no assistant).
+    if (!eng->d_sample_id)
+        if (cudaMalloc(&eng->d_sample_id, sizeof(int)) != cudaSuccess) { cudaGetLastError(); return -1; }
+    if (!eng->d_spec_ids)
+        if (cudaMalloc(&eng->d_spec_ids, M*sizeof(int)) != cudaSuccess) { cudaGetLastError(); return -1; }
+    if (!eng->d_spec_rnd)
+        if (cudaMalloc(&eng->d_spec_rnd, M*sizeof(float)) != cudaSuccess) { cudaGetLastError(); return -1; }
     eng->sb_ready = 1;
     return 0;
 }
@@ -4063,8 +4083,11 @@ static int ensure_spec_scratch(gemma4_engine_t *eng)
 // logits_out[K × VOCAB] (row i = logits AFTER token i) and advances the cache by K.
 // Returns 0 on success, -2 if it must defer to sequential decode (LoRA active),
 // -1 on error. Math matches gemma4_engine_decode token-for-token.
-int gemma4_engine_decode_batched(
-    gemma4_engine_t *eng, const int32_t *tokens, int K, float *logits_out)
+// Internal: keep_dev=1 computes the K logit rows into d_sb[11] (device) WITHOUT the
+// D2H copy, so the GPU-side spec verify (a) can sample them on-device. The public
+// wrapper below passes keep_dev=0 (original behavior: D2H iff logits_out!=NULL).
+static int decode_batched_dev(
+    gemma4_engine_t *eng, const int32_t *tokens, int K, float *logits_out, int keep_dev)
 {
     if (!eng->loaded || K <= 0) return -1;
     if (K > GEMMA4_SPEC_MAX) return -1;
@@ -4189,7 +4212,7 @@ int gemma4_engine_decode_batched(
     // (interior chunked-prefill chunks) skips the whole head — ~0.83 GB/chunk saved;
     // note d_norm (d_sb[2], the MTP h source) is only populated when logits run.
     int vocab = GEMMA4_VOCAB_SIZE;
-    if (logits_out) {
+    if (logits_out || keep_dev) {
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, K, GEMMA4_RMS_EPS);
         gemv_batched_w(eng, d_logitsK, lmhead_w(eng),
                        d_norm, H, vocab, K, stream, embd_fmt(eng));
@@ -4198,8 +4221,9 @@ int gemma4_engine_decode_batched(
             for (int i = 0; i < K; i++)
                 suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
                     d_logitsK + (size_t)i*vocab, eng->d_suppress, eng->n_suppress, vocab);
-        cudaMemcpyAsync(logits_out, d_logitsK, (size_t)K*vocab*sizeof(float),
-                        cudaMemcpyDeviceToHost, stream);
+        if (logits_out)   // keep_dev-only path leaves the rows in d_sb[11] for on-GPU verify
+            cudaMemcpyAsync(logits_out, d_logitsK, (size_t)K*vocab*sizeof(float),
+                            cudaMemcpyDeviceToHost, stream);
     }
 
     eng->global_n_tokens += K;
@@ -4217,6 +4241,18 @@ int gemma4_engine_decode_batched(
         return -1;
     }
     return 0;
+}
+
+// Public wrapper (unchanged contract): D2H the K logit rows iff logits_out!=NULL.
+int gemma4_engine_decode_batched(
+    gemma4_engine_t *eng, const int32_t *tokens, int K, float *logits_out)
+{
+    return decode_batched_dev(eng, tokens, K, logits_out, /*keep_dev=*/0);
+}
+
+// d_sb[11] device logits accessor for the GPU-side verify (a).
+static inline float *decode_batched_dev_logits(gemma4_engine_t *eng) {
+    return eng->d_sb[11];
 }
 
 // =========================================================================
@@ -4337,6 +4373,11 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
         ok &= cudaMalloc(&eng->d_sample_id, sizeof(int)) == cudaSuccess;
     if (!eng->d_sample_p)
         ok &= cudaMalloc(&eng->d_sample_p, sizeof(float)) == cudaSuccess;
+    // Device-chained draft scratch (b): maxd ids + confidences, one sync/step.
+    if (!eng->d_mtp_ids)
+        ok &= cudaMalloc(&eng->d_mtp_ids, GEMMA4_SPEC_MAX*sizeof(int)) == cudaSuccess;
+    if (!eng->d_mtp_conf)
+        ok &= cudaMalloc(&eng->d_mtp_conf, GEMMA4_SPEC_MAX*sizeof(float)) == cudaSuccess;
 
     munmap(host, fsize);
     if (!ok) {
@@ -4494,28 +4535,47 @@ __global__ void mtp_argmax_conf_kernel(
 // Requires a valid recurrent h (eng->mtp_h_valid, paired with g). Greedy argmax
 // draft, cut at the first token whose draft prob < GEMMA4_MTP_PMIN — the verify's
 // accept rule is what preserves the target distribution.
+//
+// (b) Device-chained with early-stop: step j's argmax id (written to d_mtp_ids[j])
+// feeds step j+1's embed via the DEVICE pointer and the recurrent h flows through
+// d_mtp_h on-device, so no token readback is needed mid-chain. We still read back
+// the confidence after each forward to decide whether to keep drafting — the
+// assistant forward is ~7% of a target pass, so an extra unwanted forward is NOT
+// free, and a measured A/B (chain-then-truncate vs early-stop) showed the wasted
+// forwards past the confidence cut cost MORE than the saved syncs on this GPU
+// (37.5 vs 38.4 tok/s). Keeping the early-stop, but the id no longer crosses the
+// bus (only the 4-byte confidence does) and the next embed reads the device id.
 static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int max_draft)
 {
     if (!eng->mtp.loaded || !eng->mtp_h_valid || max_draft <= 0) return 0;
     if (eng->global_n_tokens <= 0) return 0;
     if (max_draft > GEMMA4_SPEC_MAX - 1) max_draft = GEMMA4_SPEC_MAX - 1;
+    if (!eng->d_mtp_ids || !eng->d_mtp_conf) return 0;
     cudaStream_t stream = eng->stream;
-    int32_t local[GEMMA4_SPEC_MAX];   // don't clobber a caller's partial lookup draft on failure
-    int32_t tok = g, produced = 0;
+    int32_t tok = g;                  // j==0 source (host int, coherent-readable)
+    int produced = 0;
     for (int j = 0; j < max_draft; j++) {
-        mtp_forward(eng, &tok, stream);
+        const int32_t *tok_ptr = (j == 0) ? &tok : (const int32_t *)(eng->d_mtp_ids + (j - 1));
+        mtp_forward(eng, tok_ptr, stream);
         mtp_argmax_conf_kernel<<<1, 1024, 0, stream>>>(
-            eng->d_logits, GEMMA4_VOCAB_SIZE, eng->d_sample_id, eng->d_sample_p);
-        int32_t next = -1; float conf = 0.0f;
-        cudaMemcpyAsync(&next, eng->d_sample_id, sizeof(int), cudaMemcpyDeviceToHost, stream);
-        cudaMemcpyAsync(&conf, eng->d_sample_p, sizeof(float), cudaMemcpyDeviceToHost, stream);
-        if (cudaStreamSynchronize(stream) != cudaSuccess || next < 0) break;
+            eng->d_logits, GEMMA4_VOCAB_SIZE, eng->d_mtp_ids + j, eng->d_mtp_conf + j);
+        float conf = 0.0f;
+        cudaMemcpyAsync(&conf, eng->d_mtp_conf + j, sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+        if (cudaStreamSynchronize(stream) != cudaSuccess) break;
         if (conf < GEMMA4_MTP_PMIN) break;   // low confidence → stop drafting here
-        local[produced++] = next;
-        tok = next;
+        produced++;
     }
+    if (produced == 0) return 0;
     if (cudaGetLastError() != cudaSuccess) return 0;
-    memcpy(draft_out, local, (size_t)produced * sizeof(int32_t));
+    int32_t ids[GEMMA4_SPEC_MAX];
+    cudaMemcpyAsync(ids, eng->d_mtp_ids, (size_t)produced*sizeof(int),
+                    cudaMemcpyDeviceToHost, stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return 0;
+    for (int j = 0; j < produced; j++) {
+        if (ids[j] < 0) return j;
+        draft_out[j] = ids[j];
+    }
     return produced;
 }
 
@@ -4636,6 +4696,14 @@ static inline double spec_rng(uint64_t *s) {
     return (double)(x >> 11) * (1.0 / 9007199254740992.0);
 }
 
+// fwd decls — the GPU samplers (a) are defined below the spec loop with the rest of
+// the sampling code, but run_spec_loop launches them.
+__global__ void sample_logits_kernel(
+    const float *logits, int V, float temp, int top_k, float top_p, float min_p,
+    float rnd, int *out_id);
+__global__ void sample_logits_batched_kernel(
+    const float *logits, int V, float temp, int top_k, float top_p, float min_p,
+    const float *rnds, int *out_ids);
 
 static int run_spec_loop(
     gemma4_engine_t *eng, int32_t *hist, int n, float *logits,
@@ -4644,10 +4712,9 @@ static int run_spec_loop(
     int *n_accepted_out)
 {
     int V = GEMMA4_VOCAB_SIZE;
-    // Lbuf holds one logit row per forwarded token (up to draft_k+1 rows).
-    float *Lbuf = (float*)malloc((size_t)GEMMA4_SPEC_MAX*V*sizeof(float));
+    // (a) Verify logits stay on device (d_sb[11]); only K ids cross to host — no Lbuf.
     int32_t batch[GEMMA4_SPEC_MAX];
-    if (!Lbuf) return -1;
+    if (ensure_spec_scratch(eng) != 0) return -1;  // d_spec_ids/d_spec_rnd, d_sb
     auto is_stop = [&](int t){ for (int s=0;s<n_stop;s++) if (stop_ids[s]==t) return 1; return 0; };
 
     uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
@@ -4724,23 +4791,49 @@ static int run_spec_loop(
             }
         }
         if (D == 0) {
-            if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
-            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+            // Cold/no-draft step: decode g WITHOUT the 262k D2H, then sample on-device
+            // (eng->d_logits already carries softcap+suppress). decode() also refreshes
+            // the MTP recurrent h. Mirrors the verify path's on-GPU sampling.
+            if (gemma4_engine_decode(eng, g, NULL) != 0) { stop = 1; break; }
+            float rnd1 = (float)spec_rng(&rng);
+            sample_logits_kernel<<<1, 1024, 0, eng->stream>>>(
+                eng->d_logits, V, temp, top_k, top_p, min_p, rnd1, eng->d_sample_id);
+            int gid = -1;
+            cudaMemcpyAsync(&gid, eng->d_sample_id, sizeof(int),
+                            cudaMemcpyDeviceToHost, eng->stream);
+            if (cudaStreamSynchronize(eng->stream) != cudaSuccess || gid < 0) { stop = 1; break; }
+            g = gid;
             continue;
         }
         batch[0] = g;
         int K = D + 1;
-        if (gemma4_engine_decode_batched(eng, batch, K, Lbuf) != 0) {
+        // (a) GPU-side verify: forward [g,draft...] keeping the K logit rows on device
+        // (d_sb[11]), pre-draw K host uniforms, sample every row on the GPU, and read
+        // back only the K ids. Replaces the K×262144 logit D2H + K full-vocab CPU
+        // host_sample scans. Each row is sampled from the exact target distribution
+        // (greedy temp<=0 → argmax → bit-identical to host_sample), so acceptance still
+        // preserves the target distribution.
+        float rnds[GEMMA4_SPEC_MAX]; int ids[GEMMA4_SPEC_MAX];
+        for (int i = 0; i < K; i++) rnds[i] = (float)spec_rng(&rng);
+        if (decode_batched_dev(eng, batch, K, NULL, /*keep_dev=*/1) != 0) {
             if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
             g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
             continue;
         }
-        int a = 0, rejected = -1;
-        while (a < D) {
-            int s = host_sample(Lbuf + (size_t)a*V, V, temp, top_k, top_p, min_p, spec_rng(&rng));
-            if (s == batch[1+a]) { a++; }
-            else { rejected = s; break; }
+        cudaMemcpyAsync(eng->d_spec_rnd, rnds, (size_t)K*sizeof(float),
+                        cudaMemcpyHostToDevice, eng->stream);
+        sample_logits_batched_kernel<<<K, 1024, 0, eng->stream>>>(
+            decode_batched_dev_logits(eng), V, temp, top_k, top_p, min_p,
+            eng->d_spec_rnd, eng->d_spec_ids);
+        cudaMemcpyAsync(ids, eng->d_spec_ids, (size_t)K*sizeof(int),
+                        cudaMemcpyDeviceToHost, eng->stream);
+        if (cudaStreamSynchronize(eng->stream) != cudaSuccess) {
+            if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
+            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
+            continue;
         }
+        int a = 0;
+        while (a < D && ids[a] == batch[1+a]) a++;   // first mismatch = accept length
         total_accepted += a;
         // Update ONLY the EMA of the drafter that actually drafted this step — the other
         // drafter's track record is untouched evidence about ITS quality, not this one's.
@@ -4767,15 +4860,10 @@ static int run_spec_loop(
             if (is_stop(t)) { stop = 1; break; }
         }
         if (stop) break;
-        if (a < D) {
-            memcpy(logits, Lbuf + (size_t)a*V, (size_t)V*sizeof(float));
-            g = rejected;
-        } else {
-            memcpy(logits, Lbuf + (size_t)D*V, (size_t)V*sizeof(float));
-            g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
-        }
+        // Next g is the GPU-sampled token of the first unaccepted row (reject resample
+        // at row a) or the bonus row D (all accepted) — already drawn on-device above.
+        g = ids[a];
     }
-    free(Lbuf);
     if (eng->mtp.loaded && mtp_calls > 0)
         fprintf(stderr, "gem4d: [mtp] %ld draft calls, %ld proposed, %ld accepted (%.0f%%)\n",
                 mtp_calls, mtp_drafted, mtp_accepted,
@@ -4901,7 +4989,12 @@ int gemma4_sample_argmax(
 // to shared memory and the small tail (sort/top-p/min-p/draw) runs on one thread.
 // Logits are expected to already carry softcap + suppression.
 #define SAMP_MAXK 256
-__global__ void sample_logits_kernel(
+// Block-cooperative sampler BODY (one block, blockDim.x threads). Factored out of
+// sample_logits_kernel so both the single-row decode sampler and the batched
+// spec-verify sampler (one block per draft row) share identical math — the verify
+// MUST sample each row from the exact same distribution as a plain decode, else
+// speculative decoding would not be distribution-exact. Writes one id to *out_id.
+__device__ __forceinline__ void sample_logit_row(
     const float *logits, int V, float temp, int top_k, float top_p, float min_p,
     float rnd, int *out_id)
 {
@@ -4998,6 +5091,27 @@ __global__ void sample_logits_kernel(
         for (int a = 0; a < N; a++) { acc += pr[a]; if (r <= acc) { sel = cid[a]; break; } }
         *out_id = sel;
     }
+}
+
+// Single-row wrapper (unchanged public behavior): one block samples eng->d_logits.
+__global__ void sample_logits_kernel(
+    const float *logits, int V, float temp, int top_k, float top_p, float min_p,
+    float rnd, int *out_id)
+{
+    sample_logit_row(logits, V, temp, top_k, top_p, min_p, rnd, out_id);
+}
+
+// Batched spec-verify sampler: one block per draft row. Block b samples row
+// logits + b*V with its own draw rnds[b] and writes out_ids[b]. Same per-row math
+// as the single decode sampler, so each verify position is a valid target sample
+// (greedy: argmax → bit-identical to a plain decode at that position).
+__global__ void sample_logits_batched_kernel(
+    const float *logits, int V, float temp, int top_k, float top_p, float min_p,
+    const float *rnds, int *out_ids)
+{
+    int row = blockIdx.x;
+    sample_logit_row(logits + (size_t)row * V, V, temp, top_k, top_p, min_p,
+                     rnds[row], out_ids + row);
 }
 
 // Sample a token from the engine's resident logits (eng->d_logits) entirely on the
