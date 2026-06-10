@@ -4978,7 +4978,7 @@ static int run_spec_loop(
     gemma4_engine_t *eng, int32_t *hist, int n, float *logits,
     int32_t *out_tokens, int max_new, const int32_t *stop_ids, int n_stop,
     int draft_k, float temp, int top_k, float top_p, float min_p, uint64_t seed,
-    int *n_accepted_out)
+    int *n_accepted_out, gemma4_token_cb cb, void *cb_ud)
 {
     int V = GEMMA4_VOCAB_SIZE;
     // (a) Verify logits stay on device (d_sb[11]); only K ids cross to host — no Lbuf.
@@ -5005,6 +5005,7 @@ static int run_spec_loop(
     int generated = 0, total_accepted = 0, stop = 0;
     while (generated < max_new && !stop) {
         out_tokens[generated++] = g; hist[n++] = g;
+        if (cb && cb(g, cb_ud)) break;   // streaming consumer asked to stop here
         if (is_stop(g)) break;
 
         int pos = eng->global_n_tokens;
@@ -5126,6 +5127,7 @@ static int run_spec_loop(
         }
         for (int i = 0; i < a && generated < max_new; i++) {
             int t = batch[1+i]; out_tokens[generated++] = t; hist[n++] = t;
+            if (cb && cb(t, cb_ud)) { stop = 1; break; }
             if (is_stop(t)) { stop = 1; break; }
         }
         if (stop) break;
@@ -5190,7 +5192,42 @@ int gemma4_engine_generate_spec(
     }
 
     int generated = run_spec_loop(eng, hist, n, logits, out_tokens, max_new,
-        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, seed, n_accepted_out);
+        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, seed, n_accepted_out,
+        NULL, NULL);
+
+    free(hist); free(logits);
+    return generated;
+}
+
+// Streaming server/REPL path: gemma4_engine_generate_spec_continue plus a per-token
+// callback (see gemma4_token_cb). The callback fires between verify steps on the
+// calling thread, so SSE/console streaming rides the speculative fast path instead
+// of the per-token decode loop. cb == NULL behaves exactly like _continue.
+int gemma4_engine_generate_spec_stream(
+    gemma4_engine_t *eng,
+    const int32_t   *history, int n_history,
+    const float     *first_logits,
+    int32_t         *out_tokens, int max_new,
+    const int32_t   *stop_ids, int n_stop,
+    int              draft_k,
+    float            temp, int top_k, float top_p, float min_p, uint64_t seed,
+    int             *n_accepted_out,
+    gemma4_token_cb  cb, void *cb_user_data)
+{
+    if (!eng || !eng->loaded || n_history < 0 || max_new <= 0) return -1;
+    if (draft_k > GEMMA4_SPEC_MAX - 1) draft_k = GEMMA4_SPEC_MAX - 1;
+    int V = GEMMA4_VOCAB_SIZE;
+
+    int cap = n_history + max_new + 8;
+    int32_t *hist = (int32_t*)malloc((size_t)cap*sizeof(int32_t));
+    float   *logits = (float*)malloc((size_t)V*sizeof(float));
+    if (!hist || !logits) { free(hist); free(logits); return -1; }
+    if (n_history > 0) memcpy(hist, history, (size_t)n_history*sizeof(int32_t));
+    memcpy(logits, first_logits, (size_t)V*sizeof(float));
+
+    int generated = run_spec_loop(eng, hist, n_history, logits, out_tokens, max_new,
+        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, seed, n_accepted_out,
+        cb, cb_user_data);
 
     free(hist); free(logits);
     return generated;
@@ -5210,22 +5247,9 @@ int gemma4_engine_generate_spec_continue(
     float            temp, int top_k, float top_p, float min_p, uint64_t seed,
     int             *n_accepted_out)
 {
-    if (!eng || !eng->loaded || n_history < 0 || max_new <= 0) return -1;
-    if (draft_k > GEMMA4_SPEC_MAX - 1) draft_k = GEMMA4_SPEC_MAX - 1;
-    int V = GEMMA4_VOCAB_SIZE;
-
-    int cap = n_history + max_new + 8;
-    int32_t *hist = (int32_t*)malloc((size_t)cap*sizeof(int32_t));
-    float   *logits = (float*)malloc((size_t)V*sizeof(float));
-    if (!hist || !logits) { free(hist); free(logits); return -1; }
-    if (n_history > 0) memcpy(hist, history, (size_t)n_history*sizeof(int32_t));
-    memcpy(logits, first_logits, (size_t)V*sizeof(float));
-
-    int generated = run_spec_loop(eng, hist, n_history, logits, out_tokens, max_new,
-        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, seed, n_accepted_out);
-
-    free(hist); free(logits);
-    return generated;
+    return gemma4_engine_generate_spec_stream(eng, history, n_history, first_logits,
+        out_tokens, max_new, stop_ids, n_stop, draft_k,
+        temp, top_k, top_p, min_p, seed, n_accepted_out, NULL, NULL);
 }
 
 // =========================================================================

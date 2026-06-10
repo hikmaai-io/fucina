@@ -33,6 +33,7 @@ type serverEngine interface {
 	DecodeNoCopy(token int32) error
 	SampleDevice(temp float32, topK int, topP, minP, rnd float32) (int32, error)
 	GenerateSpecContinue(history []int32, firstLogits []float32, maxNew int, stops []int32, draftK int, temp float32, topK int, topP, minP float32, seed uint64) ([]int32, int, error)
+	GenerateSpecStream(history []int32, firstLogits []float32, maxNew int, stops []int32, draftK int, temp float32, topK int, topP, minP float32, seed uint64, emit func(int32) bool) ([]int32, int, error)
 	NTokens() int
 	Reset()
 	Rewind(nKeep int) bool
@@ -871,7 +872,6 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	rng := rand.New(rand.NewSource(params.Seed))
 	generated := 0
 	object := "chat.completion.chunk"
 	idPrefix := "chatcmpl"
@@ -920,58 +920,18 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	inChannel := false          // currently inside a <|channel> … <channel|> reasoning span
 	channelLabel := false       // still skipping the "thought" label at a channel's start
 
-	// GPU-side sampling (4-byte id back, no 262k logits copy).  Used whenever repeat
-	// penalty is off (the GPU sampler cannot apply it).  The device sampler handles
-	// temp=0 (argmax) and temp>0 (temperature / top-k / top-p / min-p / multinomial)
-	// correctly — the binary-search threshold bug was fixed (sHi instead of sLo).
-	gpuSample := params.RepeatPenalty == 1.0
-	temp := float32(params.Temperature)
-	for generated < params.MaxTokens {
-		// Honor client cancellation ("steering"): if pi aborts the request, stop
-		// generating immediately and release the KV lock for the next turn.
-		if ctx.Err() != nil {
-			finish = "cancelled"
-			break
-		}
-		var token int32
-		var err error
-		if gpuSample {
-			token, err = s.engine.SampleDevice(temp, params.TopK,
-				float32(params.TopP), float32(params.MinP), float32(rng.Float64()))
-		} else {
-			if logits == nil {
-				break
-			}
-			token, err = s.sampleToken(logits, params, rng)
-		}
-		if err != nil || s.tokenizer.IsStop(token) {
-			break
+	// processToken runs the streaming state machine for ONE generated token —
+	// tool-call buffering, the reasoning channel, marker suppression, stop
+	// sequences, SSE emission — and reports whether generation must stop after
+	// it. It is shared by the speculative path (where the engine invokes it as
+	// the per-token callback) and the repeat-penalty fallback loop below, so
+	// both paths stream byte-identical wire output.
+	processToken := func(token int32) bool {
+		if s.tokenizer.IsStop(token) {
+			return true
 		}
 		rawToks = append(rawToks, token)
 		generated++
-
-		// advance steps to the next token (GPU: leave logits on device; CPU:
-		// copy) and only then records the token in the prefix cache: the token
-		// enters the engine KV during this decode, not when it was sampled. The
-		// tool-call-end and stop-sequence breaks below exit the loop WITHOUT
-		// advancing, so recording before the commit left cachedTokens one token
-		// ahead of the engine on EVERY streaming tool call / stop-string hit
-		// (this path has no post-loop `committed` sync like the spec path), and
-		// the next request's Prefill had to heal the skew.
-		advance := func() error {
-			if gpuSample {
-				if derr := s.engine.DecodeNoCopy(token); derr != nil {
-					return derr
-				}
-			} else {
-				logits, err = s.engine.Decode(token)
-				if err != nil {
-					return err
-				}
-			}
-			s.kv.AppendDecoded(token)
-			return nil
-		}
 
 		// Tool-call handling: when the model opens a call, stop streaming content
 		// and buffer until the call closes — we emit it as a structured tool_calls
@@ -980,13 +940,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 			inTool = true
 		}
 		if inTool {
-			if tcEnd >= 0 && token == tcEnd {
-				break // complete tool call captured
-			}
-			if err = advance(); err != nil {
-				break
-			}
-			continue
+			return tcEnd >= 0 && token == tcEnd // true → complete tool call captured
 		}
 
 		// Reasoning channel: stream <|channel>thought … <channel|> as reasoning_content
@@ -994,18 +948,12 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 		if chOpen >= 0 && token == chOpen {
 			inChannel = true
 			channelLabel = true // next text token is the "thought" label — skip it
-			if err = advance(); err != nil {
-				break
-			}
-			continue
+			return false
 		}
 		if inChannel {
 			if chEnd >= 0 && token == chEnd {
 				inChannel = false
-				if err = advance(); err != nil {
-					break
-				}
-				continue
+				return false
 			}
 			rtext := s.tokenizer.Decode([]int32{token})
 			if channelLabel { // drop the leading "thought\n" channel label
@@ -1028,30 +976,27 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 					flusher.Flush()
 				}
 			}
-			if err = advance(); err != nil {
-				break
-			}
-			continue
+			return false
 		}
 
 		// Never stream the gemma tool/string markers to the client as visible text.
 		if s.tokenizer.IsToolMarker(token) {
-			if err = advance(); err != nil {
-				break
-			}
-			continue
+			return false
 		}
 
 		tokenStr := s.tokenizer.Decode([]int32{token})
 
 		// Stop-sequence handling: if appending this piece completes a stop string,
-		// emit only the text up to the stop and finish.
+		// emit only the NOT-YET-STREAMED text up to the stop and finish. When part
+		// of the stop string was already streamed in earlier tokens (digits split
+		// across tokens, etc.), emitted is LONGER than the trimmed text — the old
+		// TrimPrefix re-emitted the whole response in that case (double emission).
 		if len(params.Stop) > 0 {
 			if hit, trimmed := stopHit(emitted.String()+tokenStr, params.Stop); hit {
-				if tail := strings.TrimPrefix(trimmed, emitted.String()); tail != "" {
-					emitContent(tail)
+				if len(trimmed) > emitted.Len() {
+					emitContent(trimmed[emitted.Len():])
 				}
-				break
+				return true
 			}
 		}
 
@@ -1059,9 +1004,73 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 			emitted.WriteString(tokenStr)
 			emitContent(tokenStr)
 		}
+		return false
+	}
 
-		if err = advance(); err != nil {
-			break
+	if params.RepeatPenalty == 1.0 {
+		// Speculative fast path (default): MTP/prompt-lookup drafting with batched
+		// verify — one weight pass per accepted run instead of one per token — and
+		// every token streams through processToken via the engine's per-token
+		// callback. Same output distribution as the per-token loop. Stop strings
+		// and cancellation work through the callback's stop signal; only
+		// repeat-penalty (which the spec kernel cannot apply) uses the loop below.
+		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
+		if wantTools && tcEnd >= 0 {
+			stops = append(stops, tcEnd)
+		}
+		seed := uint64(params.Seed)
+		if params.Seed < 0 {
+			seed = uint64(time.Now().UnixNano())
+		}
+		history := s.kv.CurrentTokens()
+		toks, _, err := s.engine.GenerateSpecStream(history, logits, params.MaxTokens,
+			stops, 6, float32(params.Temperature), params.TopK,
+			float32(params.TopP), float32(params.MinP), seed,
+			func(t int32) bool {
+				// Honor client cancellation ("steering"): if pi aborts the
+				// request, stop generating and release the KV lock.
+				if ctx.Err() != nil {
+					finish = "cancelled"
+					return true
+				}
+				return processToken(t)
+			})
+		if err == nil {
+			// Sync the prefix cache with the tokens actually committed to the
+			// engine KV (a trailing emitted token may not be forwarded yet) so
+			// the next request reuses this response's prefix.
+			committed := s.engine.NTokens() - promptTokens
+			for i := 0; i < committed && i < len(toks); i++ {
+				s.kv.AppendDecoded(toks[i])
+			}
+		}
+	} else {
+		// Per-token decode loop with the host sampler: required for repeat-penalty
+		// (it edits logits using the token history, which the spec kernel cannot).
+		rng := rand.New(rand.NewSource(params.Seed))
+		for generated < params.MaxTokens {
+			if ctx.Err() != nil {
+				finish = "cancelled"
+				break
+			}
+			if logits == nil {
+				break
+			}
+			token, err := s.sampleToken(logits, params, rng)
+			if err != nil {
+				break
+			}
+			if processToken(token) {
+				// Stop WITHOUT decoding the final token: it never enters the
+				// engine KV, so it must not be recorded in the prefix cache.
+				break
+			}
+			logits, err = s.engine.Decode(token)
+			if err != nil {
+				break
+			}
+			// Record the token only AFTER Decode commits it to the engine KV.
+			s.kv.AppendDecoded(token)
 		}
 	}
 

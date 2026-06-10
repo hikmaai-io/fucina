@@ -161,9 +161,22 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			specTurn++
 
 			cacheToks := kv.CurrentTokens() // full cached sequence, under kv lock
-			toks, nAccepted, err := eng.GenerateSpecContinue(cacheToks, pf.Logits,
+			// Stream each token as the spec loop emits it (between verify steps),
+			// so the reply renders incrementally at full speculative speed.
+			// EOS/<turn|> are control tokens: stop without rendering them.
+			var replyBuf strings.Builder
+			toks, nAccepted, err := eng.GenerateSpecStream(cacheToks, pf.Logits,
 				nToGenerate, stops, args.DraftK, float32(args.Temperature),
-				args.TopK, float32(args.TopP), float32(args.MinP), seed)
+				args.TopK, float32(args.TopP), float32(args.MinP), seed,
+				func(t int32) bool {
+					if tok.IsStop(t) {
+						return true
+					}
+					piece := tok.Decode([]int32{t})
+					fmt.Print(piece)
+					replyBuf.WriteString(piece)
+					return false
+				})
 			if err != nil {
 				kv.Unlock()
 				fmt.Println()
@@ -179,20 +192,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 				kv.AppendDecoded(toks[i])
 			}
 			generated = len(toks)
-
-			// Render up to the first stop token — EOS/<turn|> are control tokens
-			// and must not appear in the transcript. The reply appears as one
-			// block instead of token-by-token: accepted trade-off for the single
-			// blocking spec call (~40% faster than the streaming loop).
-			cut := len(toks)
-			for i, t := range toks {
-				if tok.IsStop(t) {
-					cut = i
-					break
-				}
-			}
-			reply = tok.Decode(toks[:cut])
-			fmt.Print(reply)
+			reply = replyBuf.String()
 			specStats = fmt.Sprintf(", %d drafts accepted (avg %.2f tokens/step, draft-k=%d)",
 				nAccepted, float64(len(toks))/float64(max(1, len(toks)-nAccepted)), args.DraftK)
 		} else {

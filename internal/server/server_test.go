@@ -185,7 +185,26 @@ func (f *fakeServerEngine) SampleDevice(temp float32, topK int, topP, minP, rnd 
 
 func (f *fakeServerEngine) GenerateSpecContinue(history []int32, firstLogits []float32, maxNew int,
 	stops []int32, draftK int, temp float32, topK int, topP, minP float32, seed uint64) ([]int32, int, error) {
+	return f.GenerateSpecStream(history, firstLogits, maxNew, stops, draftK,
+		temp, topK, topP, minP, seed, nil)
+}
+
+// GenerateSpecStream mirrors the real engine's contract: every generated token
+// is reported to emit (when non-nil) in order; emit returning true stops
+// generation after that token, and all generated tokens stay in the returned
+// slice (the server reconciles the prefix cache from NTokens).
+func (f *fakeServerEngine) GenerateSpecStream(history []int32, firstLogits []float32, maxNew int,
+	stops []int32, draftK int, temp float32, topK int, topP, minP float32, seed uint64,
+	emit func(int32) bool) ([]int32, int, error) {
 	f.specCalls++
+	isStop := func(t int32) bool {
+		for _, s := range stops {
+			if s == t {
+				return true
+			}
+		}
+		return false
+	}
 	out := make([]int32, 0, len(f.script))
 	for i, tk := range f.script {
 		if i >= maxNew {
@@ -193,6 +212,12 @@ func (f *fakeServerEngine) GenerateSpecContinue(history []int32, firstLogits []f
 		}
 		out = append(out, tk)
 		f.tokens = append(f.tokens, tk)
+		if emit != nil && emit(tk) {
+			break
+		}
+		if isStop(tk) {
+			break
+		}
 	}
 	return out, len(out), nil
 }
@@ -349,8 +374,12 @@ func TestChatCompletionsStream(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("content-type=%q want text/event-stream", ct)
 	}
-	if f.sampleDeviceHits == 0 || f.decodeNoCopy == 0 {
-		t.Errorf("expected GPU sample path; sampleDevice=%d decodeNoCopy=%d", f.sampleDeviceHits, f.decodeNoCopy)
+	// Streaming rides the speculative fast path (per-token callback into the SSE
+	// state machine) — NOT the per-token GPU-sample loop, which only remains for
+	// repeat-penalty requests.
+	if f.specCalls != 1 {
+		t.Errorf("expected 1 spec stream call, got %d (sampleDevice=%d decodeNoCopy=%d)",
+			f.specCalls, f.sampleDeviceHits, f.decodeNoCopy)
 	}
 
 	events := parseSSE(t, rec.Body.String())

@@ -161,6 +161,27 @@ int gemma4_engine_generate_spec_continue(
     float temp, int top_k, float top_p, float min_p, uint64_t seed,
     int             *n_accepted_out);
 
+// Per-token streaming callback for the speculative generators: invoked once per
+// emitted token, in emission order, from the calling thread between verify steps.
+// Return nonzero to stop generation after this token (the token IS still counted
+// in out_tokens). Tokens already committed to the KV by the verify pass that
+// produced them stay committed — callers reconcile via gemma4_engine_n_tokens.
+typedef int (*gemma4_token_cb)(int32_t token, void *user_data);
+
+// gemma4_engine_generate_spec_continue with a per-token callback: the SSE/REPL
+// streaming form of the speculative fast path (same exact-distribution guarantee;
+// cb == NULL degrades to generate_spec_continue).
+int gemma4_engine_generate_spec_stream(
+    gemma4_engine_t *eng,
+    const int32_t   *history, int n_history,
+    const float     *first_logits,
+    int32_t         *out_tokens, int max_new,
+    const int32_t   *stop_ids, int n_stop,
+    int              draft_k,
+    float temp, int top_k, float top_p, float min_p, uint64_t seed,
+    int             *n_accepted_out,
+    gemma4_token_cb  cb, void *cb_user_data);
+
 // ─── Sampling ─────────────────────────────────────────────────────────
 
 int gemma4_sample_argmax(const float *logits, int vocab_size);

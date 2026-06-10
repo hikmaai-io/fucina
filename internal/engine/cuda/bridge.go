@@ -19,11 +19,26 @@ package cuda
 //     int *hits, int *misses, int *captures, int *launches) {
 //     gemma4_engine_graph_stats(eng, hits, misses, captures, launches);
 // }
+//
+// // Per-token streaming bridge: gem4dSpecTokenGo is the cgo-exported Go callback
+// // (defined in callback.go); the engine invokes it once per emitted token. The
+// // uintptr is a runtime/cgo.Handle resolving to the request's emit closure.
+// extern int gem4dSpecTokenGo(int32_t tok, void *ud);
+// static inline int _gem4d_generate_spec_stream(gemma4_engine_t *eng,
+//     const int32_t *hist, int n_hist, const float *first_logits,
+//     int32_t *out, int max_new, const int32_t *stops, int n_stop, int draft_k,
+//     float temp, int top_k, float top_p, float min_p, uint64_t seed,
+//     int *n_accepted, uintptr_t handle) {
+//     return gemma4_engine_generate_spec_stream(eng, hist, n_hist, first_logits,
+//         out, max_new, stops, n_stop, draft_k, temp, top_k, top_p, min_p, seed,
+//         n_accepted, gem4dSpecTokenGo, (void *)handle);
+// }
 import "C"
 
 import (
 	"fmt"
 	"runtime"
+	"runtime/cgo"
 	"sync"
 	"unsafe"
 )
@@ -260,6 +275,47 @@ func (e *Engine) GenerateSpecContinue(history []int32, firstLogits []float32,
 	)
 	if ng < 0 {
 		return nil, 0, fmt.Errorf("gem4d: generate_spec_continue failed")
+	}
+	return out[:ng], int(nacc), nil
+}
+
+// GenerateSpecStream is GenerateSpecContinue with a per-token emit callback: the
+// engine invokes emit(token) for every generated token, in order, between verify
+// steps, so the caller can stream while keeping the speculative fast path. emit
+// returning true stops generation after that token. The returned slice still
+// carries ALL generated tokens (including any the callback declined to render),
+// which callers need to reconcile the prefix cache with the engine KV.
+func (e *Engine) GenerateSpecStream(history []int32, firstLogits []float32,
+	maxNew int, stops []int32, draftK int,
+	temp float32, topK int, topP, minP float32, seed uint64,
+	emit func(int32) bool) ([]int32, int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	out := make([]int32, maxNew)
+	var nacc C.int
+	var histPtr *C.int32_t
+	if len(history) > 0 {
+		histPtr = (*C.int32_t)(unsafe.Pointer(&history[0]))
+	}
+	var stopsPtr *C.int32_t
+	if len(stops) > 0 {
+		stopsPtr = (*C.int32_t)(unsafe.Pointer(&stops[0]))
+	}
+	h := cgo.NewHandle(emit)
+	defer h.Delete()
+	ng := C._gem4d_generate_spec_stream(
+		e.ptr,
+		histPtr, C.int(len(history)),
+		(*C.float)(unsafe.Pointer(&firstLogits[0])),
+		(*C.int32_t)(unsafe.Pointer(&out[0])), C.int(maxNew),
+		stopsPtr, C.int(len(stops)),
+		C.int(draftK),
+		C.float(temp), C.int(topK), C.float(topP), C.float(minP), C.uint64_t(seed),
+		&nacc, C.uintptr_t(h),
+	)
+	if ng < 0 {
+		return nil, 0, fmt.Errorf("gem4d: generate_spec_stream failed")
 	}
 	return out[:ng], int(nacc), nil
 }
