@@ -40,10 +40,10 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	tokens := tok.Encode(prompt, true, false)
 	log.Printf("gem4d: prompt has %d tokens", len(tokens))
 
-	// Spec enabled (and no repeat penalty, which the spec path can't apply) →
-	// prompt-lookup speculative decode. Works for greedy AND sampling; the output
-	// distribution is identical to plain decode at the same temperature.
-	if args.Spec && args.RepeatPenalty == 1.0 {
+	// Spec enabled → prompt-lookup/MTP speculative decode. Works for greedy AND
+	// sampling — including repeat-penalty, which the engine applies on-GPU — with
+	// an output distribution identical to plain decode at the same settings.
+	if args.Spec {
 		nToGen := args.Predict
 		if nToGen < 0 {
 			nToGen = 512
@@ -55,7 +55,8 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		stops := []int32{tok.EOS, tok.EndOfTurn}
 		genStart := time.Now()
 		out, nAccepted, err := eng.GenerateSpec(tokens, nToGen, stops, args.DraftK,
-			float32(args.Temperature), args.TopK, float32(args.TopP), float32(args.MinP), seed)
+			float32(args.Temperature), args.TopK, float32(args.TopP), float32(args.MinP),
+			float32(args.RepeatPenalty), seed)
 		if err != nil {
 			log.Fatalf("gem4d: spec generate failed: %v", err)
 		}

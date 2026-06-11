@@ -184,9 +184,9 @@ func (f *fakeServerEngine) SampleDevice(temp float32, topK int, topP, minP, rnd 
 }
 
 func (f *fakeServerEngine) GenerateSpecContinue(history []int32, firstLogits []float32, maxNew int,
-	stops []int32, draftK int, temp float32, topK int, topP, minP float32, seed uint64) ([]int32, int, error) {
+	stops []int32, draftK int, temp float32, topK int, topP, minP, repeatPenalty float32, seed uint64) ([]int32, int, error) {
 	return f.GenerateSpecStream(history, firstLogits, maxNew, stops, draftK,
-		temp, topK, topP, minP, seed, nil)
+		temp, topK, topP, minP, repeatPenalty, seed, nil)
 }
 
 // GenerateSpecStream mirrors the real engine's contract: every generated token
@@ -194,7 +194,7 @@ func (f *fakeServerEngine) GenerateSpecContinue(history []int32, firstLogits []f
 // generation after that token, and all generated tokens stay in the returned
 // slice (the server reconciles the prefix cache from NTokens).
 func (f *fakeServerEngine) GenerateSpecStream(history []int32, firstLogits []float32, maxNew int,
-	stops []int32, draftK int, temp float32, topK int, topP, minP float32, seed uint64,
+	stops []int32, draftK int, temp float32, topK int, topP, minP, repeatPenalty float32, seed uint64,
 	emit func(int32) bool) ([]int32, int, error) {
 	f.specCalls++
 	isStop := func(t int32) bool {

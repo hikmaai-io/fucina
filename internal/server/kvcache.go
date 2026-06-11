@@ -107,6 +107,29 @@ const (
 	saveMinLossTokens = 1024
 )
 
+// Fresh-batched routing override. The engine's fastest prefill
+// (gemma4_engine_prefill_batched: tensor-core GEMM attention, CUDA graph,
+// ~1000 tok/s) only accepts a FRESH sequence of ≤4096 tokens; any reused
+// prefix forces the suffix down the slower warm path (~300 tok/s measured
+// clean 2026-06-11). When the reusable prefix is tiny and the suffix is
+// large, recomputing the prefix from scratch is far cheaper than the path
+// downgrade, so a sub-threshold match is treated as no match. Snapshot
+// restores are held to the same bar (see maybeSwap).
+const (
+	freshBatchedMaxTokens = 4096 // engine prefill_batched N cap
+	tinyPrefixTokens      = 256  // below this a prefix is not worth keeping
+	tinySuffixFloor       = 512  // ... unless the suffix is small too
+)
+
+// tinyPrefix reports whether reusing an lcp-token prefix of a promptLen-token
+// prompt would cost more (by exiling the suffix from the fresh batched path)
+// than recomputing it fresh.
+func tinyPrefix(promptLen, lcp int) bool {
+	return promptLen <= freshBatchedMaxTokens &&
+		lcp > 0 && lcp < tinyPrefixTokens &&
+		promptLen-lcp >= tinySuffixFloor
+}
+
 // NewKVCache creates a prefix-reuse manager bound to an engine. When the
 // engine supports KV snapshots the multi-sequence cache is enabled with a
 // default 16 GiB host budget (use SetSnapshotBudget to tune; 0 disables).
@@ -207,6 +230,14 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 
 	lcp := longestCommonPrefix(c.cachedTokens, prompt)
 
+	// Fresh-batched routing override: drop a tiny live prefix so the whole
+	// prompt goes down the fresh tensor-core path. Done BEFORE maybeSwap so
+	// `lost` counts the full live sequence (it is about to be destroyed and
+	// should be snapshotted if large).
+	if tinyPrefix(len(prompt), lcp) {
+		lcp = 0
+	}
+
 	// Multi-sequence cache: if a snapshot matches this prompt much better
 	// than the live sequence, save the live one (if losing it would be
 	// expensive) and restore the snapshot; if no snapshot helps but this
@@ -301,8 +332,11 @@ func (c *KVCache) maybeSwap(prompt []int32, liveLCP int) int {
 	// a stale twin of the soon-to-be-live sequence — generation will diverge
 	// it, so the snapshot would hold ~200 KB/token hostage for a prefix the
 	// live sequence then serves.
+	// A snapshot whose match is itself a tiny prefix is not worth restoring:
+	// the fresh batched path beats restore+warm-suffix-prefill, and the
+	// restore would needlessly consume the pooled snapshot.
 	var pinned *savedSeq
-	if best >= 0 && bestLCP > liveLCP+swapMarginTokens {
+	if best >= 0 && bestLCP > liveLCP+swapMarginTokens && !tinyPrefix(len(prompt), bestLCP) {
 		pinned = c.saved[best]
 		c.saved = append(c.saved[:best], c.saved[best+1:]...)
 		c.snapBytes -= int64(len(pinned.state))

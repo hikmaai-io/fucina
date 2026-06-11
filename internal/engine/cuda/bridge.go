@@ -27,11 +27,11 @@ package cuda
 // static inline int _gem4d_generate_spec_stream(gemma4_engine_t *eng,
 //     const int32_t *hist, int n_hist, const float *first_logits,
 //     int32_t *out, int max_new, const int32_t *stops, int n_stop, int draft_k,
-//     float temp, int top_k, float top_p, float min_p, uint64_t seed,
-//     int *n_accepted, uintptr_t handle) {
+//     float temp, int top_k, float top_p, float min_p, float repeat_penalty,
+//     uint64_t seed, int *n_accepted, uintptr_t handle) {
 //     return gemma4_engine_generate_spec_stream(eng, hist, n_hist, first_logits,
-//         out, max_new, stops, n_stop, draft_k, temp, top_k, top_p, min_p, seed,
-//         n_accepted, gem4dSpecTokenGo, (void *)handle);
+//         out, max_new, stops, n_stop, draft_k, temp, top_k, top_p, min_p,
+//         repeat_penalty, seed, n_accepted, gem4dSpecTokenGo, (void *)handle);
 // }
 import "C"
 
@@ -229,7 +229,7 @@ func (e *Engine) Decode(token int32) ([]float32, error) {
 // accepted (for measuring the acceptance rate). Greedy/argmax only — produces the
 // exact same tokens as a plain greedy decode, just faster on context-reusing text.
 func (e *Engine) GenerateSpec(prompt []int32, maxNew int, stops []int32, draftK int,
-	temp float32, topK int, topP, minP float32, seed uint64) ([]int32, int, error) {
+	temp float32, topK int, topP, minP, repeatPenalty float32, seed uint64) ([]int32, int, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -245,7 +245,8 @@ func (e *Engine) GenerateSpec(prompt []int32, maxNew int, stops []int32, draftK 
 		(*C.int32_t)(unsafe.Pointer(&out[0])), C.int(maxNew),
 		stopsPtr, C.int(len(stops)),
 		C.int(draftK),
-		C.float(temp), C.int(topK), C.float(topP), C.float(minP), C.uint64_t(seed),
+		C.float(temp), C.int(topK), C.float(topP), C.float(minP), C.float(repeatPenalty),
+		C.uint64_t(seed),
 		&nacc,
 	)
 	if ng < 0 {
@@ -285,7 +286,7 @@ func (e *Engine) SampleDevice(temp float32, topK int, topP, minP, rnd float32) (
 // firstLogits = post-prefill logits. Returns generated tokens + drafts accepted.
 func (e *Engine) GenerateSpecContinue(history []int32, firstLogits []float32,
 	maxNew int, stops []int32, draftK int,
-	temp float32, topK int, topP, minP float32, seed uint64) ([]int32, int, error) {
+	temp float32, topK int, topP, minP, repeatPenalty float32, seed uint64) ([]int32, int, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -306,7 +307,8 @@ func (e *Engine) GenerateSpecContinue(history []int32, firstLogits []float32,
 		(*C.int32_t)(unsafe.Pointer(&out[0])), C.int(maxNew),
 		stopsPtr, C.int(len(stops)),
 		C.int(draftK),
-		C.float(temp), C.int(topK), C.float(topP), C.float(minP), C.uint64_t(seed),
+		C.float(temp), C.int(topK), C.float(topP), C.float(minP), C.float(repeatPenalty),
+		C.uint64_t(seed),
 		&nacc,
 	)
 	if ng < 0 {
@@ -323,7 +325,7 @@ func (e *Engine) GenerateSpecContinue(history []int32, firstLogits []float32,
 // which callers need to reconcile the prefix cache with the engine KV.
 func (e *Engine) GenerateSpecStream(history []int32, firstLogits []float32,
 	maxNew int, stops []int32, draftK int,
-	temp float32, topK int, topP, minP float32, seed uint64,
+	temp float32, topK int, topP, minP, repeatPenalty float32, seed uint64,
 	emit func(int32) bool) ([]int32, int, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -347,7 +349,8 @@ func (e *Engine) GenerateSpecStream(history []int32, firstLogits []float32,
 		(*C.int32_t)(unsafe.Pointer(&out[0])), C.int(maxNew),
 		stopsPtr, C.int(len(stops)),
 		C.int(draftK),
-		C.float(temp), C.int(topK), C.float(topP), C.float(minP), C.uint64_t(seed),
+		C.float(temp), C.int(topK), C.float(topP), C.float(minP), C.float(repeatPenalty),
+		C.uint64_t(seed),
 		&nacc, C.uintptr_t(h),
 	)
 	if ng < 0 {

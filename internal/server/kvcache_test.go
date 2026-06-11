@@ -570,3 +570,71 @@ func TestSnapshotDisable(t *testing.T) {
 		t.Fatalf("disabled cache must not save, got %d", f.saves)
 	}
 }
+
+// seqTokens returns [base, base+1, ..., base+n-1] as int32s.
+func seqTokens(base, n int) []int32 {
+	out := make([]int32, n)
+	for i := range out {
+		out[i] = int32(base + i)
+	}
+	return out
+}
+
+func TestTinyPrefixRoutesFresh(t *testing.T) {
+	f := &fakeEngine{window: 8192}
+	kv := NewKVCache(f)
+
+	// Seed a 100-token live sequence.
+	prefillReal(t, kv, seqTokens(0, 100))
+
+	// New prompt shares the 100-token prefix but adds a 900-token suffix:
+	// tiny prefix + large suffix + prompt ≤4096 → drop the prefix so the
+	// engine sees one FRESH prefill (batched path eligible).
+	p := append(seqTokens(0, 100), seqTokens(1000, 900)...)
+	res := prefillReal(t, kv, p)
+	if res.ReusedTokens != 0 || res.NewTokens != 1000 {
+		t.Fatalf("tiny prefix: reused=%d new=%d, want 0,1000", res.ReusedTokens, res.NewTokens)
+	}
+	if f.NTokens() != 1000 {
+		t.Fatalf("engine tokens = %d, want 1000 (fresh)", f.NTokens())
+	}
+}
+
+func TestUsefulPrefixStillReused(t *testing.T) {
+	f := &fakeEngine{window: 8192}
+	kv := NewKVCache(f)
+
+	// 300-token prefix (≥ tinyPrefixTokens) must be kept even with a large suffix.
+	prefillReal(t, kv, seqTokens(0, 300))
+	p := append(seqTokens(0, 300), seqTokens(1000, 900)...)
+	res := prefillReal(t, kv, p)
+	if res.ReusedTokens != 300 || res.NewTokens != 900 {
+		t.Fatalf("useful prefix: reused=%d new=%d, want 300,900", res.ReusedTokens, res.NewTokens)
+	}
+}
+
+func TestTinyPrefixKeptForSmallSuffix(t *testing.T) {
+	f := &fakeEngine{window: 8192}
+	kv := NewKVCache(f)
+
+	// Tiny prefix but suffix below tinySuffixFloor: reuse wins, keep it.
+	prefillReal(t, kv, seqTokens(0, 100))
+	p := append(seqTokens(0, 100), seqTokens(1000, 200)...)
+	res := prefillReal(t, kv, p)
+	if res.ReusedTokens != 100 || res.NewTokens != 200 {
+		t.Fatalf("small suffix: reused=%d new=%d, want 100,200", res.ReusedTokens, res.NewTokens)
+	}
+}
+
+func TestTinyPrefixIgnoredForLargePrompts(t *testing.T) {
+	f := &fakeEngine{window: 8192}
+	kv := NewKVCache(f)
+
+	// Prompt > freshBatchedMaxTokens: no batched path either way, keep reuse.
+	prefillReal(t, kv, seqTokens(0, 100))
+	p := append(seqTokens(0, 100), seqTokens(10000, 4100)...)
+	res := prefillReal(t, kv, p)
+	if res.ReusedTokens != 100 || res.NewTokens != 4100 {
+		t.Fatalf("large prompt: reused=%d new=%d, want 100,4100", res.ReusedTokens, res.NewTokens)
+	}
+}

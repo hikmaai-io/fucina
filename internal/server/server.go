@@ -32,8 +32,8 @@ type serverEngine interface {
 	Decode(token int32) ([]float32, error)
 	DecodeNoCopy(token int32) error
 	SampleDevice(temp float32, topK int, topP, minP, rnd float32) (int32, error)
-	GenerateSpecContinue(history []int32, firstLogits []float32, maxNew int, stops []int32, draftK int, temp float32, topK int, topP, minP float32, seed uint64) ([]int32, int, error)
-	GenerateSpecStream(history []int32, firstLogits []float32, maxNew int, stops []int32, draftK int, temp float32, topK int, topP, minP float32, seed uint64, emit func(int32) bool) ([]int32, int, error)
+	GenerateSpecContinue(history []int32, firstLogits []float32, maxNew int, stops []int32, draftK int, temp float32, topK int, topP, minP, repeatPenalty float32, seed uint64) ([]int32, int, error)
+	GenerateSpecStream(history []int32, firstLogits []float32, maxNew int, stops []int32, draftK int, temp float32, topK int, topP, minP, repeatPenalty float32, seed uint64, emit func(int32) bool) ([]int32, int, error)
 	NTokens() int
 	Reset()
 	Rewind(nKeep int) bool
@@ -967,7 +967,7 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 		baseN := s.engine.NTokens()
 		toks, _, err := s.engine.GenerateSpecStream(history, logits, remaining, stops,
 			s.draftK, float32(params.Temperature), params.TopK,
-			float32(params.TopP), float32(params.MinP), seed,
+			float32(params.TopP), float32(params.MinP), float32(params.RepeatPenalty), seed,
 			func(t int32) bool {
 				if ctx.Err() != nil {
 					why = stopCancelled
@@ -1091,9 +1091,11 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 	finish := "stop"
 
 	// The speculative fast-path streams through a per-token callback, so it
-	// supports cancellation, loop detection and the thinking budget (runSpec).
-	// Only repeat-penalty and text stop-strings still need the per-token CPU loop.
-	useSpec := params.RepeatPenalty == 1.0 && len(params.Stop) == 0
+	// supports cancellation, loop detection, the thinking budget (runSpec) and
+	// repeat-penalty (applied on-GPU in the engine's spec sampler). Only text
+	// stop-strings still need the per-token CPU loop here (the non-stream path
+	// trims them post-hoc rather than via a callback).
+	useSpec := len(params.Stop) == 0
 
 	if useSpec {
 		// Speculative decoding (default): one weight pass per [g, draft...], same
@@ -1461,14 +1463,15 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 		return false
 	}
 
-	if params.RepeatPenalty == 1.0 {
-		// Speculative fast path (default): MTP/prompt-lookup drafting with batched
-		// verify — one weight pass per accepted run instead of one per token — and
-		// every token streams through processToken via the engine's per-token
-		// callback. runSpec adds the shared guards: cancellation, repetition-loop
-		// cut-off, and the thinking budget (force-closes a runaway thought channel
-		// and resumes). Generation runs to end-of-turn, not the first tool call,
-		// so multi-call turns work.
+	{
+		// Speculative fast path (now the ONLY streaming path): MTP/prompt-lookup
+		// drafting with batched verify — one weight pass per accepted run instead
+		// of one per token — every token streaming through processToken via the
+		// engine's per-token callback. runSpec adds the shared guards:
+		// cancellation, repetition-loop cut-off, and the thinking budget.
+		// Repeat-penalty is applied on-GPU inside the engine's spec sampler, so
+		// repeat_penalty != 1.0 no longer drops to a per-token CPU decode loop
+		// (1 MB logits D2H + host top-k per token, and no drafting).
 		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
 		_, specFinish, err := s.runSpec(ctx, params, logits, stops, processToken)
 		if err != nil {
@@ -1476,50 +1479,6 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 		}
 		if specFinish != "" {
 			finish = specFinish
-		}
-	} else {
-		// Per-token decode loop with the host sampler: required for repeat-penalty
-		// (it edits logits using the token history, which the spec kernel cannot).
-		rng := rand.New(rand.NewSource(params.Seed))
-		detector := &cycleDetector{}
-		capExit := true
-		for generated < params.MaxTokens {
-			if ctx.Err() != nil {
-				finish = "cancelled"
-				capExit = false
-				break
-			}
-			if logits == nil {
-				capExit = false
-				break
-			}
-			token, err := s.sampleToken(logits, params, rng)
-			if err != nil {
-				capExit = false
-				break
-			}
-			if processToken(token) {
-				// Stop WITHOUT decoding the final token: it never enters the
-				// engine KV, so it must not be recorded in the prefix cache.
-				capExit = false
-				break
-			}
-			if detector.push(token) {
-				log.Printf("gem4d: WARNING: repetition loop detected after %d tokens — cutting generation", generated)
-				finish = "length"
-				capExit = false
-				break
-			}
-			logits, err = s.engine.Decode(token)
-			if err != nil {
-				capExit = false
-				break
-			}
-			// Record the token only AFTER Decode commits it to the engine KV.
-			s.kv.AppendDecoded(token)
-		}
-		if capExit && finish == "stop" {
-			finish = "length" // ran into MaxTokens mid-output: tell the client
 		}
 	}
 

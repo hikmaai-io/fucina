@@ -1496,247 +1496,143 @@ __global__ void flash_decode_combine_rows_kernel(
         out[(size_t)r*out_stride + h*head_dim + tid] = (L > 0.0f) ? accv / L : 0.0f;
 }
 
-// =========================================================================
-// ─── Flash PREFILL attention (chunked, online-softmax, no N² scratch) ───
-// =========================================================================
-// Each chunk query attends the FROZEN history KV cache (FP8) plus the current
-// chunk's own keys (fp32 scratch, causal within the chunk). Online-softmax, so
-// shared memory is a constant 32 floats — NO [HEADS][N×N] score buffer. This is
-// what unlocks 256k-context prefill (the GEMM path OOMs at ~30k). Scale 1.0.
-// One block per (chunk-query, head); block = head_dim threads.
+// ─── Tiled-GEMM flash-prefill attention (online softmax over K/V tiles) ──
+// FlashAttention-2's tiling expressed at host level over cuBLAS tensor-core
+// GEMMs: attention = loop over K/V tiles of GEMMA4_FP_TILE_K positions; per
+// tile S = Q·K_tileᵀ (one strided-batched BF16 GEMM over all heads), a fused
+// kernel folds the tile into the running online softmax (per-row max m, sum
+// l, rescale of the fp32 O accumulator), then O += P·V_tile (GEMM, beta=1).
+// Memory is O(chunk × tile) — any context length — and the quadratic
+// attention work runs on tensor cores (~89 TFLOPS) instead of the scalar
+// warp-per-query kernels above (~9 TFLOPS peak, measured ~20% of that),
+// which were the cause of the long-context prefill decay (298→83 tok/s
+// over 1.4k→44k, measured clean 2026-06-11).
 
-__global__ void flash_prefill_sliding_kernel(
-    float *out, const float *q,
-    const kv_t *kc, const kv_t *vc,          // FLAT history [capacity][n_kv_heads][head_dim]
-    int n_heads, int n_kv_heads, int head_dim, int window,
-    int hist_count, int unused_filled,       // hist_count = tokens already in cache (= q_base)
-    const float *ck, const float *cv,        // this chunk's keys/values, fp32 [cn][okv]
-    int cn, int q_base, int okv)
-{
-    extern __shared__ float smem[];
-    int qi = blockIdx.x, head = blockIdx.y, tid = threadIdx.x;
-    if (qi >= cn) return;
-    int kv_head = head / (n_heads / n_kv_heads);
-    int pos = q_base + qi, oq = n_heads * head_dim;
-    float q_d = (tid < head_dim) ? q[(size_t)qi*oq + head*head_dim + tid] : 0.0f;
-    float acc = 0.0f, m = -INFINITY, l = 0.0f;
+#define GEMMA4_FP_CHUNK  8192   // flash-prefill chunk (queries per pass)
+#define GEMMA4_FP_TILE_K 2048   // K/V positions per attention tile
 
-    // FLAT history (Step 3): attend absolute positions [max(0,pos-window+1), hist_count-1].
-    int hlo = pos - window + 1; if (hlo < 0) hlo = 0;
-    for (int ap = hlo; ap < hist_count; ap++) {
-        float k_d = (tid < head_dim)
-            ? fp8_to_float(kc[((size_t)ap * n_kv_heads + kv_head) * head_dim + tid]) : 0.0f;
-        float s = block_reduce_sum(q_d * k_d, smem);
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l * al + p;
-        float v_d = (tid < head_dim)
-            ? fp8_to_float(vc[((size_t)ap * n_kv_heads + kv_head) * head_dim + tid]) : 0.0f;
-        acc = acc * al + p * v_d; m = mn;
-    }
-    // Chunk keys: causal j ≤ qi, sliding lower bound j ≥ qi-window+1.
-    int jlo = qi - window + 1; if (jlo < 0) jlo = 0;
-    for (int j = jlo; j <= qi; j++) {
-        float k_d = (tid < head_dim) ? ck[(size_t)j*okv + kv_head*head_dim + tid] : 0.0f;
-        float s = block_reduce_sum(q_d * k_d, smem);
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l * al + p;
-        float v_d = (tid < head_dim) ? cv[(size_t)j*okv + kv_head*head_dim + tid] : 0.0f;
-        acc = acc * al + p * v_d; m = mn;
-    }
-    if (tid < head_dim)
-        out[(size_t)qi*oq + head*head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
+// Per-(head,query) online-softmax state init: m = -inf, l = 0.
+__global__ void fp_ml_init_kernel(float *m, float *l, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { m[i] = -INFINITY; l[i] = 0.0f; }
 }
 
-__global__ void flash_prefill_global_kernel(
-    float *out, const float *q,
-    const kv_t *kc, const kv_t *vc,          // linear history [hist_len][head_dim] (frozen)
-    int n_heads, int head_dim, int hist_len,
-    const float *ck, const float *cv,        // this chunk's keys/values fp32 [cn][head_dim]
-    int cn, int q_base, int okv)
+// GQA broadcast straight from the chunk's fp32 K/V rows to BF16 GEMM operands:
+// src [rows][n_kv_heads][head_dim] fp32 → dst [rows][n_heads][head_dim] bf16.
+// grid=(ceil(head_dim/256), n_heads, rows).
+__global__ void kv_broadcast_f32_bf16_kernel(
+    __nv_bfloat16 *dst, const float *src,
+    int rows, int n_heads, int n_kv_heads, int head_dim)
 {
-    extern __shared__ float smem[];
-    int qi = blockIdx.x, head = blockIdx.y, tid = threadIdx.x;
-    if (qi >= cn) return;
-    int oq = n_heads * head_dim;             // n_kv_heads == 1
-    float q_d = (tid < head_dim) ? q[(size_t)qi*oq + head*head_dim + tid] : 0.0f;
-    float acc = 0.0f, m = -INFINITY, l = 0.0f;
-
-    for (int t = 0; t < hist_len; t++) {                 // all history is causal
-        float k_d = (tid < head_dim) ? fp8_to_float(kc[(size_t)t*head_dim + tid]) : 0.0f;
-        float s = block_reduce_sum(q_d * k_d, smem);
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l * al + p;
-        float v_d = (tid < head_dim) ? fp8_to_float(vc[(size_t)t*head_dim + tid]) : 0.0f;
-        acc = acc * al + p * v_d; m = mn;
-    }
-    for (int j = 0; j <= qi; j++) {                      // chunk keys, causal j ≤ qi
-        float k_d = (tid < head_dim) ? ck[(size_t)j*okv + tid] : 0.0f;
-        float s = block_reduce_sum(q_d * k_d, smem);
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l * al + p;
-        float v_d = (tid < head_dim) ? cv[(size_t)j*okv + tid] : 0.0f;
-        acc = acc * al + p * v_d; m = mn;
-    }
-    if (tid < head_dim)
-        out[(size_t)qi*oq + head*head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
+    int d   = blockIdx.x * blockDim.x + threadIdx.x;
+    int h   = blockIdx.y;
+    int row = blockIdx.z;
+    if (d >= head_dim || row >= rows) return;
+    int kvh = h / (n_heads / n_kv_heads);
+    dst[((size_t)row * n_heads + h) * head_dim + d] =
+        __float2bfloat16(src[((size_t)row * n_kv_heads + kvh) * head_dim + d]);
 }
 
-// ─── Tiled flash prefill (warp-per-query) ───────────────────────────────
-// The naive kernels above do one query per BLOCK with a block_reduce_sum (a full
-// __syncthreads) PER KEY — the dominant cost at large N. These assign one query per
-// WARP: each lane owns head_dim/32 elements in registers, dot products reduce via
-// __shfl (no block sync), and a block packs (blockDim/32) queries. Same math/result.
-// Launch: <<<dim3(ceil(cn/warps_per_block), HEADS), warps_per_block*32>>>.
-#define FP_SLICE_MAX 16   // head_dim/32 ≤ 512/32
-
-// FP_TILE: history positions staged in shared memory per block iteration. The
-// per-warp loops above stream the WHOLE history from DRAM once per (query,head)
-// warp — at 22k context that redundant traffic (×8 warps/block, ×16 head-blocks
-// reading the single shared global KV head) is what decayed prefill from ~760
-// to ~160 tok/s. Staging a tile cooperatively and letting all warps consume it
-// from smem divides the per-block DRAM traffic by the warp count and makes the
-// cross-block (per-head) re-reads L2-resident.
-#define FP_TILE 32
-
-__global__ void flash_prefill_global_tiled_kernel(
-    float *out, const float *q, const kv_t *kc, const kv_t *vc,
-    int n_heads, int head_dim, int hist_len,
-    const float *ck, const float *cv, int cn, int q_base, int okv)
+// History K/V tile: FP8 cache positions [t0, t0+tn) → BF16 GEMM operands with
+// GQA broadcast, [tn][n_heads*head_dim]. FP8 E4M3 → BF16 is exact (3 ≤ 7
+// mantissa bits, exponent range covered), so this loses nothing vs the scalar
+// kernels' per-element fp8_to_float. Cache layout is flat-by-absolute-position
+// [pos][n_kv_heads][head_dim] (global layers: n_kv_heads == 1).
+// grid=(ceil(head_dim/256), n_heads, tn).
+__global__ void fp_hist_tile_bf16_kernel(
+    __nv_bfloat16 *kt, __nv_bfloat16 *vt,
+    const kv_t *kc, const kv_t *vc,
+    int t0, int tn, int n_heads, int n_kv_heads, int head_dim)
 {
-    __shared__ kv_t sk[FP_TILE * GEMMA4_GLOBAL_HEAD_DIM];
-    __shared__ kv_t sv[FP_TILE * GEMMA4_GLOBAL_HEAD_DIM];
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int qi = blockIdx.x * (blockDim.x >> 5) + warp;
-    // No early return: inactive warps must still reach the __syncthreads in
-    // the cooperative tile loop.
-    bool active = (qi < cn);
-    int head = blockIdx.y, oq = n_heads * head_dim, slice = head_dim >> 5;
-    const float *qp = q + (size_t)qi*oq + head*head_dim;
-    float qreg[FP_SLICE_MAX], acc[FP_SLICE_MAX];
-    #pragma unroll
-    for (int e = 0; e < slice; e++) { qreg[e] = active ? qp[lane + 32*e] : 0.0f; acc[e] = 0.0f; }
-    float m = -INFINITY, l = 0.0f;
-
-    for (int t0 = 0; t0 < hist_len; t0 += FP_TILE) {     // history (all causal)
-        int tn = min(FP_TILE, hist_len - t0);
-        // Cooperative tile load, vectorized: rows are head_dim bytes (a
-        // multiple of 16), so uint4 copies are aligned.
-        int nv = (tn * head_dim) >> 4;
-        const uint4 *gk = (const uint4 *)(kc + (size_t)t0*head_dim);
-        const uint4 *gv = (const uint4 *)(vc + (size_t)t0*head_dim);
-        uint4 *tk = (uint4 *)sk, *tv = (uint4 *)sv;
-        for (int i = threadIdx.x; i < nv; i += blockDim.x) { tk[i] = gk[i]; tv[i] = gv[i]; }
-        __syncthreads();
-        if (active) {
-            for (int t = 0; t < tn; t++) {
-                const kv_t *kp = sk + (size_t)t*head_dim;
-                float dot = 0.0f;
-                #pragma unroll
-                for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
-                float s = warp_reduce_sum_all(dot);
-                float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-                l = l*al + p;
-                const kv_t *vp = sv + (size_t)t*head_dim;
-                #pragma unroll
-                for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
-                m = mn;
-            }
-        }
-        __syncthreads();
-    }
-    if (!active) return;
-    for (int j = 0; j <= qi; j++) {                      // chunk keys, causal
-        const float *kp = ck + (size_t)j*okv;
-        float dot = 0.0f;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) dot += qreg[e] * kp[lane + 32*e];
-        float s = warp_reduce_sum_all(dot);
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l*al + p;
-        const float *vp = cv + (size_t)j*okv;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*vp[lane + 32*e];
-        m = mn;
-    }
-    float *op = out + (size_t)qi*oq + head*head_dim;
-    #pragma unroll
-    for (int e = 0; e < slice; e++) op[lane + 32*e] = (l > 0.0f) ? acc[e]/l : 0.0f;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y, t = blockIdx.z;
+    if (d >= head_dim || t >= tn) return;
+    int kvh = h / (n_heads / n_kv_heads);
+    size_t src = ((size_t)(t0 + t) * n_kv_heads + kvh) * head_dim + d;
+    size_t dst = ((size_t)t * n_heads + h) * head_dim + d;
+    kt[dst] = __float2bfloat16(fp8_to_float(kc[src]));
+    vt[dst] = __float2bfloat16(fp8_to_float(vc[src]));
 }
 
-__global__ void flash_prefill_sliding_tiled_kernel(
-    float *out, const float *q, const kv_t *kc, const kv_t *vc,
-    int n_heads, int n_kv_heads, int head_dim, int window,
-    int hist_count, int unused_filled,                   // FLAT: hist_count tokens in cache
-    const float *ck, const float *cv, int cn, int q_base, int okv)
+// Fold one S tile into the running online softmax. S/P are col-major with
+// ld = t_ld; the column of (query qi, head h) starts at qi·csq + h·csh —
+// S(j, col) is the score of key (kbase+j) against query (q0+i), exactly as
+// written by the preceding K_tileᵀ·Q GEMM, so a query's tile scores are
+// CONTIGUOUS. Two layouts share this kernel:
+//   sliding (GQA, strided-batched GEMM): csq = t_ld, csh = t_ld·chunk
+//   global  (1 KV head, ONE wide GEMM over [hd × HEADS·cn] Q):
+//           csq = HEADS·t_ld, csh = t_ld
+// Per (query, head) block: masked tile max → m_new, α = e^(m−m_new),
+// P = e^(s−m_new) (masked → 0), l = l·α + Σ P, O-row *= α (or := 0 on the
+// query's first contributing tile, which also clears uninitialized scratch —
+// NaN-proof, unlike multiplying by α=0). Masking: causal ka ≤ pos plus the
+// sliding lower bound ka > pos−window when window > 0. Scale 1.0 (gemma4).
+// grid=(qn, n_heads), block=256, smem=32 floats.
+__global__ void fp_online_softmax_kernel(
+    const __nv_bfloat16 *S, __nv_bfloat16 *P, float *O,
+    float *mbuf, float *lbuf,
+    int tn, long long csq, long long csh,
+    int q0, int kbase, int abs0, int window,
+    int head_dim, int oq, int ml_stride)
 {
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int qi = blockIdx.x * (blockDim.x >> 5) + warp;
-    // No early return: inactive warps must still reach the cooperative tile
-    // loop's __syncthreads below (see `active`).
-    int head = blockIdx.y, kv_head = head / (n_heads / n_kv_heads);
-    int oq = n_heads * head_dim, slice = head_dim >> 5, pos = q_base + qi;
-    const float *qp = q + (size_t)qi*oq + head*head_dim;
-    float qreg[FP_SLICE_MAX], acc[FP_SLICE_MAX];
-    #pragma unroll
-    for (int e = 0; e < slice; e++) { qreg[e] = (qi < cn) ? qp[lane + 32*e] : 0.0f; acc[e] = 0.0f; }
-    float m = -INFINITY, l = 0.0f;
+    extern __shared__ float red[];
+    int qi = q0 + blockIdx.x, h = blockIdx.y;
+    int tid = threadIdx.x, nt = blockDim.x;
+    int pos = abs0 + qi;
+    const __nv_bfloat16 *sc = S + (long long)qi * csq + (long long)h * csh;
+    __nv_bfloat16 *pc = P + (long long)qi * csq + (long long)h * csh;
 
-    // FLAT history (Step 3): absolute positions [max(0,pos-window+1), hist_count-1].
-    // Tiled through shared memory (see FP_TILE): the tile range starts at the
-    // BLOCK's lowest window bound; warps with a higher bound skip the early
-    // positions per-key. All warps in a block share kv_head (same blockIdx.y).
-    __shared__ kv_t sk[FP_TILE * GEMMA4_HEAD_DIM];
-    __shared__ kv_t sv[FP_TILE * GEMMA4_HEAD_DIM];
-    int hlo = pos - window + 1; if (hlo < 0) hlo = 0;
-    int block_hlo = q_base + blockIdx.x * (blockDim.x >> 5) - window + 1;
-    if (block_hlo < 0) block_hlo = 0;
-    bool active = (qi < cn);
-    int rowv = head_dim >> 4; // uint4 vectors per row slice
-    for (int t0 = block_hlo; t0 < hist_count; t0 += FP_TILE) {
-        int tn = min(FP_TILE, hist_count - t0);
-        for (int i = threadIdx.x; i < tn * rowv; i += blockDim.x) {
-            int p = i / rowv, e = i - p * rowv;
-            size_t off = ((size_t)(t0 + p) * n_kv_heads + kv_head) * head_dim;
-            ((uint4 *)sk)[i] = ((const uint4 *)(kc + off))[e];
-            ((uint4 *)sv)[i] = ((const uint4 *)(vc + off))[e];
-        }
-        __syncthreads();
-        if (active) {
-            int lo = (hlo > t0) ? hlo - t0 : 0; // this warp's window bound in-tile
-            for (int t = lo; t < tn; t++) {
-                const kv_t *kp = sk + (size_t)t*head_dim;
-                float dot = 0.0f;
-                #pragma unroll
-                for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
-                float s = warp_reduce_sum_all(dot);
-                float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-                l = l*al + p;
-                const kv_t *vp = sv + (size_t)t*head_dim;
-                #pragma unroll
-                for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
-                m = mn;
-            }
-        }
-        __syncthreads();
+    float mx = -INFINITY;
+    for (int j = tid; j < tn; j += nt) {
+        int ka = kbase + j;
+        if (ka <= pos && (window <= 0 || ka > pos - window))
+            mx = fmaxf(mx, __bfloat162float(sc[j]));
     }
-    if (!active) return;
-    int jlo = qi - window + 1; if (jlo < 0) jlo = 0;
-    for (int j = jlo; j <= qi; j++) {                    // chunk keys
-        const float *kp = ck + (size_t)j*okv + kv_head*head_dim;
-        float dot = 0.0f;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) dot += qreg[e] * kp[lane + 32*e];
-        float s = warp_reduce_sum_all(dot);
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l*al + p;
-        const float *vp = cv + (size_t)j*okv + kv_head*head_dim;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*vp[lane + 32*e];
-        m = mn;
+    mx = block_reduce_max(mx, red);
+
+    int   mli   = h * ml_stride + qi;
+    float m_old = mbuf[mli];
+    float m_new = fmaxf(m_old, mx);
+    if (m_new == -INFINITY) {
+        // No valid key for this query yet (entire tile masked): P must still
+        // be zeroed for the unconditional P·V GEMM; m/l/O stay untouched.
+        for (int j = tid; j < tn; j += nt) pc[j] = __float2bfloat16(0.0f);
+        return;
     }
-    float *op = out + (size_t)qi*oq + head*head_dim;
-    #pragma unroll
-    for (int e = 0; e < slice; e++) op[lane + 32*e] = (l > 0.0f) ? acc[e]/l : 0.0f;
+
+    float lsum = 0.0f;
+    for (int j = tid; j < tn; j += nt) {
+        int  ka = kbase + j;
+        bool ok = ka <= pos && (window <= 0 || ka > pos - window);
+        float p = ok ? __expf(__bfloat162float(sc[j]) - m_new) : 0.0f;
+        pc[j] = __float2bfloat16(p);
+        lsum += p;
+    }
+    lsum = block_reduce_sum(lsum, red);
+
+    float *orow = O + (size_t)qi * oq + (size_t)h * head_dim;
+    if (m_old == -INFINITY) {
+        // First contributing tile: O holds garbage (previous layer / fresh
+        // cudaMalloc) — assign zero rather than scale by α=0 (0·NaN = NaN).
+        for (int e = tid; e < head_dim; e += nt) orow[e] = 0.0f;
+        if (tid == 0) { mbuf[mli] = m_new; lbuf[mli] = lsum; }
+        return;
+    }
+    float alpha = __expf(m_old - m_new);
+    if (alpha != 1.0f)
+        for (int e = tid; e < head_dim; e += nt) orow[e] *= alpha;
+    if (tid == 0) { mbuf[mli] = m_new; lbuf[mli] = lbuf[mli] * alpha + lsum; }
+}
+
+// Final pass: O /= l per (query, head) row. grid=(cn, n_heads).
+__global__ void fp_attn_norm_kernel(
+    float *O, const float *lbuf, int head_dim, int oq, int ml_stride)
+{
+    int qi = blockIdx.x, h = blockIdx.y;
+    float l = lbuf[h * ml_stride + qi];
+    float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    float *orow = O + (size_t)qi * oq + (size_t)h * head_dim;
+    for (int e = threadIdx.x; e < head_dim; e += blockDim.x) orow[e] *= inv;
 }
 
 // =========================================================================
@@ -2121,6 +2017,29 @@ struct gemma4_engine {
     float  *d_pf_attn, *d_pf_gate, *d_pf_up, *d_pf_scores;
     __nv_bfloat16 *d_pf_inb, *d_pf_qb, *d_pf_kb, *d_pf_vb;
     __nv_bfloat16 *d_pf_kbx, *d_pf_vbx, *d_pf_pb;
+
+    // ── Tiled-GEMM flash-prefill attention scratch (~2.1 GB, lazy) ──
+    // Sized for the widest layer (global oq = HEADS×512) at chunk
+    // GEMMA4_FP_CHUNK and key tile GEMMA4_FP_TILE_K. S/P are per-head
+    // batches [HEADS][CHUNK×TILE]; m/l the online-softmax running state.
+    int fp_scratch_ready;
+    __nv_bfloat16 *d_fp_qb, *d_fp_kbx, *d_fp_vbx;   // chunk Q / broadcast K,V
+    __nv_bfloat16 *d_fp_kt, *d_fp_vt;               // history K/V tile (bf16)
+    __nv_bfloat16 *d_fp_pb;                         // P tile batch (bf16)
+    __nv_bfloat16 *d_fp_st;                         // S tile batch (bf16: S write/read
+                                                    // traffic bounds the QKᵀ GEMM at k=512)
+    float *d_fp_m, *d_fp_l;                         // online softmax state
+
+    // ── Pinned double-buffer staging for KV snapshot save/restore ──
+    // The snapshot pool lives in Go (pageable host memory); a direct pageable
+    // cudaMemcpy2D runs at ~120 MB/s on GB10 (multi-second stalls per save).
+    // Staging through pinned memory (DMA ↔ pinned overlapped with a host
+    // memcpy pinned ↔ pageable) is the same pattern as the streamed weight
+    // load. kv_stage_ready: 0 = unallocated, 1 = ready, -1 = alloc failed
+    // (snapshot copies then use the old synchronous pageable fallback).
+    void       *h_kv_stage[2];
+    cudaEvent_t ev_kv_stage[2];
+    int         kv_stage_ready;
     // CUDA Graph state
     int graph_mode;
     struct { cudaGraph_t g; cudaGraphExec_t e; int N, hits, misses; } graph;
@@ -2209,6 +2128,14 @@ struct gemma4_engine {
     // K ids cross to host (vs the old K×262144 logit D2H + K CPU vocab scans).
     int    *d_spec_ids;        // [SPEC_MAX] per-row sampled token id
     float  *d_spec_rnd;        // [SPEC_MAX] per-row uniform draw (H2D once/step)
+    // GPU repeat-penalty state (lazy, ~2 MB; only touched when a request sets
+    // repeat_penalty != 1.0 — keeps such requests on the spec fast path instead
+    // of the per-token 1 MB-logits-D2H CPU loop). d_pen_cnt[v] = occurrences of
+    // v in the synced history; d_pen_hist mirrors the host hist incrementally;
+    // d_pen_batch = the current verify step's [g, draft...] for per-row extras.
+    int     *d_pen_cnt;        // [VOCAB] occurrence counts
+    int32_t *d_pen_hist;       // [global_kv_capacity + 8] history mirror
+    int32_t *d_pen_batch;      // [SPEC_MAX]
     // Device-chained MTP draft (b): maxd ids + confidences read back in ONE sync.
     int    *d_mtp_ids;         // [SPEC_MAX] chained draft ids
     float  *d_mtp_conf;        // [SPEC_MAX] per-draft top-1 confidence (PMIN gate)
@@ -3184,6 +3111,9 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_sample_p);
     CUDA_FREE(eng->d_spec_ids);
     CUDA_FREE(eng->d_spec_rnd);
+    CUDA_FREE(eng->d_pen_cnt);
+    CUDA_FREE(eng->d_pen_hist);
+    CUDA_FREE(eng->d_pen_batch);
     CUDA_FREE(eng->d_mtp_ids);
     CUDA_FREE(eng->d_mtp_conf);
     CUDA_FREE(eng->d_mtp_tok);
@@ -3220,6 +3150,13 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     cudaFree(eng->d_pf_inb); cudaFree(eng->d_pf_qb);
     cudaFree(eng->d_pf_kb); cudaFree(eng->d_pf_vb);
     cudaFree(eng->d_pf_kbx); cudaFree(eng->d_pf_vbx); cudaFree(eng->d_pf_pb);
+    cudaFree(eng->d_fp_qb); cudaFree(eng->d_fp_kbx); cudaFree(eng->d_fp_vbx);
+    cudaFree(eng->d_fp_kt); cudaFree(eng->d_fp_vt); cudaFree(eng->d_fp_pb);
+    cudaFree(eng->d_fp_st); cudaFree(eng->d_fp_m); cudaFree(eng->d_fp_l);
+    for (int b = 0; b < 2; b++) {
+        if (eng->h_kv_stage[b])  cudaFreeHost(eng->h_kv_stage[b]);
+        if (eng->ev_kv_stage[b]) cudaEventDestroy(eng->ev_kv_stage[b]);
+    }
     if (eng->stream) cudaStreamDestroy(eng->stream);
 
     free(eng);
@@ -3693,6 +3630,7 @@ static cublasStatus_t gemm_bf16(
 // =========================================================================
 // ─── Batched Prefill (Step 2 Phase 2 + Step 3) ──────────────────────────
 static int alloc_prefill_scratch(gemma4_engine_t *eng);   // fwd decl (defined below)
+static int ensure_fp_scratch(gemma4_engine_t *eng);       // fwd decl (defined below)
 // =========================================================================
 // Process the WHOLE prompt in one weight pass: per layer, one cuBLAS BF16 GEMM
 // per projection over all N tokens (tensor-core bound) instead of N token-by-
@@ -3995,11 +3933,12 @@ int gemma4_engine_prefill_flash(
     // BF16 scratch failure is not fatal here: the chunked dp4a fallback needs
     // no BF16 weights, so defer instead of failing the whole prefill.
     if (build_bf16_weights(eng) != 0) return -2;
+    if (ensure_fp_scratch(eng) != 0) return -2;           // attention tile scratch
 
     cudaStream_t stream = eng->stream;
     const int H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE, HD2 = 32*sizeof(float);
     const int HEADS = GEMMA4_HEADS, N = n_tokens;
-    const int C = (N < 8192) ? N : 8192;                  // chunk size (amortizes weight re-reads)
+    const int C = (N < GEMMA4_FP_CHUNK) ? N : GEMMA4_FP_CHUNK;  // chunk (amortizes weight re-reads)
     const int OQ_MAX = HEADS*GEMMA4_GLOBAL_HEAD_DIM, OKV_MAX = GEMMA4_KV_HEADS*GEMMA4_HEAD_DIM;
 
     cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
@@ -4070,31 +4009,146 @@ int gemma4_engine_prefill_flash(
             const float *ff = (lt==LAYER_SLIDING)? NULL : eng->d_rope_freqs;
             rope_rows_kernel<<<dim3(HEADS,cn),hd/2,0,stream>>>(d_q, d_k, abs0, HEADS, nkv, hd, cn, theta, ff);
 
-            // Flash attention (tiled, warp-per-query): chunk queries vs frozen history
-            // (cache) + chunk keys. 8 warps/block → 8 queries/block, __shfl reductions.
-            const int WPB = 8;
-            dim3 fg((cn + WPB - 1) / WPB, HEADS);
+            // ── Tiled-GEMM attention (tensor cores, online softmax) ──
+            // Chunk queries attend the frozen history cache (FP8 → BF16
+            // tiles) + this chunk's own keys (fp32 → BF16, GQA-broadcast),
+            // one K/V tile at a time: S = Q·K_tileᵀ (strided-batched GEMM
+            // over all heads), fp_online_softmax folds the tile into the
+            // running m/l and rescales the fp32 O accumulator (d_attn),
+            // then O += P·V_tile (GEMM, beta=1). See the kernel block at
+            // fp_online_softmax_kernel for layouts and masking.
+            {
+                const int T = GEMMA4_FP_TILE_K;
+                const long long sb = (long long)T * C;    // per-head S/P stride (sliding)
+                const float a1 = 1.0f, b0 = 0.0f, b1 = 1.0f;
+                const int window = (lt==LAYER_SLIDING) ? GEMMA4_SLIDING_WINDOW : 0;
+                const bool global = (lt != LAYER_SLIDING);
+
+                f32_to_bf16_kernel<<<grid1d((size_t)cn*oq),256,0,stream>>>(
+                    eng->d_fp_qb, d_q, (size_t)cn*oq);
+                if (global) {
+                    // 1 KV head: no GQA broadcast — keys/values stay [cn][hd].
+                    f32_to_bf16_kernel<<<grid1d((size_t)cn*okv),256,0,stream>>>(
+                        eng->d_fp_kbx, d_k, (size_t)cn*okv);
+                    f32_to_bf16_kernel<<<grid1d((size_t)cn*okv),256,0,stream>>>(
+                        eng->d_fp_vbx, d_v, (size_t)cn*okv);
+                } else {
+                    kv_broadcast_f32_bf16_kernel<<<dim3(grid1d(hd),HEADS,cn),256,0,stream>>>(
+                        eng->d_fp_kbx, d_k, cn, HEADS, nkv, hd);
+                    kv_broadcast_f32_bf16_kernel<<<dim3(grid1d(hd),HEADS,cn),256,0,stream>>>(
+                        eng->d_fp_vbx, d_v, cn, HEADS, nkv, hd);
+                }
+                fp_ml_init_kernel<<<grid1d((size_t)HEADS*C),256,0,stream>>>(
+                    eng->d_fp_m, eng->d_fp_l, HEADS*C);
+
+                // One tile pass over queries [q0, q0+qn); kbase = absolute
+                // position of tile key 0.
+                //
+                // GLOBAL layers (84% of attention FLOPs): Q token-major
+                // [cn][HEADS][hd] IS col-major [hd × HEADS·cn] with ld=hd, and
+                // all heads share the single KV head — so S and P·V are each
+                // ONE wide GEMM (n = HEADS·qn), no broadcast, no batching.
+                // Keys kt/vt are [tn][hd].
+                // SLIDING layers (GQA 16:8, window-bounded): strided-batched
+                // GEMM over heads with broadcast keys [tn][HEADS*hd].
+                auto tile_pass = [&](const __nv_bfloat16 *kt, const __nv_bfloat16 *vt,
+                                     int tn, int kbase, int q0, int qn){
+                    if (qn <= 0 || tn <= 0) return;
+                    if (global) {
+                        // S(j, qi·H+h) = K_j·Q_(qi,h), col-major [tn × H·qn] ld=T.
+                        cublasGemmEx(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            tn, HEADS*qn, hd,
+                            &a1, kt, CUDA_R_16BF, hd,
+                                 eng->d_fp_qb + (size_t)q0*oq, CUDA_R_16BF, hd,
+                            &b0, eng->d_fp_st + (size_t)q0*HEADS*T, CUDA_R_16BF, T,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                        fp_online_softmax_kernel<<<dim3(qn,HEADS),256,HD2,stream>>>(
+                            eng->d_fp_st, eng->d_fp_pb, d_attn, eng->d_fp_m, eng->d_fp_l,
+                            tn, (long long)HEADS*T, (long long)T,
+                            q0, kbase, abs0, window, hd, oq, C);
+                        // O[hd × H·qn] += V_tile · P, ld=hd, beta=1.
+                        cublasGemmEx(eng->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                            hd, HEADS*qn, tn,
+                            &a1, vt, CUDA_R_16BF, hd,
+                                 eng->d_fp_pb + (size_t)q0*HEADS*T, CUDA_R_16BF, T,
+                            &b1, d_attn + (size_t)q0*oq, CUDA_R_32F, hd,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                        return;
+                    }
+                    // S[h](j,i) = K_j·Q_i, col-major [tn × qn] ld=T per head.
+                    cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        tn, qn, hd,
+                        &a1, kt, CUDA_R_16BF, oq, (long long)hd,
+                             eng->d_fp_qb + (size_t)q0*oq, CUDA_R_16BF, oq, (long long)hd,
+                        &b0, eng->d_fp_st + (size_t)q0*T, CUDA_R_16BF, T, sb,
+                        HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    fp_online_softmax_kernel<<<dim3(qn,HEADS),256,HD2,stream>>>(
+                        eng->d_fp_st, eng->d_fp_pb, d_attn, eng->d_fp_m, eng->d_fp_l,
+                        tn, (long long)T, sb, q0, kbase, abs0, window, hd, oq, C);
+                    // O[h] += V_tile[h]·P[h], col-major [hd × qn] ld=oq, beta=1.
+                    cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        hd, qn, tn,
+                        &a1, vt, CUDA_R_16BF, oq, (long long)hd,
+                             eng->d_fp_pb + (size_t)q0*T, CUDA_R_16BF, T, sb,
+                        &b1, d_attn + (size_t)q0*oq, CUDA_R_32F, oq, (long long)hd,
+                        HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                };
+
+                // History tiles (frozen FP8 cache, flat absolute positions).
+                const kv_t *hk, *hv;
+                if (lt == LAYER_SLIDING) {
+                    size_t lstride = (size_t)eng->sliding_kv_capacity * kvhd;
+                    hk = eng->d_sliding_k + (size_t)l*lstride;
+                    hv = eng->d_sliding_v + (size_t)l*lstride;
+                } else {
+                    int slot = eng->global_slot[l];
+                    size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+                    hk = eng->d_global_k + (size_t)slot*stride;
+                    hv = eng->d_global_v + (size_t)slot*stride;
+                }
+                int hstart = 0;                           // sliding: only the window reach
+                if (window > 0) { hstart = abs0 - (window - 1); if (hstart < 0) hstart = 0; }
+                // Tile row stride: global keys are non-broadcast [tn][hd],
+                // sliding keys are broadcast [tn][HEADS*hd].
+                const size_t krow = global ? (size_t)okv : (size_t)oq;
+                for (int t0 = hstart; t0 < abs0; t0 += T) {
+                    int tn = (abs0 - t0 < T) ? (abs0 - t0) : T;
+                    fp_hist_tile_bf16_kernel<<<dim3(grid1d(hd),global?1:HEADS,tn),256,0,stream>>>(
+                        eng->d_fp_kt, eng->d_fp_vt, hk, hv, t0, tn, global?1:HEADS, nkv, hd);
+                    long long qe = cn;                    // queries that can see this tile
+                    if (window > 0) {
+                        qe = (long long)t0 + tn - 1 + window - abs0;
+                        if (qe > cn) qe = cn;
+                    }
+                    tile_pass(eng->d_fp_kt, eng->d_fp_vt, tn, t0, 0, (int)qe);
+                }
+                // Chunk tiles (causal; queries before a tile see none of it).
+                for (int t0 = 0; t0 < cn; t0 += T) {
+                    int tn = (cn - t0 < T) ? (cn - t0) : T;
+                    long long qe = cn;
+                    if (window > 0) {
+                        qe = (long long)t0 + tn - 1 + window;
+                        if (qe > cn) qe = cn;
+                    }
+                    tile_pass(eng->d_fp_kbx + (size_t)t0*krow, eng->d_fp_vbx + (size_t)t0*krow,
+                              tn, abs0 + t0, t0, (int)qe - t0);
+                }
+                fp_attn_norm_kernel<<<dim3(cn,HEADS),256,0,stream>>>(
+                    d_attn, eng->d_fp_l, hd, oq, C);
+            }
+
+            // Persist this chunk's K/V at absolute positions [abs0, abs0+cn-1].
             if (lt == LAYER_SLIDING) {
-                // FLAT (Step 3): history = abs0 tokens already in cache; this chunk attends
-                // the window range of absolute positions then is persisted at
-                // [abs0, abs0+cn-1] (all cn).
                 size_t lstride = (size_t)eng->sliding_kv_capacity * kvhd;
-                kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
-                kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
-                flash_prefill_sliding_tiled_kernel<<<fg, WPB*32, 0, stream>>>(
-                    d_attn, d_q, kc, vc, HEADS, nkv, hd, GEMMA4_SLIDING_WINDOW,
-                    abs0, 0, d_k, d_v, cn, abs0, okv);
                 kv_write_sliding_kernel<<<dim3(grid1d(kvhd),cn),256,0,stream>>>(
-                    kc, vc, d_k, d_v, abs0, 0, cn, kvhd, GEMMA4_SLIDING_WINDOW);
+                    eng->d_sliding_k + (size_t)l*lstride, eng->d_sliding_v + (size_t)l*lstride,
+                    d_k, d_v, abs0, 0, cn, kvhd, GEMMA4_SLIDING_WINDOW);
             } else {
                 int slot = eng->global_slot[l];
                 size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
-                kv_t *kc = eng->d_global_k + (size_t)slot*stride;
-                kv_t *vc = eng->d_global_v + (size_t)slot*stride;
-                flash_prefill_global_tiled_kernel<<<fg, WPB*32, 0, stream>>>(
-                    d_attn, d_q, kc, vc, HEADS, hd, abs0, d_k, d_v, cn, abs0, okv);
                 kv_write_global_kernel<<<dim3(grid1d(hd),cn),256,0,stream>>>(
-                    kc, vc, d_k, d_v, abs0, cn, hd);
+                    eng->d_global_k + slot*stride, eng->d_global_v + slot*stride,
+                    d_k, d_v, abs0, cn, hd);
             }
 
             f32_to_bf16_kernel<<<grid1d((size_t)cn*oq),256,0,stream>>>(d_inb, d_attn, (size_t)cn*oq);
@@ -5023,7 +5077,71 @@ static int prompt_lookup_draft(const int32_t *hist, int n, int32_t *draft,
     return 0;
 }
 
-// Greedy generation with prompt-lookup speculative decoding. Each step forwards
+// ─── GPU repeat-penalty (keeps repeat_penalty != 1.0 on the spec path) ──
+// Semantics mirror the Go sampler EXACTLY (internal/sampler.Sample): applied
+// on the RAW (softcapped) logits BEFORE temperature, once PER OCCURRENCE in
+// the past-token window — which is the ENTIRE sequence (kv.CurrentTokens()) —
+// positive logit /= rp, negative *= rp, and SKIPPED at temp <= 0 (Sample
+// short-circuits to argmax before the penalty). Per-occurrence application is
+// reproduced bit-exactly by counting occurrences and applying c sequential
+// divisions/multiplications: every application acts on the same value with
+// the same operation, so the float result equals the Go loop's regardless of
+// occurrence order (sign is stable under /,× by rp > 0, so Go's per-
+// application sign test equals one up-front test).
+
+__global__ void pen_count_kernel(int *cnt, const int32_t *toks, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int t = toks[i];
+    if (t >= 0 && t < GEMMA4_VOCAB_SIZE) atomicAdd(&cnt[t], 1);
+}
+
+// Penalize K rows of logits. Row k's window additionally contains the draft
+// tokens PRECEDING its position: batch[1..k] (batch[0] = g is already in the
+// synced history — run_spec_loop appends g to hist before drafting).
+__global__ void pen_apply_rows_kernel(
+    float *logitsK, int V, const int *cnt, const int32_t *batch, float rp)
+{
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    int k = blockIdx.y;
+    if (v >= V) return;
+    int c = cnt[v];
+    for (int j = 1; j <= k; j++) if (batch[j] == v) c++;
+    if (c == 0) return;
+    // IEEE round-to-nearest intrinsics: the build uses --use_fast_math, which
+    // lowers plain `/` to a reciprocal approximation and breaks bit-parity
+    // with the Go sampler's float32 ops (proven by the pen_test harness).
+    float x = logitsK[(size_t)k * V + v];
+    if (x > 0.0f) { for (int i = 0; i < c; i++) x = __fdiv_rn(x, rp); }
+    else          { for (int i = 0; i < c; i++) x = __fmul_rn(x, rp); }
+    logitsK[(size_t)k * V + v] = x;
+}
+
+static int ensure_pen_scratch(gemma4_engine_t *eng) {
+    if (eng->d_pen_cnt) return 0;
+    size_t hist_cap = (size_t)eng->global_kv_capacity + 8;
+    if (cudaMalloc(&eng->d_pen_cnt, (size_t)GEMMA4_VOCAB_SIZE * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&eng->d_pen_hist, hist_cap * sizeof(int32_t)) != cudaSuccess ||
+        cudaMalloc(&eng->d_pen_batch, GEMMA4_SPEC_MAX * sizeof(int32_t)) != cudaSuccess) {
+        cudaGetLastError();
+        if (eng->d_pen_cnt)   { cudaFree(eng->d_pen_cnt);   eng->d_pen_cnt = NULL; }
+        if (eng->d_pen_hist)  { cudaFree(eng->d_pen_hist);  eng->d_pen_hist = NULL; }
+        if (eng->d_pen_batch) { cudaFree(eng->d_pen_batch); eng->d_pen_batch = NULL; }
+        return -1;
+    }
+    return 0;
+}
+
+// Host-side twin for the host_sample call sites (first token after prefill +
+// the rare decode-failure fallbacks). Identical loop to internal/sampler.
+static void host_apply_penalty(float *logits, const int32_t *past, int n, float rp) {
+    for (int i = 0; i < n; i++) {
+        int32_t id = past[i];
+        if (id < 0 || id >= GEMMA4_VOCAB_SIZE) continue;
+        if (logits[id] > 0.0f) logits[id] /= rp; else logits[id] *= rp;
+    }
+}
+
 // Host-side sampler mirroring sample_logits_kernel: temp<=0 → argmax; else
 // temperature → top-k (bounded partial selection) → softmax → top-p → min-p →
 // multinomial(rnd). Used by the speculative loop, where sampling each draft
@@ -5095,13 +5213,34 @@ __global__ void sample_logits_batched_kernel(
 static int run_spec_loop(
     gemma4_engine_t *eng, int32_t *hist, int n, float *logits,
     int32_t *out_tokens, int max_new, const int32_t *stop_ids, int n_stop,
-    int draft_k, float temp, int top_k, float top_p, float min_p, uint64_t seed,
-    int *n_accepted_out, gemma4_token_cb cb, void *cb_ud)
+    int draft_k, float temp, int top_k, float top_p, float min_p, float rep_pen,
+    uint64_t seed, int *n_accepted_out, gemma4_token_cb cb, void *cb_ud)
 {
     int V = GEMMA4_VOCAB_SIZE;
     // (a) Verify logits stay on device (d_sb[11]); only K ids cross to host — no Lbuf.
     int32_t batch[GEMMA4_SPEC_MAX];
     if (ensure_spec_scratch(eng) != 0) return -1;  // d_spec_ids/d_spec_rnd, d_sb
+
+    // GPU repeat-penalty (see pen_apply_rows_kernel). Matches the Go sampler:
+    // active only for temp > 0 (Sample() short-circuits to raw argmax first),
+    // window = the whole sequence. Occurrence counts build incrementally:
+    // hist is append-only (rejected drafts never enter it), so each step
+    // uploads + counts only the tokens accepted since the last sync.
+    const int use_pen = (rep_pen != 1.0f && rep_pen > 0.0f && temp > 0.0f);
+    int pen_synced = 0;
+    if (use_pen) {
+        if (ensure_pen_scratch(eng) != 0) return -1;   // fail hard, never silently unpenalized
+        cudaMemsetAsync(eng->d_pen_cnt, 0, (size_t)V * sizeof(int), eng->stream);
+    }
+    auto pen_sync = [&](int upto) {
+        if (upto <= pen_synced) return;
+        cudaMemcpyAsync(eng->d_pen_hist + pen_synced, hist + pen_synced,
+                        (size_t)(upto - pen_synced) * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, eng->stream);
+        pen_count_kernel<<<(upto - pen_synced + 255) / 256, 256, 0, eng->stream>>>(
+            eng->d_pen_cnt, eng->d_pen_hist + pen_synced, upto - pen_synced);
+        pen_synced = upto;
+    };
     auto is_stop = [&](int t){ for (int s=0;s<n_stop;s++) if (stop_ids[s]==t) return 1; return 0; };
 
     uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
@@ -5120,6 +5259,7 @@ static int run_spec_loop(
     float ema_lookup = (float)draft_k, ema_mtp = (float)draft_k;
 
 
+    if (use_pen) host_apply_penalty(logits, hist, n, rep_pen);
     int g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
     int generated = 0, total_accepted = 0, stop = 0;
     while (generated < max_new && !stop) {
@@ -5212,6 +5352,11 @@ static int run_spec_loop(
             // (eng->d_logits already carries softcap+suppress). decode() also refreshes
             // the MTP recurrent h. Mirrors the verify path's on-GPU sampling.
             if (gemma4_engine_decode(eng, g, NULL) != 0) { stop = 1; break; }
+            if (use_pen) {
+                pen_sync(n);
+                pen_apply_rows_kernel<<<dim3((V + 255) / 256, 1), 256, 0, eng->stream>>>(
+                    eng->d_logits, V, eng->d_pen_cnt, eng->d_pen_batch, rep_pen);
+            }
             float rnd1 = (float)spec_rng(&rng);
             sample_logits_kernel<<<1, 1024, 0, eng->stream>>>(
                 eng->d_logits, V, temp, top_k, top_p, min_p, rnd1, eng->d_sample_id);
@@ -5235,8 +5380,16 @@ static int run_spec_loop(
         double vt0 = now_ms();   // decode_batched_dev(keep_dev=1) skips event timing
         if (decode_batched_dev(eng, batch, K, NULL, /*keep_dev=*/1) != 0) {
             if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
+            if (use_pen) host_apply_penalty(logits, hist, n, rep_pen);
             g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
             continue;
+        }
+        if (use_pen) {
+            pen_sync(n);
+            cudaMemcpyAsync(eng->d_pen_batch, batch, (size_t)K*sizeof(int32_t),
+                            cudaMemcpyHostToDevice, eng->stream);
+            pen_apply_rows_kernel<<<dim3((V + 255) / 256, K), 256, 0, eng->stream>>>(
+                decode_batched_dev_logits(eng), V, eng->d_pen_cnt, eng->d_pen_batch, rep_pen);
         }
         cudaMemcpyAsync(eng->d_spec_rnd, rnds, (size_t)K*sizeof(float),
                         cudaMemcpyHostToDevice, eng->stream);
@@ -5247,6 +5400,7 @@ static int run_spec_loop(
                         cudaMemcpyDeviceToHost, eng->stream);
         if (cudaStreamSynchronize(eng->stream) != cudaSuccess) {
             if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
+            if (use_pen) host_apply_penalty(logits, hist, n, rep_pen);
             g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
             continue;
         }
@@ -5319,7 +5473,8 @@ int gemma4_engine_generate_spec(
     int32_t         *out_tokens, int max_new,
     const int32_t   *stop_ids, int n_stop,
     int              draft_k,
-    float            temp, int top_k, float top_p, float min_p, uint64_t seed,
+    float            temp, int top_k, float top_p, float min_p, float repeat_penalty,
+    uint64_t seed,
     int             *n_accepted_out)
 {
     if (!eng || !eng->loaded || n_prompt <= 0 || max_new <= 0) return -1;
@@ -5346,8 +5501,8 @@ int gemma4_engine_generate_spec(
     }
 
     int generated = run_spec_loop(eng, hist, n, logits, out_tokens, max_new,
-        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, seed, n_accepted_out,
-        NULL, NULL);
+        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, repeat_penalty,
+        seed, n_accepted_out, NULL, NULL);
 
     free(hist); free(logits);
     return generated;
@@ -5364,7 +5519,8 @@ int gemma4_engine_generate_spec_stream(
     int32_t         *out_tokens, int max_new,
     const int32_t   *stop_ids, int n_stop,
     int              draft_k,
-    float            temp, int top_k, float top_p, float min_p, uint64_t seed,
+    float            temp, int top_k, float top_p, float min_p, float repeat_penalty,
+    uint64_t seed,
     int             *n_accepted_out,
     gemma4_token_cb  cb, void *cb_user_data)
 {
@@ -5380,8 +5536,8 @@ int gemma4_engine_generate_spec_stream(
     memcpy(logits, first_logits, (size_t)V*sizeof(float));
 
     int generated = run_spec_loop(eng, hist, n_history, logits, out_tokens, max_new,
-        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, seed, n_accepted_out,
-        cb, cb_user_data);
+        stop_ids, n_stop, draft_k, temp, top_k, top_p, min_p, repeat_penalty,
+        seed, n_accepted_out, cb, cb_user_data);
 
     free(hist); free(logits);
     return generated;
@@ -5398,12 +5554,13 @@ int gemma4_engine_generate_spec_continue(
     int32_t         *out_tokens, int max_new,
     const int32_t   *stop_ids, int n_stop,
     int              draft_k,
-    float            temp, int top_k, float top_p, float min_p, uint64_t seed,
+    float            temp, int top_k, float top_p, float min_p, float repeat_penalty,
+    uint64_t seed,
     int             *n_accepted_out)
 {
     return gemma4_engine_generate_spec_stream(eng, history, n_history, first_logits,
         out_tokens, max_new, stop_ids, n_stop, draft_k,
-        temp, top_k, top_p, min_p, seed, n_accepted_out, NULL, NULL);
+        temp, top_k, top_p, min_p, repeat_penalty, seed, n_accepted_out, NULL, NULL);
 }
 
 // =========================================================================
@@ -5733,10 +5890,43 @@ size_t gemma4_engine_kv_state_size(const gemma4_engine_t *eng, int n_tokens) {
            2 * (size_t)eng->n_layers_global * (size_t)n_tokens * grow;
 }
 
+// Pinned staging size per buffer (two buffers; chunks alternate between them
+// so the DMA of chunk i overlaps the host memcpy of chunk i−1).
+#define GEMMA4_KV_STAGE_BYTES (64u << 20)
+
+static int ensure_kv_stage(gemma4_engine_t *eng) {
+    if (eng->kv_stage_ready) return eng->kv_stage_ready;
+    for (int b = 0; b < 2; b++) {
+        if (cudaHostAlloc(&eng->h_kv_stage[b], GEMMA4_KV_STAGE_BYTES,
+                          cudaHostAllocDefault) != cudaSuccess ||
+            cudaEventCreateWithFlags(&eng->ev_kv_stage[b],
+                                     cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            for (int j = 0; j < 2; j++) {
+                if (eng->h_kv_stage[j])  { cudaFreeHost(eng->h_kv_stage[j]); eng->h_kv_stage[j] = NULL; }
+                if (eng->ev_kv_stage[j]) { cudaEventDestroy(eng->ev_kv_stage[j]); eng->ev_kv_stage[j] = NULL; }
+            }
+            fprintf(stderr, "gem4d: kv-snapshot pinned staging alloc failed — pageable fallback\n");
+            eng->kv_stage_ready = -1;
+            return -1;
+        }
+    }
+    eng->kv_stage_ready = 1;
+    return 1;
+}
+
 // kv_seq_copy moves the first n_tokens of all four KV regions between the
 // engine and a host buffer. dir: cudaMemcpyDeviceToHost (save) or
-// cudaMemcpyHostToDevice (restore). The synchronous Memcpy2D variants order
-// after all prior work on the device, so no explicit stream sync is needed.
+// cudaMemcpyHostToDevice (restore).
+//
+// Fast path: the host side (the Go snapshot pool) is PAGEABLE, and a direct
+// pageable cudaMemcpy2D measured ~120 MB/s (a 4.3 GB save stalled requests
+// ~20-35 s). Each region row is a CONTIGUOUS per-layer block, so the copy is
+// really 112 flat blocks — stream them through the two pinned staging
+// buffers: async DMA on eng->stream (which also orders the save after all
+// prior device work) ping-ponging with a host memcpy between staging and the
+// pageable buffer. Falls back to the old synchronous Memcpy2D when pinned
+// allocation is unavailable.
 static int kv_seq_copy(gemma4_engine_t *eng, char *buf, int n_tokens,
                        enum cudaMemcpyKind dir) {
     size_t srow, spitch, grow, gpitch;
@@ -5744,12 +5934,63 @@ static int kv_seq_copy(gemma4_engine_t *eng, char *buf, int n_tokens,
     const size_t swidth = (size_t)n_tokens * srow; // contiguous bytes per layer
     const size_t gwidth = (size_t)n_tokens * grow;
 
-    struct { void *dev; size_t pitch, width; int layers; } regions[4] = {
-        { eng->d_sliding_k, spitch, swidth, GEMMA4_MAX_LAYERS },
-        { eng->d_sliding_v, spitch, swidth, GEMMA4_MAX_LAYERS },
-        { eng->d_global_k,  gpitch, gwidth, eng->n_layers_global },
-        { eng->d_global_v,  gpitch, gwidth, eng->n_layers_global },
+    struct { char *dev; size_t pitch, width; int layers; } regions[4] = {
+        { (char *)eng->d_sliding_k, spitch, swidth, GEMMA4_MAX_LAYERS },
+        { (char *)eng->d_sliding_v, spitch, swidth, GEMMA4_MAX_LAYERS },
+        { (char *)eng->d_global_k,  gpitch, gwidth, eng->n_layers_global },
+        { (char *)eng->d_global_v,  gpitch, gwidth, eng->n_layers_global },
     };
+
+    if (ensure_kv_stage(eng) == 1) {
+        cudaStream_t stream = eng->stream;
+        // In-flight chunk per staging buffer (host side of the pending copy).
+        struct { char *host; size_t bytes; } pend[2] = {{NULL,0},{NULL,0}};
+        int b = 0, fail = 0;
+        for (int r = 0; r < 4 && !fail; r++) {
+            for (int l = 0; l < regions[r].layers && !fail; l++) {
+                char *dev = regions[r].dev + (size_t)l * regions[r].pitch;
+                for (size_t off = 0; off < regions[r].width && !fail; off += GEMMA4_KV_STAGE_BYTES) {
+                    size_t sz = regions[r].width - off;
+                    if (sz > GEMMA4_KV_STAGE_BYTES) sz = GEMMA4_KV_STAGE_BYTES;
+                    if (dir == cudaMemcpyDeviceToHost) {
+                        // Drain the buffer's previous chunk (DMA done → host memcpy out).
+                        if (pend[b].host) {
+                            if (cudaEventSynchronize(eng->ev_kv_stage[b]) != cudaSuccess) { fail = 1; break; }
+                            memcpy(pend[b].host, eng->h_kv_stage[b], pend[b].bytes);
+                        }
+                        if (cudaMemcpyAsync(eng->h_kv_stage[b], dev + off, sz, dir, stream) != cudaSuccess ||
+                            cudaEventRecord(eng->ev_kv_stage[b], stream) != cudaSuccess) { fail = 1; break; }
+                        pend[b].host = buf; pend[b].bytes = sz;
+                    } else {
+                        // Reuse gate: the buffer's previous H2D must have completed.
+                        if (pend[b].host &&
+                            cudaEventSynchronize(eng->ev_kv_stage[b]) != cudaSuccess) { fail = 1; break; }
+                        memcpy(eng->h_kv_stage[b], buf, sz);
+                        if (cudaMemcpyAsync(dev + off, eng->h_kv_stage[b], sz, dir, stream) != cudaSuccess ||
+                            cudaEventRecord(eng->ev_kv_stage[b], stream) != cudaSuccess) { fail = 1; break; }
+                        pend[b].host = buf; pend[b].bytes = sz;
+                    }
+                    buf += sz;
+                    b ^= 1;
+                }
+            }
+        }
+        if (!fail) {
+            for (int j = 0; j < 2; j++) {   // drain both buffers
+                if (!pend[j].host) continue;
+                if (cudaEventSynchronize(eng->ev_kv_stage[j]) != cudaSuccess) { fail = 1; break; }
+                if (dir == cudaMemcpyDeviceToHost)
+                    memcpy(pend[j].host, eng->h_kv_stage[j], pend[j].bytes);
+            }
+        }
+        if (!fail) return 0;
+        fprintf(stderr, "gem4d: staged kv_seq_copy failed (%s) — engine state %s\n",
+                cudaGetErrorString(cudaGetLastError()),
+                dir == cudaMemcpyDeviceToHost ? "intact (save aborted)" : "UNDEFINED");
+        return -1;
+    }
+
+    // Fallback: synchronous pageable Memcpy2D (orders after prior device work).
     for (int r = 0; r < 4; r++) {
         cudaError_t err;
         if (dir == cudaMemcpyDeviceToHost) {
@@ -5816,6 +6057,43 @@ static int alloc_prefill_scratch(gemma4_engine_t *eng) {
     if (ok != cudaSuccess) { cudaGetLastError(); return -1; }
     eng->pf_scratch_ready = 1;
     fprintf(stderr, "gem4d: persistent prefill scratch (N<=%d)\n", NC);
+    return 0;
+}
+
+// Tiled-GEMM flash-prefill attention scratch (~2.1 GB), lazy on first flash
+// prefill, engine-lifetime. Sized for the widest layer (global oq = 16×512)
+// at the full chunk; smaller chunks/layers just pack tighter (runtime ld /
+// strides). Failure is non-fatal: the caller defers to the chunked-decode
+// fallback, same as a BF16-weights failure.
+static int ensure_fp_scratch(gemma4_engine_t *eng) {
+    if (eng->fp_scratch_ready) return 0;
+    const size_t C  = GEMMA4_FP_CHUNK, T = GEMMA4_FP_TILE_K;
+    const size_t OQ = (size_t)GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM;
+    const size_t HC = (size_t)GEMMA4_HEADS * C;
+    cudaError_t ok = cudaSuccess;
+    #define A(p,sz) if(ok==cudaSuccess) ok=cudaMalloc(&(p),(size_t)(sz))
+    A(eng->d_fp_qb,  C*OQ*sizeof(__nv_bfloat16));
+    A(eng->d_fp_kbx, C*OQ*sizeof(__nv_bfloat16));
+    A(eng->d_fp_vbx, C*OQ*sizeof(__nv_bfloat16));
+    A(eng->d_fp_kt,  T*OQ*sizeof(__nv_bfloat16));
+    A(eng->d_fp_vt,  T*OQ*sizeof(__nv_bfloat16));
+    A(eng->d_fp_st,  HC*T*sizeof(__nv_bfloat16));
+    A(eng->d_fp_pb,  HC*T*sizeof(__nv_bfloat16));
+    A(eng->d_fp_m,   HC*sizeof(float));
+    A(eng->d_fp_l,   HC*sizeof(float));
+    #undef A
+    if (ok != cudaSuccess) {
+        cudaGetLastError();
+        __nv_bfloat16 *bb[] = {eng->d_fp_qb, eng->d_fp_kbx, eng->d_fp_vbx,
+                               eng->d_fp_kt, eng->d_fp_vt, eng->d_fp_pb};
+        for (__nv_bfloat16 *p : bb) cudaFree(p);
+        cudaFree(eng->d_fp_st); cudaFree(eng->d_fp_m); cudaFree(eng->d_fp_l);
+        eng->d_fp_qb = eng->d_fp_kbx = eng->d_fp_vbx = NULL;
+        eng->d_fp_kt = eng->d_fp_vt = eng->d_fp_pb = eng->d_fp_st = NULL;
+        eng->d_fp_m = eng->d_fp_l = NULL;
+        return -1;
+    }
+    eng->fp_scratch_ready = 1;
     return 0;
 }
 

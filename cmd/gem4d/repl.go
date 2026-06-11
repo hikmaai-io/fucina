@@ -135,9 +135,9 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		// output distribution as plain decode, and no 1 MiB logits D2H copy +
 		// O(262k) host top-k per token. The REPL has no text stop-strings and
 		// needs no mid-flight cancellation, so eligibility is just spec-on + no
-		// repeat penalty (the spec kernel cannot apply it; mirrors
-		// server.generateResponse). Otherwise fall back to the per-token loop.
-		useSpec := args.Spec && args.RepeatPenalty == 1.0
+		// (repeat-penalty included — the engine applies it on-GPU). Otherwise
+		// fall back to the per-token loop.
+		useSpec := args.Spec
 
 		var reply string
 		genStart := time.Now()
@@ -167,7 +167,8 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			var replyBuf strings.Builder
 			toks, nAccepted, err := eng.GenerateSpecStream(cacheToks, pf.Logits,
 				nToGenerate, stops, args.DraftK, float32(args.Temperature),
-				args.TopK, float32(args.TopP), float32(args.MinP), seed,
+				args.TopK, float32(args.TopP), float32(args.MinP),
+				float32(args.RepeatPenalty), seed,
 				func(t int32) bool {
 					if tok.IsStop(t) {
 						return true

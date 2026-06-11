@@ -147,7 +147,8 @@ int gemma4_engine_generate_spec(
     int32_t         *out_tokens, int max_new,
     const int32_t   *stop_ids, int n_stop,
     int              draft_k,
-    float temp, int top_k, float top_p, float min_p, uint64_t seed,
+    float temp, int top_k, float top_p, float min_p, float repeat_penalty,
+    uint64_t seed,
     int             *n_accepted_out);
 
 // Server path: speculative generation continuing from an ALREADY-prefilled engine.
@@ -159,7 +160,8 @@ int gemma4_engine_generate_spec_continue(
     int32_t         *out_tokens, int max_new,
     const int32_t   *stop_ids, int n_stop,
     int              draft_k,
-    float temp, int top_k, float top_p, float min_p, uint64_t seed,
+    float temp, int top_k, float top_p, float min_p, float repeat_penalty,
+    uint64_t seed,
     int             *n_accepted_out);
 
 // Per-token streaming callback for the speculative generators: invoked once per
@@ -179,7 +181,8 @@ int gemma4_engine_generate_spec_stream(
     int32_t         *out_tokens, int max_new,
     const int32_t   *stop_ids, int n_stop,
     int              draft_k,
-    float temp, int top_k, float top_p, float min_p, uint64_t seed,
+    float temp, int top_k, float top_p, float min_p, float repeat_penalty,
+    uint64_t seed,
     int             *n_accepted_out,
     gemma4_token_cb  cb, void *cb_user_data);
 
