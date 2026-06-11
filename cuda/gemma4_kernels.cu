@@ -5649,6 +5649,91 @@ int gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep) {
     return 0;
 }
 
+// ─── KV sequence snapshot / restore ──────────────────────────────────
+//
+// With the flat per-position layout, a sequence's complete KV state is the
+// first n_tokens positions of each layer's K/V region — four strided 2D
+// copies (sliding K/V over all 48 layer slots, global K/V over the compact
+// global-layer slots). The host buffer layout is simply those four regions
+// concatenated. Used by the server's multi-conversation prefix cache: saving
+// the live conversation before an unrelated request evicts it turns the
+// later "switch back" from a full re-prefill (~100 s at 20k ctx) into a
+// memcpy (~ms on unified memory).
+
+// kv_seq_pitches fills the per-buffer row sizes (bytes per token per layer)
+// and layer pitches (bytes between consecutive layers' regions).
+static void kv_seq_pitches(const gemma4_engine_t *eng,
+                           size_t *srow, size_t *spitch,
+                           size_t *grow, size_t *gpitch) {
+    *srow   = (size_t)GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM * sizeof(kv_t);
+    *spitch = (size_t)eng->sliding_kv_capacity * (*srow);
+    *grow   = (size_t)GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
+    *gpitch = (size_t)eng->global_kv_capacity * (*grow);
+}
+
+size_t gemma4_engine_kv_state_size(const gemma4_engine_t *eng, int n_tokens) {
+    if (!eng || n_tokens <= 0 || n_tokens > eng->sliding_kv_capacity ||
+        n_tokens > eng->global_kv_capacity) return 0;
+    size_t srow, spitch, grow, gpitch;
+    kv_seq_pitches(eng, &srow, &spitch, &grow, &gpitch);
+    return 2 * (size_t)GEMMA4_MAX_LAYERS    * (size_t)n_tokens * srow +
+           2 * (size_t)eng->n_layers_global * (size_t)n_tokens * grow;
+}
+
+// kv_seq_copy moves the first n_tokens of all four KV regions between the
+// engine and a host buffer. dir: cudaMemcpyDeviceToHost (save) or
+// cudaMemcpyHostToDevice (restore). The synchronous Memcpy2D variants order
+// after all prior work on the device, so no explicit stream sync is needed.
+static int kv_seq_copy(gemma4_engine_t *eng, char *buf, int n_tokens,
+                       enum cudaMemcpyKind dir) {
+    size_t srow, spitch, grow, gpitch;
+    kv_seq_pitches(eng, &srow, &spitch, &grow, &gpitch);
+    const size_t swidth = (size_t)n_tokens * srow; // contiguous bytes per layer
+    const size_t gwidth = (size_t)n_tokens * grow;
+
+    struct { void *dev; size_t pitch, width; int layers; } regions[4] = {
+        { eng->d_sliding_k, spitch, swidth, GEMMA4_MAX_LAYERS },
+        { eng->d_sliding_v, spitch, swidth, GEMMA4_MAX_LAYERS },
+        { eng->d_global_k,  gpitch, gwidth, eng->n_layers_global },
+        { eng->d_global_v,  gpitch, gwidth, eng->n_layers_global },
+    };
+    for (int r = 0; r < 4; r++) {
+        cudaError_t err;
+        if (dir == cudaMemcpyDeviceToHost) {
+            err = cudaMemcpy2D(buf, regions[r].width,
+                               regions[r].dev, regions[r].pitch,
+                               regions[r].width, regions[r].layers, dir);
+        } else {
+            err = cudaMemcpy2D(regions[r].dev, regions[r].pitch,
+                               buf, regions[r].width,
+                               regions[r].width, regions[r].layers, dir);
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gem4d: kv_seq_copy region %d failed: %s\n",
+                    r, cudaGetErrorString(err));
+            return -1;
+        }
+        buf += regions[r].width * regions[r].layers;
+    }
+    return 0;
+}
+
+int gemma4_engine_kv_save(gemma4_engine_t *eng, void *buf, int n_tokens) {
+    if (!eng || !buf || n_tokens <= 0 || n_tokens > eng->global_n_tokens) return -1;
+    return kv_seq_copy(eng, (char *)buf, n_tokens, cudaMemcpyDeviceToHost);
+}
+
+int gemma4_engine_kv_restore(gemma4_engine_t *eng, const void *buf, int n_tokens) {
+    if (!eng || !buf || n_tokens <= 0 ||
+        n_tokens > eng->sliding_kv_capacity || n_tokens > eng->global_kv_capacity)
+        return -1;
+    if (kv_seq_copy(eng, (char *)buf, n_tokens, cudaMemcpyHostToDevice) != 0)
+        return -1;
+    eng->global_n_tokens = n_tokens;
+    eng->mtp_h_valid = 0; // the MTP draft state belonged to the replaced sequence
+    return 0;
+}
+
 // ─── Persistent prefill scratch allocator ───────────────────────────
 static int alloc_prefill_scratch(gemma4_engine_t *eng) {
     if (eng->pf_scratch_ready) return 0;

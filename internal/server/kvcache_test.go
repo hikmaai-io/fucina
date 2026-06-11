@@ -412,3 +412,161 @@ func TestStatsCounters(t *testing.T) {
 		t.Fatalf("DetailedStats: reusedTokens=%d want 2", reused)
 	}
 }
+
+// ─── Multi-sequence snapshot cache ──────────────────────────────────
+
+// fakeSnapEngine extends fakeEngine with the kvSnapshotter capability. The
+// "state" is just a copy of the token slice serialized as bytes — enough to
+// verify the save/restore plumbing and policy without a GPU.
+type fakeSnapEngine struct {
+	fakeEngine
+	saves, restores int
+}
+
+func (f *fakeSnapEngine) KVStateSize(n int) int {
+	if n <= 0 || n > len(f.tokens) {
+		// real engine also caps by capacity; tests don't need that path
+		if n <= 0 {
+			return 0
+		}
+	}
+	return n * 4
+}
+
+func (f *fakeSnapEngine) KVSave(buf []byte, n int) error {
+	if n > len(f.tokens) {
+		return errors.New("fakeSnapEngine: save beyond live sequence")
+	}
+	for i := 0; i < n; i++ {
+		v := f.tokens[i]
+		buf[i*4], buf[i*4+1], buf[i*4+2], buf[i*4+3] =
+			byte(v), byte(v>>8), byte(v>>16), byte(v>>24)
+	}
+	f.saves++
+	return nil
+}
+
+func (f *fakeSnapEngine) KVRestore(buf []byte, n int) error {
+	f.tokens = f.tokens[:0]
+	for i := 0; i < n; i++ {
+		v := int32(buf[i*4]) | int32(buf[i*4+1])<<8 |
+			int32(buf[i*4+2])<<16 | int32(buf[i*4+3])<<24
+		f.tokens = append(f.tokens, v)
+	}
+	f.restores++
+	return nil
+}
+
+func seq(start, n int) []int32 {
+	s := make([]int32, n)
+	for i := range s {
+		s[i] = int32(start + i)
+	}
+	return s
+}
+
+// The interloper scenario: a large conversation is evicted by a small
+// unrelated request; its next turn must restore the snapshot and prefill only
+// the new suffix instead of the whole conversation.
+func TestSnapshotSurvivesInterloper(t *testing.T) {
+	f := &fakeSnapEngine{fakeEngine: fakeEngine{window: 1 << 20}}
+	kv := NewKVCache(f)
+
+	agent := seq(1000, 2048) // big conversation (>= saveMinLossTokens)
+	res := prefillReal(t, kv, agent)
+	if res.NewTokens != 2048 {
+		t.Fatalf("cold prefill: NewTokens=%d want 2048", res.NewTokens)
+	}
+
+	// Interloper: tiny unrelated prompt destroys the live sequence — but the
+	// agent conversation must be snapshotted first.
+	interloper := seq(900000, 64)
+	prefillReal(t, kv, interloper)
+	if f.saves != 1 {
+		t.Fatalf("interloper must trigger exactly one snapshot save, got %d", f.saves)
+	}
+
+	// Agent returns with one more turn appended: restore + suffix-only prefill.
+	turn2 := append(append([]int32{}, agent...), seq(5000, 32)...)
+	res = prefillReal(t, kv, turn2)
+	if f.restores != 1 {
+		t.Fatalf("agent return must restore the snapshot, got %d restores", f.restores)
+	}
+	if res.ReusedTokens != 2048 || res.NewTokens != 32 {
+		t.Fatalf("after restore: reused=%d new=%d, want 2048/32", res.ReusedTokens, res.NewTokens)
+	}
+}
+
+// Small live sequences are not worth snapshotting; unrelated requests just
+// miss as before.
+func TestSnapshotSkipsSmallSequences(t *testing.T) {
+	f := &fakeSnapEngine{fakeEngine: fakeEngine{window: 1 << 20}}
+	kv := NewKVCache(f)
+
+	prefillReal(t, kv, seq(0, 256)) // below saveMinLossTokens
+	prefillReal(t, kv, seq(50000, 64))
+	if f.saves != 0 {
+		t.Fatalf("small sequence must not be snapshotted, got %d saves", f.saves)
+	}
+}
+
+// The byte budget evicts the least-recently-saved sequence.
+func TestSnapshotLRUEviction(t *testing.T) {
+	f := &fakeSnapEngine{fakeEngine: fakeEngine{window: 1 << 20}}
+	kv := NewKVCache(f)
+	kv.SetSnapshotBudget(2048 * 4 * 2) // room for two 2048-token states
+
+	a, b, c := seq(0, 2048), seq(100000, 2048), seq(200000, 2048)
+	prefillReal(t, kv, a)
+	prefillReal(t, kv, b) // saves a
+	prefillReal(t, kv, c) // saves b -> pool {a, b} exactly at budget
+	prefillReal(t, kv, seq(300000, 2048))
+	// saves c -> evicts a (LRU): pool must be {b, c}
+	if len(kv.saved) != 2 {
+		t.Fatalf("pool size=%d want 2", len(kv.saved))
+	}
+	if kv.saved[0].tokens[0] != b[0] || kv.saved[1].tokens[0] != c[0] {
+		t.Fatalf("pool = {%d, %d} want {%d, %d} (LRU must evict the oldest)",
+			kv.saved[0].tokens[0], kv.saved[1].tokens[0], b[0], c[0])
+	}
+}
+
+// Restoring under budget pressure: when saving the live sequence would evict
+// the very snapshot being restored, the restore must still succeed (the
+// candidate is pinned out of the pool before eviction runs).
+func TestSnapshotRestorePinnedUnderPressure(t *testing.T) {
+	f := &fakeSnapEngine{fakeEngine: fakeEngine{window: 1 << 20}}
+	kv := NewKVCache(f)
+	kv.SetSnapshotBudget(2048 * 4) // exactly ONE 2048-token state
+
+	a := seq(0, 2048)
+	prefillReal(t, kv, a)
+	prefillReal(t, kv, seq(100000, 2048)) // saves a (fills the whole budget)
+
+	// Coming back to a: the live 2048-token sequence wants saving, which can
+	// only fit by evicting something — and the only entry is a itself.
+	res := prefillReal(t, kv, append(append([]int32{}, a...), 7, 8, 9))
+	if f.restores != 1 || res.ReusedTokens != 2048 {
+		t.Fatalf("pinned restore failed (restores=%d reused=%d)", f.restores, res.ReusedTokens)
+	}
+}
+
+// SetSnapshotBudget(0) disables the feature and frees the pool.
+func TestSnapshotDisable(t *testing.T) {
+	f := &fakeSnapEngine{fakeEngine: fakeEngine{window: 1 << 20}}
+	kv := NewKVCache(f)
+	prefillReal(t, kv, seq(0, 2048))
+	prefillReal(t, kv, seq(100000, 64))
+	if f.saves != 1 {
+		t.Fatalf("expected one save before disabling, got %d", f.saves)
+	}
+	kv.SetSnapshotBudget(0)
+	if len(kv.saved) != 0 || kv.snapBytes != 0 {
+		t.Fatalf("disable must clear the pool")
+	}
+	prefillReal(t, kv, seq(0, 2048))
+	prefillReal(t, kv, seq(200000, 64))
+	if f.saves != 1 {
+		t.Fatalf("disabled cache must not save, got %d", f.saves)
+	}
+}

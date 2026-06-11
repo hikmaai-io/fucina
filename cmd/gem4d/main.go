@@ -122,6 +122,7 @@ func main() {
 		srv.SetThinkingDefault(gemserver.ParseThinkingLevel(args.Thinking))
 		srv.SetDraftK(args.DraftK)
 		srv.SetThinkBudget(args.ThinkBudget)
+		srv.SetKVSnapshotBudget(int64(args.KVSnapshotGB * (1 << 30)))
 		// Debug request dumping: --debug or --log-level debug.
 		if args.Debug || strings.EqualFold(args.LogLevel, "debug") {
 			srv.SetDebug(true)

@@ -40,6 +40,8 @@ Server options:
   --timeout N                Request timeout (default: 600s)
   --n-slots N                Number of slots (default: 1)
   --draft-k N                Speculative draft length per step (default: 6)
+  --kv-snapshot-gb F         Host-memory budget (GiB) for snapshotted KV sequences
+                             (multi-conversation prefix cache; 0 = off, default 16)
   --think-budget N           Max reasoning tokens per turn before the thought
                              channel is force-closed (0 = auto: max_tokens/2;
                              negative = unlimited)

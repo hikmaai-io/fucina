@@ -424,6 +424,11 @@ func (s *Server) SetDraftK(k int) {
 // an empty-content message.
 func (s *Server) SetThinkBudget(n int) { s.thinkBudget = n }
 
+// SetKVSnapshotBudget bounds the host memory for snapshotted KV sequences
+// (multi-conversation prefix cache; --kv-snapshot-gb). 0 disables. No effect
+// when the engine lacks snapshot support.
+func (s *Server) SetKVSnapshotBudget(bytes int64) { s.kv.SetSnapshotBudget(bytes) }
+
 // SetModelName overrides the id reported by /v1/models and echoed in responses.
 // Callers pass a quantization-aware id (e.g. derived from the GGUF filename) so
 // clients can tell which build they are talking to.

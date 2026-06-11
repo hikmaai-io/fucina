@@ -246,6 +246,16 @@ int  gemma4_engine_n_tokens(const gemma4_engine_t *eng);  // tokens in KV cache
 void gemma4_engine_reset(gemma4_engine_t *eng);           // rewind to empty
 int  gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep); // keep first n_keep
 
+// KV sequence snapshot/restore (multi-conversation prefix cache). The flat
+// per-position KV layout makes a sequence's state exactly the first n_tokens
+// positions of each K/V buffer, so save/restore are four strided 2D copies.
+// state_size returns the host-buffer size needed for n_tokens (0 on bad args);
+// save/restore return 0 on success. Restore overwrites the live sequence and
+// sets the engine token count to n_tokens.
+size_t gemma4_engine_kv_state_size(const gemma4_engine_t *eng, int n_tokens);
+int    gemma4_engine_kv_save(gemma4_engine_t *eng, void *buf, int n_tokens);
+int    gemma4_engine_kv_restore(gemma4_engine_t *eng, const void *buf, int n_tokens);
+
 // ─── CUDA Graph support (experimental, off by default) ─────────────
 // Call gemma4_engine_set_graph_mode(eng, 1) to enable. This allocates
 // persistent prefill scratch and prepares graph capture infrastructure.

@@ -29,15 +29,16 @@ type CLIArgs struct {
 	PresencePenalty  float64
 
 	// Generation
-	Prompt      string
-	PromptFile  string
-	Predict     int
-	Keep        int
-	NoDisplay   bool
-	Spec        bool
-	DraftK      int
-	ThinkBudget int  // server: reasoning-channel token budget (0=auto, <0=off)
-	CudaGraphs  bool // --cuda-graphs (experimental, off by default)
+	Prompt       string
+	PromptFile   string
+	Predict      int
+	Keep         int
+	NoDisplay    bool
+	Spec         bool
+	DraftK       int
+	ThinkBudget  int     // server: reasoning-channel token budget (0=auto, <0=off)
+	KVSnapshotGB float64 // server: host-memory budget for saved KV sequences (0 = off)
+	CudaGraphs   bool    // --cuda-graphs (experimental, off by default)
 
 	// Server
 	Host     string
@@ -104,6 +105,8 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.IntVar(&a.DraftK, "draft-k", 6, "Max speculative draft length per step")
 	fs.IntVar(&a.ThinkBudget, "think-budget", 0,
 		"Server: max reasoning-channel tokens per turn before the thought channel is force-closed (0 = auto: half of max_tokens; negative = unlimited)")
+	fs.Float64Var(&a.KVSnapshotGB, "kv-snapshot-gb", 16,
+		"Server: host-memory budget (GiB) for snapshotted KV sequences so one client cannot evict another's cached conversation (0 = off)")
 	fs.BoolVar(&a.CudaGraphs, "cuda-graphs", false, "Enable CUDA graph support (experimental, allocates persistent prefill scratch)")
 	// Defaults follow the google/gemma-4-12B model card's standardized sampling
 	// configuration (temperature 1.0, top_p 0.95, top_k 64; no min-p). The GGUF

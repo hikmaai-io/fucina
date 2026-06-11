@@ -396,6 +396,44 @@ func (e *Engine) Rewind(nKeep int) bool {
 	return C.gemma4_engine_rewind(e.ptr, C.int(nKeep)) == 0
 }
 
+// KVStateSize returns the host-buffer size in bytes needed to snapshot the
+// first nTokens of the KV cache (0 if nTokens is out of range).
+func (e *Engine) KVStateSize(nTokens int) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return int(C.gemma4_engine_kv_state_size(e.ptr, C.int(nTokens)))
+}
+
+// KVSave snapshots the first nTokens of the live KV sequence into buf (sized
+// via KVStateSize). The live sequence is untouched. ~200 KB/token, copied at
+// unified-memory bandwidth — tens of ms for a 20k-token conversation, versus
+// the ~100 s full re-prefill it replaces.
+func (e *Engine) KVSave(buf []byte, nTokens int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(buf) == 0 {
+		return fmt.Errorf("gem4d: kv save: empty buffer")
+	}
+	if C.gemma4_engine_kv_save(e.ptr, unsafe.Pointer(&buf[0]), C.int(nTokens)) != 0 {
+		return fmt.Errorf("gem4d: kv save failed (%d tokens)", nTokens)
+	}
+	return nil
+}
+
+// KVRestore overwrites the live KV sequence with a snapshot taken by KVSave
+// and sets the engine token count to nTokens.
+func (e *Engine) KVRestore(buf []byte, nTokens int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(buf) == 0 {
+		return fmt.Errorf("gem4d: kv restore: empty buffer")
+	}
+	if C.gemma4_engine_kv_restore(e.ptr, unsafe.Pointer(&buf[0]), C.int(nTokens)) != 0 {
+		return fmt.Errorf("gem4d: kv restore failed (%d tokens)", nTokens)
+	}
+	return nil
+}
+
 // TimingStats holds accumulated prefill/decode timing for speed reporting.
 type TimingStats struct {
 	PrefillTokens int
