@@ -239,6 +239,7 @@ func (r *ggufReader) skipValue(valType uint32) bool {
 //	kv     = key(string) + type(u32) + value
 //
 // We extract:
+//
 //	tokenizer.ggml.tokens        (string array) -> vocab
 //	tokenizer.ggml.scores        (float array)  -> scores
 //	tokenizer.ggml.bos_token_id  (u32/i32)
