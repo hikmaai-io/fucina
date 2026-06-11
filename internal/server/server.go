@@ -51,9 +51,16 @@ type Server struct {
 	thinkingDefault bool         // startup default for the gemma-4 reasoning channel
 	debug           bool         // dump full request bodies + rendered prompts
 	logLevel        atomic.Int32 // gates per-request access logs (see logLevelT)
+	draftK          int          // speculative draft length per step (--draft-k)
+	thinkBudget     int          // reasoning-channel token budget: 0=auto (MaxTokens/2), <0=off
+	lastUsed        atomic.Int64 // engine NTokens mirror so /metrics never blocks on the kv lock
 	metrics         Metrics
 	httpServer      *http.Server
 }
+
+// prefillAborter is satisfied by engines that support cooperative prefill
+// cancellation (cuda.Engine). Detected by assertion so test fakes stay minimal.
+type prefillAborter interface{ AbortPrefill() }
 
 // logLevelT is a tiny leveled-logging knob for the server package (no external
 // deps). Higher = quieter. Per-request access logs are emitted at Info; setting
@@ -395,10 +402,27 @@ func New(eng serverEngine, tok *tokenizer.Tokenizer) *Server {
 		kv:        NewKVCache(eng),
 		modelName: "gemma-4-12b-it",
 		genParams: DefaultParams(),
+		draftK:    6,
 	}
 	s.logLevel.Store(int32(logLevelInfo))
 	return s
 }
+
+// SetDraftK sets the speculative draft length used by the server generation
+// paths (--draft-k). Out-of-range values are ignored (engine cap is SPEC_MAX-1).
+func (s *Server) SetDraftK(k int) {
+	if k > 0 && k <= 15 {
+		s.draftK = k
+	}
+}
+
+// SetThinkBudget bounds the gemma-4 reasoning channel per request: after this
+// many thought tokens the server force-closes the channel (committing the
+// <channel|> token) and lets the model answer. 0 = auto (half of MaxTokens),
+// negative = unlimited. Guards against the runaway-thinking failure mode where
+// a turn burns the whole MaxTokens cap inside the thought channel and delivers
+// an empty-content message.
+func (s *Server) SetThinkBudget(n int) { s.thinkBudget = n }
 
 // SetModelName overrides the id reported by /v1/models and echoed in responses.
 // Callers pass a quantization-aware id (e.g. derived from the GGUF filename) so
@@ -434,18 +458,20 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 // handleMetrics reports live KV/context utilization, prefix-cache hit rate, and
 // prefill/decode throughput (cumulative + last request). JSON for easy curl/pi use.
+// LOCK-FREE: it must answer instantly even while a request holds the kv lock for
+// a multi-second prefill+generation span (s.lastUsed mirrors engine.NTokens).
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	ctxCap := int(s.engine.ContextSize())
-	s.kv.Lock()
-	used := s.engine.NTokens()
-	s.kv.Unlock()
+	used := int(s.lastUsed.Load())
 	hits, misses, reused, reqTok := s.kv.DetailedStats()
 
-	// gemma-4 KV memory (FP8, 1 byte/elem; K and V stored separately):
-	//   sliding: MAX_LAYERS(48) × KV_HEADS(8) × WINDOW(1024) × HEAD_DIM(256), fixed
-	//   global:  GLOBAL_LAYERS(8) × ctxCap × GLOBAL_HEAD_DIM(512), grows with ctx
+	// gemma-4 KV memory (FP8, 1 byte/elem; K and V stored separately). Since the
+	// flat per-position sliding cache (DECODE-30-35 Step 3) BOTH caches scale
+	// with the context capacity:
+	//   sliding: MAX_LAYERS(48) × KV_HEADS(8) × HEAD_DIM(256) × ctxCap
+	//   global:  GLOBAL_LAYERS(8) × GLOBAL_HEAD_DIM(512) × ctxCap
 	const mib = 1024.0 * 1024.0
-	slidingMB := float64(48*8*1024*256) * 2 / mib
+	slidingMB := float64(48*8*256) * float64(ctxCap) * 2 / mib
 	globalMB := float64(8*512) * float64(ctxCap) * 2 / mib
 
 	writeJSON(w, http.StatusOK, s.metrics.snapshot(
@@ -460,11 +486,23 @@ type statusRecorder struct {
 
 func (r *statusRecorder) WriteHeader(code int) { r.status = code; r.ResponseWriter.WriteHeader(code) }
 
-// Flush/Hijack are needed because the streaming handler type-asserts http.Flusher.
+// Flush is needed because the streaming handler type-asserts http.Flusher.
 func (r *statusRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Unwrap lets http.NewResponseController reach the underlying writer's
+// per-request deadline/flush support through this wrapper.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// FlushError propagates flush errors (e.g. an expired write deadline) through
+// this wrapper. Without it, ResponseController.Flush matches the error-less
+// Flush() above and always reports nil — which silently killed the
+// stalled-client cutoff (sseWriter.stalled) in production.
+func (r *statusRecorder) FlushError() error {
+	return http.NewResponseController(r.ResponseWriter).Flush()
 }
 
 // logRequest logs each HTTP request's method, path, status, and duration so that
@@ -503,6 +541,9 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Bound the body read: an agent context is large (hundreds of KB) but finite;
+	// without a cap any client could OOM the process that also owns the GPU.
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -581,12 +622,27 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	ctx := int(s.engine.ContextSize())
 	if req.MaxTokens > 0 {
 		params.MaxTokens = req.MaxTokens // explicit client cap
+		// Clamp to the window. A client (pi) sizes max_tokens to its CONFIGURED
+		// contextWindow, which may exceed the server's actual --ctx. Left unclamped,
+		// budget = ctx-MaxTokens below goes negative, the compaction guard never
+		// fires, and an over-long prompt is pushed into a smaller KV cache (window
+		// wrap → garbage + full re-prefill every turn). Reserve at least half the
+		// window for the prompt so completion can never starve prefill entirely.
+		if cap := ctx / 2; params.MaxTokens > cap {
+			params.MaxTokens = cap
+		}
 	} else {
-		// No client cap (pi omits max_tokens): generate until EOS or the context
-		// fills — matching llama.cpp (n_predict = -1, "no limit") and vLLM (defaults
-		// max_tokens to max_model_len - prompt_tokens). Cap to the space left after
-		// the prompt; the model stops at end-of-turn on its own well before this.
-		params.MaxTokens = ctx - len(tokens)
+		// No client cap (pi omits max_tokens). DO NOT set MaxTokens = ctx-len(tokens):
+		// that collapses the completion budget toward zero as the conversation grows,
+		// and at full context clamps to 1 token — so pi gets a single-token (dead)
+		// reply and the compaction guard below (budget = ctx-MaxTokens = len(tokens))
+		// never even fires. Instead RESERVE a fixed completion budget and let
+		// compaction trim the OLDEST prompt tokens to make room. The model stops at
+		// EOS/end-of-turn on its own well before this bound; it is only a runaway cap.
+		params.MaxTokens = s.genParams.MaxTokens // generous default (DefaultParams: 8192)
+		if cap := ctx / 2; params.MaxTokens > cap {
+			params.MaxTokens = cap // never starve the prompt of room
+		}
 		if params.MaxTokens < 1 {
 			params.MaxTokens = 1
 		}
@@ -611,20 +667,102 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		tokens = kept
 	}
 
+	// Streaming requests get their first bytes BEFORE the prefill: SSE headers +
+	// role delta now (~1ms TTFB instead of the full prefill latency), then a
+	// ": ping" heartbeat while the prefill runs, so the client (and any proxy)
+	// can tell a working server from a hung one. Consequence: any later failure
+	// must be reported in-stream — the 200 is already on the wire.
+	var sse *sseWriter
+	if params.Stream {
+		var ok bool
+		sse, ok = newSSEWriter(w, legacy, s.modelName)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+		sse.begin()
+	}
+
 	// Acquire the single physical KV cache for the whole request (prefill +
 	// generation). The handler is the lock OWNER: it holds the lock for the
 	// entire prefill+generation span and releases it here via defer. The
 	// response helpers run while this lock is held and must NOT unlock it.
+	if sse != nil {
+		sse.startHeartbeat(10 * time.Second)
+		// Panic safety only: every normal path stops the heartbeat explicitly
+		// (and MUST, before any token write). stopHeartbeat is idempotent; this
+		// defer prevents a leaked goroutine writing to a dead ResponseWriter if
+		// Prefill panics.
+		defer sse.stopHeartbeat()
+	}
 	s.kv.Lock()
 	defer s.kv.Unlock()
+
+	// The wait for the lock can be long (another request's prefill+generation).
+	// If the client gave up in the meantime, don't burn a prefill for a dead
+	// socket — N rapid abort+retry cycles otherwise stack N zombie prefills.
+	if r.Context().Err() != nil {
+		if sse != nil {
+			sse.stopHeartbeat()
+			s.finishStream(sse, "cancelled", len(tokens), 0)
+		} else {
+			http.Error(w, "client closed request", 499)
+		}
+		log.Printf("gem4d: request cancelled while queued; skipping prefill")
+		return
+	}
+
+	// Cooperative prefill cancellation: a watcher trips the engine's abort flag
+	// when the client disconnects, so an ESC during a long prefill stops at the
+	// next chunk/layer boundary instead of grinding on with the lock held.
+	prefillDone := make(chan struct{})
+	watcherDone := make(chan struct{})
+	if ab, ok := s.engine.(prefillAborter); ok {
+		go func() {
+			defer close(watcherDone)
+			select {
+			case <-r.Context().Done():
+				ab.AbortPrefill()
+			case <-prefillDone:
+			}
+		}()
+	} else {
+		close(watcherDone)
+	}
 
 	// Cache-aware prefill: reuse the longest cached prefix and compute only the
 	// divergent suffix. The returned logits are for the final prompt token, so
 	// no phantom Decode(0) is needed.
 	prefillStart := time.Now()
 	pf, err := s.kv.Prefill(tokens)
+	close(prefillDone)
+	// JOIN the watcher before proceeding: a stale AbortPrefill must land while
+	// THIS request still holds the kv lock, so the next request's chain-head
+	// clear erases it. An un-joined watcher could fire after the next request's
+	// prefill started and spuriously abort it (confirmed race).
+	<-watcherDone
+	if sse != nil {
+		sse.stopHeartbeat() // heartbeat must be joined before any token writes
+	}
 	if err != nil {
-		http.Error(w, fmt.Sprintf("prefill failed: %v", err), http.StatusInternalServerError)
+		s.lastUsed.Store(int64(s.engine.NTokens())) // keep the /metrics mirror honest
+		if r.Context().Err() != nil {
+			// Client-initiated abort (the watcher tripped the engine flag) —
+			// not a server fault. The prefix cache keeps the shared prefix
+			// (kvcache treats aborts as consistent), so the retry re-prefills
+			// only the suffix.
+			log.Printf("gem4d: prefill aborted by client disconnect")
+			if sse != nil {
+				s.finishStream(sse, "cancelled", len(tokens), 0)
+			}
+			return
+		}
+		log.Printf("gem4d: prefill failed: %v", err)
+		if sse != nil {
+			sse.errorEvent(fmt.Sprintf("prefill failed: %v", err))
+		} else {
+			http.Error(w, fmt.Sprintf("prefill failed: %v", err), http.StatusInternalServerError)
+		}
 		return
 	}
 	prefillElapsed := time.Since(prefillStart)
@@ -635,6 +773,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	}
 	s.metrics.recordPrefill(pf.NewTokens, prefillElapsed.Seconds())
 	used := s.engine.NTokens()
+	s.lastUsed.Store(int64(used))
 	log.Printf("gem4d: prefill %d tokens (%d cached, %d new) in %.2fs (%.1f tok/s) | ctx %d/%d (%.0f%%)",
 		promptTokens, pf.ReusedTokens, pf.NewTokens, prefillElapsed.Seconds(), prefillTPS,
 		used, ctx, 100.0*float64(used)/float64(ctx))
@@ -642,10 +781,35 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	logits := pf.Logits
 
 	if params.Stream {
-		s.streamResponse(r.Context(), w, params, promptTokens, logits, wantTools, legacy)
+		s.streamResponse(r.Context(), sse, params, promptTokens, logits, wantTools)
 	} else {
 		s.generateResponse(r.Context(), w, params, promptTokens, logits, wantTools, legacy)
 	}
+	s.lastUsed.Store(int64(s.engine.NTokens()))
+}
+
+// finishStream emits the terminal finish_reason + usage chunk and [DONE] on an
+// already-begun SSE stream (used by the early-exit paths that never generate).
+func (s *Server) finishStream(sse *sseWriter, finish string, promptTokens, completion int) {
+	usage := &Usage{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completion,
+		TotalTokens:      promptTokens + completion,
+	}
+	if sse.legacy {
+		sse.event(CompletionStreamResponse{
+			ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
+			Choices: []CompletionStreamChoice{{Index: 0, Text: "", FinishReason: finish}},
+			Usage:   usage,
+		})
+	} else {
+		sse.event(StreamResponse{
+			ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
+			Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: finish}},
+			Usage:   usage,
+		})
+	}
+	sse.done()
 }
 
 func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
@@ -660,6 +824,10 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleHealth is LOCK-FREE for the same reason as /metrics: a health endpoint
+// that blocks behind an in-flight request's kv lock reports "dead" precisely
+// while the server is doing its job (engine.NTokens takes the engine mutex,
+// held across the whole prefill — use the atomic mirror instead).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	hits, misses, hitRate := s.kv.Stats()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -668,7 +836,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"prefix_hits":    hits,
 			"prefix_misses":  misses,
 			"token_hit_rate": hitRate,
-			"cached_tokens":  s.engine.NTokens(),
+			"cached_tokens":  s.lastUsed.Load(),
 			"context_size":   s.engine.ContextSize(),
 		},
 	})
@@ -717,6 +885,169 @@ func (s *Server) renderChatTemplate(messages []ChatMessage, tools []Tool, enable
 	return r.Render(msgs)
 }
 
+// runSpec drives the speculative generation engine with the server-side guards
+// shared by the streaming and non-streaming paths:
+//
+//   - client cancellation (checked per token via the engine callback);
+//   - repetition-loop detection (true period detection on emitted ids — the
+//     Req3 runaway burned 130s/8192 tokens in a cycle the drafter accelerated);
+//   - a reasoning-channel token budget: when the model has thought for `budget`
+//     tokens without closing the channel, the server stops the engine, COMMITS
+//     a <channel|> token itself (Decode — safe here: the engine mutex is free
+//     once GenerateSpecStream returns; calling Decode from inside the callback
+//     would self-deadlock), and resumes generation so the turn still produces
+//     an answer instead of an empty-content message.
+//
+// emit is the caller's per-token handler (the streaming state machine); nil for
+// non-streaming. Returns all generated tokens (markers included, plus any
+// injected <channel|>), a finish_reason — "stop", "length", "cancelled", or ""
+// when emit asked to stop (the caller knows why) — and the first engine error.
+// The prefix cache is synced with engine-committed tokens after every round;
+// the caller must hold the kv lock.
+func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []float32,
+	stops []int32, emit func(int32) bool) ([]int32, string, error) {
+
+	chOpen, chEnd := s.tokenizer.ChannelOpen, s.tokenizer.ChannelEnd
+	tcOpen, tcEnd := s.tokenizer.ToolCallOpen, s.tokenizer.ToolCallEnd
+	budget := s.thinkBudget
+	if budget == 0 {
+		budget = params.MaxTokens / 2 // auto: never let thinking eat the whole turn
+	}
+	seed := uint64(params.Seed)
+	if params.Seed < 0 {
+		seed = uint64(time.Now().UnixNano())
+	}
+
+	const (
+		stopNone = iota
+		stopCancelled
+		stopLoop
+		stopThink
+		stopEmit
+	)
+	var all []int32
+	detector := &cycleDetector{}
+	thinkToks, inCh, inTC, thinkClosed := 0, false, false, false
+	remaining := params.MaxTokens
+
+	for remaining > 0 {
+		why := stopNone
+		history := s.kv.CurrentTokens()
+		baseN := s.engine.NTokens()
+		toks, _, err := s.engine.GenerateSpecStream(history, logits, remaining, stops,
+			s.draftK, float32(params.Temperature), params.TopK,
+			float32(params.TopP), float32(params.MinP), seed,
+			func(t int32) bool {
+				if ctx.Err() != nil {
+					why = stopCancelled
+					return true
+				}
+				// Channel/tool tracking for the thinking budget. Tool-call spans
+				// are excluded: their tokens are not "thinking", and the budget
+				// must never fire inside one (the force-closed <channel|> would
+				// be committed into the middle of the buffered call body).
+				switch {
+				case tcOpen >= 0 && t == tcOpen:
+					inTC = true
+				case tcEnd >= 0 && t == tcEnd:
+					inTC = false
+				case chOpen >= 0 && t == chOpen:
+					inCh = true
+				case chEnd >= 0 && t == chEnd:
+					inCh = false
+				case inCh && !inTC:
+					thinkToks++
+				}
+				if detector.push(t) {
+					why = stopLoop
+					return true
+				}
+				if emit != nil && emit(t) {
+					why = stopEmit
+					return true
+				}
+				if inCh && !inTC && !thinkClosed && budget > 0 && thinkToks >= budget {
+					why = stopThink
+					return true
+				}
+				return false
+			})
+		// Sync the prefix cache with the tokens actually committed to the engine
+		// KV (a trailing emitted token may not be forwarded) so the next request
+		// reuses this response's prefix.
+		committed := s.engine.NTokens() - baseN
+		appended := committed
+		if appended > len(toks) {
+			appended = len(toks)
+		}
+		for i := 0; i < appended; i++ {
+			s.kv.AppendDecoded(toks[i])
+		}
+		all = append(all, toks...)
+		remaining -= len(toks)
+		seed++ // a resumed round must not replay the same random draws
+		if err != nil {
+			// Make truncation visible: a mid-stream engine failure must not
+			// look like a clean completion to an agent client.
+			return all, "length", err
+		}
+
+		switch why {
+		case stopCancelled:
+			return all, "cancelled", nil
+		case stopLoop:
+			log.Printf("gem4d: WARNING: repetition loop detected after %d tokens — cutting generation", len(all))
+			return all, "length", nil
+		case stopEmit:
+			return all, "", nil
+		case stopThink:
+			if chEnd < 0 || remaining <= 0 {
+				return all, "length", nil
+			}
+			// The verify pass commits the WHOLE accepted run before the per-token
+			// emission loop, so when the budget stopped the callback mid-run the
+			// engine holds accepted-but-unemitted tokens beyond `appended`. Trim
+			// them: the injected <channel|> must land exactly after the last
+			// token recorded in cachedTokens, or the bookkeeping and the KV
+			// CONTENT diverge silently and the next request reuses a corrupted
+			// prefix (confirmed by review).
+			if !s.engine.Rewind(baseN + appended) {
+				return all, "length", nil
+			}
+			lg, derr := s.engine.Decode(chEnd) // commit <channel|> into the KV
+			if derr != nil {
+				return all, "length", derr
+			}
+			s.kv.AppendDecoded(chEnd)
+			all = append(all, chEnd)
+			remaining--
+			detector.push(chEnd)
+			inCh, thinkClosed = false, true
+			if emit != nil && emit(chEnd) { // streaming state machine closes its channel
+				return all, "", nil // it asked to stop — honor it
+			}
+			log.Printf("gem4d: thinking budget (%d tokens) reached — force-closed the thought channel", budget)
+			logits = lg
+			continue
+		default:
+			// The engine stopped on its own: a stop token, or max_new exhausted.
+			if n := len(toks); n > 0 {
+				last := toks[n-1]
+				for _, sid := range stops {
+					if last == sid {
+						return all, "stop", nil
+					}
+				}
+			}
+			if remaining <= 0 {
+				return all, "length", nil // hit the cap mid-output: tell the client
+			}
+			return all, "stop", nil
+		}
+	}
+	return all, "length", nil
+}
+
 // generateResponse runs non-streaming generation. The caller (handler) is the
 // lock OWNER and holds s.kv.Lock() for the whole request; this function runs
 // under that lock and must NOT release it. When legacy is true it emits the
@@ -728,66 +1059,74 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 	genStart := time.Now()
 	finish := "stop"
 
-	// The speculative fast-path is a single blocking engine call: it cannot check
-	// text stop-strings or honor mid-flight cancellation. Use it only when neither
-	// is needed; otherwise fall back to the per-token CPU loop.
+	// The speculative fast-path streams through a per-token callback, so it
+	// supports cancellation, loop detection and the thinking budget (runSpec).
+	// Only repeat-penalty and text stop-strings still need the per-token CPU loop.
 	useSpec := params.RepeatPenalty == 1.0 && len(params.Stop) == 0
 
 	if useSpec {
 		// Speculative decoding (default): one weight pass per [g, draft...], same
 		// output distribution as plain decode. Continues from the prefilled state.
+		// Generation runs to end-of-turn (NOT the first tool-call end), so a turn
+		// may carry MULTIPLE tool calls; parseToolCalls extracts them all.
 		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
-		if wantTools && tcEnd >= 0 {
-			stops = append(stops, tcEnd)
-		}
-		seed := uint64(params.Seed)
-		if params.Seed < 0 {
-			seed = uint64(time.Now().UnixNano())
-		}
-		history := s.kv.CurrentTokens()
 		var err error
-		toks, _, err = s.engine.GenerateSpecContinue(history, logits, params.MaxTokens,
-			stops, 6, float32(params.Temperature), params.TopK,
-			float32(params.TopP), float32(params.MinP), seed)
+		var specFinish string
+		toks, specFinish, err = s.runSpec(ctx, params, logits, stops, nil)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("generation failed: %v", err), http.StatusInternalServerError)
-			return
+			if len(toks) == 0 {
+				http.Error(w, fmt.Sprintf("generation failed: %v", err), http.StatusInternalServerError)
+				return
+			}
+			// Partial output: deliver what exists, but make the failure visible.
+			log.Printf("gem4d: generation error after %d tokens: %v", len(toks), err)
 		}
-		// Sync the prefix cache with the tokens actually committed to the engine
-		// KV (a trailing stop token may be emitted but not forwarded).
-		committed := s.engine.NTokens() - promptTokens
-		for i := 0; i < committed && i < len(toks); i++ {
-			s.kv.AppendDecoded(toks[i])
+		if specFinish != "" {
+			finish = specFinish
 		}
 		generated = len(toks)
 	} else {
-		// Per-token decode loop with the CPU sampler: required for repeat-penalty,
-		// text stop-sequences, and cancellation ("steering").
+		// Per-token decode loop with the CPU sampler: required for repeat-penalty
+		// and text stop-sequences.
 		rng := rand.New(rand.NewSource(params.Seed))
+		detector := &cycleDetector{}
+		capExit := true
 		for generated < params.MaxTokens {
 			if logits == nil {
+				capExit = false
 				break
 			}
 			if ctx.Err() != nil { // client aborted / steered away
 				finish = "cancelled"
+				capExit = false
 				break
 			}
 			token, err := s.sampleToken(logits, params, rng)
 			if err != nil || s.tokenizer.IsStop(token) {
+				capExit = false
 				break
 			}
 			toks = append(toks, token)
 			generated++
+			if detector.push(token) {
+				log.Printf("gem4d: WARNING: repetition loop detected after %d tokens — cutting generation", generated)
+				finish = "length"
+				capExit = false
+				break
+			}
 			if wantTools && tcEnd >= 0 && token == tcEnd {
+				capExit = false
 				break
 			}
 			if hit, trimmed := stopHit(s.tokenizer.Decode(toks), params.Stop); hit {
 				toks = s.tokenizer.Encode(trimmed, false, false)
+				capExit = false
 				break
 			}
 			var err2 error
 			logits, err2 = s.engine.Decode(token)
 			if err2 != nil {
+				capExit = false
 				break
 			}
 			// Record the token in the prefix cache only AFTER Decode commits it
@@ -797,6 +1136,9 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			// on every stop-sequence request, and the next Prefill had to heal
 			// the skew (a warning plus one lost token of reuse).
 			s.kv.AppendDecoded(token)
+		}
+		if capExit && finish == "stop" {
+			finish = "length" // ran into MaxTokens mid-output: tell the client
 		}
 	}
 	s.logGenSpeed(genStart, generated)
@@ -808,11 +1150,24 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 	reasoning, rest := splitReasoning(s.tokenizer.DecodeRaw(toks))
 	msg.ReasoningContent = reasoning
 	if wantTools {
+		if finish == "length" || finish == "cancelled" {
+			// Truncated turn: never dispatch a trailing UNTERMINATED call whose
+			// arguments were cut at an arbitrary token (mirror of the streaming
+			// path's guard); complete earlier calls still parse.
+			if o := strings.LastIndex(rest, "<|tool_call>"); o > strings.LastIndex(rest, "<tool_call|>") {
+				rest = rest[:o]
+			}
+		}
 		content, calls := parseToolCalls(rest)
-		msg.Content = content
+		// parseToolCalls leaves non-call text as-is; with generation running to
+		// end-of-turn the literal "<turn|>" marker would otherwise leak into
+		// message.content (streaming never emits markers — keep parity).
+		msg.Content = strings.TrimSpace(stripMarkers(content))
 		if len(calls) > 0 {
 			msg.ToolCalls = calls
-			finish = "tool_calls"
+			if finish != "cancelled" {
+				finish = "tool_calls"
+			}
 		}
 	} else {
 		// rest still carries control markers as literal strings (DecodeRaw); strip
@@ -857,56 +1212,29 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 	})
 }
 
-// streamResponse runs streaming generation. The caller (handler) is the lock
-// OWNER and holds s.kv.Lock() for the whole request; this function runs under
-// that lock and must NOT release it. When legacy is true it emits the
-// /v1/completions text_completion stream shape (choices[].text) instead of the
-// chat.completion.chunk shape (choices[].delta).
-func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools, legacy bool) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
+// streamResponse runs streaming generation over an already-begun SSE session
+// (headers + role delta went out before the prefill; see serveCompletions).
+// The caller (handler) is the lock OWNER and holds s.kv.Lock() for the whole
+// request; this function runs under that lock and must NOT release it.
+func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools bool) {
+	legacy := sse.legacy
 	generated := 0
-	object := "chat.completion.chunk"
-	idPrefix := "chatcmpl"
-	if legacy {
-		object = "text_completion"
-		idPrefix = "cmpl"
-	}
-	completionID := fmt.Sprintf("%s-%d", idPrefix, time.Now().UnixNano())
-	created := time.Now().Unix()
 	genStart := time.Now()
 
 	// emitContent streams a piece of visible text in the right wire shape for the
 	// active endpoint (chat delta vs legacy text).
 	emitContent := func(text string) {
 		if legacy {
-			writeSSE(w, CompletionStreamResponse{
-				ID: completionID, Object: object, Created: created, Model: s.modelName,
+			sse.event(CompletionStreamResponse{
+				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
 				Choices: []CompletionStreamChoice{{Index: 0, Text: text}},
 			})
 		} else {
-			writeSSE(w, StreamResponse{
-				ID: completionID, Object: object, Created: created, Model: s.modelName,
+			sse.event(StreamResponse{
+				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
 				Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: text}}},
 			})
 		}
-		flusher.Flush()
-	}
-
-	// Role delta (chat only; legacy text_completion has no role).
-	if !legacy {
-		writeSSE(w, StreamResponse{
-			ID: completionID, Object: object, Created: created, Model: s.modelName,
-			Choices: []StreamChoice{{Index: 0, Delta: Delta{Role: "assistant"}}},
-		})
-		flusher.Flush()
 	}
 
 	tcOpen := s.tokenizer.ToolCallOpen
@@ -919,13 +1247,23 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 	inTool := false             // currently inside a <|tool_call> … <tool_call|> span
 	inChannel := false          // currently inside a <|channel> … <channel|> reasoning span
 	channelLabel := false       // still skipping the "thought" label at a channel's start
+	completedCalls := 0         // tool calls fully captured this turn (multi-call support)
+	toolToks := 0               // tokens buffered inside the CURRENT tool-call span
+
+	// Bounds for the tool-call buffer. The Req3 incident: a repetition loop
+	// INSIDE an unterminated tool call silently swallowed ~7950 of 8192 tokens —
+	// no wire output, no warning, a dead turn. The cap turns that failure mode
+	// into a visible, bounded one (the cycle detector in runSpec usually fires
+	// first; this is the backstop for non-cyclic runaways).
+	const maxToolToks = 2048
+	const maxToolCalls = 8
 
 	// processToken runs the streaming state machine for ONE generated token —
 	// tool-call buffering, the reasoning channel, marker suppression, stop
 	// sequences, SSE emission — and reports whether generation must stop after
 	// it. It is shared by the speculative path (where the engine invokes it as
-	// the per-token callback) and the repeat-penalty fallback loop below, so
-	// both paths stream byte-identical wire output.
+	// the per-token callback via runSpec) and the repeat-penalty fallback loop
+	// below, so both paths stream byte-identical wire output.
 	processToken := func(token int32) bool {
 		if s.tokenizer.IsStop(token) {
 			return true
@@ -933,19 +1271,49 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 		rawToks = append(rawToks, token)
 		generated++
 
+		// A stalled client (write deadline expired) can't be streamed to; its
+		// blocked writes would otherwise wedge the engine callback forever.
+		if sse.stalled() {
+			finish = "cancelled"
+			return true
+		}
+
 		// Tool-call handling: when the model opens a call, stop streaming content
-		// and buffer until the call closes — we emit it as a structured tool_calls
-		// delta after the loop. Mirrors the non-streaming spec path (one call/turn).
-		if wantTools && tcOpen >= 0 && token == tcOpen {
+		// and buffer until the call closes — calls are emitted as structured
+		// tool_calls deltas after the loop. A closed call does NOT stop the turn:
+		// the model may emit further calls (multi/parallel tool calls); the turn
+		// ends at end-of-turn, on the first prose after a call, or at the caps.
+		if wantTools && tcOpen >= 0 && token == tcOpen && !inTool {
+			// !inTool: a re-emitted open marker inside an unterminated span must
+			// NOT reset the counter — that would defeat the maxToolToks backstop
+			// for exactly the runaway it exists to bound.
 			inTool = true
+			toolToks = 0
 		}
 		if inTool {
-			return tcEnd >= 0 && token == tcEnd // true → complete tool call captured
+			toolToks++
+			if tcEnd >= 0 && token == tcEnd {
+				inTool = false
+				completedCalls++
+				return completedCalls >= maxToolCalls
+			}
+			if toolToks > maxToolToks {
+				log.Printf("gem4d: WARNING: unterminated tool call exceeded %d buffered tokens — cutting generation (runaway inside a tool-call span)", maxToolToks)
+				finish = "length"
+				return true
+			}
+			if toolToks%64 == 0 {
+				sse.ping() // liveness during the silently-buffered span
+			}
+			return false
 		}
 
 		// Reasoning channel: stream <|channel>thought … <channel|> as reasoning_content
 		// (not content), so the client can show/hide the thinking block separately.
 		if chOpen >= 0 && token == chOpen {
+			if completedCalls > 0 {
+				return true // calls captured and the model is moving on — dispatch them
+			}
 			inChannel = true
 			channelLabel = true // next text token is the "thought" label — skip it
 			return false
@@ -969,11 +1337,10 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 					// Legacy text_completion has no reasoning channel; fold it into text.
 					emitContent(rtext)
 				} else {
-					writeSSE(w, StreamResponse{
-						ID: completionID, Object: object, Created: created, Model: s.modelName,
+					sse.event(StreamResponse{
+						ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
 						Choices: []StreamChoice{{Index: 0, Delta: Delta{ReasoningContent: rtext}}},
 					})
-					flusher.Flush()
 				}
 			}
 			return false
@@ -985,6 +1352,14 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 		}
 
 		tokenStr := s.tokenizer.Decode([]int32{token})
+
+		// After ≥1 completed tool call, whitespace between/after calls is
+		// swallowed and the first real prose ends the turn — the captured calls
+		// are dispatched together (the gemma turn normally closes right after
+		// its call block, so this costs nothing in the common case).
+		if completedCalls > 0 {
+			return strings.TrimSpace(tokenStr) != ""
+		}
 
 		// Stop-sequence handling: if appending this piece completes a stop string,
 		// emit only the NOT-YET-STREAMED text up to the stop and finish. When part
@@ -1011,110 +1386,98 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, para
 		// Speculative fast path (default): MTP/prompt-lookup drafting with batched
 		// verify — one weight pass per accepted run instead of one per token — and
 		// every token streams through processToken via the engine's per-token
-		// callback. Same output distribution as the per-token loop. Stop strings
-		// and cancellation work through the callback's stop signal; only
-		// repeat-penalty (which the spec kernel cannot apply) uses the loop below.
+		// callback. runSpec adds the shared guards: cancellation, repetition-loop
+		// cut-off, and the thinking budget (force-closes a runaway thought channel
+		// and resumes). Generation runs to end-of-turn, not the first tool call,
+		// so multi-call turns work.
 		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
-		if wantTools && tcEnd >= 0 {
-			stops = append(stops, tcEnd)
+		_, specFinish, err := s.runSpec(ctx, params, logits, stops, processToken)
+		if err != nil {
+			log.Printf("gem4d: generation error after %d tokens: %v", generated, err)
 		}
-		seed := uint64(params.Seed)
-		if params.Seed < 0 {
-			seed = uint64(time.Now().UnixNano())
-		}
-		history := s.kv.CurrentTokens()
-		toks, _, err := s.engine.GenerateSpecStream(history, logits, params.MaxTokens,
-			stops, 6, float32(params.Temperature), params.TopK,
-			float32(params.TopP), float32(params.MinP), seed,
-			func(t int32) bool {
-				// Honor client cancellation ("steering"): if pi aborts the
-				// request, stop generating and release the KV lock.
-				if ctx.Err() != nil {
-					finish = "cancelled"
-					return true
-				}
-				return processToken(t)
-			})
-		if err == nil {
-			// Sync the prefix cache with the tokens actually committed to the
-			// engine KV (a trailing emitted token may not be forwarded yet) so
-			// the next request reuses this response's prefix.
-			committed := s.engine.NTokens() - promptTokens
-			for i := 0; i < committed && i < len(toks); i++ {
-				s.kv.AppendDecoded(toks[i])
-			}
+		if specFinish != "" {
+			finish = specFinish
 		}
 	} else {
 		// Per-token decode loop with the host sampler: required for repeat-penalty
 		// (it edits logits using the token history, which the spec kernel cannot).
 		rng := rand.New(rand.NewSource(params.Seed))
+		detector := &cycleDetector{}
+		capExit := true
 		for generated < params.MaxTokens {
 			if ctx.Err() != nil {
 				finish = "cancelled"
+				capExit = false
 				break
 			}
 			if logits == nil {
+				capExit = false
 				break
 			}
 			token, err := s.sampleToken(logits, params, rng)
 			if err != nil {
+				capExit = false
 				break
 			}
 			if processToken(token) {
 				// Stop WITHOUT decoding the final token: it never enters the
 				// engine KV, so it must not be recorded in the prefix cache.
+				capExit = false
+				break
+			}
+			if detector.push(token) {
+				log.Printf("gem4d: WARNING: repetition loop detected after %d tokens — cutting generation", generated)
+				finish = "length"
+				capExit = false
 				break
 			}
 			logits, err = s.engine.Decode(token)
 			if err != nil {
+				capExit = false
 				break
 			}
 			// Record the token only AFTER Decode commits it to the engine KV.
 			s.kv.AppendDecoded(token)
 		}
+		if capExit && finish == "stop" {
+			finish = "length" // ran into MaxTokens mid-output: tell the client
+		}
 	}
 
 	// Emit any captured tool call(s) as a structured delta before the final chunk.
 	if wantTools {
-		if _, calls := parseToolCalls(s.tokenizer.DecodeRaw(rawToks)); len(calls) > 0 {
+		raw := s.tokenizer.DecodeRaw(rawToks)
+		if inTool && (finish == "length" || finish == "cancelled") {
+			// The turn was TRUNCATED inside an unterminated call: its arguments
+			// are arbitrarily-cut text (often the repetition cycle itself). The
+			// lenient recovery in parseToolCalls must not dispatch it — drop the
+			// trailing unterminated span; complete earlier calls still go out.
+			if i := strings.LastIndex(raw, "<|tool_call>"); i >= 0 {
+				raw = raw[:i]
+			}
+		}
+		if _, calls := parseToolCalls(raw); len(calls) > 0 {
 			deltas := make([]DeltaToolCall, len(calls))
 			for i, c := range calls {
 				deltas[i] = DeltaToolCall{Index: i, ID: c.ID, Type: c.Type, Function: c.Function}
 			}
-			writeSSE(w, StreamResponse{
-				ID: completionID, Object: "chat.completion.chunk", Created: created, Model: s.modelName,
+			sse.event(StreamResponse{
+				ID: sse.id, Object: "chat.completion.chunk", Created: sse.created, Model: s.modelName,
 				Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: deltas}}},
 			})
-			flusher.Flush()
-			finish = "tool_calls"
+			if finish != "cancelled" {
+				finish = "tool_calls"
+			}
+		} else if inTool {
+			// The stream ended inside an unterminated tool-call span and nothing
+			// parseable was recovered: ~toolToks tokens of model output are being
+			// dropped. Without this line the turn dies silently (the Req3 mode).
+			log.Printf("gem4d: WARNING: generation ended inside an unterminated tool call (%d tokens buffered, finish=%s) — no tool_calls emitted", toolToks, finish)
 		}
 	}
 
 	s.logGenSpeed(genStart, generated)
-
-	// Final chunk carries finish_reason AND usage so the client can track context
-	// consumption (prompt + completion tokens) on streamed responses, matching the
-	// non-streaming path. OpenAI sends usage on the terminal chunk.
-	usage := &Usage{
-		PromptTokens:     promptTokens,
-		CompletionTokens: generated,
-		TotalTokens:      promptTokens + generated,
-	}
-	if legacy {
-		writeSSE(w, CompletionStreamResponse{
-			ID: completionID, Object: object, Created: created, Model: s.modelName,
-			Choices: []CompletionStreamChoice{{Index: 0, Text: "", FinishReason: finish}},
-			Usage:   usage,
-		})
-	} else {
-		writeSSE(w, StreamResponse{
-			ID: completionID, Object: object, Created: created, Model: s.modelName,
-			Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: finish}},
-			Usage:   usage,
-		})
-	}
-	writeDONE(w)
-	flusher.Flush()
+	s.finishStream(sse, finish, promptTokens, generated)
 }
 
 // logGenSpeed logs generation throughput in tokens/second and records it for /metrics.
@@ -1154,16 +1517,6 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func writeSSE(w http.ResponseWriter, v interface{}) {
-	data, _ := json.Marshal(v)
-	fmt.Fprintf(w, "data: %s\n\n", data)
-}
-
-// writeDONE writes the terminal SSE sentinel that OpenAI-style clients expect.
-func writeDONE(w http.ResponseWriter) {
-	fmt.Fprint(w, "data: [DONE]\n\n")
-}
-
 // stopHit reports whether `text` contains any of the stop strings. If so it
 // returns the text truncated at the FIRST stop occurrence (the stop string
 // itself is removed), matching OpenAI semantics.
@@ -1186,7 +1539,17 @@ func stopHit(text string, stops []string) (bool, string) {
 func (s *Server) Start(addr string) error {
 	mux := http.NewServeMux()
 	s.RegisterRoutes(mux)
-	s.httpServer = &http.Server{Addr: addr, Handler: mux}
+	s.httpServer = &http.Server{
+		Addr:    addr,
+		Handler: mux,
+		// ReadHeaderTimeout closes slowloris sockets; IdleTimeout reaps dead
+		// keep-alive connections. ReadTimeout/WriteTimeout stay ZERO on purpose:
+		// a WriteTimeout is measured from the end of the header read and would
+		// kill long SSE streams (multi-minute generations); per-flush write
+		// deadlines (sseWriter.flush) bound stalled clients instead.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	log.Printf("gem4d: server listening on %s", addr)
 	return s.httpServer.ListenAndServe()
 }

@@ -205,11 +205,14 @@ func (f *fakeServerEngine) GenerateSpecStream(history []int32, firstLogits []flo
 		}
 		return false
 	}
+	// Consume the script from the shared cursor (NOT from the start) so a
+	// resumed round — the server's thinking-budget force-close re-enters
+	// generation after a Decode — continues where the previous round stopped,
+	// like the real engine's KV-continuation does.
 	out := make([]int32, 0, len(f.script))
-	for i, tk := range f.script {
-		if i >= maxNew {
-			break
-		}
+	for len(out) < maxNew && f.cursor < len(f.script) {
+		tk := f.script[f.cursor]
+		f.cursor++
 		out = append(out, tk)
 		f.tokens = append(f.tokens, tk)
 		if emit != nil && emit(tk) {
@@ -549,6 +552,41 @@ func TestChatCompletionsContextCompaction(t *testing.T) {
 	// re-prepended, allowing budget+1).
 	if f.lastPrefillLen > budget+1 {
 		t.Errorf("prefilled %d tokens, want <= %d (compaction failed)", f.lastPrefillLen, budget+1)
+	}
+	if f.lastPrefillLen == 0 {
+		t.Error("nothing prefilled")
+	}
+}
+
+// Regression: when a client (pi) omits max_tokens and the prompt approaches the
+// context window, the server must RESERVE a completion budget and compact the
+// prompt — not collapse max_tokens toward 1 token (which produced dead, empty
+// replies and meant compaction never fired). With no max_tokens the reserved
+// budget is ctx/2, so the prompt is trimmed to fit ctx/2 (+1 BOS).
+func TestChatCompletionsNoMaxTokensCompacts(t *testing.T) {
+	tk, idx := newServerTokenizer(t)
+	const ctxSize = 16
+	f := &fakeServerEngine{ctxSize: ctxSize, vocab: tk.NumTokens(), eos: tk.EOS, script: helloWorldScript(idx)}
+	srv := New(f, tk)
+	srv.SetLogLevel("warn")
+
+	longPrompt := strings.Repeat("hello world ", 20)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages":    []map[string]string{{"role": "user", "content": longPrompt}},
+		"temperature": 0,
+		// no max_tokens — the pi path
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	// Reserved completion budget is ctx/2, so compaction trims the prompt to
+	// ctx-ctx/2 = ctx/2 tokens (a leading BOS may be re-prepended).
+	budget := ctxSize - ctxSize/2
+	if f.lastPrefillLen > budget+1 {
+		t.Errorf("prefilled %d tokens, want <= %d (no-max_tokens compaction failed)", f.lastPrefillLen, budget+1)
 	}
 	if f.lastPrefillLen == 0 {
 		t.Error("nothing prefilled")

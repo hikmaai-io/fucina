@@ -7,8 +7,10 @@ import (
 
 // TestKVCacheConcurrentStats exercises the lock discipline: a writer goroutine
 // drives the full prefill+decode span under Lock()/Unlock() while a reader
-// goroutine concurrently reads Stats()/DetailedStats() (which take the mutex
-// internally). Run with -race to detect data races.
+// goroutine concurrently reads Stats()/DetailedStats() — which are LOCK-FREE
+// (atomic counters) precisely so /metrics//health answer while a request holds
+// the kv lock. Run with -race: any future regression that reaches the
+// mutex-guarded state (cachedTokens) from these accessors trips the detector.
 func TestKVCacheConcurrentStats(t *testing.T) {
 	f := &fakeEngine{window: 1 << 30}
 	kv := NewKVCache(f)

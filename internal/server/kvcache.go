@@ -1,8 +1,10 @@
 package server
 
 import (
+	"errors"
 	"log"
 	"sync"
+	"sync/atomic"
 )
 
 // kvEngine is the consumer-side view of the inference engine that KVCache
@@ -50,11 +52,14 @@ type KVCache struct {
 	mu           sync.Mutex
 	cachedTokens []int32 // exact tokens currently in the engine KV cache
 
-	// stats
-	hits      int
-	misses    int
-	hitTokens int64
-	reqTokens int64
+	// stats — atomics so /metrics and /health can read them WITHOUT taking mu,
+	// which is held for the entire prefill+generate span of an in-flight request
+	// (a health endpoint that blocks ~100s behind a long prefill reports "dead"
+	// exactly while the server is doing its job). Writers still run under mu.
+	hits      atomic.Int64
+	misses    atomic.Int64
+	hitTokens atomic.Int64
+	reqTokens atomic.Int64
 }
 
 // NewKVCache creates a prefix-reuse manager bound to an engine.
@@ -170,7 +175,20 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 
 	logits, err := c.engine.Prefill(suffix)
 	if err != nil {
-		// On failure, the engine KV state is undefined: reset to be safe.
+		// Cooperative abort (client disconnected mid-prefill): the engine state
+		// is CONSISTENT — committed chunks sit at their correct absolute
+		// positions and unaccounted writes are never read (write-before-advance
+		// invariant of the flat KV). Keep the shared prefix: cachedTokens
+		// already holds exactly the lcp prefix and the engine may only be
+		// AHEAD, which the next request's rewind heals. Dropping everything
+		// here made every ESC cost a full re-prefill of the conversation, so
+		// repeated abort+retry never converged. Detected structurally (an
+		// error exposing Aborted() true) so this package needs no cgo import.
+		var ab interface{ Aborted() bool }
+		if errors.As(err, &ab) && ab.Aborted() {
+			return nil, err
+		}
+		// On real failure, the engine KV state is undefined: reset to be safe.
 		c.engine.Reset()
 		c.cachedTokens = c.cachedTokens[:0]
 		return nil, err
@@ -181,12 +199,12 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 
 	// stats
 	if lcp > 0 {
-		c.hits++
+		c.hits.Add(1)
 	} else {
-		c.misses++
+		c.misses.Add(1)
 	}
-	c.hitTokens += int64(lcp)
-	c.reqTokens += int64(len(prompt))
+	c.hitTokens.Add(int64(lcp))
+	c.reqTokens.Add(int64(len(prompt)))
 
 	return res, nil
 }
@@ -216,22 +234,23 @@ func (c *KVCache) AppendDecoded(token int32) {
 	c.cachedTokens = append(c.cachedTokens, token)
 }
 
-// Stats returns cumulative prefix-cache statistics.
+// Stats returns cumulative prefix-cache statistics. Lock-free: safe to call
+// while another request holds the KV lock (the /health use case).
 func (c *KVCache) Stats() (hits, misses int, hitRate float64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	hits, misses = c.hits, c.misses
-	if c.reqTokens > 0 {
-		hitRate = float64(c.hitTokens) / float64(c.reqTokens)
+	hits, misses = int(c.hits.Load()), int(c.misses.Load())
+	// Load hitTokens BEFORE reqTokens (the writer adds hitTokens first): a
+	// concurrent update then transiently UNDER-reports the rate instead of
+	// pairing a new hitTokens with an old reqTokens (rate > 1.0).
+	hitTok := c.hitTokens.Load()
+	if req := c.reqTokens.Load(); req > 0 {
+		hitRate = float64(hitTok) / float64(req)
 	}
 	return
 }
 
-// DetailedStats returns the raw prefix-cache counters for /metrics.
+// DetailedStats returns the raw prefix-cache counters for /metrics. Lock-free.
 func (c *KVCache) DetailedStats() (hits, misses int, reusedTokens, reqTokens int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.hits, c.misses, c.hitTokens, c.reqTokens
+	return int(c.hits.Load()), int(c.misses.Load()), c.hitTokens.Load(), c.reqTokens.Load()
 }
 
 // longestCommonPrefix returns the length of the longest shared prefix of a, b.
