@@ -29,14 +29,15 @@ type CLIArgs struct {
 	PresencePenalty  float64
 
 	// Generation
-	Prompt     string
-	PromptFile string
-	Predict    int
-	Keep       int
-	NoDisplay  bool
-	Spec       bool
-	DraftK     int
-	CudaGraphs bool // --cuda-graphs (experimental, off by default)
+	Prompt      string
+	PromptFile  string
+	Predict     int
+	Keep        int
+	NoDisplay   bool
+	Spec        bool
+	DraftK      int
+	ThinkBudget int  // server: reasoning-channel token budget (0=auto, <0=off)
+	CudaGraphs  bool // --cuda-graphs (experimental, off by default)
 
 	// Server
 	Host     string
@@ -85,13 +86,24 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.StringVar(&a.AssistantPath, "assistant", "",
 		"Path to the Gemma-4 MTP assistant GGUF (official draft head; enables draft-mtp speculation)")
 
-	fs.IntVar(&a.ContextSize, "ctx", 4096, "Context size in tokens")
-	fs.IntVar(&a.ContextSize, "c", 4096, "Context size (short)")
+	// Default to the model's maximum trained context (262144). A coding agent
+	// injects large file contents via Read tool responses; a small window forces
+	// constant compaction, which trims the oldest tokens and collapses the prefix
+	// cache (longestCommonPrefix → ~1), re-prefilling the whole window every turn.
+	// MEMORY COST at full context (FP8 KV, 1 B/elem, K+V): global 8 layers ×
+	// 512 head-dim × ctx ≈ 2.1 GiB, and the FLAT per-position sliding cache
+	// (DECODE-30-35 Step 3) SCALES WITH CTX: 48 layers × 8 heads × 256 head-dim
+	// × ctx ≈ 51.5 GiB — ~54 GiB total, sized for the 128 GB GB10 box; use
+	// --ctx 131072 (~27 GiB) or lower elsewhere. Engine clamps to 262144.
+	fs.IntVar(&a.ContextSize, "ctx", 262144, "Context size in tokens")
+	fs.IntVar(&a.ContextSize, "c", 262144, "Context size (short)")
 	fs.IntVar(&a.BatchSize, "batch-size", 2048, "Logical maximum batch size")
 	fs.IntVar(&a.Threads, "threads", 8, "Number of CPU threads for preprocessing")
 
 	fs.BoolVar(&a.Spec, "spec", true, "Prompt-lookup speculative decoding (greedy/temp=0 only)")
 	fs.IntVar(&a.DraftK, "draft-k", 6, "Max speculative draft length per step")
+	fs.IntVar(&a.ThinkBudget, "think-budget", 0,
+		"Server: max reasoning-channel tokens per turn before the thought channel is force-closed (0 = auto: half of max_tokens; negative = unlimited)")
 	fs.BoolVar(&a.CudaGraphs, "cuda-graphs", false, "Enable CUDA graph support (experimental, allocates persistent prefill scratch)")
 	// Defaults follow the google/gemma-4-12B model card's standardized sampling
 	// configuration (temperature 1.0, top_p 0.95, top_k 64; no min-p). The GGUF

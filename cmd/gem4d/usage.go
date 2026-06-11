@@ -16,7 +16,7 @@ Model options:
   --assistant FILE           Gemma-4 MTP assistant GGUF (official draft head; ~2x decode)
 
 Inference options:
-  --ctx N                    Context size (default: 4096, max: 262144)
+  --ctx N                    Context size (default: 262144, max: 262144)
   --batch-size N             Maximum batch size (default: 2048)
   --threads N                CPU threads (default: 8)
 
@@ -39,6 +39,10 @@ Server options:
   --port N                   Server port (default: 8080)
   --timeout N                Request timeout (default: 600s)
   --n-slots N                Number of slots (default: 1)
+  --draft-k N                Speculative draft length per step (default: 6)
+  --think-budget N           Max reasoning tokens per turn before the thought
+                             channel is force-closed (0 = auto: max_tokens/2;
+                             negative = unlimited)
 
 Other options:
   --cuda-device N            CUDA device ID (default: 0)

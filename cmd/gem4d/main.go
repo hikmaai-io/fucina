@@ -108,12 +108,20 @@ func main() {
 	if isServer {
 		// Server mode
 		addr := fmt.Sprintf("%s:%d", args.Host, args.Port)
+		// Eagerly run the lazy first-prefill setup (persistent prefill scratch +
+		// BF16 dequant scratch) so request #1's prefill timer measures prefill,
+		// not ~0.5-2.1s of one-time cudaMallocs.
+		warmStart := time.Now()
+		eng.Warmup()
+		log.Printf("gem4d: prefill scratch warmed in %.2fs", time.Since(warmStart).Seconds())
 		srv := gemserver.New(eng, tok)
 		// Report a quantization-aware model id (GGUF basename minus extension), e.g.
 		// gemma-4-12b-it-qat-q4_0, so clients can see which build/quant they hit.
 		srv.SetModelName(strings.TrimSuffix(filepath.Base(args.ModelPath), ".gguf"))
 		// Startup default for the reasoning channel; per-request reasoning_effort wins.
 		srv.SetThinkingDefault(gemserver.ParseThinkingLevel(args.Thinking))
+		srv.SetDraftK(args.DraftK)
+		srv.SetThinkBudget(args.ThinkBudget)
 		// Debug request dumping: --debug or --log-level debug.
 		if args.Debug || strings.EqualFold(args.LogLevel, "debug") {
 			srv.SetDebug(true)

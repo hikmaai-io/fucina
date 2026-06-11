@@ -25,8 +25,8 @@ func mustParse(t *testing.T, argv []string) (CLIArgs, testFlags) {
 func TestParseArgsDefaults(t *testing.T) {
 	a, tf := mustParse(t, nil)
 
-	if a.ContextSize != 4096 {
-		t.Errorf("ContextSize = %d, want 4096", a.ContextSize)
+	if a.ContextSize != 262144 {
+		t.Errorf("ContextSize = %d, want 262144", a.ContextSize)
 	}
 	if a.Temperature != 1.0 {
 		t.Errorf("Temperature = %v, want 1.0", a.Temperature)
