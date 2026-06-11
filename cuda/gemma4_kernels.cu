@@ -1589,34 +1589,62 @@ __global__ void flash_prefill_global_kernel(
 // Launch: <<<dim3(ceil(cn/warps_per_block), HEADS), warps_per_block*32>>>.
 #define FP_SLICE_MAX 16   // head_dim/32 ≤ 512/32
 
+// FP_TILE: history positions staged in shared memory per block iteration. The
+// per-warp loops above stream the WHOLE history from DRAM once per (query,head)
+// warp — at 22k context that redundant traffic (×8 warps/block, ×16 head-blocks
+// reading the single shared global KV head) is what decayed prefill from ~760
+// to ~160 tok/s. Staging a tile cooperatively and letting all warps consume it
+// from smem divides the per-block DRAM traffic by the warp count and makes the
+// cross-block (per-head) re-reads L2-resident.
+#define FP_TILE 32
+
 __global__ void flash_prefill_global_tiled_kernel(
     float *out, const float *q, const kv_t *kc, const kv_t *vc,
     int n_heads, int head_dim, int hist_len,
     const float *ck, const float *cv, int cn, int q_base, int okv)
 {
+    __shared__ kv_t sk[FP_TILE * GEMMA4_GLOBAL_HEAD_DIM];
+    __shared__ kv_t sv[FP_TILE * GEMMA4_GLOBAL_HEAD_DIM];
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int qi = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (qi >= cn) return;
+    // No early return: inactive warps must still reach the __syncthreads in
+    // the cooperative tile loop.
+    bool active = (qi < cn);
     int head = blockIdx.y, oq = n_heads * head_dim, slice = head_dim >> 5;
     const float *qp = q + (size_t)qi*oq + head*head_dim;
     float qreg[FP_SLICE_MAX], acc[FP_SLICE_MAX];
     #pragma unroll
-    for (int e = 0; e < slice; e++) { qreg[e] = qp[lane + 32*e]; acc[e] = 0.0f; }
+    for (int e = 0; e < slice; e++) { qreg[e] = active ? qp[lane + 32*e] : 0.0f; acc[e] = 0.0f; }
     float m = -INFINITY, l = 0.0f;
 
-    for (int t = 0; t < hist_len; t++) {                 // history (all causal)
-        const kv_t *kp = kc + (size_t)t*head_dim;
-        float dot = 0.0f;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
-        float s = warp_reduce_sum_all(dot);
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l*al + p;
-        const kv_t *vp = vc + (size_t)t*head_dim;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
-        m = mn;
+    for (int t0 = 0; t0 < hist_len; t0 += FP_TILE) {     // history (all causal)
+        int tn = min(FP_TILE, hist_len - t0);
+        // Cooperative tile load, vectorized: rows are head_dim bytes (a
+        // multiple of 16), so uint4 copies are aligned.
+        int nv = (tn * head_dim) >> 4;
+        const uint4 *gk = (const uint4 *)(kc + (size_t)t0*head_dim);
+        const uint4 *gv = (const uint4 *)(vc + (size_t)t0*head_dim);
+        uint4 *tk = (uint4 *)sk, *tv = (uint4 *)sv;
+        for (int i = threadIdx.x; i < nv; i += blockDim.x) { tk[i] = gk[i]; tv[i] = gv[i]; }
+        __syncthreads();
+        if (active) {
+            for (int t = 0; t < tn; t++) {
+                const kv_t *kp = sk + (size_t)t*head_dim;
+                float dot = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
+                float s = warp_reduce_sum_all(dot);
+                float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+                l = l*al + p;
+                const kv_t *vp = sv + (size_t)t*head_dim;
+                #pragma unroll
+                for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
+                m = mn;
+            }
+        }
+        __syncthreads();
     }
+    if (!active) return;
     for (int j = 0; j <= qi; j++) {                      // chunk keys, causal
         const float *kp = ck + (size_t)j*okv;
         float dot = 0.0f;
@@ -1643,30 +1671,55 @@ __global__ void flash_prefill_sliding_tiled_kernel(
 {
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int qi = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (qi >= cn) return;
+    // No early return: inactive warps must still reach the cooperative tile
+    // loop's __syncthreads below (see `active`).
     int head = blockIdx.y, kv_head = head / (n_heads / n_kv_heads);
     int oq = n_heads * head_dim, slice = head_dim >> 5, pos = q_base + qi;
     const float *qp = q + (size_t)qi*oq + head*head_dim;
     float qreg[FP_SLICE_MAX], acc[FP_SLICE_MAX];
     #pragma unroll
-    for (int e = 0; e < slice; e++) { qreg[e] = qp[lane + 32*e]; acc[e] = 0.0f; }
+    for (int e = 0; e < slice; e++) { qreg[e] = (qi < cn) ? qp[lane + 32*e] : 0.0f; acc[e] = 0.0f; }
     float m = -INFINITY, l = 0.0f;
 
     // FLAT history (Step 3): absolute positions [max(0,pos-window+1), hist_count-1].
+    // Tiled through shared memory (see FP_TILE): the tile range starts at the
+    // BLOCK's lowest window bound; warps with a higher bound skip the early
+    // positions per-key. All warps in a block share kv_head (same blockIdx.y).
+    __shared__ kv_t sk[FP_TILE * GEMMA4_HEAD_DIM];
+    __shared__ kv_t sv[FP_TILE * GEMMA4_HEAD_DIM];
     int hlo = pos - window + 1; if (hlo < 0) hlo = 0;
-    for (int ap = hlo; ap < hist_count; ap++) {
-        const kv_t *kp = kc + (size_t)((size_t)ap*n_kv_heads + kv_head)*head_dim;
-        float dot = 0.0f;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
-        float s = warp_reduce_sum_all(dot);
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l*al + p;
-        const kv_t *vp = vc + (size_t)((size_t)ap*n_kv_heads + kv_head)*head_dim;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
-        m = mn;
+    int block_hlo = q_base + blockIdx.x * (blockDim.x >> 5) - window + 1;
+    if (block_hlo < 0) block_hlo = 0;
+    bool active = (qi < cn);
+    int rowv = head_dim >> 4; // uint4 vectors per row slice
+    for (int t0 = block_hlo; t0 < hist_count; t0 += FP_TILE) {
+        int tn = min(FP_TILE, hist_count - t0);
+        for (int i = threadIdx.x; i < tn * rowv; i += blockDim.x) {
+            int p = i / rowv, e = i - p * rowv;
+            size_t off = ((size_t)(t0 + p) * n_kv_heads + kv_head) * head_dim;
+            ((uint4 *)sk)[i] = ((const uint4 *)(kc + off))[e];
+            ((uint4 *)sv)[i] = ((const uint4 *)(vc + off))[e];
+        }
+        __syncthreads();
+        if (active) {
+            int lo = (hlo > t0) ? hlo - t0 : 0; // this warp's window bound in-tile
+            for (int t = lo; t < tn; t++) {
+                const kv_t *kp = sk + (size_t)t*head_dim;
+                float dot = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
+                float s = warp_reduce_sum_all(dot);
+                float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+                l = l*al + p;
+                const kv_t *vp = sv + (size_t)t*head_dim;
+                #pragma unroll
+                for (int e = 0; e < slice; e++) acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
+                m = mn;
+            }
+        }
+        __syncthreads();
     }
+    if (!active) return;
     int jlo = qi - window + 1; if (jlo < 0) jlo = 0;
     for (int j = jlo; j <= qi; j++) {                    // chunk keys
         const float *kp = ck + (size_t)j*okv + kv_head*head_dim;
