@@ -40,6 +40,14 @@ import (
 type Message struct {
 	Role    string
 	Content string
+	// Reasoning is the assistant turn's thought-channel payload (the client's
+	// reasoning_content echo). Historical assistant turns are re-rendered WITH
+	// their channel block — empty when Reasoning is "" — so the rendered prompt
+	// token-matches what generation actually committed to the KV cache. Without
+	// it, every multi-turn request diverged at the channel opener of the last
+	// assistant turn and re-prefilled the whole turn (measured: a constant
+	// ~263-token re-prefill per agent tool-loop iteration).
+	Reasoning string
 }
 
 // ModelTurnOpenNoThink opens an assistant turn and pre-fills an already-closed
@@ -131,7 +139,15 @@ func (r Renderer) Render(messages []Message) string {
 				// generation instead of closing it.
 				sb.WriteString(open)
 			} else {
-				sb.WriteString("<|turn>model\n")
+				// Historical model turn: re-render the thought channel the turn
+				// was generated with. Thinking OFF commits the pre-closed empty
+				// channel from ModelTurnOpenNoThink into the KV; thinking ON
+				// commits the model's own reasoning. Reproducing it keeps the
+				// rendered prompt token-identical to the cached KV sequence, so
+				// the prefix cache survives the turn (see Message.Reasoning).
+				sb.WriteString("<|turn>model\n<|channel>thought\n")
+				sb.WriteString(msg.Reasoning)
+				sb.WriteString("<channel|>")
 				sb.WriteString(msg.Content)
 				sb.WriteString(extra)
 				sb.WriteString("<turn|>\n")

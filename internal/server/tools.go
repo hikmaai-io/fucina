@@ -147,7 +147,13 @@ func encodeGemmaValue(v interface{}) string {
 	case json.Number:
 		return x.String()
 	case string:
-		return gstr(x)
+		// Plain JSON-style quotes, NOT the <|"|> delimiter: the model itself
+		// emits `path: "value"` in its calls (observed at temp 0), and the
+		// re-render must token-match that emission or the prefix cache
+		// diverges inside the previous turn on every multi-turn request. The
+		// <|"|> form remains the DECLARATION syntax (gstr) and is still
+		// accepted by the parser.
+		return strconv.Quote(x)
 	case map[string]interface{}:
 		var parts []string
 		for _, k := range sortedKeys(x) {
@@ -328,7 +334,14 @@ func splitReasoning(s string) (reasoning, rest string) {
 			break
 		}
 	}
-	return strings.TrimSpace(rsb.String()), osb.String()
+	// Reasoning is returned EXACTLY as generated (no trimming): the client
+	// echoes it back as reasoning_content, and the chat template re-renders it
+	// inside the thought channel. Any whitespace skew breaks the token match
+	// with the cached KV — the model typically ends its reasoning with "\n",
+	// and without it the re-encoded ".<channel|>" boundary even BPE-merges
+	// instead of hitting the <channel|> special token (observed). Streaming
+	// clients already receive the exact payload, delta by delta.
+	return rsb.String(), osb.String()
 }
 
 // stripChannels removes complete <|channel>…<channel|> blocks and any stray
@@ -363,6 +376,34 @@ func parseGemmaValue(s string, i int) (interface{}, int, bool) {
 			return s[i:], len(s), true
 		}
 		return s[i : i+end], i + end + len(sd), true
+	}
+	if s[i] == '"' { // string: plain JSON-style quotes (what the model emits)
+		var sb strings.Builder
+		j := i + 1
+		for j < len(s) {
+			c := s[j]
+			if c == '\\' && j+1 < len(s) {
+				// JSON escapes; unknown sequences keep the escaped char as-is.
+				switch s[j+1] {
+				case 'n':
+					sb.WriteByte('\n')
+				case 't':
+					sb.WriteByte('\t')
+				case 'r':
+					sb.WriteByte('\r')
+				default:
+					sb.WriteByte(s[j+1])
+				}
+				j += 2
+				continue
+			}
+			if c == '"' {
+				return sb.String(), j + 1, true
+			}
+			sb.WriteByte(c)
+			j++
+		}
+		return sb.String(), j, true // unterminated: rest of input
 	}
 	switch s[i] {
 	case '{':

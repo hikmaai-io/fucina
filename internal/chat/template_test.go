@@ -30,7 +30,7 @@ func TestMultiTurnWithAssistant(t *testing.T) {
 		{Role: "user", Content: "q2"},
 	}, false, "", nil)
 	want := "<|turn>user\nq1<turn|>\n" +
-		"<|turn>model\na1<turn|>\n" +
+		"<|turn>model\n<|channel>thought\n<channel|>a1<turn|>\n" +
 		"<|turn>user\nq2<turn|>\n" +
 		ModelTurnOpenNoThink
 	if got != want {
@@ -110,8 +110,30 @@ func TestTurnExtraHook(t *testing.T) {
 		}
 		return ""
 	})
-	if !contains(got, "<|turn>model\naCALLS<turn|>\n") {
+	if !contains(got, "<|turn>model\n<|channel>thought\n<channel|>aCALLS<turn|>\n") {
 		t.Errorf("turnExtra must append inside model turn: %q", got)
+	}
+}
+
+// Historical assistant turns re-render their thought channel so the prompt
+// token-matches what generation committed to the KV (prefix-cache reuse).
+func TestHistoricalTurnReasoningEcho(t *testing.T) {
+	got := Renderer{EnableThinking: true}.Render([]Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1", Reasoning: "I pondered"},
+		{Role: "user", Content: "q2"},
+	})
+	if !contains(got, "<|turn>model\n<|channel>thought\nI pondered<channel|>a1<turn|>\n") {
+		t.Errorf("reasoning echo must re-render the thought channel: %q", got)
+	}
+	// Without an echo the channel renders empty but is still present.
+	got2 := Renderer{}.Render([]Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "q2"},
+	})
+	if !contains(got2, "<|turn>model\n<|channel>thought\n<channel|>a1<turn|>\n") {
+		t.Errorf("historical turn must carry an empty pre-closed channel: %q", got2)
 	}
 }
 

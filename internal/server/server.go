@@ -730,6 +730,32 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		close(watcherDone)
 	}
 
+	// Debug: show WHERE the new prompt diverges from the cached sequence, in
+	// both token ids and text. This is the tool for diagnosing prefix-cache
+	// misses caused by re-render drift (a rendered turn that does not
+	// token-match what generation committed to the KV).
+	if s.debug || os.Getenv("GEM4D_DEBUG") == "1" {
+		cached := s.kv.CurrentTokens()
+		lcp := longestCommonPrefix(cached, tokens)
+		if lcp < len(cached) && lcp < len(tokens) {
+			lo := lcp - 8
+			if lo < 0 {
+				lo = 0
+			}
+			hiC, hiP := lcp+24, lcp+24
+			if hiC > len(cached) {
+				hiC = len(cached)
+			}
+			if hiP > len(tokens) {
+				hiP = len(tokens)
+			}
+			log.Printf("gem4d: prefix diverges at %d/%d cached:\n  cache:  %v %q\n  prompt: %v %q",
+				lcp, len(cached),
+				cached[lo:hiC], s.tokenizer.DecodeRaw(cached[lo:hiC]),
+				tokens[lo:hiP], s.tokenizer.DecodeRaw(tokens[lo:hiP]))
+		}
+	}
+
 	// Cache-aware prefill: reuse the longest cached prefix and compute only the
 	// divergent suffix. The returned logits are for the final prompt token, so
 	// no phantom Decode(0) is needed.
@@ -858,7 +884,7 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 func (s *Server) renderChatTemplate(messages []ChatMessage, tools []Tool, enableThinking bool) string {
 	msgs := make([]chat.Message, len(messages))
 	for i, m := range messages {
-		msgs[i] = chat.Message{Role: m.Role, Content: m.Content}
+		msgs[i] = chat.Message{Role: m.Role, Content: m.Content, Reasoning: m.ReasoningContent}
 	}
 
 	// Tool declarations go inside the forced system turn.
@@ -1069,10 +1095,43 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 		// output distribution as plain decode. Continues from the prefilled state.
 		// Generation runs to end-of-turn (NOT the first tool-call end), so a turn
 		// may carry MULTIPLE tool calls; parseToolCalls extracts them all.
+		//
+		// emit mirrors the streaming path's post-call cutoff: once ≥1 call has
+		// closed, only whitespace and further calls may follow. The first prose
+		// or tool marker after a call means the model is moving past its calls —
+		// usually starting to HALLUCINATE the tool response (observed: fake file
+		// contents / a <|tool_response> runaway). Stopping there keeps the turn's
+		// KV clean (call ends the cached sequence, so the next request's
+		// re-rendered prompt token-matches it) and saves the wasted tokens.
+		var emit func(int32) bool
+		tcOpen := s.tokenizer.ToolCallOpen
+		if wantTools && tcOpen >= 0 {
+			inTool, completed := false, 0
+			emit = func(t int32) bool {
+				if t == tcOpen {
+					inTool = true
+					return false
+				}
+				if inTool {
+					if tcEnd >= 0 && t == tcEnd {
+						inTool = false
+						completed++
+					}
+					return false
+				}
+				if completed > 0 {
+					if s.tokenizer.IsToolMarker(t) {
+						return true
+					}
+					return strings.TrimSpace(s.tokenizer.DecodeRaw([]int32{t})) != ""
+				}
+				return false
+			}
+		}
 		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
 		var err error
 		var specFinish string
-		toks, specFinish, err = s.runSpec(ctx, params, logits, stops, nil)
+		toks, specFinish, err = s.runSpec(ctx, params, logits, stops, emit)
 		if err != nil {
 			if len(toks) == 0 {
 				http.Error(w, fmt.Sprintf("generation failed: %v", err), http.StatusInternalServerError)
@@ -1083,6 +1142,17 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 		}
 		if specFinish != "" {
 			finish = specFinish
+		} else if emit != nil {
+			// The post-call cutoff fired: the token that triggered it (first
+			// prose/marker after the calls) is hallucination, not answer text —
+			// drop everything after the last completed call so it can't leak
+			// into message.content.
+			for i := len(toks) - 1; i >= 0; i-- {
+				if toks[i] == tcEnd {
+					toks = toks[:i+1]
+					break
+				}
+			}
 		}
 		generated = len(toks)
 	} else {
@@ -1347,8 +1417,12 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 		}
 
 		// Never stream the gemma tool/string markers to the client as visible text.
+		// After ≥1 completed call a tool marker means the model is starting to
+		// HALLUCINATE the tool response (observed: a <|tool_response> runaway
+		// burning the whole token budget) — the calls are complete, dispatch
+		// them. Before any call, just swallow the stray marker.
 		if s.tokenizer.IsToolMarker(token) {
-			return false
+			return completedCalls > 0
 		}
 
 		tokenStr := s.tokenizer.Decode([]int32{token})
