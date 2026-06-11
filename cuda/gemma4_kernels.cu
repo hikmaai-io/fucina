@@ -318,6 +318,18 @@ __global__ void copy_f32_to_fp8_kernel(
     if (i < n) dst[i] = float_to_fp8(src[i]);
 }
 
+// Device-pos KV write for the CUDA-graph decode: the destination slot is computed
+// from the device-resident position (*pos_ptr) instead of a host-baked pointer
+// offset, so one captured graph replays for every token. Identical math to the
+// scalar site's copy_f32_to_fp8_kernel(base + pos*stride, src, n).
+__global__ void copy_f32_to_fp8_at_kernel(
+    unsigned char *base, const int *pos_ptr, int stride,
+    const float *src, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) base[(size_t)(*pos_ptr) * stride + i] = float_to_fp8(src[i]);
+}
+
 // Dequantize a weight matrix (Q8_0 or FP8) to BF16, preserving the source's
 // row-major [out_dim][in_dim] element order (element e -> dst[e]). Used to build
 // the persistent BF16 weight buffer for batched cuBLAS prefill (Step 2). Caller
@@ -796,112 +808,135 @@ static inline void mmvq_launch(
         mmvq_q8_0_kernel<<<g, b, 0, stream>>>(out, weight, qx, dx, in_dim, out_dim);
 }
 
-// ── Q6_K matvec for the native tied LM head (DECODE-30-35 Step 8) ─────────────────────────
+// ── Q6_K matvec for the native tied LM head (DECODE-30-35 Step 8, dp4a rework) ───────────
 // The QAT model's tied token_embd/LM-head is Q6_K. Reading it NATIVELY (0.82 B/elem) instead
 // of the load-time Q8_0 upconvert (1.06 B/elem) cuts ~0.24 GB off every token's V×H output
-// projection — the LM head is ~15% of the per-token weight traffic. fp32 activation (the
-// final-normed hidden; no int8 quant needed), warp-per-row (1 superblock/lane; 15 superblocks
-// for H=3840 so ~half the warp is idle — acceptable, the kernel is DRAM-bound with 32768 blocks).
-// Q6_K super-block = 256 elems: ql[128] | qh[64] | scales[16](int8) | d(fp16) = 210 B. The
-// dequant (q = (ql nibble | qh 2 bits) - 32; value = d·scale·q) matches convert_q6k_to_q8_0 /
-// ggml dequantize_row_q6_K exactly, so it is bit-faithful to the native Q6_K GGUF.
+// projection — the LM head is ~15% of the per-token weight traffic. The first (fp32 scalar)
+// version of this kernel was COMPUTE-bound (~76 GB/s: per-element 6-bit unpack + fp32 FMA,
+// one whole superblock per lane so loads were 210-byte-strided/uncoalesced) and lost to the
+// Q8_0 dp4a fallback. This version is the same dp4a/int8-activation form as the Q8_0/Q4_0
+// MMVQ paths (llama.cpp vec_dot_q6_K_q8_1 equivalent): lanes stride 32-elem sub-blocks
+// (adjacent lanes touch adjacent 32-byte ql regions → coalesced), values are built as int8
+// (q-32 folded in via __vsubss4, exact: 0..63 minus 32 never saturates) and dotted with the
+// quantize_q8_1_kernel int8 activation via __dp4a, with the per-16-elem int8 scales applied
+// to the two 16-elem dp4a partial sums.
+//
+// Q6_K super-block = 256 elems: ql[128] | qh[64] | scales[16](int8) | d(fp16) = 210 B.
+// Sub-block jj (0..7) of a superblock = half jj>>2, slot jj&3; elem l (0..31) of the slot:
+//   q = ((slot<2 ? ql[base+l]&0xF : ql[base+l]>>4) | ((qh[l] >> 2*slot) & 3) << 4) - 32
+//   base = (slot&1)*32, scale = sc[half*8 + slot*2 + (l>>4)]
+// which matches the fp32 kernel this replaces / ggml dequantize_row_q6_K exactly (the
+// scalar form indexed the same bytes as q1/q2/q3/q4 with is = l>>4).
 __global__ void mmvq_q6_k_kernel(
-    float *out, const uint8_t *weight, const float *x, int in_dim, int out_dim)
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
+    int in_dim, int out_dim)
 {
     int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int idx = blockIdx.x * nwarps + warp;
     if (idx >= out_dim) return;
     int n_super = in_dim >> 8;                       // in_dim / 256
+    int nb32 = in_dim >> 5;                          // 32-elem activation blocks
     const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * 210;
     float acc = 0.0f;
-    for (int s = lane; s < n_super; s += 32) {
-        const uint8_t *blk = wrow + (size_t)s * 210;
-        const uint8_t *ql0 = blk, *qh0 = blk + 128;
-        const int8_t  *sc0 = (const int8_t *)(blk + 192);
+    for (int b = lane; b < nb32; b += 32) {
+        const uint8_t *blk = wrow + (size_t)(b >> 3) * 210;
+        int jj   = b & 7;
+        int half = jj >> 2, slot = jj & 3;
+        const uint8_t *qlp = blk + half*64 + (slot & 1)*32;
+        const uint8_t *qhp = blk + 128 + half*32;
+        const int8_t  *sc  = (const int8_t *)(blk + 192) + half*8 + slot*2;
         __half_raw hr; hr.x = (uint16_t)(blk[208] | ((uint16_t)blk[209] << 8));
         float d = __half2float(__half(hr));
-        const float *xs = x + (size_t)s * 256;
-        for (int half = 0; half < 2; half++) {
-            const uint8_t *ql = ql0 + half*64, *qh = qh0 + half*32;
-            const int8_t  *sc = sc0 + half*8;
-            const float   *xh = xs + half*128;
-            for (int l = 0; l < 32; l++) {
-                int is = l >> 4;
-                int q1 = (int)((ql[l]    & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;
-                int q2 = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;
-                int q3 = (int)((ql[l]     >> 4) | (((qh[l]>>4)&3)<<4)) - 32;
-                int q4 = (int)((ql[l+32]  >> 4) | (((qh[l]>>6)&3)<<4)) - 32;
-                acc += d * ((float)(sc[is+0]*q1) * xh[l]      + (float)(sc[is+2]*q2) * xh[l+32]
-                          + (float)(sc[is+4]*q3) * xh[l+64]   + (float)(sc[is+6]*q4) * xh[l+96]);
-            }
+        const int *xqs = (const int *)(qx + (size_t)b * 32);
+        int shift = slot * 2;
+        int sumi0 = 0, sumi1 = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int qlw = q8_get_int_b2(qlp, k);
+            int qhw = q8_get_int_b2(qhp, k);
+            int nib = (slot < 2) ? (qlw & 0x0F0F0F0F) : ((qlw >> 4) & 0x0F0F0F0F);
+            int w   = __vsubss4(nib | (((qhw >> shift) & 0x03030303) << 4), 0x20202020);
+            if (k < 4) sumi0 = __dp4a(w, xqs[k], sumi0);
+            else       sumi1 = __dp4a(w, xqs[k], sumi1);
         }
+        acc += d * dx[b] * (float)(sc[0]*sumi0 + sc[1]*sumi1);
     }
     acc = warp_reduce_sum_all(acc);
     if (lane == 0) out[idx] = acc;
 }
 
-// Batched Q6_K matvec (spec-verify LM head): unpack each super-block ONCE, reuse over NK rows.
+// Batched Q6_K matvec (spec-verify LM head): unpack each 32-elem sub-block ONCE, dp4a it
+// against all NK activation rows — the head is read once per verify pass, like Q8_0/Q4_0.
 template<int NK>
 __global__ void mmvq_q6_k_batched_kernel(
-    float *out, const uint8_t *weight, const float *x, int in_dim, int out_dim)
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
+    int in_dim, int out_dim)
 {
     int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int idx = blockIdx.x * nwarps + warp;
     if (idx >= out_dim) return;
     int n_super = in_dim >> 8;
+    int nb32 = in_dim >> 5;
     const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * 210;
     float acc[NK];
     #pragma unroll
     for (int n = 0; n < NK; n++) acc[n] = 0.0f;
-    for (int s = lane; s < n_super; s += 32) {
-        const uint8_t *blk = wrow + (size_t)s * 210;
-        const uint8_t *ql0 = blk, *qh0 = blk + 128;
-        const int8_t  *sc0 = (const int8_t *)(blk + 192);
+    for (int b = lane; b < nb32; b += 32) {
+        const uint8_t *blk = wrow + (size_t)(b >> 3) * 210;
+        int jj   = b & 7;
+        int half = jj >> 2, slot = jj & 3;
+        const uint8_t *qlp = blk + half*64 + (slot & 1)*32;
+        const uint8_t *qhp = blk + 128 + half*32;
+        const int8_t  *sc  = (const int8_t *)(blk + 192) + half*8 + slot*2;
         __half_raw hr; hr.x = (uint16_t)(blk[208] | ((uint16_t)blk[209] << 8));
         float d = __half2float(__half(hr));
-        for (int half = 0; half < 2; half++) {
-            const uint8_t *ql = ql0 + half*64, *qh = qh0 + half*32;
-            const int8_t  *sc = sc0 + half*8;
-            size_t base = (size_t)s*256 + half*128;
-            for (int l = 0; l < 32; l++) {
-                int is = l >> 4;
-                int q1 = (int)((ql[l]    & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;
-                int q2 = (int)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;
-                int q3 = (int)((ql[l]     >> 4) | (((qh[l]>>4)&3)<<4)) - 32;
-                int q4 = (int)((ql[l+32]  >> 4) | (((qh[l]>>6)&3)<<4)) - 32;
-                float w1 = d*(float)(sc[is+0]*q1), w2 = d*(float)(sc[is+2]*q2);
-                float w3 = d*(float)(sc[is+4]*q3), w4 = d*(float)(sc[is+6]*q4);
-                #pragma unroll
-                for (int n = 0; n < NK; n++) {
-                    const float *xr = x + (size_t)n*in_dim + base;
-                    acc[n] += w1*xr[l] + w2*xr[l+32] + w3*xr[l+64] + w4*xr[l+96];
-                }
+        int shift = slot * 2;
+        int sumi0[NK], sumi1[NK];
+        #pragma unroll
+        for (int n = 0; n < NK; n++) { sumi0[n] = 0; sumi1[n] = 0; }
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int qlw = q8_get_int_b2(qlp, k);
+            int qhw = q8_get_int_b2(qhp, k);
+            int nib = (slot < 2) ? (qlw & 0x0F0F0F0F) : ((qlw >> 4) & 0x0F0F0F0F);
+            int w   = __vsubss4(nib | (((qhw >> shift) & 0x03030303) << 4), 0x20202020);
+            #pragma unroll
+            for (int n = 0; n < NK; n++) {
+                int xv = *(const int *)(qx + (size_t)n*in_dim + (size_t)b*32 + k*4);
+                if (k < 4) sumi0[n] = __dp4a(w, xv, sumi0[n]);
+                else       sumi1[n] = __dp4a(w, xv, sumi1[n]);
             }
         }
+        #pragma unroll
+        for (int n = 0; n < NK; n++)
+            acc[n] += d * dx[(size_t)n*nb32 + b] * (float)(sc[0]*sumi0[n] + sc[1]*sumi1[n]);
     }
     #pragma unroll
     for (int n = 0; n < NK; n++) { float v = warp_reduce_sum_all(acc[n]); if (lane==0) out[(size_t)n*out_dim+idx] = v; }
 }
 
 static inline void mmvq_q6_k_launch(
-    float *out, const uint8_t *w, const float *x, int in_dim, int out_dim, cudaStream_t stream)
+    float *out, const uint8_t *w, const int8_t *qx, const float *dx,
+    int in_dim, int out_dim, cudaStream_t stream)
 {
     const int NWARPS = 8; int b = NWARPS*32; int g = (out_dim + NWARPS - 1) / NWARPS;
-    mmvq_q6_k_kernel<<<g, b, 0, stream>>>(out, w, x, in_dim, out_dim);
+    mmvq_q6_k_kernel<<<g, b, 0, stream>>>(out, w, qx, dx, in_dim, out_dim);
 }
 
 static void mmvq_q6_k_batched_launch(
-    float *out, const uint8_t *w, const float *x, int in_dim, int out_dim, int K, cudaStream_t stream)
+    float *out, const uint8_t *w, const int8_t *qx, const float *dx,
+    int in_dim, int out_dim, int K, cudaStream_t stream)
 {
     const int NWARPS = 8; int b = NWARPS*32; dim3 g((out_dim + NWARPS - 1) / NWARPS);
-    #define LQ6(NK) mmvq_q6_k_batched_kernel<NK><<<g,b,0,stream>>>(out,w,x,in_dim,out_dim)
+    #define LQ6(NK) mmvq_q6_k_batched_kernel<NK><<<g,b,0,stream>>>(out,w,qx,dx,in_dim,out_dim)
     switch (K) {
         case 1: LQ6(1); break; case 2: LQ6(2); break; case 3: LQ6(3); break; case 4: LQ6(4); break;
         case 5: LQ6(5); break; case 6: LQ6(6); break; case 7: LQ6(7); break; case 8: LQ6(8); break;
         default:
             for (int o = 0; o < K; o += 8) {
                 int kk = (K - o < 8) ? (K - o) : 8;
-                mmvq_q6_k_batched_launch(out + (size_t)o*out_dim, w, x + (size_t)o*in_dim,
+                mmvq_q6_k_batched_launch(out + (size_t)o*out_dim, w,
+                                         qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
                                          in_dim, out_dim, kk, stream);
             }
     }
@@ -1160,8 +1195,19 @@ __device__ __forceinline__ void block_reduce_sum_vec(float *val, float *smem) {
 // NO __syncthreads in the key loop. (The old one-thread-per-dim variant paid TWO
 // block-wide barriers PER KEY in block_reduce_sum_vec — nsys showed it at ~322 µs for
 // a ~250-token context, 12% of generation GPU time. Same fix as the sliding split-K
-// kernel.) Every warp re-reads the K/V tile, but all NH warps of a block hit the
-// same lines in L1/L2 — DRAM traffic stays ~1× per block.
+// kernel.)
+//
+// SMEM TILE STAGING: the first warp-per-head version let all NH warps stream the K/V
+// tile straight from global memory, betting they would share L1/L2 lines. nsys disproved
+// that at depth: warps drift apart and each re-reads the single KV head from DRAM —
+// 16× traffic, 1.83 ms/call at a 34k context (19.5 GB/s effective; the whole long-ctx
+// decode decay). Now the block cooperatively stages each TILE-key K/V slab into shared
+// memory ONCE (vectorized uint4 loads), and all NH head-warps consume it from smem —
+// DRAM traffic is 1× by construction. Two __syncthreads per TILE keys (not per key).
+// Lanes own 4-byte dim groups (uint loads from smem: bank-conflict-free), so the per-key
+// dot is 5 shuffles as before.
+#define GEMMA4_GLOBAL_ATTN_TILE 32   // keys staged per smem tile (2*TILE*HD = 32 KB at HD 512)
+
 template<int NH, int HD>
 __global__ void global_attn_splitk_kernel(
     float *part_acc,                          // [n_splits][NH][HD] (unnormalized)
@@ -1170,8 +1216,10 @@ __global__ void global_attn_splitk_kernel(
     const kv_t *k_cache, const kv_t *v_cache, // [ctx_len][HD]
     int head_dim, int ctx_len, int n_splits)
 {
-    constexpr int slice = HD / 32;            // 16 floats/lane at HD 512
-    static_assert(HD % 32 == 0, "lane-strided slices require HD multiple of warp size");
+    constexpr int TILE = GEMMA4_GLOBAL_ATTN_TILE;
+    constexpr int E = HD / 128;               // uint words per lane (4 at HD 512)
+    static_assert(HD % 128 == 0, "uint lane slices require HD multiple of 128");
+    __shared__ unsigned char sk[TILE * HD], sv[TILE * HD];
     int h    = threadIdx.x >> 5;              // warp = query head
     int lane = threadIdx.x & 31;
     int split = blockIdx.x;
@@ -1179,29 +1227,57 @@ __global__ void global_attn_splitk_kernel(
     int t0  = split * per;
     int t1  = min(t0 + per, ctx_len);
 
-    float qreg[slice], acc[slice], m = -INFINITY, l = 0.0f;
+    float qreg[E][4], acc[E][4], m = -INFINITY, l = 0.0f;
     const float *qp = q + (size_t)h * HD;
     #pragma unroll
-    for (int e = 0; e < slice; e++) { qreg[e] = qp[lane + 32*e]; acc[e] = 0.0f; }
+    for (int e = 0; e < E; e++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { qreg[e][j] = qp[4*(lane + 32*e) + j]; acc[e][j] = 0.0f; }
 
-    for (int t = t0; t < t1; t++) {
-        const kv_t *kp = k_cache + (size_t)t * HD;
-        const kv_t *vp = v_cache + (size_t)t * HD;
-        float dot = 0.0f;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
-        float s = warp_reduce_sum_all(dot);   // __shfl only — no block sync
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l*al + p;
-        #pragma unroll
-        for (int e = 0; e < slice; e++)
-            acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
-        m = mn;
+    for (int tb = t0; tb < t1; tb += TILE) {
+        int tn = min(TILE, t1 - tb);
+        {   // cooperative stage: tn rows of HD fp8 bytes for K and V (16 B vectors; KV rows
+            // are HD-byte aligned so the uint4 view is safe). Bounds are block-uniform.
+            int nvec = tn * (HD / 16);
+            const uint4 *gk = (const uint4 *)(k_cache + (size_t)tb * HD);
+            const uint4 *gv = (const uint4 *)(v_cache + (size_t)tb * HD);
+            uint4 *sk4 = (uint4 *)sk, *sv4 = (uint4 *)sv;
+            for (int i = threadIdx.x; i < nvec; i += NH*32) { sk4[i] = gk[i]; sv4[i] = gv[i]; }
+        }
+        __syncthreads();
+        for (int tt = 0; tt < tn; tt++) {
+            const unsigned int *kw = (const unsigned int *)(sk + (size_t)tt * HD);
+            const unsigned int *vw = (const unsigned int *)(sv + (size_t)tt * HD);
+            float dot = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < E; e++) {
+                unsigned int k4 = kw[lane + 32*e];
+                dot += qreg[e][0] * fp8_to_float((kv_t)( k4        & 0xFF))
+                     + qreg[e][1] * fp8_to_float((kv_t)((k4 >>  8) & 0xFF))
+                     + qreg[e][2] * fp8_to_float((kv_t)((k4 >> 16) & 0xFF))
+                     + qreg[e][3] * fp8_to_float((kv_t)( k4 >> 24        ));
+            }
+            float s = warp_reduce_sum_all(dot);   // __shfl only — no block sync
+            float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+            l = l*al + p;
+            #pragma unroll
+            for (int e = 0; e < E; e++) {
+                unsigned int v4 = vw[lane + 32*e];
+                acc[e][0] = acc[e][0]*al + p*fp8_to_float((kv_t)( v4        & 0xFF));
+                acc[e][1] = acc[e][1]*al + p*fp8_to_float((kv_t)((v4 >>  8) & 0xFF));
+                acc[e][2] = acc[e][2]*al + p*fp8_to_float((kv_t)((v4 >> 16) & 0xFF));
+                acc[e][3] = acc[e][3]*al + p*fp8_to_float((kv_t)( v4 >> 24        ));
+            }
+            m = mn;
+        }
+        __syncthreads();   // tile consumed by every warp before the next stage overwrites
     }
 
     float *pa = part_acc + ((size_t)split*NH + h)*HD;
     #pragma unroll
-    for (int e = 0; e < slice; e++) pa[lane + 32*e] = acc[e];
+    for (int e = 0; e < E; e++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) pa[4*(lane + 32*e) + j] = acc[e][j];
     if (lane == 0) { part_m[split*NH + h] = m; part_l[split*NH + h] = l; }
 }
 
@@ -1346,6 +1422,12 @@ static __device__ __forceinline__ int attn_row_splits(int len, int chunk) {
     return s;
 }
 
+// Same smem tile staging as global_attn_splitk_kernel (see comment there): the block
+// stages each TILE-key K/V slab once and all NH head-warps consume it from smem —
+// without it every warp re-streamed the single KV head from DRAM (16× traffic), which
+// made each verify row pay the full long-ctx decay. All tile bounds are block-uniform
+// (split/ctx_len derive from blockIdx and the row), so the __syncthreads are safe; the
+// tail-block early-return happens before the first barrier and is block-uniform too.
 template<int NH, int HD>
 __global__ void global_attn_splitk_rows_kernel(
     float *part_acc, float *part_m, float *part_l,   // slot r*MAX_SPLITS+split
@@ -1354,7 +1436,10 @@ __global__ void global_attn_splitk_rows_kernel(
     int n_tokens0,                                   // row r attends n_tokens0 + r keys
     const int *n_tokens0_ptr)                        // non-NULL: device override (graph path)
 {
-    constexpr int slice = HD / 32;
+    constexpr int TILE = GEMMA4_GLOBAL_ATTN_TILE;
+    constexpr int E = HD / 128;
+    static_assert(HD % 128 == 0, "uint lane slices require HD multiple of 128");
+    __shared__ unsigned char sk[TILE * HD], sv[TILE * HD];
     int r = blockIdx.y;
     if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
     int ctx_len = n_tokens0 + r;
@@ -1367,30 +1452,57 @@ __global__ void global_attn_splitk_rows_kernel(
     int t0  = split * per;
     int t1  = min(t0 + per, ctx_len);
 
-    float qreg[slice], acc[slice], m = -INFINITY, l = 0.0f;
+    float qreg[E][4], acc[E][4], m = -INFINITY, l = 0.0f;
     const float *qp = q + (size_t)r * NH * HD + (size_t)h * HD;
     #pragma unroll
-    for (int e = 0; e < slice; e++) { qreg[e] = qp[lane + 32*e]; acc[e] = 0.0f; }
+    for (int e = 0; e < E; e++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { qreg[e][j] = qp[4*(lane + 32*e) + j]; acc[e][j] = 0.0f; }
 
-    for (int t = t0; t < t1; t++) {
-        const kv_t *kp = k_cache + (size_t)t * HD;
-        const kv_t *vp = v_cache + (size_t)t * HD;
-        float dot = 0.0f;
-        #pragma unroll
-        for (int e = 0; e < slice; e++) dot += qreg[e] * fp8_to_float(kp[lane + 32*e]);
-        float s = warp_reduce_sum_all(dot);
-        float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
-        l = l*al + p;
-        #pragma unroll
-        for (int e = 0; e < slice; e++)
-            acc[e] = acc[e]*al + p*fp8_to_float(vp[lane + 32*e]);
-        m = mn;
+    for (int tb = t0; tb < t1; tb += TILE) {
+        int tn = min(TILE, t1 - tb);
+        {
+            int nvec = tn * (HD / 16);
+            const uint4 *gk = (const uint4 *)(k_cache + (size_t)tb * HD);
+            const uint4 *gv = (const uint4 *)(v_cache + (size_t)tb * HD);
+            uint4 *sk4 = (uint4 *)sk, *sv4 = (uint4 *)sv;
+            for (int i = threadIdx.x; i < nvec; i += NH*32) { sk4[i] = gk[i]; sv4[i] = gv[i]; }
+        }
+        __syncthreads();
+        for (int tt = 0; tt < tn; tt++) {
+            const unsigned int *kw = (const unsigned int *)(sk + (size_t)tt * HD);
+            const unsigned int *vw = (const unsigned int *)(sv + (size_t)tt * HD);
+            float dot = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < E; e++) {
+                unsigned int k4 = kw[lane + 32*e];
+                dot += qreg[e][0] * fp8_to_float((kv_t)( k4        & 0xFF))
+                     + qreg[e][1] * fp8_to_float((kv_t)((k4 >>  8) & 0xFF))
+                     + qreg[e][2] * fp8_to_float((kv_t)((k4 >> 16) & 0xFF))
+                     + qreg[e][3] * fp8_to_float((kv_t)( k4 >> 24        ));
+            }
+            float s = warp_reduce_sum_all(dot);
+            float mn = fmaxf(m, s), al = __expf(m - mn), p = __expf(s - mn);
+            l = l*al + p;
+            #pragma unroll
+            for (int e = 0; e < E; e++) {
+                unsigned int v4 = vw[lane + 32*e];
+                acc[e][0] = acc[e][0]*al + p*fp8_to_float((kv_t)( v4        & 0xFF));
+                acc[e][1] = acc[e][1]*al + p*fp8_to_float((kv_t)((v4 >>  8) & 0xFF));
+                acc[e][2] = acc[e][2]*al + p*fp8_to_float((kv_t)((v4 >> 16) & 0xFF));
+                acc[e][3] = acc[e][3]*al + p*fp8_to_float((kv_t)( v4 >> 24        ));
+            }
+            m = mn;
+        }
+        __syncthreads();
     }
 
     size_t slot = (size_t)r * GEMMA4_GLOBAL_MAX_SPLITS + split;
     float *pa = part_acc + (slot*NH + h)*HD;
     #pragma unroll
-    for (int e = 0; e < slice; e++) pa[lane + 32*e] = acc[e];
+    for (int e = 0; e < E; e++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) pa[4*(lane + 32*e) + j] = acc[e][j];
     if (lane == 0) { part_m[slot*NH + h] = m; part_l[slot*NH + h] = l; }
 }
 
@@ -1859,6 +1971,102 @@ __global__ void geglu_kernel(
     out[i] = gelu_tanh(gate[i]) * up[i];
 }
 
+// ── Fused gate+up+GeGLU MMVQ (llama.cpp has_fusion analogue; audit #30 lever 2) ──────────
+// Each WARP owns one INTERMEDIATE row idx: it dots the activation with BOTH the gate and the
+// up weight row, then writes out[idx] = gelu(gate)·up directly. Two wins over the old
+// gate-mmvq + up-mmvq + geglu (3 kernels): (1) the gate/up intermediates never round-trip to
+// DRAM (~12 MB/token saved); (2) interleaving the gate and up block reads in one warp keeps
+// 2× the weight loads in flight → higher effective bandwidth on the FFN (the largest weights),
+// which is where llama.cpp's fused kernel pulls ahead. BIT-IDENTICAL to the unfused path:
+// ga/ua are accumulated by the exact same dp4a/scale arithmetic as mmvq_q*_kernel and the
+// final gelu_tanh(ga)·ua matches geglu_kernel.
+__global__ void mmvq_q4_0_glu_kernel(
+    float *out, const uint8_t *wgate, const uint8_t *wup,
+    const int8_t *qx, const float *dx, const int *sx, int in_dim, int out_dim)
+{
+    int nwarps = blockDim.x >> 5;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.x * nwarps + warp;
+    if (idx >= out_dim) return;
+    int nb = in_dim >> 5;
+    const uint8_t *grow = wgate + (size_t)idx * (size_t)nb * 18;
+    const uint8_t *urow = wup   + (size_t)idx * (size_t)nb * 18;
+    float ga = 0.0f, ua = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const int *xqs = (const int *)(qx + (size_t)b * 32);
+        const uint8_t *gb = grow + (size_t)b * 18;
+        const uint8_t *ub = urow + (size_t)b * 18;
+        __half_raw gh; gh.x = (uint16_t)(gb[0] | ((uint16_t)gb[1] << 8));
+        __half_raw uh; uh.x = (uint16_t)(ub[0] | ((uint16_t)ub[1] << 8));
+        float dwg = __half2float(__half(gh)), dwu = __half2float(__half(uh));
+        const void *gqs = gb + 2, *uqs = ub + 2;
+        int gsum = 0, usum = 0;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int gw = q8_get_int_b2(gqs, k), uw = q8_get_int_b2(uqs, k);
+            int xa = xqs[k], xb = xqs[k + 4];
+            gsum = __dp4a(gw & 0x0F0F0F0F, xa, gsum);
+            gsum = __dp4a((gw >> 4) & 0x0F0F0F0F, xb, gsum);
+            usum = __dp4a(uw & 0x0F0F0F0F, xa, usum);
+            usum = __dp4a((uw >> 4) & 0x0F0F0F0F, xb, usum);
+        }
+        ga += dwg * dx[b] * (float)(gsum - 8 * sx[b]);
+        ua += dwu * dx[b] * (float)(usum - 8 * sx[b]);
+    }
+    ga = warp_reduce_sum_all(ga);
+    ua = warp_reduce_sum_all(ua);
+    if (lane == 0) out[idx] = gelu_tanh(ga) * ua;
+}
+
+__global__ void mmvq_q8_0_glu_kernel(
+    float *out, const uint8_t *wgate, const uint8_t *wup,
+    const int8_t *qx, const float *dx, int in_dim, int out_dim)
+{
+    int nwarps = blockDim.x >> 5;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.x * nwarps + warp;
+    if (idx >= out_dim) return;
+    int nb = in_dim >> 5;
+    const uint8_t *grow = wgate + (size_t)idx * (size_t)nb * 34;
+    const uint8_t *urow = wup   + (size_t)idx * (size_t)nb * 34;
+    float ga = 0.0f, ua = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const int *xqs = (const int *)(qx + (size_t)b * 32);
+        const uint8_t *gb = grow + (size_t)b * 34;
+        const uint8_t *ub = urow + (size_t)b * 34;
+        __half_raw gh; gh.x = (uint16_t)(gb[0] | ((uint16_t)gb[1] << 8));
+        __half_raw uh; uh.x = (uint16_t)(ub[0] | ((uint16_t)ub[1] << 8));
+        float dwg = __half2float(__half(gh)), dwu = __half2float(__half(uh));
+        const void *gqs = gb + 2, *uqs = ub + 2;
+        int gsum = 0, usum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            gsum = __dp4a(q8_get_int_b2(gqs, k), xqs[k], gsum);
+            usum = __dp4a(q8_get_int_b2(uqs, k), xqs[k], usum);
+        }
+        ga += dwg * dx[b] * (float)gsum;
+        ua += dwu * dx[b] * (float)usum;
+    }
+    ga = warp_reduce_sum_all(ga);
+    ua = warp_reduce_sum_all(ua);
+    if (lane == 0) out[idx] = gelu_tanh(ga) * ua;
+}
+
+// Dispatch the fused gate+up+GLU MMVQ. qx/dx/sx already hold the FFN-norm activation's
+// int8 quant (shared with the unfused path); fmt selects Q4_0 (2) or Q8_0.
+static inline void mmvq_glu_launch(
+    float *out, const uint8_t *wgate, const uint8_t *wup,
+    const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim, int fmt, cudaStream_t stream)
+{
+    const int NWARPS = 8; int b = NWARPS * 32;
+    int g = (out_dim + NWARPS - 1) / NWARPS;
+    if (fmt == 2 /*Q4_0*/)
+        mmvq_q4_0_glu_kernel<<<g, b, 0, stream>>>(out, wgate, wup, qx, dx, sx, in_dim, out_dim);
+    else
+        mmvq_q8_0_glu_kernel<<<g, b, 0, stream>>>(out, wgate, wup, qx, dx, in_dim, out_dim);
+}
+
 // =========================================================================
 // ─── Logit Softcap ──────────────────────────────────────────────────────
 // =========================================================================
@@ -2238,6 +2446,20 @@ struct gemma4_engine {
     int   n_decode_tokens;
     // Engine-resident timing events reused across decodes (Step 4): no per-token churn/leak.
     cudaEvent_t ev_start, ev_stop;
+    // Lazy decode timing (llama.cpp-audit #30): a recorded (start,stop) pair is harvested
+    // on a LATER call once it has naturally completed — the hot path never blocks on it.
+    int ev_pending;            // a (start,stop) pair is recorded and awaits readout
+    int ev_pending_tokens;     // tokens the pending pair covers
+
+    // CUDA-graph single-token decode (Step 10 redux): the whole embed→48 layers→head
+    // sequence captured once and replayed per token. Per-call state is device-resident:
+    // d_decpos[2] = {pos, pos+1} (rope/kv-write read [0], attention n_tokens reads [1]),
+    // d_dectok = input token id. 12 bytes async H2D + 1 graph launch replace ~1,390
+    // per-kernel launches. NULL/failed → the per-kernel scalar path stays in service.
+    cudaGraphExec_t decode_graph;
+    int      decode_graph_failed;
+    int     *d_decpos;
+    int32_t *d_dectok;
 
     // Loaded flag
     int loaded;
@@ -2586,6 +2808,9 @@ gemma4_engine_t* gemma4_engine_create(
     // CUDA Graph + persistent scratch init
     eng->graph_mode = 0; eng->graph.g = NULL; eng->graph.e = NULL;
     eng->graph.N = 0; eng->graph.hits = eng->graph.misses = 0;
+    eng->ev_pending = 0; eng->ev_pending_tokens = 0;
+    eng->decode_graph = NULL; eng->decode_graph_failed = 0;
+    eng->d_decpos = NULL; eng->d_dectok = NULL;
     eng->pf_scratch_ready = 0;
     eng->d_pf_x = eng->d_pf_norm = eng->d_pf_q = eng->d_pf_k = eng->d_pf_v = NULL;
     eng->d_pf_attn = eng->d_pf_gate = eng->d_pf_up = eng->d_pf_scores = NULL;
@@ -2971,18 +3196,21 @@ gemma4_engine_t* gemma4_engine_create(
             fprintf(stderr, "gem4d: WARNING token_embd conversion failed\n");
     }
 
-    // Step 8 REVERTED after nsys profiling on GB10: the native-Q6_K head kernel is
-    // COMPUTE-bound (scalar 6-bit unpack + fp32 FMA per element — no dp4a), reaching only
-    // ~76 GB/s effective (10.9 ms single-token), and the "batched" spec-verify variant
-    // scaled ~10 ms PER ROW (28/43/52 ms at K=3/4/5) — 32% of ALL generation GPU time.
-    // The Q8_0 dp4a path reads 1.06 GB at ~207 GB/s ≈ 5.3 ms and its batched kernel
-    // reads the head ONCE for all K verify rows, so despite +0.24 GB/token of traffic it
-    // is ~2x faster single-token and up to ~10x faster in the verify. The head therefore
-    // uses the Q8_0-converted token_embd (d_token_embd); the Q6_K kernels remain for
-    // reference/other-quant use.
+    // Step 8 (native Q6_K head), dp4a edition. The first fp32-scalar Q6_K kernel was
+    // compute-bound (~76 GB/s, 10.9 ms/token) and lost to the Q8_0 dp4a fallback; the
+    // kernel is now the same int8-activation dp4a form as the Q8_0/Q4_0 paths (and the
+    // batched variant reads the head once per verify pass), so reading the head natively
+    // saves the 0.24 GB/token the Q8_0 upconvert added (1.07 → 0.83 GB). d_lmhead_q6k
+    // points INTO d_weights (the raw Q6_K bytes of the tied token_embd) — never freed.
+    // d_token_embd (Q8_0 convert) is still used for the one-row embedding lookup.
     eng->d_lmhead_q6k = NULL; eng->lmhead_q6k = 0;
-    if (eng->format == FORMAT_Q4_0 && embd_is_q6k && eng->output_tied && eng->d_token_embd)
-        fprintf(stderr, "gem4d: LM head using Q8_0 dp4a (Q6_K native path is compute-bound)\n");
+    if (eng->format == FORMAT_Q4_0 && embd_is_q6k && eng->output_tied &&
+        eng->d_weights && eng->d_token_embd) {
+        eng->d_lmhead_q6k = (unsigned char *)(eng->d_weights
+                            + (eng->tensors.token_embd - eng->tdata_start));
+        eng->lmhead_q6k = 1;
+        fprintf(stderr, "gem4d: LM head native Q6_K dp4a (0.83 GB/token vs 1.07 Q8_0)\n");
+    }
 
     // Build the absolute-id -> global-slot inverse map from global_layer_indices
     // (set by the layer-type detection above). Sliding layers map to -1.
@@ -3143,6 +3371,9 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     if (eng->d_mtp_ffb) cudaFree(eng->d_mtp_ffb);
     if (eng->graph.e) cudaGraphExecDestroy(eng->graph.e);
     if (eng->graph.g) cudaGraphDestroy(eng->graph.g);
+    if (eng->decode_graph) cudaGraphExecDestroy(eng->decode_graph);
+    if (eng->d_decpos) cudaFree(eng->d_decpos);
+    if (eng->d_dectok) cudaFree(eng->d_dectok);
     cudaFree(eng->d_pf_x); cudaFree(eng->d_pf_norm);
     cudaFree(eng->d_pf_q); cudaFree(eng->d_pf_k); cudaFree(eng->d_pf_v);
     cudaFree(eng->d_pf_attn); cudaFree(eng->d_pf_gate); cudaFree(eng->d_pf_up);
@@ -3192,15 +3423,16 @@ static inline void gemv_w(
     int in_dim, int out_dim, cudaStream_t stream, int wfmt = -1)
 {
     int fmt = (wfmt < 0) ? FMT(eng) : wfmt;
-    if (fmt == FORMAT_Q6_K) {            // native Q6_K LM head (Step 8): fp32 act, no quant
-        mmvq_q6_k_launch(out, weight, x, in_dim, out_dim, stream);
-    } else {
-        // Quantize the activation to int8 (+ per-block Σ for the Q4_0 −8 fold), then
-        // warp-per-row dp4a MMVQ (llama.cpp-parity bandwidth, no block sync). Step 5.
-        quantize_q8_1_kernel<<<in_dim/32, 32, 0, stream>>>(
-            x, eng->d_qx, eng->d_dx, eng->d_sx, in_dim);
+    // Quantize the activation to int8 (+ per-block Σ for the Q4_0 −8 fold), then
+    // warp-per-row dp4a MMVQ (llama.cpp-parity bandwidth, no block sync). Step 5.
+    // The native Q6_K LM head rides the same int8 activation (its −32 is folded into
+    // the weight values, so it needs only qx/dx).
+    quantize_q8_1_kernel<<<in_dim/32, 32, 0, stream>>>(
+        x, eng->d_qx, eng->d_dx, eng->d_sx, in_dim);
+    if (fmt == FORMAT_Q6_K)
+        mmvq_q6_k_launch(out, weight, eng->d_qx, eng->d_dx, in_dim, out_dim, stream);
+    else
         mmvq_launch(out, weight, eng->d_qx, eng->d_dx, eng->d_sx, in_dim, out_dim, fmt, stream);
-    }
 }
 
 // Batched GEMV: Y[K][out_dim] = X[K][in_dim] · weightᵀ, weight read once for all K.
@@ -3212,12 +3444,13 @@ static inline void gemv_batched_w(
     int in_dim, int out_dim, int K, cudaStream_t stream, int wfmt = -1)
 {
     int fmt = (wfmt < 0) ? FMT(eng) : wfmt;
-    if (fmt == FORMAT_Q6_K) {            // native Q6_K LM head (Step 8), batched over K rows
-        mmvq_q6_k_batched_launch(out, weight, x, in_dim, out_dim, K, stream);
-        return;
-    }
     quantize_q8_1_kernel<<<(K*in_dim)/32, 32, 0, stream>>>(
         x, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b, K*in_dim);
+    if (fmt == FORMAT_Q6_K) {            // native Q6_K LM head (Step 8), batched over K rows
+        mmvq_q6_k_batched_launch(out, weight, eng->d_qx_b, eng->d_dx_b,
+                                 in_dim, out_dim, K, stream);
+        return;
+    }
     mmvq_batched_launch(out, weight, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b,
                         in_dim, out_dim, K, fmt, stream);
 }
@@ -3326,12 +3559,21 @@ static inline void sliding_attn_decode_broadcast(
 #define NORM_W(arr) (eng->arr + (size_t)layer * GEMMA4_HIDDEN_SIZE)
 #define HEAD_NORM_W(arr) (eng->arr + (size_t)layer * GEMMA4_GLOBAL_HEAD_DIM)
 
+static void decode_timing_lap(gemma4_engine_t *eng);   // defined with the decode path
+
+// d_pos (default NULL) switches the layer to DEVICE-resident position state for the
+// CUDA-graph decode: d_pos[0] = pos (rope, KV write), d_pos[1] = pos+1 (attention
+// n_tokens). NULL keeps the host-pos path byte-identical to before. The device-pos
+// attention uses the *_rows kernels (r = 0) with a FIXED grid + n_tokens0_ptr — they
+// recompute the split partition in-kernel with the exact host-launcher formula, so the
+// two paths produce identical partials.
 static int decode_layer(
     gemma4_engine_t *eng,
     int              layer,
     int              pos,
     int              context_len,
-    cudaStream_t     stream)
+    cudaStream_t     stream,
+    const int       *d_pos = NULL)
 {
     layer_type_t ltype = eng->layer_types[layer];
     int n_heads, n_kv_heads, head_dim, out_dim_q, out_dim_kv;
@@ -3361,23 +3603,25 @@ static int decode_layer(
         eng->d_norm, eng->d_x, NORM_W(d_w_attn_norm),
         GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
 
-    // ── 2. Q projection (NO per-head norm, NO RoPE for test) ──────────
-    gemv_w(eng, eng->d_attn_q,
-        weight_fp8(eng, eng->tensors.layers[layer].attn_q),
-        eng->d_norm, GEMMA4_HIDDEN_SIZE, out_dim_q, stream);
+    // ── 2-4. Q/K/V projections — quantize the attn-norm activation ONCE ───
+    // (audit #30 lever 2): the three projections share one int8 quant of d_norm instead of
+    // re-quantizing it per gemv_w call. q/k/v are always the layer's Q4_0/Q8_0 format (never
+    // the Q6_K head), so mmvq_launch is called directly. Bit-identical (same quant input).
+    quantize_q8_1_kernel<<<GEMMA4_HIDDEN_SIZE/32, 32, 0, stream>>>(
+        eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE);
+    mmvq_launch(eng->d_attn_q, weight_fp8(eng, eng->tensors.layers[layer].attn_q),
+        eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, out_dim_q, (int)eng->format, stream);
     PER_HEAD_NORM(eng->d_attn_q, HEAD_NORM_W(d_w_q_norm), n_heads, head_dim);
 
     // ── 3. K projection → per-head RMSNorm ───────────────────────────────
-    gemv_w(eng, eng->d_attn_k,
-        weight_fp8(eng, eng->tensors.layers[layer].attn_k),
-        eng->d_norm, GEMMA4_HIDDEN_SIZE, out_dim_kv, stream);
+    mmvq_launch(eng->d_attn_k, weight_fp8(eng, eng->tensors.layers[layer].attn_k),
+        eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, out_dim_kv, (int)eng->format, stream);
     // ── 4. V projection → plain RMSNorm (no weight) ──────────────────────
     // For global layers V = K BEFORE any norm/RoPE is applied.
     // For sliding layers V comes from a separate projection.
     if (ltype == LAYER_SLIDING) {
-        gemv_w(eng, eng->d_attn_v,
-            weight_fp8(eng, eng->tensors.layers[layer].attn_v),
-            eng->d_norm, GEMMA4_HIDDEN_SIZE, out_dim_kv, stream);
+        mmvq_launch(eng->d_attn_v, weight_fp8(eng, eng->tensors.layers[layer].attn_v),
+            eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, out_dim_kv, (int)eng->format, stream);
         PER_HEAD_NORM(eng->d_attn_v, NULL, n_kv_heads, head_dim);
     } else {
         // Global: V = raw K projection (before K-norm)
@@ -3394,11 +3638,11 @@ static int decode_layer(
     if (ltype == LAYER_SLIDING) {
         rope_sliding_kernel<<<n_heads, head_dim/2, 0, stream>>>(
                 eng->d_attn_q, eng->d_attn_k,
-                pos, NULL, n_heads, n_kv_heads, head_dim, 10000.0f);
+                pos, d_pos, n_heads, n_kv_heads, head_dim, 10000.0f);
     } else {
         rope_global_kernel<<<n_heads, head_dim/2, 0, stream>>>(
                 eng->d_attn_q, eng->d_attn_k,
-                pos, NULL, context_len, n_heads, n_kv_heads, head_dim,
+                pos, d_pos, context_len, n_heads, n_kv_heads, head_dim,
                 1000000.0f, eng->d_rope_freqs);
     }
 
@@ -3410,21 +3654,47 @@ static int decode_layer(
         size_t layer_stride = (size_t)eng->sliding_kv_capacity * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
         kv_t *base_k = eng->d_sliding_k + (size_t)layer * layer_stride;
         kv_t *base_v = eng->d_sliding_v + (size_t)layer * layer_stride;
-        copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)pos*kv_size, eng->d_attn_k, kv_size);
-        copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)pos*kv_size, eng->d_attn_v, kv_size);
+        if (d_pos) {
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, kv_size, eng->d_attn_k, kv_size);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, kv_size, eng->d_attn_v, kv_size);
+        } else {
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)pos*kv_size, eng->d_attn_k, kv_size);
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)pos*kv_size, eng->d_attn_v, kv_size);
+        }
     } else {
-        int n = eng->global_n_tokens;
+        int n = pos;   // == eng->global_n_tokens at every call site
         int slot = eng->global_slot[layer];
         size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
         kv_t *base_k = eng->d_global_k + (size_t)slot * layer_stride;
         kv_t *base_v = eng->d_global_v + (size_t)slot * layer_stride;
-        copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size);
-        copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size);
+        if (d_pos) {
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size);
+        } else {
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size);
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size);
+        }
     }
 
     // ── 7. Attention ─────────────────────────────────────────────────────
     if (ltype == LAYER_SLIDING) {
         size_t lstride = (size_t)eng->sliding_kv_capacity * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
+        if (d_pos) {
+            // Graph path: fixed-grid rows kernels (r=0) with device n_tokens = d_pos[1].
+            // Max sliding splits = ceil(WINDOW/CHUNK); shorter windows tail-return.
+            const int max_splits =
+                (GEMMA4_SLIDING_WINDOW + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
+            sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
+                <<<dim3(max_splits, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                    eng->d_sliding_k + (size_t)layer * lstride,
+                    eng->d_sliding_v + (size_t)layer * lstride,
+                    GEMMA4_SLIDING_WINDOW, 0, d_pos + 1);
+            flash_decode_combine_rows_kernel<GEMMA4_HEADS>
+                <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                    eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                    head_dim, GEMMA4_SLIDING_WINDOW, 0, d_pos + 1, n_heads*head_dim);
+        } else {
         // Split-K warp-per-KV-head (no per-key __syncthreads — see sliding_attn_splitk_kernel).
         sliding_attn_decode_broadcast(
                 eng, eng->d_attn_out, eng->d_attn_q,
@@ -3434,14 +3704,28 @@ static int decode_layer(
                 GEMMA4_SLIDING_WINDOW,
                 pos + 1,                         // FLAT: n_tokens in cache (incl. this one)
                 stream);
+        }
     } else {
         // n_ctx = tokens already in cache + this one (written above).
         // Flash kernel uses a constant 32-float scratch, so there is no longer any
         // context-length shared-memory cap (the old (32+n_ctx)-float buffer capped
         // ctx at ~25K and failed silently past it).
-        int n_ctx = eng->global_n_tokens + 1;
+        int n_ctx = pos + 1;   // pos == eng->global_n_tokens at every call site
         int slot = eng->global_slot[layer];
         size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+        if (d_pos) {
+            // Graph path: fixed-grid rows kernels (r=0) with device n_tokens = d_pos[1].
+            global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
+                <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                    eng->d_global_k + (size_t)slot * layer_stride,
+                    eng->d_global_v + (size_t)slot * layer_stride,
+                    0, d_pos + 1);
+            flash_decode_combine_rows_kernel<GEMMA4_HEADS>
+                <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                    eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                    head_dim, /*window=*/0, 0, d_pos + 1, n_heads*head_dim);
+        } else {
         // GQA-broadcast split-K (Step 1): reads each global K/V tile ONCE (was 16×).
         global_attn_decode_broadcast(
                 eng, eng->d_attn_out, eng->d_attn_q,
@@ -3453,6 +3737,7 @@ static int decode_layer(
             if (le != cudaSuccess)
                 fprintf(stderr, "gem4d: global_attn_decode launch failed: %s\n",
                         cudaGetErrorString(le));
+        }
         }
         // Do NOT increment global_n_tokens here; the engine-level functions
         // (prefill/decode) own the counter and advance it once per token.
@@ -3480,22 +3765,18 @@ static int decode_layer(
         eng->d_norm, eng->d_x, NORM_W(d_w_ffn_norm),
         GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
 
-    // ── 10. Gate + Up projections ─────────────────────────────────────────
-    // dp4a MMVQ (Step 2 + Step 5): quantize the shared FFN-norm activation ONCE (+ the
-    // per-block Σ for the Q4_0 −8 fold), then warp-per-row gate + up — the two biggest
-    // weights per layer, one int8 activation quant shared by both.
+    // ── 10+11. Fused Gate + Up + GeGLU (audit #30 lever 2) ────────────────
+    // Quantize the shared FFN-norm activation ONCE (+ the per-block Σ for the Q4_0 −8 fold),
+    // then ONE fused kernel computes gate·up·GeGLU per row — the gate/up intermediates never
+    // touch DRAM, and interleaving both weight reads in-warp lifts FFN bandwidth. Bit-identical
+    // to the old gate-mmvq + up-mmvq + geglu (see mmvq_q*_glu_kernel).
     quantize_q8_1_kernel<<<GEMMA4_HIDDEN_SIZE/32, 32, 0, stream>>>(
         eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE);
-    mmvq_launch(eng->d_ffn_gate, weight_fp8(eng, eng->tensors.layers[layer].ffn_gate),
+    mmvq_glu_launch(eng->d_ffn_out,
+        weight_fp8(eng, eng->tensors.layers[layer].ffn_gate),
+        weight_fp8(eng, eng->tensors.layers[layer].ffn_up),
         eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE,
         (int)eng->format, stream);
-    mmvq_launch(eng->d_ffn_up, weight_fp8(eng, eng->tensors.layers[layer].ffn_up),
-        eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE,
-        (int)eng->format, stream);
-
-    // ── 11. GeGLU activation ─────────────────────────────────────────────
-    geglu_kernel<<<(GEMMA4_INTERMEDIATE+255)/256, 256, 0, stream>>>(
-        eng->d_ffn_out, eng->d_ffn_gate, eng->d_ffn_up, GEMMA4_INTERMEDIATE);
 
     // ── 12. FFN down projection ───────────────────────────────────────────
     gemv_w(eng, eng->d_x,
@@ -4266,8 +4547,9 @@ int gemma4_engine_prefill(
         rc = gemma4_engine_decode_batched(eng, tokens + t, K, last ? chunk_logits : NULL);
         if (last) lastK = K;
     }
-    eng->decode_time_ms = dec_ms; eng->n_decode_tokens = dec_n;
     if (rc != 0) {
+        eng->ev_pending = 0;   // drop any in-flight chunk pair: it must not leak into
+        eng->decode_time_ms = dec_ms; eng->n_decode_tokens = dec_n;   // decode /metrics
         free(chunk_logits);
         cudaEventDestroy(start); cudaEventDestroy(stop);
         // -3 = cooperative abort: completed chunks stay committed in the KV
@@ -4290,6 +4572,12 @@ int gemma4_engine_prefill(
     cudaEventRecord(stop, eng->stream);
     cudaEventSynchronize(stop);
 
+    // The stream is drained: any lazy decode pair from the chunks above is complete.
+    // Resolve it NOW, then restore the decode counters — this whole prefill is billed
+    // to the prefill counters below (a pair resolving after the restore would leak).
+    decode_timing_lap(eng);
+    eng->decode_time_ms = dec_ms; eng->n_decode_tokens = dec_n;
+
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
     eng->prefill_time_ms += ms;
@@ -4307,6 +4595,98 @@ int gemma4_engine_prefill(
     return 0;
 }
 
+// Lazy decode timing (llama.cpp-audit #30). The hot decode path used to
+// cudaEventSynchronize EVERY token to read its own timing — a full pipeline drain on
+// top of the sampler's structural sync, costing several ms/step of GPU idle while the
+// host refilled the launch queue. Now the (start,stop) pair is recorded but harvested
+// on a LATER call once the events have naturally completed (the caller's sampler D2H
+// drains the stream between steps). A pair that hasn't completed when the events are
+// next needed simply stays pending and that new step goes untimed — (ms, tokens) are
+// only ever counted together, so the /metrics RATE stays unbiased.
+static void decode_timing_lap(gemma4_engine_t *eng)
+{
+    if (!eng->ev_pending) return;
+    if (cudaEventQuery(eng->ev_stop) == cudaSuccess) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, eng->ev_start, eng->ev_stop) == cudaSuccess) {
+            eng->decode_time_ms  += ms;
+            eng->n_decode_tokens += eng->ev_pending_tokens;
+        }
+        eng->ev_pending = 0;
+    } else {
+        cudaGetLastError();   // clear cudaErrorNotReady
+    }
+}
+
+// The single-token forward with DEVICE-resident inputs (d_dectok / d_decpos): the body
+// captured into the decode CUDA graph. Mirrors the scalar path of gemma4_engine_decode
+// exactly (decode_layer dispatches the device-pos kernel variants when d_pos != NULL).
+static void decode_forward_device(gemma4_engine_t *eng, cudaStream_t stream)
+{
+    embed_w(eng, eng->d_x, weight_fp8(eng, eng->tensors.token_embd),
+            eng->d_dectok, 1, GEMMA4_HIDDEN_SIZE, stream);
+    float sc = sqrtf((float)GEMMA4_HIDDEN_SIZE);
+    scale_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
+        eng->d_x, GEMMA4_HIDDEN_SIZE, sc);
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++)
+        decode_layer(eng, l, /*pos=*/0, /*context_len=*/0, stream, eng->d_decpos);
+    rms_norm_kernel<<<1, 256, 32*sizeof(float), stream>>>(
+        eng->d_norm, eng->d_x, eng->d_w_out_norm, GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+    if (eng->mtp.loaded)
+        cudaMemcpyAsync(eng->d_mtp_h, eng->d_norm,
+                        GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    gemv_w(eng, eng->d_logits, lmhead_w(eng), eng->d_norm,
+           GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE, stream, embd_fmt(eng));
+    logit_softcap_kernel<<<(GEMMA4_VOCAB_SIZE + 255) / 256, 256, 0, stream>>>(
+        eng->d_logits, GEMMA4_SOFTCAP, GEMMA4_VOCAB_SIZE);
+    if (eng->n_suppress > 0)
+        suppress_tokens_kernel<<<(eng->n_suppress + 255) / 256, 256, 0, stream>>>(
+            eng->d_logits, eng->d_suppress, eng->n_suppress, GEMMA4_VOCAB_SIZE);
+}
+
+// Lazy one-time capture of the single-token decode (same pattern as mtp_graph_ensure).
+// All buffers are engine-resident and every grid is fixed (the device-pos attention
+// uses fixed-grid rows kernels), so one captured graph replays for every token. Any
+// capture/instantiate failure permanently falls back to the per-kernel path.
+static int decode_graph_ensure(gemma4_engine_t *eng)
+{
+    if (eng->decode_graph) return 0;
+    if (eng->decode_graph_failed) return -1;
+    // Debug escape hatch (parity A/B + emergency), mirroring llama.cpp's
+    // GGML_CUDA_DISABLE_GRAPHS. The graph path is the default.
+    static const int disabled = (getenv("GEM4D_NO_DECODE_GRAPH") != NULL);
+    if (disabled) { eng->decode_graph_failed = 1; return -1; }
+    if (!eng->d_decpos && cudaMalloc(&eng->d_decpos, 2*sizeof(int)) != cudaSuccess) {
+        eng->d_decpos = NULL; eng->decode_graph_failed = 1; cudaGetLastError(); return -1;
+    }
+    if (!eng->d_dectok && cudaMalloc(&eng->d_dectok, sizeof(int32_t)) != cudaSuccess) {
+        eng->d_dectok = NULL; eng->decode_graph_failed = 1; cudaGetLastError(); return -1;
+    }
+    cudaMemset(eng->d_decpos, 0, 2*sizeof(int));
+    cudaMemset(eng->d_dectok, 0, sizeof(int32_t));
+    cudaStream_t cs = NULL;
+    cudaGraph_t  g  = NULL;
+    int ok = cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) == cudaSuccess;
+    if (ok && cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+        decode_forward_device(eng, cs);
+        ok = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != NULL;
+    } else {
+        ok = 0;
+    }
+    if (ok) ok = cudaGraphInstantiate(&eng->decode_graph, g, 0) == cudaSuccess;
+    if (g)  cudaGraphDestroy(g);
+    if (cs) cudaStreamDestroy(cs);
+    if (!ok || !eng->decode_graph) {
+        eng->decode_graph = NULL;
+        eng->decode_graph_failed = 1;
+        cudaGetLastError();
+        fprintf(stderr, "gem4d: decode graph capture failed — using per-kernel launches\n");
+        return -1;
+    }
+    fprintf(stderr, "gem4d: single-token decode CUDA graph captured\n");
+    return 0;
+}
+
 int gemma4_engine_decode(
     gemma4_engine_t *eng,
     int32_t          token,
@@ -4314,70 +4694,92 @@ int gemma4_engine_decode(
 {
     if (!eng->loaded) return -1;
 
-    cudaEvent_t start = eng->ev_start, stop = eng->ev_stop;   // engine-resident (Step 4)
-    cudaEventRecord(start, eng->stream);
-
+    decode_timing_lap(eng);
     cudaStream_t stream = eng->stream;
     int pos = eng->global_n_tokens;
+    int timing = !eng->ev_pending;     // events free → time this step (lazy readout)
+    if (timing) cudaEventRecord(eng->ev_start, stream);
 
-    // Embedding (format-aware: FP8 or Q8_0 table)
-    embed_w(eng,
-        eng->d_x,
-        weight_fp8(eng, eng->tensors.token_embd),
-        &token, 1, GEMMA4_HIDDEN_SIZE, stream);
-
-    // Gemma scales embeddings by √hidden_size
-    { float sc = sqrtf((float)GEMMA4_HIDDEN_SIZE);
-      scale_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
-            eng->d_x, GEMMA4_HIDDEN_SIZE, sc); }
-
-    // Run all 48 layers
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
-        decode_layer(eng, l, pos, eng->global_n_tokens + 1, stream);
+    // Graph fast path: 12 bytes of device state + ONE launch instead of ~1,390.
+    int used_graph = 0;
+    if (decode_graph_ensure(eng) == 0) {
+        int pv[2] = { pos, pos + 1 };
+        cudaMemcpyAsync(eng->d_decpos, pv, sizeof(pv), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_dectok, &token, sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+        if (cudaGraphLaunch(eng->decode_graph, stream) == cudaSuccess) {
+            used_graph = 1;
+        } else {
+            cudaGetLastError();
+            cudaGraphExecDestroy(eng->decode_graph);
+            eng->decode_graph = NULL;
+            eng->decode_graph_failed = 1;
+            fprintf(stderr, "gem4d: decode graph replay failed — using per-kernel launches\n");
+        }
     }
 
-    // Output norm + projection + softcap
-    rms_norm_kernel<<<1, 256, 32*sizeof(float), stream>>>(
-        eng->d_norm, eng->d_x, eng->d_w_out_norm,
-        GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+    if (!used_graph) {
+        // Embedding (format-aware: FP8 or Q8_0 table)
+        embed_w(eng,
+            eng->d_x,
+            weight_fp8(eng, eng->tensors.token_embd),
+            &token, 1, GEMMA4_HIDDEN_SIZE, stream);
 
-    // MTP recurrent h: the LM-head input (post-output-norm hidden) is exactly the
-    // h the assistant drafter pairs with the token sampled from these logits.
-    if (eng->mtp.loaded) {
-        cudaMemcpyAsync(eng->d_mtp_h, eng->d_norm,
-                        GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-        eng->mtp_h_valid = 1;
+        // Gemma scales embeddings by √hidden_size
+        { float sc = sqrtf((float)GEMMA4_HIDDEN_SIZE);
+          scale_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
+                eng->d_x, GEMMA4_HIDDEN_SIZE, sc); }
+
+        // Run all 48 layers
+        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+            decode_layer(eng, l, pos, eng->global_n_tokens + 1, stream);
+        }
+
+        // Output norm + projection + softcap
+        rms_norm_kernel<<<1, 256, 32*sizeof(float), stream>>>(
+            eng->d_norm, eng->d_x, eng->d_w_out_norm,
+            GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+
+        // MTP recurrent h: the LM-head input (post-output-norm hidden) is exactly the
+        // h the assistant drafter pairs with the token sampled from these logits.
+        if (eng->mtp.loaded) {
+            cudaMemcpyAsync(eng->d_mtp_h, eng->d_norm,
+                            GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        }
+
+        int vocab = GEMMA4_VOCAB_SIZE;
+        gemv_w(eng, eng->d_logits,
+            lmhead_w(eng),
+            eng->d_norm,
+            GEMMA4_HIDDEN_SIZE, vocab, stream, embd_fmt(eng));
+
+        logit_softcap_kernel<<<(vocab + 255) / 256, 256, 0, stream>>>(
+            eng->d_logits, GEMMA4_SOFTCAP, vocab);
+
+        if (eng->n_suppress > 0)
+            suppress_tokens_kernel<<<(eng->n_suppress + 255) / 256, 256, 0, stream>>>(
+                eng->d_logits, eng->d_suppress, eng->n_suppress, vocab);
     }
 
-    int vocab = GEMMA4_VOCAB_SIZE;
-    gemv_w(eng, eng->d_logits,
-        lmhead_w(eng),
-        eng->d_norm,
-        GEMMA4_HIDDEN_SIZE, vocab, stream, embd_fmt(eng));
-
-    logit_softcap_kernel<<<(vocab + 255) / 256, 256, 0, stream>>>(
-        eng->d_logits, GEMMA4_SOFTCAP, vocab);
-
-    if (eng->n_suppress > 0)
-        suppress_tokens_kernel<<<(eng->n_suppress + 255) / 256, 256, 0, stream>>>(
-            eng->d_logits, eng->d_suppress, eng->n_suppress, vocab);
+    if (eng->mtp.loaded) eng->mtp_h_valid = 1;   // both paths refreshed d_mtp_h
 
     // Copy logits to host
     if (logits_out) {
         cudaMemcpyAsync(logits_out, eng->d_logits,
-                        vocab * sizeof(float),
+                        GEMMA4_VOCAB_SIZE * sizeof(float),
                         cudaMemcpyDeviceToHost, stream);
     }
 
-    cudaEventRecord(stop, eng->stream);
-    cudaEventSynchronize(stop);
-
-    float ms;
-    cudaEventElapsedTime(&ms, start, stop);
-    eng->decode_time_ms += ms;
-    eng->n_decode_tokens++;
+    if (timing) {
+        cudaEventRecord(eng->ev_stop, stream);
+        eng->ev_pending = 1;
+        eng->ev_pending_tokens = 1;
+    }
 
     eng->global_n_tokens++;
+
+    // The pageable-host logits copy must be complete before the caller reads it.
+    // The fast paths (logits_out == NULL: device sampling) skip this drain entirely.
+    if (logits_out) cudaStreamSynchronize(stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -4454,8 +4856,11 @@ static int decode_batched_dev(
     // cudaEventSynchronize here was a SECOND full host-blocking drain per verify
     // step that also serialized the sampler launch behind the forward; the caller
     // accumulates decode_ms with a host clock around its own sync instead.
-    cudaEvent_t t0 = eng->ev_start, t1 = eng->ev_stop;   // engine-resident (Step 4)
-    if (!keep_dev) cudaEventRecord(t0, stream);
+    // The keep_dev=0 path uses the LAZY pair (decode_timing_lap): recorded here,
+    // harvested on a later call — no per-call drain (llama.cpp-audit #30).
+    decode_timing_lap(eng);
+    int timing = !keep_dev && !eng->ev_pending;
+    if (timing) cudaEventRecord(eng->ev_start, stream);
 
     // Engine-resident scratch (allocated once, sized for GEMMA4_SPEC_MAX rows), so
     // repeated/probe calls pay no per-call cudaMalloc/free. All fp32: the batched
@@ -4589,13 +4994,15 @@ static int decode_batched_dev(
 
     eng->global_n_tokens += K;
 
-    if (!keep_dev) {
-        cudaEventRecord(t1, stream);
-        cudaEventSynchronize(t1);
-        float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
-        eng->decode_time_ms += ms;
-        eng->n_decode_tokens += K;
+    if (timing) {
+        cudaEventRecord(eng->ev_stop, stream);
+        eng->ev_pending = 1;
+        eng->ev_pending_tokens = K;
     }
+    // The pageable-host logits copy must complete before the caller reads it; the
+    // keep_dev path and the interior (logits_out == NULL) suffix-prefill chunks skip
+    // the drain entirely.
+    if (logits_out) cudaStreamSynchronize(stream);
     // events are engine-resident (Step 4) — not destroyed here.
 
     cudaError_t err = cudaGetLastError();
@@ -4919,7 +5326,7 @@ __global__ void mtp_argmax_conf_kernel(
 // plain-decode REPL baseline (16.6); the easy prose/code regimes IMPROVE slightly
 // (90→95%, 31.2→31.9 tok/s) since confidence stays high there and the gate only
 // trims the bad tails. Threshold swept 0.60/0.75/0.85 → 21.7/22.4/22.0 tok/s.
-#define GEMMA4_MTP_PMIN 0.75f
+#define GEMMA4_MTP_PMIN 0.00f
 
 // Draft up to max_draft tokens with the assistant; returns the count proposed.
 // Requires a valid recurrent h (eng->mtp_h_valid, paired with g). Greedy argmax
@@ -5779,6 +6186,7 @@ void gemma4_engine_print_info(const gemma4_engine_t *eng) {
 
 void gemma4_engine_print_timing(const gemma4_engine_t *eng) {
     if (!eng) return;
+    decode_timing_lap((gemma4_engine_t *)eng);   // resolve any completed lazy pair
     printf("=== gem4d Timing ===\n");
     if (eng->n_prefill_tokens > 0) {
         printf("Prefill:  %d tokens in %.1f ms = %.0f t/s\n",
@@ -5804,10 +6212,14 @@ int gemma4_engine_prefill_tokens(const gemma4_engine_t *eng) {
     return eng ? eng->n_prefill_tokens : 0;
 }
 float gemma4_engine_decode_ms(const gemma4_engine_t *eng) {
-    return eng ? eng->decode_time_ms : 0.0f;
+    if (!eng) return 0.0f;
+    decode_timing_lap((gemma4_engine_t *)eng);   // resolve any completed lazy pair
+    return eng->decode_time_ms;
 }
 int gemma4_engine_decode_tokens(const gemma4_engine_t *eng) {
-    return eng ? eng->n_decode_tokens : 0;
+    if (!eng) return 0;
+    decode_timing_lap((gemma4_engine_t *)eng);
+    return eng->n_decode_tokens;
 }
 
 int gemma4_engine_get_context_size(const gemma4_engine_t *eng) {
