@@ -106,6 +106,9 @@ func makeVocab() (tokens []string, scores []float32, idx map[string]int32) {
 	pieces := []string{
 		"▁hello", "hello", "▁world", "world", "▁",
 		"h", "e", "l", "o",
+		// boundary-straddling piece: greedy matching would take "o<" over "o"
+		// before a control marker (the Encode pre-split regression).
+		"o<",
 		// gemma-4 control tokens
 		"<|turn>", "<turn|>", "<|channel>", "<channel|>",
 		"<|tool>", "<tool|>", "<|tool_call>", "<tool_call|>",
@@ -481,5 +484,23 @@ func TestNumTokens(t *testing.T) {
 	tk, idx := newTestTokenizer(t)
 	if got := tk.NumTokens(); got != len(idx) {
 		t.Errorf("NumTokens() = %d, want %d", got, len(idx))
+	}
+}
+
+// Control markers must encode to their ids even when the preceding text ends
+// in a character that forms a vocab piece with '<' ("hello<channel|>" must not
+// become ... "o<" "channel" ... — that token mismatch silently broke KV prefix
+// reuse for re-rendered reasoning channels ending without a newline).
+func TestEncode_MarkerAfterTextWithoutBoundary(t *testing.T) {
+	tk, idx := newTestTokenizer(t)
+	got := tk.Encode("hello<channel|>", false, false)
+	want := []int32{idx["hello"], idx["<channel|>"]}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("Encode(hello<channel|>) = %v, want %v (o< must not eat the marker)", got, want)
+	}
+	// And a marker mid-text re-splits cleanly on both sides.
+	got = tk.Encode("hello<tool_call|>world", false, false)
+	if len(got) != 3 || got[1] != idx["<tool_call|>"] {
+		t.Errorf("Encode(hello<tool_call|>world) = %v, want marker id %d in the middle", got, idx["<tool_call|>"])
 	}
 }

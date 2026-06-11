@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -54,6 +55,22 @@ type Tokenizer struct {
 	ToolRespOpen int32 // <|tool_response> (tool result back to the model)
 	ToolRespEnd  int32 // <tool_response|>
 	StringDelim  int32 // <|"|>            (string value delimiter in the dict syntax)
+
+	// specials are the control-marker literals (above) that resolved to vocab
+	// ids, longest-first. Encode splits the input at these literals BEFORE the
+	// greedy longest-prefix matcher runs: matching from an arbitrary position
+	// can otherwise merge a preceding character into the marker's leading '<'
+	// (".<channel|>" → ".<" + "channel" + "|>") so the marker id is never
+	// produced — re-encoded prompts then token-mismatch the generated sequence
+	// and silently break KV prefix reuse.
+	specials []specialToken
+}
+
+// specialToken pairs a control-marker literal with its vocab id for Encode's
+// pre-split scan.
+type specialToken struct {
+	str string
+	id  int32
 }
 
 // Score represents a token candidate during decoding.
@@ -354,6 +371,22 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 	t.ToolRespEnd = lookup("<tool_response|>", -1)
 	t.StringDelim = lookup(`<|"|>`, -1)
 
+	// Register the marker literals for Encode's pre-split scan (longest-first
+	// so no marker can shadow a longer one sharing its prefix). <|think|> has
+	// no dedicated struct field but appears in rendered prompts.
+	for _, s := range []string{
+		"<|turn>", "<turn|>", "<|channel>", "<channel|>",
+		"<|tool>", "<tool|>", "<|tool_call>", "<tool_call|>",
+		"<|tool_response>", "<tool_response|>", `<|"|>`, "<|think|>",
+	} {
+		if id, ok := t.tokenToID[s]; ok {
+			t.specials = append(t.specials, specialToken{str: s, id: id})
+		}
+	}
+	sort.Slice(t.specials, func(i, j int) bool {
+		return len(t.specials[i].str) > len(t.specials[j].str)
+	})
+
 	return t, nil
 }
 
@@ -424,6 +457,37 @@ func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 	// SentencePiece space normalization: ' ' -> U+2581.
 	text = strings.ReplaceAll(text, " ", spaceMarker)
 
+	// Split at control-marker literals FIRST (see Tokenizer.specials): the
+	// greedy matcher below must never see a marker, or a piece straddling the
+	// marker's leading '<' (e.g. ".<") can win the longest-prefix race and the
+	// marker id is never produced.
+	start := 0
+	for i := 0; i < len(text); i++ {
+		if text[i] != '<' {
+			continue
+		}
+		for _, sp := range t.specials {
+			if strings.HasPrefix(text[i:], sp.str) {
+				tokens = t.encodeGreedy(text[start:i], tokens)
+				tokens = append(tokens, sp.id)
+				i += len(sp.str) - 1 // -1: the loop increment adds it back
+				start = i + 1
+				break
+			}
+		}
+	}
+	tokens = t.encodeGreedy(text[start:], tokens)
+
+	if addEos {
+		tokens = append(tokens, t.EOS)
+	}
+
+	return tokens
+}
+
+// encodeGreedy runs the longest-prefix-match loop over a text segment that
+// contains no control-marker literals, appending to tokens.
+func (t *Tokenizer) encodeGreedy(text string, tokens []int32) []int32 {
 	for len(text) > 0 {
 		matched := false
 
@@ -455,11 +519,6 @@ func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 			text = text[1:]
 		}
 	}
-
-	if addEos {
-		tokens = append(tokens, t.EOS)
-	}
-
 	return tokens
 }
 
