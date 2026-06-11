@@ -111,7 +111,8 @@ void gemma4_engine_destroy(gemma4_engine_t *eng);
 
 // ─── Core inference ──────────────────────────────────────────────────
 
-// Prefill: process n_tokens in sequence, filling KV cache
+// Prefill: process n_tokens in sequence, filling KV cache.
+// Returns 0 / -1 / -3 (aborted between chunks via gemma4_engine_abort_prefill).
 int gemma4_engine_prefill(
     gemma4_engine_t *eng,
     const int32_t   *tokens,        // [n_tokens] input token IDs
@@ -208,10 +209,24 @@ int gemma4_engine_prefill_batched(
 
 // Chunked FLASH prefill: bounded per-chunk memory (O(chunk + KV), no [HEADS][N×N]
 // score buffer), so it handles arbitrary context (256k+) where the batched GEMM path
-// OOMs. BF16 tensor-core projections, online-softmax flash attention. Same
-// fresh-sequence contract & logits_out as prefill_batched. 0 / -2 (defer) / -1.
+// OOMs. BF16 tensor-core projections, online-softmax flash attention. UNLIKE
+// prefill_batched it also accepts a NON-EMPTY cache (global_n_tokens > 0): the new
+// tokens are processed as chunks attending the frozen history at absolute
+// positions — the fast path for multi-turn agent SUFFIX prefills. Tiny suffixes
+// (<32 tokens) defer (-2) to the chunked dp4a path, which is cheaper there.
+// Returns 0 / -2 (defer) / -1 / -3 (aborted via gemma4_engine_abort_prefill).
 int gemma4_engine_prefill_flash(
     gemma4_engine_t *eng, const int32_t *tokens, int n_tokens, float *logits_out);
+
+// Eagerly allocate the lazy first-prefill state (persistent prefill scratch +
+// BF16 dequant scratch); call once at server startup so request #1 doesn't pay
+// ~0.5-2.1 s of one-time cudaMallocs inside its prefill timer. Idempotent.
+int gemma4_engine_warmup(gemma4_engine_t *eng);
+
+// Cooperative prefill abort, callable from another thread while a prefill is in
+// flight: the chunked prefill loops poll it between chunks and return -3. The
+// flag clears at the next prefill's entry.
+void gemma4_engine_abort_prefill(gemma4_engine_t *eng);
 
 // ─── Diagnostics ─────────────────────────────────────────────────────
 

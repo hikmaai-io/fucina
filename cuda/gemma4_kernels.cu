@@ -2262,6 +2262,12 @@ struct gemma4_engine {
     // Loaded flag
     int loaded;
 
+    // Cooperative prefill abort: set from another thread (no lock — the prefill
+    // holds the engine mutex) via gemma4_engine_abort_prefill(); polled between
+    // prefill chunks. Cleared at every prefill entry. Plain int is fine for a
+    // sticky advisory flag (worst case the abort lands one chunk late).
+    volatile int abort_req;
+
     // ─── LoRA adapter support ───────────────────────────────────────────
 };
 
@@ -3645,6 +3651,8 @@ int gemma4_engine_prefill_batched(
     gemma4_engine_t *eng, const int32_t *tokens, int n_tokens, float *logits_out)
 {
     eng->mtp_h_valid = 0;   // prefill invalidates the MTP drafter's recurrent h
+    eng->abort_req = 0;     // chain head: a new prefill clears any stale abort
+                            // (the -2 fallthroughs to flash/chunked keep it live)
 
     if (!eng->loaded || n_tokens <= 0) return -1;
     if (eng->global_n_tokens != 0) return -2;             // need fresh sequence
@@ -3909,17 +3917,31 @@ int gemma4_engine_prefill_batched(
 // frozen KV cache (history) + its own keys via the online-softmax flash kernels — no
 // [HEADS][N×N] score buffer, so memory is O(chunk + KV) and arbitrary context (256k+)
 // is possible (the GEMM batched path OOMs past ~25k). Projections still use BF16
-// tensor-core GEMMs per chunk. Same fresh-sequence contract & logits_out as
-// prefill_batched. Returns 0 / -2 (defer) / -1.
+// tensor-core GEMMs per chunk. Same logits_out contract as prefill_batched.
+//
+// SUFFIX-CAPABLE: unlike prefill_batched (whose GEMM attention is chunk-internal
+// N×N with no history term), every per-chunk kernel here already takes an absolute
+// base — chunk 2 of a fresh prefill IS a suffix prefill. A non-empty cache
+// (global_n_tokens > 0) is therefore handled by offsetting the per-chunk base by
+// the existing token count: RoPE positions, the flash kernels' history bounds and
+// q_base, and the flat KV writes all use absolute positions. This is what keeps
+// multi-turn agent suffixes (re-rendered assistant turn + tool result) off the
+// ~127 tok/s chunked-decode fallback. Returns 0 / -2 (defer) / -1.
 int gemma4_engine_prefill_flash(
     gemma4_engine_t *eng, const int32_t *tokens, int n_tokens, float *logits_out)
 {
     eng->mtp_h_valid = 0;   // prefill invalidates the MTP drafter's recurrent h
 
     if (!eng->loaded || n_tokens <= 0) return -1;
-    if (eng->global_n_tokens != 0) return -2;             // need fresh sequence
-    if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
-    if (build_bf16_weights(eng) != 0) return -1;
+    const int base0 = eng->global_n_tokens;               // 0 = fresh, >0 = suffix
+    if (base0 + n_tokens > eng->global_kv_capacity) return -2;  // would overflow cache
+    // Tiny suffixes stay on the chunked dp4a fallback: this path pays a fixed
+    // per-chunk full-model BF16 dequant (~28 GB of traffic, ~125 ms) that only
+    // amortizes past a few dozen tokens; below that two 16-token dp4a chunks win.
+    if (base0 > 0 && n_tokens < 32) return -2;
+    // BF16 scratch failure is not fatal here: the chunked dp4a fallback needs
+    // no BF16 weights, so defer instead of failing the whole prefill.
+    if (build_bf16_weights(eng) != 0) return -2;
 
     cudaStream_t stream = eng->stream;
     const int H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE, HD2 = 32*sizeof(float);
@@ -3953,12 +3975,20 @@ int gemma4_engine_prefill_flash(
         gemm_bf16(eng, eng->d_bf16_layer[p], d_inb, dst, in_dim, out_dim, rows);
     };
 
+    int aborted = 0;
     for (int c0 = 0; c0 < N; c0 += C) {
+        if (eng->abort_req) { aborted = 1; break; }       // client gone — stop between chunks
         int cn = (N - c0 < C) ? (N - c0) : C;
+        const int abs0 = base0 + c0;                      // chunk's absolute base position
         embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), tokens + c0, cn, H, stream);
         scale_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, cn*H, sqrtf((float)H));
 
         for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+            // Abort granularity: one 8192-token chunk runs ~30s at long context,
+            // so poll per LAYER (~0.7s). Mid-chunk abort is safe for the same
+            // reason as mid-prefill: nothing is accounted until global_n_tokens
+            // advances, so partial KV writes are invisible and overwritten.
+            if (eng->abort_req) { aborted = 1; break; }
             layer_type_t lt = eng->layer_types[l];
             int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
             int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
@@ -3985,32 +4015,33 @@ int gemma4_engine_prefill_flash(
 
             float theta = (lt==LAYER_SLIDING)? 10000.0f : 1000000.0f;
             const float *ff = (lt==LAYER_SLIDING)? NULL : eng->d_rope_freqs;
-            rope_rows_kernel<<<dim3(HEADS,cn),hd/2,0,stream>>>(d_q, d_k, c0, HEADS, nkv, hd, cn, theta, ff);
+            rope_rows_kernel<<<dim3(HEADS,cn),hd/2,0,stream>>>(d_q, d_k, abs0, HEADS, nkv, hd, cn, theta, ff);
 
             // Flash attention (tiled, warp-per-query): chunk queries vs frozen history
             // (cache) + chunk keys. 8 warps/block → 8 queries/block, __shfl reductions.
             const int WPB = 8;
             dim3 fg((cn + WPB - 1) / WPB, HEADS);
             if (lt == LAYER_SLIDING) {
-                // FLAT (Step 3): history = c0 tokens already in cache; this chunk attends the
-                // window range of absolute positions then is persisted at [c0, c0+cn-1] (all cn).
+                // FLAT (Step 3): history = abs0 tokens already in cache; this chunk attends
+                // the window range of absolute positions then is persisted at
+                // [abs0, abs0+cn-1] (all cn).
                 size_t lstride = (size_t)eng->sliding_kv_capacity * kvhd;
                 kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
                 kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
                 flash_prefill_sliding_tiled_kernel<<<fg, WPB*32, 0, stream>>>(
                     d_attn, d_q, kc, vc, HEADS, nkv, hd, GEMMA4_SLIDING_WINDOW,
-                    c0, 0, d_k, d_v, cn, c0, okv);
+                    abs0, 0, d_k, d_v, cn, abs0, okv);
                 kv_write_sliding_kernel<<<dim3(grid1d(kvhd),cn),256,0,stream>>>(
-                    kc, vc, d_k, d_v, c0, 0, cn, kvhd, GEMMA4_SLIDING_WINDOW);
+                    kc, vc, d_k, d_v, abs0, 0, cn, kvhd, GEMMA4_SLIDING_WINDOW);
             } else {
                 int slot = eng->global_slot[l];
                 size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
                 kv_t *kc = eng->d_global_k + (size_t)slot*stride;
                 kv_t *vc = eng->d_global_v + (size_t)slot*stride;
                 flash_prefill_global_tiled_kernel<<<fg, WPB*32, 0, stream>>>(
-                    d_attn, d_q, kc, vc, HEADS, hd, c0, d_k, d_v, cn, c0, okv);
+                    d_attn, d_q, kc, vc, HEADS, hd, abs0, d_k, d_v, cn, abs0, okv);
                 kv_write_global_kernel<<<dim3(grid1d(hd),cn),256,0,stream>>>(
-                    kc, vc, d_k, d_v, c0, cn, hd);
+                    kc, vc, d_k, d_v, abs0, cn, hd);
             }
 
             f32_to_bf16_kernel<<<grid1d((size_t)cn*oq),256,0,stream>>>(d_inb, d_attn, (size_t)cn*oq);
@@ -4027,6 +4058,7 @@ int gemma4_engine_prefill_flash(
                 scale_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, cn*H, eng->h_out_scale[l]);
         }
 
+        if (aborted) break;
         if (c0 + cn >= N) {                               // last chunk: logits of last token
             float *x_last = d_x + (size_t)(cn-1)*H;
             rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
@@ -4043,12 +4075,27 @@ int gemma4_engine_prefill_flash(
         }
         cudaStreamSynchronize(stream);                    // chunk boundary (cache state advanced)
     }
-    eng->global_n_tokens = N;
+    if (!aborted) {
+        eng->global_n_tokens = base0 + N;
+        // The last chunk's output-normed last-token hidden (d_norm) is exactly the
+        // recurrent h the MTP drafter pairs with the first sampled token — restore it
+        // (parity with the chunked-decode suffix path and gemma4_engine_decode) so
+        // drafting starts immediately after a suffix prefill.
+        if (eng->mtp.loaded) {
+            cudaMemcpyAsync(eng->d_mtp_h, eng->d_norm,
+                            GEMMA4_HIDDEN_SIZE * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+            eng->mtp_h_valid = 1;
+        }
+    }
+    // On abort: global_n_tokens stays at base0 — KV entries written by completed
+    // chunks sit beyond the accounted length, are never read, and are overwritten
+    // by the next prefill. The cache state is exactly "nothing happened".
 
     cudaEventRecord(t1, stream);
     cudaEventSynchronize(t1);
     float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
-    eng->prefill_time_ms += ms; eng->n_prefill_tokens += N;
+    if (!aborted) { eng->prefill_time_ms += ms; eng->n_prefill_tokens += N; }
     cudaEventDestroy(t0); cudaEventDestroy(t1);
 
     for (float *p : fbufs) cudaFree(p);
@@ -4058,7 +4105,7 @@ int gemma4_engine_prefill_flash(
         fprintf(stderr, "gem4d: flash-prefill CUDA error: %s\n", cudaGetErrorString(err));
         return -1;
     }
-    return 0;
+    return aborted ? -3 : 0;
 }
 
 // =========================================================================
@@ -4106,6 +4153,7 @@ int gemma4_engine_prefill(
     float dec_ms = eng->decode_time_ms; int dec_n = eng->n_decode_tokens;
     int rc = 0, lastK = 0;
     for (int t = 0; t < n_tokens && rc == 0; t += GEMMA4_SPEC_MAX) {
+        if (eng->abort_req) { rc = -3; break; }  // client gone — stop between chunks
         int K = (n_tokens - t < GEMMA4_SPEC_MAX) ? (n_tokens - t) : GEMMA4_SPEC_MAX;
         int last = (t + K == n_tokens);
         rc = gemma4_engine_decode_batched(eng, tokens + t, K, last ? chunk_logits : NULL);
@@ -4115,7 +4163,9 @@ int gemma4_engine_prefill(
     if (rc != 0) {
         free(chunk_logits);
         cudaEventDestroy(start); cudaEventDestroy(stop);
-        return -1;
+        // -3 = cooperative abort: completed chunks stay committed in the KV
+        // (global_n_tokens advanced); the next request's Rewind trims them.
+        return rc == -3 ? -3 : -1;
     }
     if (logits_out && chunk_logits)
         memcpy(logits_out, chunk_logits + (size_t)(lastK - 1) * GEMMA4_VOCAB_SIZE,
@@ -4292,8 +4342,13 @@ static int decode_batched_dev(
     const int HEADS = GEMMA4_HEADS;
     const int pos = eng->global_n_tokens;            // captured; advanced only at end
 
+    // Timing: events only on the public (keep_dev=0) path. The spec-verify caller
+    // (keep_dev=1) syncs the stream itself right after sampling — its old per-step
+    // cudaEventSynchronize here was a SECOND full host-blocking drain per verify
+    // step that also serialized the sampler launch behind the forward; the caller
+    // accumulates decode_ms with a host clock around its own sync instead.
     cudaEvent_t t0 = eng->ev_start, t1 = eng->ev_stop;   // engine-resident (Step 4)
-    cudaEventRecord(t0, stream);
+    if (!keep_dev) cudaEventRecord(t0, stream);
 
     // Engine-resident scratch (allocated once, sized for GEMMA4_SPEC_MAX rows), so
     // repeated/probe calls pay no per-call cudaMalloc/free. All fp32: the batched
@@ -4427,11 +4482,13 @@ static int decode_batched_dev(
 
     eng->global_n_tokens += K;
 
-    cudaEventRecord(t1, stream);
-    cudaEventSynchronize(t1);
-    float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
-    eng->decode_time_ms += ms;
-    eng->n_decode_tokens += K;
+    if (!keep_dev) {
+        cudaEventRecord(t1, stream);
+        cudaEventSynchronize(t1);
+        float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
+        eng->decode_time_ms += ms;
+        eng->n_decode_tokens += K;
+    }
     // events are engine-resident (Step 4) — not destroyed here.
 
     cudaError_t err = cudaGetLastError();
@@ -4965,6 +5022,14 @@ static inline double spec_rng(uint64_t *s) {
     return (double)(x >> 11) * (1.0 / 9007199254740992.0);
 }
 
+// Monotonic host clock in ms. Used to time regions that already end with a
+// stream sync (the spec verify step), replacing a redundant per-step
+// cudaEventSynchronize in decode_batched_dev.
+static inline double now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
 // fwd decls — the GPU samplers (a) are defined below the spec loop with the rest of
 // the sampling code, but run_spec_loop launches them.
 __global__ void sample_logits_kernel(
@@ -4988,6 +5053,7 @@ static int run_spec_loop(
 
     uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
     long mtp_calls = 0, mtp_drafted = 0, mtp_accepted = 0;   // drafter diagnostics
+    long mtp_declines = 0;   // assistant invoked but drafted 0 (paid ≥1 forward, invisible otherwise)
     long lk_calls  = 0, lk_drafted  = 0, lk_accepted  = 0, lk_displaced = 0;
     // Cold counter stays SHARED across drafters: a fully-rejected step says the local
     // text is hostile to speculation whichever drafter produced it, and sharing keeps a
@@ -5025,12 +5091,31 @@ static int run_spec_loop(
         // preferred also keeps the displacement bar honest: a shrunken ema_lookup must
         // not lower the full-length requirement lookup has to clear to displace MTP.
         int mtp_ready = eng->mtp.loaded && eng->mtp_h_valid;
-        int maxd = (int)((mtp_ready ? ema_mtp : ema_lookup) + 1.5f);
-        if (maxd > draft_k) maxd = draft_k;
-        if (maxd < 2)       maxd = 2;
-        if (cold >= 4) { maxd = 0; cold = 0; }
-        if (maxd > room) maxd = room; if (maxd < 0) maxd = 0;
-        if (generated + 1 >= max_new) maxd = 0;
+        // Per-drafter budgets: each drafter is sized by ITS OWN acceptance record.
+        // A single budget keyed off the preferred drafter let MTP's mediocre EMA
+        // clamp a ~99%-accepting lookup chain to ~2-token drafts on repetitive
+        // agent text (file/diff re-emission) — the dominant tool-call decode
+        // regime (measured: 62.9 tok/s where ~85-100 was available).
+        int maxd_mtp = (int)(ema_mtp + 1.5f);
+        if (maxd_mtp > draft_k) maxd_mtp = draft_k;
+        if (maxd_mtp < 2)       maxd_mtp = 2;
+        // Lookup drafts are host-side free (only the verify cost scales, ~0.23x a
+        // decode per row): when its EMA saturates the configured cap, let the cap
+        // grow toward the batch limit (K = D+1 ≤ GEMMA4_SPEC_MAX) — acceptance was
+        // measured to scale with draft length on verbatim text (k=12→9.38, k=15→
+        // 10.71 avg accepted), and the EMA shrinks it back within ~2 steps when
+        // the text turns novel.
+        int cap_lk = draft_k;
+        // lk_accepted > 0: the EMA starts optimistic at draft_k, so without the
+        // evidence gate the cap would unlock on step 1 with zero track record.
+        if (lk_accepted > 0 && ema_lookup >= (float)draft_k - 1.0f) cap_lk = GEMMA4_SPEC_MAX - 1;
+        int maxd_lk = (int)(ema_lookup + 1.5f);
+        if (maxd_lk > cap_lk) maxd_lk = cap_lk;
+        if (maxd_lk < 2)      maxd_lk = 2;
+        if (cold >= 4) { maxd_mtp = 0; maxd_lk = 0; cold = 0; }
+        if (maxd_mtp > room) maxd_mtp = room; if (maxd_mtp < 0) maxd_mtp = 0;
+        if (maxd_lk  > room) maxd_lk  = room; if (maxd_lk  < 0) maxd_lk  = 0;
+        if (generated + 1 >= max_new) { maxd_mtp = 0; maxd_lk = 0; }
 
         // Drafter policy (one config): consensus prompt-lookup is FREE, but when the MTP
         // assistant is available it may displace MTP only when its draft is genuinely
@@ -5048,18 +5133,27 @@ static int run_spec_loop(
         // assistant pass + a stream sync, so medium-confidence tokens the gate admits
         // past the recent accepted run don't pay for themselves.
         int lk_ng = 0, lk_nocc = 0;
-        int D = prompt_lookup_draft(hist, n, batch+1, maxd, 2, draft_k, &lk_ng, &lk_nocc);
-        if (D > 0) { lk_calls++; lk_drafted += D; }   // counted at draft time, like mtp
+        int D = prompt_lookup_draft(hist, n, batch+1, maxd_lk, 2, draft_k, &lk_ng, &lk_nocc);
         int from_mtp = 0;
-        int lookup_strong = (D > 0 && D == maxd && lk_ng >= 3 && lk_nocc >= 2);
-        if (mtp_ready && maxd > 0 && !lookup_strong) {
-            int Dm = mtp_draft(eng, g, batch+1, maxd);   // drafts into a local buf; on 0 the
-            if (Dm > 0) {                                // lookup draft in batch+1 is intact
-                if (D > 0) lk_displaced++;               // weak lookup draft lost to MTP
+        // The displacement bar stays pinned to the MTP budget: to displace MTP a
+        // lookup draft must reach the full length MTP would have been allowed,
+        // with a >=3-gram match corroborated by >=2 occurrences. (Pinning to the
+        // lookup budget would let a shrunken ema_lookup lower the bar.)
+        int lookup_strong = (D > 0 && maxd_mtp > 0 && D >= maxd_mtp && lk_ng >= 3 && lk_nocc >= 2);
+        if (mtp_ready && maxd_mtp > 0 && !lookup_strong) {
+            int Dm = mtp_draft(eng, g, batch+1, maxd_mtp);  // drafts into a local buf; on 0 the
+            if (Dm > 0) {                                   // lookup draft in batch+1 is intact
+                if (D > 0) lk_displaced++;                  // weak lookup draft lost to MTP
                 D = Dm; from_mtp = 1;
                 mtp_calls++; mtp_drafted += Dm;
+            } else {
+                mtp_declines++;   // paid ≥1 assistant forward, drafted nothing
             }
         }
+        // Count lookup drafts only when they reach the verify (displaced drafts
+        // were inflating the denominator: Req1's "0% of 71 proposed" was really
+        // 2 verified drafts — a stats artifact).
+        if (D > 0 && !from_mtp) { lk_calls++; lk_drafted += D; }
         if (D == 0) {
             // Cold/no-draft step: decode g WITHOUT the 262k D2H, then sample on-device
             // (eng->d_logits already carries softcap+suppress). decode() also refreshes
@@ -5085,6 +5179,7 @@ static int run_spec_loop(
         // preserves the target distribution.
         float rnds[GEMMA4_SPEC_MAX]; int ids[GEMMA4_SPEC_MAX];
         for (int i = 0; i < K; i++) rnds[i] = (float)spec_rng(&rng);
+        double vt0 = now_ms();   // decode_batched_dev(keep_dev=1) skips event timing
         if (decode_batched_dev(eng, batch, K, NULL, /*keep_dev=*/1) != 0) {
             if (gemma4_engine_decode(eng, g, logits) != 0) { stop = 1; break; }
             g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
@@ -5102,6 +5197,10 @@ static int run_spec_loop(
             g = host_sample(logits, V, temp, top_k, top_p, min_p, spec_rng(&rng));
             continue;
         }
+        // Stream is drained: charge the whole verify step (forward + sample + D2H)
+        // to the decode counters, replacing the event timing skipped under keep_dev.
+        eng->decode_time_ms += (float)(now_ms() - vt0);
+        eng->n_decode_tokens += K;
         int a = 0;
         while (a < D && ids[a] == batch[1+a]) a++;   // first mismatch = accept length
         total_accepted += a;
@@ -5135,13 +5234,15 @@ static int run_spec_loop(
         // at row a) or the bonus row D (all accepted) — already drawn on-device above.
         g = ids[a];
     }
-    if (eng->mtp.loaded && mtp_calls > 0)
-        fprintf(stderr, "gem4d: [mtp] %ld draft calls, %ld proposed, %ld accepted (%.0f%%)\n",
+    if (eng->mtp.loaded && (mtp_calls > 0 || mtp_declines > 0))
+        fprintf(stderr, "gem4d: [mtp] %ld draft calls, %ld proposed, %ld accepted (%.0f%%), %ld declined\n",
                 mtp_calls, mtp_drafted, mtp_accepted,
-                100.0 * mtp_accepted / (double)(mtp_drafted > 0 ? mtp_drafted : 1));
+                100.0 * mtp_accepted / (double)(mtp_drafted > 0 ? mtp_drafted : 1),
+                mtp_declines);
     // Lookup symmetric to [mtp], plus the count of weak drafts the policy handed to MTP
-    // instead — that displacement rate IS the new policy, so it must be visible here.
-    if (lk_calls > 0)
+    // instead — that displacement rate IS the new policy, so it must be visible here
+    // (also when displacement was TOTAL, i.e. zero verified lookup drafts).
+    if (lk_calls > 0 || lk_displaced > 0)
         fprintf(stderr, "gem4d: [lookup] %ld draft calls, %ld proposed, %ld accepted (%.0f%%), %ld displaced by mtp\n",
                 lk_calls, lk_drafted, lk_accepted,
                 100.0 * lk_accepted / (double)(lk_drafted > 0 ? lk_drafted : 1),
@@ -5595,5 +5696,26 @@ void gemma4_engine_graph_stats(const gemma4_engine_t *eng,
     if (misses) *misses = eng->graph.misses;
     if (captures) *captures = eng->graph.N > 0 ? 1 : 0;
     if (launches) *launches = eng->graph.hits;
+}
+
+// Eagerly run the lazy first-prefill setup (persistent prefill scratch ≈2.9 GB +
+// rotating BF16 dequant scratch ≈0.5 GB) so request #1's prefill timer measures
+// prefill, not one-time cudaMallocs (~0.5-2.1 s otherwise charged to it). Both
+// halves are idempotent. A scratch-alloc failure is non-fatal (the batched path
+// defers to flash, which needs only the BF16 scratch).
+int gemma4_engine_warmup(gemma4_engine_t *eng) {
+    if (!eng || !eng->loaded) return -1;
+    int rc = 0;
+    if (alloc_prefill_scratch(eng) != 0) rc = -1;
+    if (build_bf16_weights(eng) != 0)    rc = -1;
+    return rc;
+}
+
+// Cooperative prefill abort: called from a DIFFERENT thread than the one blocked
+// inside a prefill (which holds the Go engine mutex). The chunked prefill loops
+// poll the flag between chunks and return -3; the flag is cleared at the next
+// prefill's entry (chain head). Safe to call at any time — at worst a no-op.
+void gemma4_engine_abort_prefill(gemma4_engine_t *eng) {
+    if (eng) eng->abort_req = 1;
 }
 

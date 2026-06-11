@@ -161,11 +161,47 @@ func (e *Engine) Prefill(tokens []int32) ([]float32, error) {
 	if ret == -2 {
 		ret = C.gemma4_engine_prefill(e.ptr, tokPtr, n, logPtr)
 	}
+	if ret == -3 {
+		return nil, prefillAborted{}
+	}
 	if ret != 0 {
 		return nil, fmt.Errorf("gem4d: prefill failed")
 	}
 
 	return logits, nil
+}
+
+// prefillAborted marks a cooperative cancellation (AbortPrefill): the engine
+// state is consistent (committed chunks at correct positions; unaccounted
+// writes never read), so the prefix cache may retain the shared prefix. The
+// server's kvcache detects it structurally via the anonymous
+// interface{ Aborted() bool } — no cgo import needed there.
+type prefillAborted struct{}
+
+func (prefillAborted) Error() string { return "gem4d: prefill aborted" }
+func (prefillAborted) Aborted() bool { return true }
+
+// AbortPrefill asks an in-flight Prefill (on another goroutine) to stop at the
+// next chunk/layer boundary. It deliberately does NOT take e.mu — the
+// prefilling goroutine holds it — and only writes an advisory flag engine-side.
+// The caller (server) joins its watcher goroutine while still holding the kv
+// lock, so a stale call can never outlive its request; the residual e.ptr read
+// vs Close() race is confined to process shutdown.
+func (e *Engine) AbortPrefill() {
+	if e.ptr != nil {
+		C.gemma4_engine_abort_prefill(e.ptr)
+	}
+}
+
+// Warmup eagerly runs the engine's lazy first-prefill setup (persistent prefill
+// scratch + BF16 dequant scratch, ~0.5-2.1s of cudaMallocs) so the first
+// request's prefill timer measures prefill rather than setup. Call once at
+// server startup. Errors are non-fatal (the prefill paths keep their lazy
+// fallbacks) so none are returned.
+func (e *Engine) Warmup() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	C.gemma4_engine_warmup(e.ptr)
 }
 
 // Decode processes a single token and returns logits.
