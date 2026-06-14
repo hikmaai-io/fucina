@@ -53,7 +53,8 @@ func avg(tok int64, sec float64) float64 {
 // context-utilization and prefix-cache stats supplied by the caller.
 func (m *Metrics) snapshot(model string, ctxUsed, ctxCap int,
 	kvSlidingMB, kvGlobalMB float64,
-	hits, misses int, reusedTok, reqTok int64) map[string]interface{} {
+	hits, misses int, reusedTok, reqTok int64,
+	specSteps, specDrafted, specAccepted, specEmitted int64) map[string]interface{} {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -65,6 +66,16 @@ func (m *Metrics) snapshot(model string, ctxUsed, ctxCap int,
 	hitRate := 0.0
 	if reqTok > 0 {
 		hitRate = float64(reusedTok) / float64(reqTok)
+	}
+	// Speculative-decode health: τ = tokens emitted per target forward (higher = the
+	// drafter is carrying more of the decode); acceptance = matched drafts / proposed.
+	tokensPerForward := 0.0
+	if specSteps > 0 {
+		tokensPerForward = float64(specEmitted) / float64(specSteps)
+	}
+	acceptRate := 0.0
+	if specDrafted > 0 {
+		acceptRate = float64(specAccepted) / float64(specDrafted)
 	}
 	return map[string]interface{}{
 		"model":    model,
@@ -95,6 +106,14 @@ func (m *Metrics) snapshot(model string, ctxUsed, ctxCap int,
 		"totals": map[string]interface{}{
 			"prefill_tokens": m.prefillTokens,
 			"decode_tokens":  m.decodeTokens,
+		},
+		"speculation": map[string]interface{}{
+			"verify_forwards":    specSteps,
+			"drafted":            specDrafted,
+			"accepted":           specAccepted,
+			"emitted":            specEmitted,
+			"tokens_per_forward": round3(tokensPerForward),
+			"accept_rate":        round3(acceptRate),
 		},
 	}
 }

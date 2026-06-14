@@ -244,6 +244,13 @@ int   gemma4_engine_prefill_tokens(const gemma4_engine_t *eng);
 float gemma4_engine_decode_ms(const gemma4_engine_t *eng);
 int   gemma4_engine_decode_tokens(const gemma4_engine_t *eng);
 
+// Cumulative speculative-decode acceptance counters (across all spec calls), for /metrics:
+// τ = emitted/steps tokens per verify forward; acceptance = accepted/drafted.
+long  gemma4_engine_spec_steps(const gemma4_engine_t *eng);
+long  gemma4_engine_spec_drafted(const gemma4_engine_t *eng);
+long  gemma4_engine_spec_accepted(const gemma4_engine_t *eng);
+long  gemma4_engine_spec_emitted(const gemma4_engine_t *eng);
+
 // KV cache state management (for prefix reuse across requests)
 int  gemma4_engine_n_tokens(const gemma4_engine_t *eng);  // tokens in KV cache
 void gemma4_engine_reset(gemma4_engine_t *eng);           // rewind to empty

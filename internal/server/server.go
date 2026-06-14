@@ -38,6 +38,7 @@ type serverEngine interface {
 	Reset()
 	Rewind(nKeep int) bool
 	ContextSize() uint32
+	SpecStats() (steps, drafted, accepted, emitted int64)
 }
 
 // ─── Types ─────────────────────────────────────────────────────────
@@ -54,7 +55,14 @@ type Server struct {
 	draftK          int          // speculative draft length per step (--draft-k)
 	thinkBudget     int          // reasoning-channel token budget: 0=auto (MaxTokens/2), <0=off
 	lastUsed        atomic.Int64 // engine NTokens mirror so /metrics never blocks on the kv lock
-	metrics         Metrics
+	// Speculative-decode counter mirrors, refreshed at end-of-generation under the kv
+	// lock so /metrics reads them lock-free (calling engine.SpecStats() from /metrics
+	// would take the engine mutex and block behind a multi-minute generation).
+	specSteps    atomic.Int64
+	specDrafted  atomic.Int64
+	specAccepted atomic.Int64
+	specEmitted  atomic.Int64
+	metrics      Metrics
 	httpServer      *http.Server
 }
 
@@ -479,8 +487,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	slidingMB := float64(48*8*256) * float64(ctxCap) * 2 / mib
 	globalMB := float64(8*512) * float64(ctxCap) * 2 / mib
 
+	// Lock-free: read the mirrored spec counters (refreshed under the kv lock at
+	// end-of-generation), NOT engine.SpecStats() which would take the engine mutex.
 	writeJSON(w, http.StatusOK, s.metrics.snapshot(
-		s.modelName, used, ctxCap, slidingMB, globalMB, hits, misses, reused, reqTok))
+		s.modelName, used, ctxCap, slidingMB, globalMB, hits, misses, reused, reqTok,
+		s.specSteps.Load(), s.specDrafted.Load(), s.specAccepted.Load(), s.specEmitted.Load()))
 }
 
 // statusRecorder captures the response status so the access log can report it.
@@ -817,6 +828,12 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		s.generateResponse(r.Context(), w, params, promptTokens, logits, wantTools, legacy)
 	}
 	s.lastUsed.Store(int64(s.engine.NTokens()))
+	// Refresh the lock-free spec-decode mirror for /metrics (still under the kv lock).
+	st, dr, ac, em := s.engine.SpecStats()
+	s.specSteps.Store(st)
+	s.specDrafted.Store(dr)
+	s.specAccepted.Store(ac)
+	s.specEmitted.Store(em)
 }
 
 // finishStream emits the terminal finish_reason + usage chunk and [DONE] on an
@@ -1589,7 +1606,13 @@ func (s *Server) Start(addr string) error {
 		IdleTimeout:       120 * time.Second,
 	}
 	log.Printf("gem4d: server listening on %s", addr)
-	return s.httpServer.ListenAndServe()
+	// ErrServerClosed is the normal result of a graceful Stop()/Shutdown — report it
+	// as a clean return so the caller falls through to its deferred engine teardown
+	// (rather than os.Exit-ing mid-CUDA-call).
+	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
 // Stop gracefully shuts the HTTP server down, allowing in-flight requests up to

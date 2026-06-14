@@ -380,6 +380,18 @@ func (e *Engine) NTokens() int {
 	return int(C.gemma4_engine_n_tokens(e.ptr))
 }
 
+// SpecStats returns cumulative speculative-decode acceptance counters for /metrics:
+// steps (verify forwards), drafted (proposed draft tokens), accepted (matched drafts),
+// emitted (accepted + bonus committed per step). τ = emitted/steps; acceptance = accepted/drafted.
+func (e *Engine) SpecStats() (steps, drafted, accepted, emitted int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return int64(C.gemma4_engine_spec_steps(e.ptr)),
+		int64(C.gemma4_engine_spec_drafted(e.ptr)),
+		int64(C.gemma4_engine_spec_accepted(e.ptr)),
+		int64(C.gemma4_engine_spec_emitted(e.ptr))
+}
+
 // Reset rewinds the KV cache to empty so the next Prefill starts a fresh
 // sequence at position 0. It does not free device memory.
 func (e *Engine) Reset() {

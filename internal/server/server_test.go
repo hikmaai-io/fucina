@@ -229,6 +229,10 @@ func (f *fakeServerEngine) NTokens() int        { return len(f.tokens) }
 func (f *fakeServerEngine) Reset()              { f.tokens = f.tokens[:0] }
 func (f *fakeServerEngine) ContextSize() uint32 { return f.ctxSize }
 
+func (f *fakeServerEngine) SpecStats() (steps, drafted, accepted, emitted int64) {
+	return 0, 0, 0, 0
+}
+
 func (f *fakeServerEngine) Rewind(nKeep int) bool {
 	if nKeep < 0 || nKeep > len(f.tokens) {
 		return false
