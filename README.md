@@ -49,11 +49,39 @@ Bottom-up, each layer builds on the one below it:
 - **Speculative decoding** — prompt-lookup speculation is on by default (`--spec`), works for both
   greedy and sampling at the same output distribution; an optional **MTP assistant** (the official
   Gemma-4 draft head) can be loaded with `--assistant` to draft novel text.
+- **CUDA-graph decode** — both the single-token decode step and the K-row batched
+  speculative-verify forward are captured as **position-independent** CUDA graphs (device-resident
+  position, KV-cache writes *inside* the graph) and replayed each step, eliminating per-kernel
+  launch overhead. Captured eagerly at startup by `Warmup()` so request #1 pays no capture cost.
+  Opt out with `GEM4D_NO_BATCHED_GRAPH=1` / `GEM4D_NO_DECODE_GRAPH=1`.
+- **Packed-Q4_0 decode weights** (default-on) — a repacked `[16-byte-aligned quants ‖ fp16 scales]`
+  copy of the Q4_0 projections for coalesced `uint4` GEMV loads. Bit-exact; opt out with
+  `GEM4D_NO_PACKED=1`.
+- **FP8 KV cache** — the KV cache is stored as **E4M3** (1 byte/element), halving KV bandwidth
+  versus fp16 while attention runs on FP8 Tensor Cores.
 - **GPU-side sampling** — when no repeat penalty is configured, the next token is selected on the
   device and decoded without copying the 262k-element logit vector back to the host.
 - **OpenAI-compatible API** — `/v1/chat/completions` (streaming + non-streaming) with **tool
   calling** and the **gemma-4 thinking channel** (reasoning emitted as `reasoning_content`,
   controlled per-request via `reasoning_effort` / `thinking` / `enable_thinking`).
+
+### Performance (dense 12B, GB10)
+
+Measured against `llama.cpp` (`llama-server`) on a fair side-by-side harness
+(`scripts/pi_bench.py`: identical transcript, temperature 0, thinking on, MTP draft head on both):
+
+- **Decode: at parity-to-ahead overall, and +15–20% at high context (≥5k tokens)** — gem4d's
+  decode throughput *rises* with context as acceptance climbs and the FP8-KV flash attention
+  scales, which is the regime that dominates long agentic sessions.
+- **Prefill: steady-state tied**; the residual gap is the one-time cold turns (small-N GEMM
+  efficiency), not steady throughput.
+- **Tool-calling quality matches on the easy suite and is ahead on hard agentic scenarios**
+  (`tool-eval-bench`), at equal-or-faster latency.
+
+The decode wins come from the **CUDA-graph launch-bubble removal and speculation acceptance (τ)** —
+not from weight-load width. Single-token decode on GB10 is **bandwidth-bound on total weight
+bytes**, so wider (128-bit) loads change instruction count but not bytes and do not help; see the
+`speculation` block in `/metrics` (`accept_rate`, `tokens_per_forward`) to observe τ live.
 
 ## Requirements
 
@@ -140,7 +168,7 @@ Run `gem4d --help` for the full flag list.
 | `GET  /v1/models`       | Lists the loaded model id                                                |
 | `POST /v1/embeddings`   | Stub — returns an empty data list                                        |
 | `GET  /health`          | Liveness + KV cache stats (hits, misses, hit rate, cached tokens)        |
-| `GET  /metrics`         | KV/context utilization, prefix-cache hit rate, prefill/decode throughput |
+| `GET  /metrics`         | KV/context utilization, prefix-cache hit rate, prefill/decode throughput, `speculation` block (accept_rate, tokens_per_forward) |
 
 ## Testing
 

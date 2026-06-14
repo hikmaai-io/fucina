@@ -1,0 +1,60 @@
+# gem4d
+
+> A Gemma 4 12B inference engine in Go + CUDA C++, built for exactly one target: the NVIDIA DGX
+> Spark **GB10** (Blackwell, `sm_121a`, CUDA 13.0). Loads Q4_0 (QAT) / Q8_0 GGUF weights, runs the
+> full forward pass on-GPU with FP8 Tensor-Core attention, and serves an OpenAI-compatible HTTP
+> API plus one-shot and interactive CLI modes. Hardware-specific and experimental.
+
+The model is Gemma 4 12B: 48 layers (40 sliding-window + 8 global attention), GeGLU FFN
+(`gelu_pytorch_tanh`, intermediate 15360), RoPE/p-RoPE, logit softcap 30.0, vocab 262144, a Q6_K
+tied LM head, hidden 3840. Decode on GB10 is **memory-bandwidth-bound on total weight bytes**: the
+levers that move it are CUDA-graph launch-bubble removal and speculation acceptance (τ), not
+weight-load width.
+
+## Architecture (bottom-up)
+
+- [cuda/gemma4_kernels.cu](cuda/gemma4_kernels.cu): the entire dense-12B forward pass — quantized
+  GEMV/GEMM (Q4_0/Q6_K/Q8_0 dp4a, warp-per-row), FP8 flash attention, RoPE, RMSNorm, GeGLU, GPU
+  sampling, and the CUDA-graph capture/replay. Compiled to `cuda/libgem4d.a`.
+- [cuda/gemma4_kernels.cuh](cuda/gemma4_kernels.cuh): model dimensions and the engine struct.
+- [internal/engine/cuda/bridge.go](internal/engine/cuda/bridge.go): the CGO bridge — wraps the
+  opaque CUDA engine as a Go `Engine` (`NewEngine`, `Prefill`, `Decode`, `DecodeNoCopy`,
+  `SampleDevice`, `GenerateSpec`, `LoadAssistant`, `SpecStats`, …).
+- [internal/server](internal/server): OpenAI-compatible HTTP server, gemma-4 chat template, tool-call
+  parsing, thinking channel, prefix-reuse KV cache.
+- [internal/tokenizer](internal/tokenizer): Gemma 4 SentencePiece/Unigram tokenizer.
+- [cmd/gem4d](cmd/gem4d): CLI entry point and the three run modes (`main.go`, `oneshot.go`, `args.go`).
+
+## Build & run
+
+- [Makefile](Makefile): `make` builds `cuda/libgem4d.a` (nvcc `-arch=sm_121a`) then the Go binary;
+  it verifies the cubin arch and the device-upload code path (cgo does not hash the static archive).
+- [README.md](README.md): full build, usage, flags, HTTP API, and performance summary.
+- Run: `gem4d -m model.gguf --ctx 32768 --port 8080` (server) or `gem4d -m model.gguf -p "Hi" -n 100`.
+- Smoke test: `make smoke`. CPU tests: `go test ./internal/server/ ./internal/tokenizer/`.
+
+## Decode performance facts
+
+- **CUDA graphs** are position-independent (device-resident position, KV writes inside the graph)
+  and cover single-token decode + the K-row batched speculative-verify forward; both replayed every
+  step. Pre-captured at startup by `Warmup()`. Opt out: `GEM4D_NO_DECODE_GRAPH=1`,
+  `GEM4D_NO_BATCHED_GRAPH=1`.
+- **Packed-Q4_0** (`[16-B quants ‖ fp16 scales]`, coalesced `uint4` loads) is default-on, bit-exact,
+  opt out `GEM4D_NO_PACKED=1`. Net ~neutral on single-token decode — decode is bandwidth-bound, so
+  wider loads cut instruction count but not bytes. Do not expect a speedup from load width here.
+- **FP8 E4M3 KV cache** (1 B/elem). Attention is not the gap; weight-load bandwidth is.
+- Observe speculation acceptance live in `/metrics` → `speculation` block (`accept_rate`,
+  `tokens_per_forward`). τ is the highest-leverage decode tunable.
+
+## Benchmarks
+
+- [scripts/pi_bench.py](scripts/pi_bench.py): fair side-by-side vs an OpenAI-compatible server
+  (divergence-free transcript) — the canonical decode/prefill head-to-head.
+- [scripts/parity_bench.py](scripts/parity_bench.py): bit-exact fingerprint + suffix-prefill parity.
+- [scripts/benchmark_gem4.py](scripts/benchmark_gem4.py): prefill-decay, decode-rate, tool-loop.
+
+## Optional / separate efforts
+
+- DiffusionGemma (block text-diffusion MoE) is a **separate, in-progress** engine (`cuda/diffusion_*`,
+  `internal/engine/diffusion/`, `cmd/gem4d/diffusion.go`) — not part of the dense-12B path above.
+- NVFP4 / FP4 tensor-core GEMM (`GEM4D_FP4`) is experimental prefill work, separate from dense decode.
