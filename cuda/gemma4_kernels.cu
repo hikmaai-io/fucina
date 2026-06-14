@@ -7213,14 +7213,48 @@ int gemma4_engine_warmup(gemma4_engine_t *eng) {
     const char *nw = getenv("GEM4D_NO_WARMUP_PASS");
     if (nw && nw[0] == '1') return 0;
 
+    // (1) Pre-capture EVERY CUDA graph now (capture-only, no KV state touched) so
+    // request #1's generation pays zero graph-capture cost. Lazy capture otherwise
+    // lands on the first generated tokens — the cold turns the agentic bench showed
+    // (turn-0/1 decode well below steady state). Covers the single-token decode graph,
+    // the MTP draft graph (only if the assistant is loaded — mtp_forward reads the MTP
+    // buffers), and the batched spec-verify graph for every K.
+    decode_graph_ensure(eng);
+    if (eng->mtp.loaded) mtp_graph_ensure(eng);
+    for (int k = 1; k <= GEMMA4_SPEC_MAX; k++) batched_graph_ensure(eng, k);
+
+    // (2) Real passes that fault in scratch + load every lazily-bound CUDA module and
+    // let cuBLAS init its workspaces, across ALL the shapes request #1 will hit — not
+    // just the one fresh batched prefill. Each is rewound so warmup leaks no KV state.
     const int WN = 2048;   // ≤ 4096 → exercises the batched tensor-core prefill path
     int32_t *toks = (int32_t*)malloc((size_t)WN * sizeof(int32_t));
     float   *logits = (float*)malloc((size_t)GEMMA4_VOCAB_SIZE * sizeof(float));
     if (toks && logits) {
         for (int i = 0; i < WN; i++) toks[i] = i % 64;  // arbitrary valid token ids
-        if (gemma4_engine_prefill_batched(eng, toks, WN, logits) == 0)
+
+        // (a) batched fresh prefill, then a few decodes — warms the decode mmvq kernels
+        // (distinct modules from the cuBLAS prefill GEMMs) and replays the decode graph.
+        if (gemma4_engine_prefill_batched(eng, toks, WN, logits) == 0) {
+            for (int i = 0; i < 4; i++) gemma4_engine_decode(eng, toks[i % 64], logits);
             cudaStreamSynchronize(eng->stream);
+        }
         gemma4_engine_reset(eng);   // rewind cursors — warmup must not leak KV state
+
+        // (b) flash continuation path (a suffix prefill on a non-empty cache) — the
+        // turn-1+ path the fresh batched warmup above never exercises. Warm it at a
+        // REPRESENTATIVE width (~2k): cuBLAS re-selects GEMM kernels per N, so a tiny
+        // 256-tok flash pass leaves the first real ~2.5k suffix prefill (turn 1) cold.
+        if (gemma4_engine_prefill_batched(eng, toks, 256, logits) == 0) {
+            gemma4_engine_prefill_flash(eng, toks, WN, logits);   // WN=2048-wide flash
+            cudaStreamSynchronize(eng->stream);
+        }
+        gemma4_engine_reset(eng);
+
+        // (c) small-N fresh prefill — warms the short-prompt GEMM shapes of turn 0
+        // (cuBLAS re-selects kernels per N; the WN=2048 pass doesn't cover N≈128).
+        if (gemma4_engine_prefill_batched(eng, toks, 128, logits) == 0)
+            cudaStreamSynchronize(eng->stream);
+        gemma4_engine_reset(eng);
     }
     free(toks);
     free(logits);
