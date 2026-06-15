@@ -11,13 +11,13 @@ type Metrics struct {
 	requests int64
 
 	// prefill
-	prefillTokens int64
-	prefillSec    float64
+	prefillTokens  int64
+	prefillSec     float64
 	lastPrefillTPS float64
 
 	// decode
-	decodeTokens int64
-	decodeSec    float64
+	decodeTokens  int64
+	decodeSec     float64
 	lastDecodeTPS float64
 }
 
@@ -86,9 +86,9 @@ func (m *Metrics) snapshot(model string, ctxUsed, ctxCap int,
 			"used_pct": round1(usedPct),
 		},
 		"kv_cache_mb": map[string]interface{}{
-			"sliding":  round1(kvSlidingMB),
-			"global":   round1(kvGlobalMB),
-			"total":    round1(kvSlidingMB + kvGlobalMB),
+			"sliding": round1(kvSlidingMB),
+			"global":  round1(kvGlobalMB),
+			"total":   round1(kvSlidingMB + kvGlobalMB),
 		},
 		"prefix_cache": map[string]interface{}{
 			"hits":           hits,

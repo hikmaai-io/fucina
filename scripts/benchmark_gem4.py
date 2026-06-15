@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark gem4d server: prefill scaling, decode throughput, agentic tool loop.
+"""Benchmark fucina server: prefill scaling, decode throughput, agentic tool loop.
 
 Phases (select with --phase, default all):
   prefill   Cold-prefill latency vs context size (decay curve). Each request
@@ -274,7 +274,7 @@ def main():
     try:
         srv = Server(args.url)
     except Exception as e:
-        sys.exit(f"cannot reach gem4d at {args.url}: {e}")
+        sys.exit(f"cannot reach fucina at {args.url}: {e}")
     print(f"server: {srv.model}  ctx={srv.ctx}")
 
     if args.phase in ("all", "prefill"):

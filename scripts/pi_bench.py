@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pi-real side-by-side benchmark: gem4d vs any OpenAI-compatible server (llama-server).
+"""pi-real side-by-side benchmark: fucina vs any OpenAI-compatible server (llama-server).
 
 The point of this harness (vs parity_bench/benchmark_gem4) is a FAIR head-to-head on
 the *actual* pi workload: an agentic tool-loop with thinking ON, at a large context
@@ -12,7 +12,7 @@ counts are identical across servers turn-by-turn — the thing that made the ear
 `pi` comparison apples-to-oranges (outputs drifted, contexts diverged) can't happen.
 
 Per turn, per server we report:
-  new      newly-prefilled tokens (gem4d: /metrics delta; llama: response timings.prompt_n)
+  new      newly-prefilled tokens (fucina: /metrics delta; llama: response timings.prompt_n)
   pf_t/s   prefill throughput (server self-reported)
   dec_t/s  decode throughput  (server self-reported; falls back to gen_tok/decode_wall)
   wall_s   end-to-end client wall for the request
@@ -21,7 +21,7 @@ Determinism: temperature 0. Thinking on by default (the pi case). Stdlib only.
 
 Usage:
   python3 scripts/pi_bench.py \
-      --server gem4d=http://127.0.0.1:8080 \
+      --server fucina=http://127.0.0.1:8080 \
       --server llama=http://127.0.0.1:8000 \
       --turns 8 --result-bytes 6000 --max-tokens 256 --thinking
 """
@@ -53,7 +53,7 @@ def fake_file(path, nbytes):
 
 
 class Server:
-    """OpenAI-compatible endpoint. Reads gem4d /metrics if present, else uses the
+    """OpenAI-compatible endpoint. Reads fucina /metrics if present, else uses the
     `timings` block llama-server attaches to chat-completion responses."""
     def __init__(self, name, base):
         self.name = name
@@ -75,7 +75,7 @@ class Server:
     def send(self, messages, tools, thinking, max_tokens, temperature):
         payload = {"model": self.model, "messages": messages,
                    "temperature": temperature, "stream": False,
-                   # gem4d understands these; llama ignores unknown keys and reasons
+                   # fucina understands these; llama ignores unknown keys and reasons
                    # per its own chat template (reasoning-budget) by default.
                    "thinking": thinking, "enable_thinking": thinking,
                    "timings_per_token": True}
@@ -95,7 +95,7 @@ class Server:
         comp = usage.get("completion_tokens", 0)
 
         new = pf = dec = float("nan")
-        if m0 and m1:  # gem4d path — authoritative split from /metrics
+        if m0 and m1:  # fucina path — authoritative split from /metrics
             new = m1["totals"]["prefill_tokens"] - m0["totals"]["prefill_tokens"]
             pf = m1["throughput_tok_s"]["prefill_last"]
             dec = m1["throughput_tok_s"]["decode_last"]

@@ -12,13 +12,13 @@ import (
 	"unsafe"
 )
 
-// gem4dSpecTokenGo is the per-token bridge the speculative engine calls during
+// fucinaSpecTokenGo is the per-token bridge the speculative engine calls during
 // GenerateSpecStream. ud is a runtime/cgo.Handle whose value is the request's
 // emit closure (func(int32) bool); returning 1 tells the engine to stop
 // generation after this token.
 //
-//export gem4dSpecTokenGo
-func gem4dSpecTokenGo(tok C.int32_t, ud unsafe.Pointer) C.int {
+//export fucinaSpecTokenGo
+func fucinaSpecTokenGo(tok C.int32_t, ud unsafe.Pointer) C.int {
 	h := cgo.Handle(uintptr(ud))
 	emit := h.Value().(func(int32) bool)
 	if emit(int32(tok)) {

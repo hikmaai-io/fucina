@@ -12,6 +12,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>         // __nv_fp8_storage_t, conversion functions
+#include <cuda_fp4.h>         // __nv_fp4_storage_t, NVFP4 E2M1 conversion (FUCINA_FP4)
+#include <cublasLt.h>         // NVFP4 block-scaled tensor-core GEMM (FUCINA_FP4)
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
@@ -339,18 +341,6 @@ __global__ void dequant_to_bf16_kernel(
 {
     uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __float2bfloat16(decode_weight(src, (int)i, fmt));
-}
-
-// ─── NVFP4 accuracy-spike simulation ───────────────────────────────────
-// Round a value to the nearest NVFP4 (E2M1) magnitude: {0,.5,1,1.5,2,3,4,6}.
-static __device__ __forceinline__ float round_e2m1(float x) {
-    float s = (x < 0.0f) ? -1.0f : 1.0f;
-    x = fabsf(x);
-    const float lv[8] = {0.0f,0.5f,1.0f,1.5f,2.0f,3.0f,4.0f,6.0f};
-    float best = lv[0], bd = fabsf(x - lv[0]);
-    #pragma unroll
-    for (int i = 1; i < 8; i++) { float d = fabsf(x - lv[i]); if (d < bd) { bd = d; best = lv[i]; } }
-    return s * best;
 }
 
 // Convert f32 -> bf16 (for activations feeding the cuBLAS GEMM).
@@ -821,7 +811,7 @@ static void mmvq_batched_launch(
     #undef LAUNCH
 }
 
-// ─── GEM4D_PACKED: repacked-Q4_0 decode GEMV (coalesced uint4 loads) ─────────────────────
+// ─── FUCINA_PACKED: repacked-Q4_0 decode GEMV (coalesced uint4 loads) ─────────────────────
 // Repack one projection's native Q4_0 blocks (18 B = fp16 scale ‖ 16 nibble bytes) into a
 // structure-of-arrays: [out_dim·nb × 16 quant bytes] then [out_dim·nb × fp16 scale]. Block
 // i's quants land 16-B aligned at quants+i·16; its scale at scales[i] (raw fp16 bits). One
@@ -2432,6 +2422,10 @@ __global__ void scale_kernel(float *x, int n, float s) {
 // ─── Engine Implementation ──────────────────────────────────────────────
 // =========================================================================
 
+// Projection indices (order matches proj_desc); declared before the engine struct
+// because NVFP4 weight arrays are dimensioned [layer][PJ_COUNT].
+enum { PJ_Q = 0, PJ_K, PJ_V, PJ_O, PJ_GATE, PJ_UP, PJ_DOWN, PJ_COUNT };
+
 struct gemma4_engine {
     // GGUF data (mmap'd)
     const uint8_t *gguf_data;
@@ -2470,7 +2464,7 @@ struct gemma4_engine {
     __nv_bfloat16 *d_bf16_layer[2][7];  // [pingpong][proj] [out_dim×in_dim], max-sized
     int            bf16_ready;          // 1 once the scratch is allocated
 
-    // GEM4D_PACKED decode path (opt-in): a parallel copy of the Q4_0 projection blob
+    // FUCINA_PACKED decode path (opt-in): a parallel copy of the Q4_0 projection blob
     // repacked per projection into [16-B-aligned quants ‖ fp16 scales] so the decode
     // GEMV reads each block's 16 nibble bytes with ONE coalesced 128-bit (uint4) load
     // instead of the native 18-B block's 2-byte-granular loads. Same dp4a math / −8 fold
@@ -2654,6 +2648,26 @@ struct gemma4_engine {
     float  *d_pf_dx;           // [MMQ_MAX_N × INTERMEDIATE/32] per-block scales
     int    *d_pf_sx;           // [MMQ_MAX_N × INTERMEDIATE/32] per-block Σ int8 (−8 fold)
     int     mmq_ready;         // 1 once the MMQ prefill scratch is allocated
+
+    // ── NVFP4 prefill (FUCINA_FP4): block-scaled FP4 tensor-core projections ──
+    // Persistent per-(layer,proj) NVFP4 weights (~4.25 bpw, ~6.3 GB all layers) built once
+    // on first prefill: packed E2M1 values + per-16-elem E4M3 block scales (cuBLASLt 32×4×4
+    // swizzled layout) + a per-tensor fp32 global scale. cuBLASLt computes the GEMM ~2.4×
+    // faster than the BF16 tensor-core path. Activation quantized per-GEMM into d_fp4_act*.
+    cublasLtHandle_t cublaslt;
+    uint8_t *d_fp4_w[GEMMA4_MAX_LAYERS][PJ_COUNT];   // packed [out_dim × in_dim/2]
+    uint8_t *d_fp4_wsc[GEMMA4_MAX_LAYERS][PJ_COUNT]; // swizzled E4M3 [pad(out,128)×pad(in/16,4)]
+    float   *d_fp4_gsw;        // device [MAX_LAYERS*PJ_COUNT] weight per-tensor global scales
+    int      fp4_ready;        // 1 once persistent NVFP4 weights are built
+    uint8_t *d_fp4_act;        // activation packed E2M1 scratch (lazily sized to N×in/2)
+    uint8_t *d_fp4_actsc;      // activation swizzled E4M3 block scales scratch
+    uint8_t *d_fp4_actlin;     // activation LINEAR E4M3 block scales (pre-swizzle) scratch
+    float   *d_fp4_gsact;      // device scalar: activation global scale (per GEMM)
+    float   *d_fp4_alpha;      // device scalar: alpha = gs_w · gs_act (device pointer-mode)
+    float   *d_fp4_amax;       // device scalar: activation amax reduction target
+    size_t   fp4_act_cap;      // current activation-scratch capacity in tokens (N)
+    void    *d_fp4_ws;         // cuBLASLt workspace
+    cublasLtMatmulDesc_t fp4_desc; // cached NVFP4 matmul descriptor
 
     // Suppressed token ids (tokenizer.ggml.suppress_tokens) masked to -inf
     int32_t *d_suppress;
@@ -3033,7 +3047,7 @@ static unsigned char* convert_q6k_to_q8_0(const unsigned char *src, int64_t n_el
     return dst;
 }
 
-static int build_packed_q4(gemma4_engine_t *eng);  // GEM4D_PACKED: lazy/eager repack (body below)
+static int build_packed_q4(gemma4_engine_t *eng);  // FUCINA_PACKED: lazy/eager repack (body below)
 
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
@@ -3053,7 +3067,7 @@ gemma4_engine_t* gemma4_engine_create(
 
     // Validate context
     if (context_size > GEMMA4_MAX_CTX) {
-        fprintf(stderr, "gem4d: context size %u exceeds max %u\n",
+        fprintf(stderr, "fucina: context size %u exceeds max %u\n",
                 context_size, GEMMA4_MAX_CTX);
         free(eng);
         return NULL;
@@ -3122,7 +3136,7 @@ gemma4_engine_t* gemma4_engine_create(
     // Open and mmap the GGUF file
     eng->gguf_fd = open(model_path, O_RDONLY);
     if (eng->gguf_fd < 0) {
-        perror("gem4d: open model");
+        perror("fucina: open model");
         gemma4_engine_destroy(eng);
         return NULL;
     }
@@ -3134,12 +3148,12 @@ gemma4_engine_t* gemma4_engine_create(
     eng->gguf_data = (const uint8_t *)mmap(
         NULL, eng->gguf_size, PROT_READ, MAP_PRIVATE, eng->gguf_fd, 0);
     if (eng->gguf_data == MAP_FAILED) {
-        perror("gem4d: mmap model");
+        perror("fucina: mmap model");
         gemma4_engine_destroy(eng);
         return NULL;
     }
 
-    fprintf(stderr, "gem4d: loaded %s (%.2f GB)\n",
+    fprintf(stderr, "fucina: loaded %s (%.2f GB)\n",
             model_path, eng->gguf_size / (1024.0 * 1024.0 * 1024.0));
 
     // Auto-detect the weight format from the GGUF tensor table. Trusting the CLI flag
@@ -3152,7 +3166,7 @@ gemma4_engine_t* gemma4_engine_create(
         for (int t = 0; t < 2; t++) {
             if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, names[t], &_off, &_n, &gtype) == 0) {
                 if (gtype != GGML_TYPE_Q4_0 && gtype != GGML_TYPE_Q8_0) {
-                    fprintf(stderr, "gem4d: unsupported GGUF layer tensor type %u — "
+                    fprintf(stderr, "fucina: unsupported GGUF layer tensor type %u — "
                             "only Q4_0 (QAT) and Q8_0 models are supported\n", gtype);
                     gemma4_engine_destroy(eng);
                     return NULL;
@@ -3166,7 +3180,7 @@ gemma4_engine_t* gemma4_engine_create(
         if (gguf_find_tensor(eng->gguf_data, eng->gguf_size,
                 "token_embd.weight", &_off, &_n, &etype) == 0 && etype == GGML_TYPE_Q6_K) {
             embd_is_q6k = 1;
-            fprintf(stderr, "gem4d: token_embd is Q6_K — will convert to Q8_0 at load\n");
+            fprintf(stderr, "fucina: token_embd is Q6_K — will convert to Q8_0 at load\n");
         }
     }
 
@@ -3226,7 +3240,7 @@ gemma4_engine_t* gemma4_engine_create(
         pattern_parsed = true;
     }
     if (!pattern_parsed) {
-        fprintf(stderr, "gem4d: warning: no attention pattern in GGUF, "
+        fprintf(stderr, "fucina: warning: no attention pattern in GGUF, "
                         "using default 5-sliding/1-global cadence\n");
     }
 
@@ -3238,7 +3252,7 @@ gemma4_engine_t* gemma4_engine_create(
                 name, &_off, &_n) == 0) { \
             eng->tensors.field = _off; \
         } else { \
-            fprintf(stderr, "gem4d: tensor '%s' not found in GGUF\n", name); \
+            fprintf(stderr, "fucina: tensor '%s' not found in GGUF\n", name); \
         } \
     } while(0)
 
@@ -3311,7 +3325,7 @@ gemma4_engine_t* gemma4_engine_create(
         } else {
             eng->tensors.output_weight = eng->tensors.token_embd;
             eng->output_tied = 1;
-            fprintf(stderr, "gem4d: output.weight not present — using tied "
+            fprintf(stderr, "fucina: output.weight not present — using tied "
                             "token_embd.weight as LM head\n");
         }
     }
@@ -3364,11 +3378,18 @@ gemma4_engine_t* gemma4_engine_create(
     cudaMalloc(&eng->d_dx_b, (size_t)GEMMA4_SPEC_MAX * (GEMMA4_INTERMEDIATE/32) * sizeof(float));
     cudaMalloc(&eng->d_sx_b, (size_t)GEMMA4_SPEC_MAX * (GEMMA4_INTERMEDIATE/32) * sizeof(int));
     if (!eng->d_qx || !eng->d_dx || !eng->d_sx || !eng->d_qx_b || !eng->d_dx_b || !eng->d_sx_b) {
-        fprintf(stderr, "gem4d: dp4a activation scratch alloc failed\n");
+        fprintf(stderr, "fucina: dp4a activation scratch alloc failed\n");
         gemma4_engine_destroy(eng);
         return NULL;
     }
     eng->d_pf_qx = NULL; eng->d_pf_dx = NULL; eng->d_pf_sx = NULL; eng->mmq_ready = 0;
+    // NVFP4 prefill (FUCINA_FP4) — all lazy, built on first prefill if enabled
+    eng->cublaslt = NULL; eng->fp4_ready = 0; eng->fp4_desc = NULL;
+    eng->d_fp4_gsw = NULL; eng->d_fp4_act = NULL; eng->d_fp4_actsc = NULL;
+    eng->d_fp4_actlin = NULL; eng->d_fp4_gsact = NULL; eng->d_fp4_alpha = NULL;
+    eng->d_fp4_amax = NULL; eng->fp4_act_cap = 0; eng->d_fp4_ws = NULL;
+    for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
+        eng->d_fp4_w[l][p]=NULL; eng->d_fp4_wsc[l][p]=NULL; }
 
     // Load rope_freqs.weight into device buffer for global-layer RoPE.
     {
@@ -3406,7 +3427,7 @@ gemma4_engine_t* gemma4_engine_create(
             cudaMalloc(&eng->d_suppress, sarr.count * sizeof(int32_t));
             cudaMemcpy(eng->d_suppress, sarr.data,
                        sarr.count * sizeof(int32_t), cudaMemcpyHostToDevice);
-            fprintf(stderr, "gem4d: %d suppressed tokens masked\n", eng->n_suppress);
+            fprintf(stderr, "fucina: %d suppressed tokens masked\n", eng->n_suppress);
         }
     }
 
@@ -3461,7 +3482,7 @@ gemma4_engine_t* gemma4_engine_create(
     if (eng->tdata_start != 0) {
         size_t tbytes = eng->gguf_size - eng->tdata_start;
         if (cudaMalloc(&eng->d_weights, tbytes) == cudaSuccess) {
-            fprintf(stderr, "gem4d: uploading %.2f GB of weights to device...\n",
+            fprintf(stderr, "fucina: uploading %.2f GB of weights to device...\n",
                     tbytes / (1024.0*1024.0*1024.0));
             // Pinned, double-buffered sequential streaming (fast). Fall back to the
             // direct mmap copy only if the pinned path fails to initialize.
@@ -3469,12 +3490,12 @@ gemma4_engine_t* gemma4_engine_create(
                                         (off_t)eng->tdata_start, tbytes) != 0 &&
                 cudaMemcpy(eng->d_weights, eng->gguf_data + eng->tdata_start,
                            tbytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-                fprintf(stderr, "gem4d: weight upload failed — falling back to mmap\n");
+                fprintf(stderr, "fucina: weight upload failed — falling back to mmap\n");
                 cudaFree(eng->d_weights);
                 eng->d_weights = NULL;
             }
         } else {
-            fprintf(stderr, "gem4d: cudaMalloc(%zu) failed — using mmap'd weights\n",
+            fprintf(stderr, "fucina: cudaMalloc(%zu) failed — using mmap'd weights\n",
                     tbytes);
             cudaGetLastError(); // clear error state
         }
@@ -3492,11 +3513,11 @@ gemma4_engine_t* gemma4_engine_create(
             if (cudaMalloc(&eng->d_token_embd, q8bytes) == cudaSuccess)
                 cudaMemcpy(eng->d_token_embd, q8, q8bytes, cudaMemcpyHostToDevice);
             free(q8);
-            fprintf(stderr, "gem4d: token_embd Q6_K->Q8_0 converted (%.2f GB)\n",
+            fprintf(stderr, "fucina: token_embd Q6_K->Q8_0 converted (%.2f GB)\n",
                     q8bytes / (1024.0*1024.0*1024.0));
         }
         if (!eng->d_token_embd)
-            fprintf(stderr, "gem4d: WARNING token_embd conversion failed\n");
+            fprintf(stderr, "fucina: WARNING token_embd conversion failed\n");
     }
 
     // Step 8 (native Q6_K head), dp4a edition. The first fp32-scalar Q6_K kernel was
@@ -3512,7 +3533,7 @@ gemma4_engine_t* gemma4_engine_create(
         eng->d_lmhead_q6k = (unsigned char *)(eng->d_weights
                             + (eng->tensors.token_embd - eng->tdata_start));
         eng->lmhead_q6k = 1;
-        fprintf(stderr, "gem4d: LM head native Q6_K dp4a (0.83 GB/token vs 1.07 Q8_0)\n");
+        fprintf(stderr, "fucina: LM head native Q6_K dp4a (0.83 GB/token vs 1.07 Q8_0)\n");
     }
 
     // Build the absolute-id -> global-slot inverse map from global_layer_indices
@@ -3551,7 +3572,7 @@ gemma4_engine_t* gemma4_engine_create(
         GEMMA4_KV_HEADS * (size_t)eng->sliding_kv_capacity * GEMMA4_HEAD_DIM * sizeof(kv_t);
     if (cudaMalloc(&eng->d_sliding_k, sliding_kv_size) != cudaSuccess ||
         cudaMalloc(&eng->d_sliding_v, sliding_kv_size) != cudaSuccess) {
-        fprintf(stderr, "gem4d: failed to allocate sliding KV cache (%.1f MB ×2)\n",
+        fprintf(stderr, "fucina: failed to allocate sliding KV cache (%.1f MB ×2)\n",
                 sliding_kv_size / (1024.0*1024.0));
         cudaGetLastError();
         free(eng);
@@ -3566,7 +3587,7 @@ gemma4_engine_t* gemma4_engine_create(
         context_size * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
     if (cudaMalloc(&eng->d_global_k, global_kv_size) != cudaSuccess ||
         cudaMalloc(&eng->d_global_v, global_kv_size) != cudaSuccess) {
-        fprintf(stderr, "gem4d: failed to allocate global KV cache (%.1f MB ×2)\n",
+        fprintf(stderr, "fucina: failed to allocate global KV cache (%.1f MB ×2)\n",
                 global_kv_size / (1024.0*1024.0));
         cudaGetLastError();
         free(eng);
@@ -3574,22 +3595,22 @@ gemma4_engine_t* gemma4_engine_create(
     }
 
     eng->loaded = 1;
-    fprintf(stderr, "gem4d: engine initialized (%.2f GB model, %u ctx, %s)\n",
+    fprintf(stderr, "fucina: engine initialized (%.2f GB model, %u ctx, %s)\n",
             eng->gguf_size / (1024.0*1024.0*1024.0),
             context_size,
             eng->format == FORMAT_Q4_0 ? "Q4_0" : "Q8_0");
-    fprintf(stderr, "gem4d: %d sliding + %d global layers\n",
+    fprintf(stderr, "fucina: %d sliding + %d global layers\n",
             eng->n_layers_sliding, eng->n_layers_global);
-    fprintf(stderr, "gem4d: KV cache: sliding=%.1f MB, global=%.1f MB\n",
+    fprintf(stderr, "fucina: KV cache: sliding=%.1f MB, global=%.1f MB\n",
             sliding_kv_size / (1024.0*1024.0),
             global_kv_size / (1024.0*1024.0));
 
     // Repacked-Q4_0 decode GEMV: DEFAULT-ON for dense 12B+MTP (bit-exact, ~+2-3% decode
     // via coalesced uint4 weight loads; costs +6.96 GB weight VRAM — fine on GB10's 128 GB
     // unified memory). Built eagerly now — before any request or CUDA-graph capture — so
-    // the decode GEMV's packed branch is a pure read. Opt out with GEM4D_NO_PACKED=1.
+    // the decode GEMV's packed branch is a pure read. Opt out with FUCINA_NO_PACKED=1.
     {
-        const char *off = getenv("GEM4D_NO_PACKED");
+        const char *off = getenv("FUCINA_NO_PACKED");
         if (!(off && off[0] == '1')) build_packed_q4(eng);   // non-fatal: falls back if it fails
     }
 
@@ -3674,6 +3695,22 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
 
 
     if (eng->cublas) cublasDestroy(eng->cublas);
+    // NVFP4 prefill resources
+    if (eng->fp4_ready) {
+        for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
+            if (eng->d_fp4_w[l][p]) cudaFree(eng->d_fp4_w[l][p]);
+            if (eng->d_fp4_wsc[l][p]) cudaFree(eng->d_fp4_wsc[l][p]); }
+        if (eng->d_fp4_gsw)    cudaFree(eng->d_fp4_gsw);
+        if (eng->d_fp4_act)    cudaFree(eng->d_fp4_act);
+        if (eng->d_fp4_actsc)  cudaFree(eng->d_fp4_actsc);
+        if (eng->d_fp4_actlin) cudaFree(eng->d_fp4_actlin);
+        if (eng->d_fp4_gsact)  cudaFree(eng->d_fp4_gsact);
+        if (eng->d_fp4_alpha)  cudaFree(eng->d_fp4_alpha);
+        if (eng->d_fp4_amax)   cudaFree(eng->d_fp4_amax);
+        if (eng->d_fp4_ws)     cudaFree(eng->d_fp4_ws);
+        if (eng->fp4_desc)     cublasLtMatmulDescDestroy(eng->fp4_desc);
+        if (eng->cublaslt)     cublasLtDestroy(eng->cublaslt);
+    }
     if (eng->ev_start) cudaEventDestroy(eng->ev_start);
     if (eng->ev_stop)  cudaEventDestroy(eng->ev_stop);
     if (eng->mtp.d_w)   cudaFree(eng->mtp.d_w);
@@ -3740,7 +3777,7 @@ static inline const unsigned char* weight_fp8(
 // ─── Format-dispatching GEMV / embed launchers ─────────────────────────
 #define FMT(eng)  ((int)(eng)->format)
 
-// GEM4D_PACKED gate (built eagerly at create when GEM4D_PACKED=1, so this is a pure read —
+// FUCINA_PACKED gate (built eagerly at create when FUCINA_PACKED=1, so this is a pure read —
 // no allocation in the hot/graph-captured path). Only Q4_0 layer projections live in
 // d_weights, so the fmt==Q4_0 guard already excludes the (Q8_0) token_embd/LM-head; the
 // pointer-range check is belt-and-suspenders. A projection's packed base is at the same
@@ -3751,7 +3788,7 @@ static inline bool use_packed_q4(const gemma4_engine_t *eng, int fmt, const uint
 }
 
 // Q4_0-aware single-token MMVQ over an ALREADY-quantized activation (qx/dx/sx, K=1 layout):
-// routes to the packed kernel when GEM4D_PACKED is active, else the native dp4a path. Used by
+// routes to the packed kernel when FUCINA_PACKED is active, else the native dp4a path. Used by
 // the call sites that pre-quantize once and call mmvq_launch directly (decode_layer q/k/v).
 static inline void mmvq_q4aware(
     const gemma4_engine_t *eng, float *out, const uint8_t *weight,
@@ -3809,7 +3846,7 @@ static inline void gemv_batched_w(
                                  in_dim, out_dim, K, stream);
         return;
     }
-    if (use_packed_q4(eng, fmt, weight)) {   // GEM4D_PACKED: coalesced uint4 weight loads
+    if (use_packed_q4(eng, fmt, weight)) {   // FUCINA_PACKED: coalesced uint4 weight loads
         const uint8_t  *q = eng->d_weights_packed + (weight - eng->d_weights);
         const uint16_t *s = (const uint16_t *)(q + (size_t)out_dim * (in_dim >> 5) * 16);
         mmvq_q4_0_packed_batched_launch(out, q, s, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b,
@@ -3954,7 +3991,6 @@ static int decode_layer(
 
     const int block    = 256;
     const int smem32   = 32 * sizeof(float);
-    const int smemH    = (32 + GEMMA4_HIDDEN_SIZE)  * sizeof(float); // unused here
 
     // ─────────────────────────────────────────────────────────────────
     // Save the pre-layer residual once; it will be added back after attn.
@@ -4100,7 +4136,7 @@ static int decode_layer(
         {
             cudaError_t le = cudaGetLastError();
             if (le != cudaSuccess)
-                fprintf(stderr, "gem4d: global_attn_decode launch failed: %s\n",
+                fprintf(stderr, "fucina: global_attn_decode launch failed: %s\n",
                         cudaGetErrorString(le));
         }
         }
@@ -4171,7 +4207,6 @@ static int decode_layer(
 // =========================================================================
 
 // Projection ids, indexing the rotating per-layer scratch eng->d_bf16_layer[p].
-enum { PJ_Q = 0, PJ_K, PJ_V, PJ_O, PJ_GATE, PJ_UP, PJ_DOWN, PJ_COUNT };
 
 // Resolve a projection's source byte offset + GEMM dims for a layer. Returns 0
 // for projections that do not exist (global layers have no separate V weight).
@@ -4225,7 +4260,7 @@ static int build_bf16_weights(gemma4_engine_t *eng)
             if (maxn[p] == 0) continue;
             if (cudaMalloc(&eng->d_bf16_layer[b][p],
                            maxn[p] * sizeof(__nv_bfloat16)) != cudaSuccess) {
-                fprintf(stderr, "gem4d: BF16 dequant scratch alloc failed at buf %d proj %d "
+                fprintf(stderr, "fucina: BF16 dequant scratch alloc failed at buf %d proj %d "
                         "(%.2f GB in so far)\n", b, p, total / 1e9);
                 cudaGetLastError();
                 for (int bb = 0; bb < 2; bb++)
@@ -4236,13 +4271,13 @@ static int build_bf16_weights(gemma4_engine_t *eng)
             total += maxn[p] * sizeof(__nv_bfloat16);
         }
     }
-    fprintf(stderr, "gem4d: BF16 per-layer dequant scratch (%.2f GB rotating x2 "
+    fprintf(stderr, "fucina: BF16 per-layer dequant scratch (%.2f GB rotating x2 "
             "pipelined, vs 21.8 GB persistent)\n", total / 1e9);
     eng->bf16_ready = 1;
     return 0;
 }
 
-// GEM4D_PACKED: build the repacked-Q4_0 decode blob (idempotent). Allocates a copy the same
+// FUCINA_PACKED: build the repacked-Q4_0 decode blob (idempotent). Allocates a copy the same
 // size as d_weights and repacks every Q4_0 projection in place (same per-projection offset)
 // into [16-B-aligned quants ‖ fp16 scales]. Q4_0 models only. Returns 0 on success; on any
 // failure leaves packed_ready=0 (callers fall back to the native dp4a path) — never fatal.
@@ -4252,7 +4287,7 @@ static int build_packed_q4(gemma4_engine_t *eng)
     if (FMT(eng) != FORMAT_Q4_0 || !eng->d_weights) return -1;
     size_t tbytes = eng->gguf_size - eng->tdata_start;
     if (cudaMalloc(&eng->d_weights_packed, tbytes) != cudaSuccess) {
-        fprintf(stderr, "gem4d: packed-Q4_0 alloc failed (%.2f GB) — packed decode path off\n",
+        fprintf(stderr, "fucina: packed-Q4_0 alloc failed (%.2f GB) — packed decode path off\n",
                 tbytes / 1e9);
         cudaGetLastError();
         eng->d_weights_packed = NULL;
@@ -4274,13 +4309,13 @@ static int build_packed_q4(gemma4_engine_t *eng)
     cudaDeviceSynchronize();
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        fprintf(stderr, "gem4d: packed-Q4_0 repack error: %s — packed decode path off\n",
+        fprintf(stderr, "fucina: packed-Q4_0 repack error: %s — packed decode path off\n",
                 cudaGetErrorString(e));
         cudaFree(eng->d_weights_packed);
         eng->d_weights_packed = NULL;
         return -1;
     }
-    fprintf(stderr, "gem4d: packed-Q4_0 decode weights built (%.2f GB, 16-B-aligned quants "
+    fprintf(stderr, "fucina: packed-Q4_0 decode weights built (%.2f GB, 16-B-aligned quants "
             "‖ fp16 scales — coalesced uint4 GEMV loads)\n", tbytes / 1e9);
     eng->packed_ready = 1;
     return 0;
@@ -4322,6 +4357,217 @@ static cublasStatus_t gemm_bf16(
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// NVFP4 (block-scaled FP4) prefill projections — FUCINA_FP4.
+//
+// cuBLASLt computes D[out×N] = W[out×in] @ X[in×N] with W,X in CUDA_R_4F_E2M1,
+// per-16-element E4M3 block scales (VEC16_UE4M3) and a per-tensor fp32 global
+// scale folded into alpha. ~2.4× the BF16 tensor-core GEMM on GB10. Block scale
+// tensor uses cuBLASLt's 32×4×4 swizzled layout (validated bit-exact in
+// cuda/test_fp4_gemm.cu). Accuracy is the gate (E2M1 = 1 mantissa bit) — flag-gated.
+// ─────────────────────────────────────────────────────────────────────────
+#define NVFP4_BLK 16
+
+// amax over [n] elements (bf16) → atomic max into a device float (init 0).
+__global__ void nvfp4_amax_bf16_kernel(const __nv_bfloat16 *x, uint64_t n, float *amax) {
+    uint64_t i = blockIdx.x*(uint64_t)blockDim.x + threadIdx.x;
+    float v = (i < n) ? fabsf(__bfloat162float(x[i])) : 0.f;
+    // warp reduce then block atomic
+    for (int o=16;o>0;o>>=1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+    __shared__ float s[32];
+    int lane = threadIdx.x&31, wid = threadIdx.x>>5;
+    if (lane==0) s[wid]=v;
+    __syncthreads();
+    if (wid==0){ v = (lane < (blockDim.x+31)/32) ? s[lane] : 0.f;
+        for(int o=16;o>0;o>>=1) v=fmaxf(v,__shfl_xor_sync(0xffffffff,v,o));
+        if(lane==0) atomicMax((int*)amax, __float_as_int(v)); } // values ≥0 → int order ok
+}
+// gs = amax / (6*448); guard 0.
+__global__ void nvfp4_gs_kernel(const float *amax, float *gs) {
+    float a = *amax; *gs = (a>0.f) ? a/(6.0f*448.0f) : 1e-30f;
+}
+// alpha[0] = gs_w · gs_act ; alpha[1] = 0 (beta), for device pointer-mode.
+__global__ void nvfp4_alpha_kernel(const float *gsw, const float *gsact, float *alpha) {
+    alpha[0] = (*gsw) * (*gsact); alpha[1] = 0.f;
+}
+
+// Quantize [rows][k] bf16 (k = contraction, contiguous) → packed E2M1 [rows][k/2] +
+// LINEAR E4M3 block scales [rows][k/16]. gs read from device scalar.
+__global__ void nvfp4_quant_bf16_kernel(const __nv_bfloat16 *__restrict__ X,
+        uint8_t *__restrict__ fp4, uint8_t *__restrict__ bscale,
+        int rows, int k, const float *gsp) {
+    int row = blockIdx.y;
+    int blk = blockIdx.x*blockDim.x + threadIdx.x;
+    int nblk = k/NVFP4_BLK;
+    if (row>=rows || blk>=nblk) return;
+    float gs = *gsp;
+    const __nv_bfloat16 *xr = X + (size_t)row*k + blk*NVFP4_BLK;
+    float v[NVFP4_BLK], amax=0.f;
+    #pragma unroll
+    for(int i=0;i<NVFP4_BLK;i++){ v[i]=__bfloat162float(xr[i]); amax=fmaxf(amax,fabsf(v[i])); }
+    float bs_stored = (amax>0.f) ? amax/6.0f/gs : 0.f;
+    __nv_fp8_storage_t e = __nv_cvt_float_to_fp8(bs_stored, __NV_SATFINITE, __NV_E4M3);
+    bscale[(size_t)row*nblk + blk] = (uint8_t)e;
+    float bsf = __half2float(__half(__nv_cvt_fp8_to_halfraw(e, __NV_E4M3)));
+    float divisor = gs*bsf; if (divisor<=0.f) divisor = 1e30f;
+    uint8_t *o = fp4 + (size_t)row*(k/2) + blk*(NVFP4_BLK/2);
+    #pragma unroll
+    for(int i=0;i<NVFP4_BLK;i+=2){
+        float2 p = make_float2(v[i]/divisor, v[i+1]/divisor);
+        o[i/2] = (uint8_t)__nv_cvt_float2_to_fp4x2(p, __NV_E2M1, cudaRoundNearest);
+    }
+}
+// Linear [outer][nblk] E4M3 scales → cuBLASLt 32×4×4 swizzled layout (nblk_pad mult of 4).
+__global__ void nvfp4_swizzle_kernel(const uint8_t *__restrict__ lin, uint8_t *__restrict__ sw,
+        int outer, int nblk, int nblk_pad) {
+    int o = blockIdx.y*blockDim.y + threadIdx.y;
+    int s = blockIdx.x*blockDim.x + threadIdx.x;
+    if (o>=outer || s>=nblk) return;
+    int oo=o/128, oi=o%128, so=s/4, si=s%4;
+    size_t off = ((size_t)oo*(nblk_pad/4)+so)*512 + (oi%32)*16 + (oi/32)*4 + si;
+    sw[off] = lin[(size_t)o*nblk + s];
+}
+static inline int nvfp4_pad(int x,int m){ return ((x+m-1)/m)*m; }
+
+// Quantize one operand (bf16 [rows][k]) into caller-provided packed+swizzled-scale
+// buffers, computing its per-tensor global scale into gsp (device). amax_scratch is a
+// device float (reset here). For weights: called once at build. For activations: per GEMM.
+static void nvfp4_quantize(const __nv_bfloat16 *X, int rows, int k,
+        uint8_t *fp4, uint8_t *lin_sc, uint8_t *sw_sc, float *gsp,
+        float *amax_scratch, cudaStream_t st) {
+    cudaMemsetAsync(amax_scratch, 0, sizeof(float), st);
+    uint64_t n = (uint64_t)rows*k;
+    nvfp4_amax_bf16_kernel<<<(unsigned)((n+255)/256),256,0,st>>>(X, n, amax_scratch);
+    nvfp4_gs_kernel<<<1,1,0,st>>>(amax_scratch, gsp);
+    int nblk = k/NVFP4_BLK;
+    dim3 b(256), g((nblk+255)/256, rows);
+    nvfp4_quant_bf16_kernel<<<g,b,0,st>>>(X, fp4, lin_sc, rows, k, gsp);
+    int kp = nvfp4_pad(nblk,4);
+    dim3 b2(32,8), g2((nblk+31)/32,(rows+7)/8);
+    nvfp4_swizzle_kernel<<<g2,b2,0,st>>>(lin_sc, sw_sc, rows, nblk, kp);
+}
+
+// Build persistent NVFP4 weights for every (layer,proj). Dequants each projection
+// (Q4_0/Q8_0 → bf16 in a temp buffer) then NVFP4-quantizes it. Returns 0 / -1.
+static int build_fp4_weights(gemma4_engine_t *eng) {
+    if (eng->fp4_ready) return 0;
+    if (cublasLtCreate(&eng->cublaslt) != CUBLAS_STATUS_SUCCESS) return -1;
+    // find max projection element count for the temp bf16 + linear-scale scratch
+    uint64_t maxn = 0; int max_in = 0, max_out = 0;
+    for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
+        uint64_t off; int in_dim,out_dim; if(!proj_desc(eng,l,p,&off,&in_dim,&out_dim)) continue;
+        uint64_t nn=(uint64_t)in_dim*out_dim; if(nn>maxn)maxn=nn;
+        if(in_dim>max_in)max_in=in_dim; if(out_dim>max_out)max_out=out_dim;
+    }
+    __nv_bfloat16 *tmp_bf=nullptr; uint8_t *tmp_lin=nullptr;
+    int ok=1;
+    if (cudaMalloc(&tmp_bf, maxn*sizeof(__nv_bfloat16))!=cudaSuccess) ok=0;
+    if (ok && cudaMalloc(&tmp_lin, (size_t)max_out*(max_in/NVFP4_BLK))!=cudaSuccess) ok=0;
+    if (ok && cudaMalloc(&eng->d_fp4_gsw, (size_t)GEMMA4_MAX_LAYERS*PJ_COUNT*sizeof(float))!=cudaSuccess) ok=0;
+    if (ok && cudaMalloc(&eng->d_fp4_amax, sizeof(float))!=cudaSuccess) ok=0;
+    size_t wbytes=0;
+    for (int l=0; ok && l<GEMMA4_MAX_LAYERS; l++) for (int p=0; ok && p<PJ_COUNT; p++){
+        uint64_t off; int in_dim,out_dim; if(!proj_desc(eng,l,p,&off,&in_dim,&out_dim)) continue;
+        size_t packed=(size_t)out_dim*(in_dim/2);
+        size_t swsz=(size_t)nvfp4_pad(out_dim,128)*nvfp4_pad(in_dim/NVFP4_BLK,4);
+        if (cudaMalloc(&eng->d_fp4_w[l][p], packed)!=cudaSuccess){ok=0;break;}
+        if (cudaMalloc(&eng->d_fp4_wsc[l][p], swsz)!=cudaSuccess){ok=0;break;}
+        cudaMemset(eng->d_fp4_wsc[l][p],0,swsz);
+        uint64_t nn=(uint64_t)in_dim*out_dim;
+        dequant_to_bf16_kernel<<<(unsigned)((nn+255)/256),256>>>(tmp_bf, weight_fp8(eng,off), nn, FMT(eng));
+        nvfp4_quantize(tmp_bf, out_dim, in_dim, eng->d_fp4_w[l][p], tmp_lin,
+                       eng->d_fp4_wsc[l][p], eng->d_fp4_gsw + (l*PJ_COUNT+p), eng->d_fp4_amax, 0);
+        wbytes += packed + swsz;
+    }
+    cudaDeviceSynchronize();
+    if (tmp_bf) cudaFree(tmp_bf);
+    if (tmp_lin) cudaFree(tmp_lin);
+    if (!ok || cudaGetLastError()!=cudaSuccess) {
+        fprintf(stderr,"fucina: NVFP4 weight build failed — BF16 prefill fallback\n");
+        return -1;
+    }
+    // activation scratch global-scale + alpha + workspace + cached desc
+    cudaMalloc(&eng->d_fp4_gsact, sizeof(float));
+    cudaMalloc(&eng->d_fp4_alpha, 2*sizeof(float));   // [alpha, beta=0]
+    eng->d_fp4_ws=nullptr; cudaMalloc(&eng->d_fp4_ws, 64ull<<20);
+    cublasLtMatmulDescCreate(&eng->fp4_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasOperation_t opT=CUBLAS_OP_T, opN=CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+    int32_t smode=CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &smode, sizeof(smode));
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &smode, sizeof(smode));
+    int32_t pmode=CUBLASLT_POINTER_MODE_DEVICE;
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pmode, sizeof(pmode));
+    eng->fp4_ready=1;
+    fprintf(stderr,"fucina: NVFP4 prefill weights built (%.2f GB, ~2.4× BF16 tensor-core GEMM)\n", wbytes/1e9);
+    return 0;
+}
+
+// Ensure activation NVFP4 scratch holds N tokens over the widest projection (INTERMEDIATE).
+static int ensure_fp4_act(gemma4_engine_t *eng, int N) {
+    if ((size_t)N <= eng->fp4_act_cap) return 0;
+    if (eng->d_fp4_act)    cudaFree(eng->d_fp4_act);
+    if (eng->d_fp4_actsc)  cudaFree(eng->d_fp4_actsc);
+    if (eng->d_fp4_actlin) cudaFree(eng->d_fp4_actlin);
+    eng->d_fp4_act=nullptr; eng->d_fp4_actsc=nullptr; eng->d_fp4_actlin=nullptr;
+    size_t I = GEMMA4_INTERMEDIATE;
+    size_t packed=(size_t)N*(I/2);
+    size_t swsz=(size_t)nvfp4_pad(N,128)*nvfp4_pad(I/NVFP4_BLK,4);
+    size_t linsz=(size_t)N*(I/NVFP4_BLK);
+    if (cudaMalloc(&eng->d_fp4_act, packed)!=cudaSuccess) { eng->fp4_act_cap=0; return -1; }
+    if (cudaMalloc(&eng->d_fp4_actsc, swsz)!=cudaSuccess) { cudaFree(eng->d_fp4_act); eng->d_fp4_act=nullptr; eng->fp4_act_cap=0; return -1; }
+    if (cudaMalloc(&eng->d_fp4_actlin, linsz)!=cudaSuccess) { cudaFree(eng->d_fp4_act); cudaFree(eng->d_fp4_actsc); eng->d_fp4_act=eng->d_fp4_actsc=nullptr; eng->fp4_act_cap=0; return -1; }
+    eng->fp4_act_cap=N;
+    return 0;
+}
+
+// NVFP4 projection: dst[out×N] = W[out×in] @ X[in×N]. X is the shared bf16 activation
+// (d_inb) → quantized to NVFP4 here. Weight is persistent NVFP4. alpha = gs_w·gs_act
+// (device pointer-mode). Falls through (returns false) if scratch alloc fails.
+static bool gemm_nvfp4(gemma4_engine_t *eng, int l, int p, const __nv_bfloat16 *X,
+        float *dst, int in_dim, int out_dim, int N, cudaStream_t st) {
+    if (ensure_fp4_act(eng, N)!=0) return false;
+    // quantize activation [N × in_dim] (rows=N, k=in_dim) → packed + swizzled scales
+    int nblk=in_dim/NVFP4_BLK;
+    cudaMemsetAsync(eng->d_fp4_actsc, 0,
+        (size_t)nvfp4_pad(N,128)*nvfp4_pad(nblk,4), st);
+    cudaMemsetAsync(eng->d_fp4_amax,0,sizeof(float),st);
+    uint64_t nn=(uint64_t)N*in_dim;
+    nvfp4_amax_bf16_kernel<<<(unsigned)((nn+255)/256),256,0,st>>>(X, nn, eng->d_fp4_amax);
+    nvfp4_gs_kernel<<<1,1,0,st>>>(eng->d_fp4_amax, eng->d_fp4_gsact);
+    dim3 b(256), g((nblk+255)/256, N);
+    nvfp4_quant_bf16_kernel<<<g,b,0,st>>>(X, eng->d_fp4_act, eng->d_fp4_actlin, N, in_dim, eng->d_fp4_gsact);
+    dim3 b2(32,8), g2((nblk+31)/32,(N+7)/8);
+    nvfp4_swizzle_kernel<<<g2,b2,0,st>>>(eng->d_fp4_actlin, eng->d_fp4_actsc, N, nblk, nvfp4_pad(nblk,4));
+    // alpha = gs_w · gs_act
+    nvfp4_alpha_kernel<<<1,1,0,st>>>(eng->d_fp4_gsw + (l*PJ_COUNT+p), eng->d_fp4_gsact, eng->d_fp4_alpha);
+    // descriptor scale pointers (weight=A, activation=B)
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+        &eng->d_fp4_wsc[l][p], sizeof(void*));
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+        &eng->d_fp4_actsc, sizeof(void*));
+    cublasLtMatrixLayout_t Ad,Bd,Dd;
+    cublasLtMatrixLayoutCreate(&Ad, CUDA_R_4F_E2M1, in_dim, out_dim, in_dim);
+    cublasLtMatrixLayoutCreate(&Bd, CUDA_R_4F_E2M1, in_dim, N, in_dim);
+    cublasLtMatrixLayoutCreate(&Dd, CUDA_R_32F, out_dim, N, out_dim);
+    cublasLtMatmulPreference_t pref; cublasLtMatmulPreferenceCreate(&pref);
+    size_t ws=64ull<<20;
+    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws));
+    cublasLtMatmulHeuristicResult_t res[4]; int found=0;
+    cublasLtMatmulAlgoGetHeuristic(eng->cublaslt, eng->fp4_desc, Ad, Bd, Dd, Dd, pref, 4, res, &found);
+    bool okrun=false;
+    if (found>0) {
+        cublasStatus_t s = cublasLtMatmul(eng->cublaslt, eng->fp4_desc,
+            eng->d_fp4_alpha, eng->d_fp4_w[l][p], Ad, eng->d_fp4_act, Bd,
+            eng->d_fp4_alpha+1, dst, Dd, dst, Dd, &res[0].algo, eng->d_fp4_ws, ws, st);
+        okrun = (s==CUBLAS_STATUS_SUCCESS);
+    }
+    cublasLtMatmulPreferenceDestroy(pref);
+    cublasLtMatrixLayoutDestroy(Ad); cublasLtMatrixLayoutDestroy(Bd); cublasLtMatrixLayoutDestroy(Dd);
+    return okrun;
+}
+
 // Lazily allocate the tiled-MMQ prefill activation scratch (Q4_0 models only): the
 // quantized [N × in_dim] activation for N ≤ MMQ_MAX_N over the widest projection
 // (in_dim = INTERMEDIATE). Idempotent. Returns 0 on success, -1 on failure (caller
@@ -4336,14 +4582,14 @@ static int ensure_mmq_scratch(gemma4_engine_t *eng)
     if (cudaMalloc(&eng->d_pf_dx, Nmax * (I/32) * sizeof(float)) != cudaSuccess) ok = 0;
     if (cudaMalloc(&eng->d_pf_sx, Nmax * (I/32) * sizeof(int))   != cudaSuccess) ok = 0;
     if (!ok) {
-        fprintf(stderr, "gem4d: MMQ prefill scratch alloc failed — BF16 fallback\n");
+        fprintf(stderr, "fucina: MMQ prefill scratch alloc failed — BF16 fallback\n");
         cudaGetLastError();
         if (eng->d_pf_qx) { cudaFree(eng->d_pf_qx); eng->d_pf_qx = NULL; }
         if (eng->d_pf_dx) { cudaFree(eng->d_pf_dx); eng->d_pf_dx = NULL; }
         if (eng->d_pf_sx) { cudaFree(eng->d_pf_sx); eng->d_pf_sx = NULL; }
         return -1;
     }
-    fprintf(stderr, "gem4d: tiled-MMQ prefill scratch (%.2f GB, native Q4_0 weights, "
+    fprintf(stderr, "fucina: tiled-MMQ prefill scratch (%.2f GB, native Q4_0 weights, "
             "no BF16 dequant for N ≤ %d)\n",
             (Nmax*I + Nmax*(I/32)*8) / 1e9, GEMMA4_MMQ_MAX_N);
     eng->mmq_ready = 1;
@@ -4377,13 +4623,13 @@ static void mmq_proj(
 // require an int8 TENSOR-CORE (IMMA/mma.sync) MMQ — a separate, larger effort.
 //
 // So the MMQ path is compiled under BLACKWELL_NATIVE_FP4 (kernel kept for the future IMMA
-// rework and for A/B) but is OFF by default; opt in at runtime with GEM4D_MMQ=1. The
+// rework and for A/B) but is OFF by default; opt in at runtime with FUCINA_MMQ=1. The
 // default prefill stays on the faster BF16 + always-pipelined-dequant path.
 static inline bool mmq_enabled(gemma4_engine_t *eng, int N)
 {
 #if BLACKWELL_NATIVE_FP4
     static int opt = -1;
-    if (opt < 0) { const char *e = getenv("GEM4D_MMQ"); opt = (e && e[0] == '1') ? 1 : 0; }
+    if (opt < 0) { const char *e = getenv("FUCINA_MMQ"); opt = (e && e[0] == '1') ? 1 : 0; }
     if (!opt) return false;
     return (FMT(eng) == FORMAT_Q4_0) && (N <= GEMMA4_MMQ_MAX_N)
            && ensure_mmq_scratch(eng) == 0;
@@ -4440,7 +4686,24 @@ int gemma4_engine_prefill_batched(
     // suffix prefills. Above MMQ_MAX_N the BF16 tensor-core GEMM (with pipelined dequant)
     // wins, so we fall through to it. mmq needs no BF16 scratch; only build it otherwise.
     const bool use_mmq = mmq_enabled(eng, N);
-    if (!use_mmq && build_bf16_weights(eng) != 0) return -1;
+    // NVFP4 tensor-core prefill (FUCINA_FP4=1): persistent NVFP4 weights + per-GEMM
+    // activation quant + cuBLASLt block-scaled FP4 GEMM (~2.4× BF16). Needs no per-layer
+    // dequant pipeline. Falls back to BF16 if weight/scratch build fails.
+    // NVFP4 wins only for large-batch prefill: at small N the per-GEMM activation-quant
+    // overhead cancels the tensor-core speedup (measured: ~tied ≤256 tok, 1.47× @2113).
+    // DEFAULT ON with a 1024-token floor: that floor is tool-eval-validated CLEAN (core-15
+    // 97/100 == BF16 baseline), whereas a 256 floor regressed an error-handling scenario
+    // (90/100) — FP4 on the 256-1024 multi-turn prefills was the culprit. FUCINA_FP4=0 opts
+    // out entirely; FUCINA_FP4_MIN overrides the floor. Lazy: weights build only when a
+    // prefill actually clears the floor, so short-prompt sessions pay nothing.
+    static int fp4_opt = -1, fp4_min = 1024;
+    if (fp4_opt < 0) {
+        const char *e = getenv("FUCINA_FP4"); fp4_opt = (e && e[0]=='0') ? 0 : 1;  // on unless =0
+        const char *mn = getenv("FUCINA_FP4_MIN"); if (mn) fp4_min = atoi(mn);
+    }
+    const bool use_fp4 = fp4_opt && !use_mmq && N >= fp4_min
+                         && build_fp4_weights(eng) == 0 && ensure_fp4_act(eng, N) == 0;
+    if (!use_mmq && !use_fp4 && build_bf16_weights(eng) != 0) return -1;
 
     cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0, stream);
@@ -4449,7 +4712,7 @@ int gemma4_engine_prefill_batched(
     // next layer's Q4_0→BF16 dequant runs on dq_stream while this layer's GEMMs run. Graph
     // capture cannot join that fork, so it stays off when we run the BF16 path (overlap is
     // the larger, every-N win). MMQ needs no dequant at all → ovl is false there.
-    const bool ovl = !use_mmq;
+    const bool ovl = !use_mmq && !use_fp4;
     const bool use_graph = false;
     bool graph_replay = false;
     if (use_graph && eng->graph.N == N && eng->graph.e) {
@@ -4500,7 +4763,7 @@ int gemma4_engine_prefill_batched(
     float *fbufs[] = {d_x,d_norm,d_q,d_k,d_v,d_attn,d_gate,d_up,d_scores};
     __nv_bfloat16 *bbufs[] = {d_inb,d_qb,d_kb,d_vb,d_kbx,d_vbx,d_pb};
     if (!ok) {
-        fprintf(stderr, "gem4d: batched-prefill scratch alloc failed (N=%d) — fallback\n", N);
+        fprintf(stderr, "fucina: batched-prefill scratch alloc failed (N=%d) — fallback\n", N);
         cudaGetLastError();
         for (float *p : fbufs) if(p) cudaFree(p);
         for (__nv_bfloat16 *p : bbufs) if(p) cudaFree(p);
@@ -4525,7 +4788,9 @@ int gemma4_engine_prefill_batched(
     // MMQ: native Q4_0 weight read once, no BF16 materialize. BF16: cuBLAS tensor-core
     // GEMM over the pipelined dequant scratch (curbuf).
     auto gemm_proj = [&](int l, int p, int in_dim, int out_dim, float *dst){
-        if (use_mmq) {
+        if (use_fp4) {
+            gemm_nvfp4(eng, l, p, d_inb, dst, in_dim, out_dim, N, stream);
+        } else if (use_mmq) {
             uint64_t off; int idim, odim;
             proj_desc(eng, l, p, &off, &idim, &odim);
             mmq_proj(eng, weight_fp8(eng, off), d_inb, dst, in_dim, out_dim, N, stream);
@@ -4702,7 +4967,7 @@ int gemma4_engine_prefill_batched(
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "gem4d: batched-prefill CUDA error: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "fucina: batched-prefill CUDA error: %s\n", cudaGetErrorString(err));
         return -1;
     }
     return 0;
@@ -4766,7 +5031,7 @@ int gemma4_engine_prefill_flash(
     #undef PALLOC
     float *fbufs[] = {d_x,d_norm,d_q,d_k,d_v,d_attn,d_gate,d_up};
     if (!ok) {
-        fprintf(stderr, "gem4d: flash-prefill scratch alloc failed (C=%d) — fallback\n", C);
+        fprintf(stderr, "fucina: flash-prefill scratch alloc failed (C=%d) — fallback\n", C);
         cudaGetLastError();
         for (float *p : fbufs) if(p) cudaFree(p);
         if (d_inb) cudaFree(d_inb);
@@ -5046,7 +5311,7 @@ int gemma4_engine_prefill_flash(
     cudaFree(d_inb);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "gem4d: flash-prefill CUDA error: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "fucina: flash-prefill CUDA error: %s\n", cudaGetErrorString(err));
         return -1;
     }
     return aborted ? -3 : 0;
@@ -5071,11 +5336,8 @@ int gemma4_engine_prefill(
     cudaEventCreate(&stop);
     cudaEventRecord(start, eng->stream);
 
-    cudaStream_t stream = eng->stream;
-    (void)stream;
-
     if (eng->global_n_tokens + n_tokens > eng->global_kv_capacity) {
-        fprintf(stderr, "gem4d: prefill of %d tokens exceeds context (%d/%d used)\n",
+        fprintf(stderr, "fucina: prefill of %d tokens exceeds context (%d/%d used)\n",
                 n_tokens, eng->global_n_tokens, eng->global_kv_capacity);
         cudaEventDestroy(start); cudaEventDestroy(stop);
         return -1;
@@ -5144,7 +5406,7 @@ int gemma4_engine_prefill(
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "gem4d: prefill CUDA error: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "fucina: prefill CUDA error: %s\n", cudaGetErrorString(err));
         return -1;
     }
 
@@ -5210,7 +5472,7 @@ static int decode_graph_ensure(gemma4_engine_t *eng)
     if (eng->decode_graph_failed) return -1;
     // Debug escape hatch (parity A/B + emergency), mirroring llama.cpp's
     // GGML_CUDA_DISABLE_GRAPHS. The graph path is the default.
-    static const int disabled = (getenv("GEM4D_NO_DECODE_GRAPH") != NULL);
+    static const int disabled = (getenv("FUCINA_NO_DECODE_GRAPH") != NULL);
     if (disabled) { eng->decode_graph_failed = 1; return -1; }
     if (!eng->d_decpos && cudaMalloc(&eng->d_decpos, 2*sizeof(int)) != cudaSuccess) {
         eng->d_decpos = NULL; eng->decode_graph_failed = 1; cudaGetLastError(); return -1;
@@ -5236,10 +5498,10 @@ static int decode_graph_ensure(gemma4_engine_t *eng)
         eng->decode_graph = NULL;
         eng->decode_graph_failed = 1;
         cudaGetLastError();
-        fprintf(stderr, "gem4d: decode graph capture failed — using per-kernel launches\n");
+        fprintf(stderr, "fucina: decode graph capture failed — using per-kernel launches\n");
         return -1;
     }
-    fprintf(stderr, "gem4d: single-token decode CUDA graph captured\n");
+    fprintf(stderr, "fucina: single-token decode CUDA graph captured\n");
     return 0;
 }
 
@@ -5269,7 +5531,7 @@ int gemma4_engine_decode(
             cudaGraphExecDestroy(eng->decode_graph);
             eng->decode_graph = NULL;
             eng->decode_graph_failed = 1;
-            fprintf(stderr, "gem4d: decode graph replay failed — using per-kernel launches\n");
+            fprintf(stderr, "fucina: decode graph replay failed — using per-kernel launches\n");
         }
     }
 
@@ -5339,7 +5601,7 @@ int gemma4_engine_decode(
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "gem4d: decode CUDA error: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "fucina: decode CUDA error: %s\n", cudaGetErrorString(err));
         return -1;
     }
 
@@ -5552,7 +5814,7 @@ static int batched_graph_ensure(gemma4_engine_t *eng, int K)
     if (K < 1 || K > GEMMA4_SPEC_MAX) return -1;
     if (eng->batched_graph[K]) return 0;
     if (eng->batched_graph_failed) return -1;
-    static const int disabled = (getenv("GEM4D_NO_BATCHED_GRAPH") != NULL);
+    static const int disabled = (getenv("FUCINA_NO_BATCHED_GRAPH") != NULL);
     if (disabled) { eng->batched_graph_failed = 1; return -1; }
     if (ensure_spec_scratch(eng) != 0) { eng->batched_graph_failed = 1; return -1; }
     if (!eng->d_specpos &&
@@ -5576,10 +5838,10 @@ static int batched_graph_ensure(gemma4_engine_t *eng, int K)
         eng->batched_graph[K] = NULL;
         eng->batched_graph_failed = 1;
         cudaGetLastError();
-        fprintf(stderr, "gem4d: batched spec-verify graph capture failed (K=%d) — per-kernel launches\n", K);
+        fprintf(stderr, "fucina: batched spec-verify graph capture failed (K=%d) — per-kernel launches\n", K);
         return -1;
     }
-    fprintf(stderr, "gem4d: batched spec-verify CUDA graph captured (K=%d)\n", K);
+    fprintf(stderr, "fucina: batched spec-verify CUDA graph captured (K=%d)\n", K);
     return 0;
 }
 
@@ -5618,7 +5880,7 @@ static int decode_batched_dev(
         cudaGraphExecDestroy(eng->batched_graph[K]);
         eng->batched_graph[K] = NULL;
         eng->batched_graph_failed = 1;
-        fprintf(stderr, "gem4d: batched graph replay failed — using per-kernel launches\n");
+        fprintf(stderr, "fucina: batched graph replay failed — using per-kernel launches\n");
     }
 
     // ── Per-kernel path (public path, interior prefill chunks, or graph fallback) ─────
@@ -5660,7 +5922,7 @@ static int decode_batched_dev(
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "gem4d: decode_batched CUDA error: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "fucina: decode_batched CUDA error: %s\n", cudaGetErrorString(err));
         return -1;
     }
     return 0;
@@ -5718,13 +5980,13 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
     if (eng->mtp.loaded) return 0;
 
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "gem4d: assistant open failed: %s\n", path); return -1; }
+    if (fd < 0) { fprintf(stderr, "fucina: assistant open failed: %s\n", path); return -1; }
     struct stat st;
     if (fstat(fd, &st) != 0) { close(fd); return -1; }
     uint64_t fsize = (uint64_t)st.st_size;
     uint8_t *host = (uint8_t *)mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    if (host == MAP_FAILED) { fprintf(stderr, "gem4d: assistant mmap failed\n"); return -1; }
+    if (host == MAP_FAILED) { fprintf(stderr, "fucina: assistant mmap failed\n"); return -1; }
 
     int ok = 1;
     ok &= cudaMalloc(&eng->mtp.d_w, fsize) == cudaSuccess;
@@ -5737,9 +5999,9 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
         char _nm[128]; snprintf(_nm, sizeof(_nm), namefmt, ##__VA_ARGS__); \
         uint64_t _off = 0; uint32_t _ty = 0; \
         if (gguf_find_tensor(host, fsize, _nm, &_off, &n_el, &_ty) != 0) { \
-            fprintf(stderr, "gem4d: assistant tensor missing: %s\n", _nm); ok = 0; \
+            fprintf(stderr, "fucina: assistant tensor missing: %s\n", _nm); ok = 0; \
         } else if (_ty != (uint32_t)(want_type)) { \
-            fprintf(stderr, "gem4d: assistant tensor %s has type %u (want %u)\n", \
+            fprintf(stderr, "fucina: assistant tensor %s has type %u (want %u)\n", \
                     _nm, _ty, (uint32_t)(want_type)); ok = 0; \
         } else { (dst) = _off; } \
     } while (0)
@@ -5810,12 +6072,12 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
     munmap(host, fsize);
     if (!ok) {
         if (eng->mtp.d_w) { cudaFree(eng->mtp.d_w); eng->mtp.d_w = NULL; }
-        fprintf(stderr, "gem4d: assistant load FAILED — MTP drafting disabled\n");
+        fprintf(stderr, "fucina: assistant load FAILED — MTP drafting disabled\n");
         return -1;
     }
     eng->mtp.loaded = 1;
     eng->mtp_h_valid = 0;
-    fprintf(stderr, "gem4d: MTP assistant loaded (%s, %.0f MB) — draft-mtp speculation ON\n",
+    fprintf(stderr, "fucina: MTP assistant loaded (%s, %.0f MB) — draft-mtp speculation ON\n",
             path, fsize / (1024.0 * 1024.0));
     return 0;
 }
@@ -6020,7 +6282,7 @@ static int mtp_graph_ensure(gemma4_engine_t *eng)
         eng->mtp_graph = NULL;
         eng->mtp_graph_failed = 1;
         cudaGetLastError();   // clear any capture-path error state
-        fprintf(stderr, "gem4d: MTP forward graph capture failed — using per-kernel launches\n");
+        fprintf(stderr, "fucina: MTP forward graph capture failed — using per-kernel launches\n");
         return -1;
     }
     return 0;
@@ -6494,7 +6756,7 @@ static int run_spec_loop(
         int keep = pos + 1 + a;
         // FLAT KV (Step 3): rewind is exact now; check the return defensively (design :4756).
         if (keep < eng->global_n_tokens && gemma4_engine_rewind(eng, keep) != 0) {
-            fprintf(stderr, "gem4d: spec rewind to %d failed — stopping spec\n", keep);
+            fprintf(stderr, "fucina: spec rewind to %d failed — stopping spec\n", keep);
             stop = 1; break;
         }
         for (int i = 0; i < a && generated < max_new; i++) {
@@ -6508,7 +6770,7 @@ static int run_spec_loop(
         g = ids[a];
     }
     if (eng->mtp.loaded && (mtp_calls > 0 || mtp_declines > 0))
-        fprintf(stderr, "gem4d: [mtp] %ld draft calls, %ld proposed, %ld accepted (%.0f%%), %ld declined\n",
+        fprintf(stderr, "fucina: [mtp] %ld draft calls, %ld proposed, %ld accepted (%.0f%%), %ld declined\n",
                 mtp_calls, mtp_drafted, mtp_accepted,
                 100.0 * mtp_accepted / (double)(mtp_drafted > 0 ? mtp_drafted : 1),
                 mtp_declines);
@@ -6516,7 +6778,7 @@ static int run_spec_loop(
     // instead — that displacement rate IS the new policy, so it must be visible here
     // (also when displacement was TOTAL, i.e. zero verified lookup drafts).
     if (lk_calls > 0 || lk_displaced > 0)
-        fprintf(stderr, "gem4d: [lookup] %ld draft calls, %ld proposed, %ld accepted (%.0f%%), %ld displaced by mtp\n",
+        fprintf(stderr, "fucina: [lookup] %ld draft calls, %ld proposed, %ld accepted (%.0f%%), %ld displaced by mtp\n",
                 lk_calls, lk_drafted, lk_accepted,
                 100.0 * lk_accepted / (double)(lk_drafted > 0 ? lk_drafted : 1),
                 lk_displaced);
@@ -6819,7 +7081,7 @@ int gemma4_engine_sample_device(
 
 void gemma4_engine_print_info(const gemma4_engine_t *eng) {
     if (!eng) return;
-    printf("=== gem4d Engine Info ===\n");
+    printf("=== fucina Engine Info ===\n");
     printf("Model size:  %.2f GB\n", eng->gguf_size / (1024.0*1024.0*1024.0));
     printf("Context:     %u tokens\n", eng->context_size);
     printf("Format:      %s\n", eng->format == FORMAT_Q4_0 ? "Q4_0" : "Q8_0");
@@ -6846,7 +7108,7 @@ void gemma4_engine_print_info(const gemma4_engine_t *eng) {
 void gemma4_engine_print_timing(const gemma4_engine_t *eng) {
     if (!eng) return;
     decode_timing_lap((gemma4_engine_t *)eng);   // resolve any completed lazy pair
-    printf("=== gem4d Timing ===\n");
+    printf("=== fucina Timing ===\n");
     if (eng->n_prefill_tokens > 0) {
         printf("Prefill:  %d tokens in %.1f ms = %.0f t/s\n",
                 eng->n_prefill_tokens, eng->prefill_time_ms,
@@ -6981,7 +7243,7 @@ static int ensure_kv_stage(gemma4_engine_t *eng) {
                 if (eng->h_kv_stage[j])  { cudaFreeHost(eng->h_kv_stage[j]); eng->h_kv_stage[j] = NULL; }
                 if (eng->ev_kv_stage[j]) { cudaEventDestroy(eng->ev_kv_stage[j]); eng->ev_kv_stage[j] = NULL; }
             }
-            fprintf(stderr, "gem4d: kv-snapshot pinned staging alloc failed — pageable fallback\n");
+            fprintf(stderr, "fucina: kv-snapshot pinned staging alloc failed — pageable fallback\n");
             eng->kv_stage_ready = -1;
             return -1;
         }
@@ -7059,7 +7321,7 @@ static int kv_seq_copy(gemma4_engine_t *eng, char *buf, int n_tokens,
             }
         }
         if (!fail) return 0;
-        fprintf(stderr, "gem4d: staged kv_seq_copy failed (%s) — engine state %s\n",
+        fprintf(stderr, "fucina: staged kv_seq_copy failed (%s) — engine state %s\n",
                 cudaGetErrorString(cudaGetLastError()),
                 dir == cudaMemcpyDeviceToHost ? "intact (save aborted)" : "UNDEFINED");
         return -1;
@@ -7078,7 +7340,7 @@ static int kv_seq_copy(gemma4_engine_t *eng, char *buf, int n_tokens,
                                regions[r].width, regions[r].layers, dir);
         }
         if (err != cudaSuccess) {
-            fprintf(stderr, "gem4d: kv_seq_copy region %d failed: %s\n",
+            fprintf(stderr, "fucina: kv_seq_copy region %d failed: %s\n",
                     r, cudaGetErrorString(err));
             return -1;
         }
@@ -7131,7 +7393,7 @@ static int alloc_prefill_scratch(gemma4_engine_t *eng) {
     #undef A
     if (ok != cudaSuccess) { cudaGetLastError(); return -1; }
     eng->pf_scratch_ready = 1;
-    fprintf(stderr, "gem4d: persistent prefill scratch (N<=%d)\n", NC);
+    fprintf(stderr, "fucina: persistent prefill scratch (N<=%d)\n", NC);
     return 0;
 }
 
@@ -7205,12 +7467,12 @@ int gemma4_engine_warmup(gemma4_engine_t *eng) {
     // cuBLAS lazily inits its library + GEMM workspaces on the first cublasGemmEx,
     // CUDA lazily loads each kernel module on its first launch, and the persistent
     // scratch pages fault in on first touch. Paid on request #1, this is the whole
-    // gap between gem4d's cold prefill (~1385 tok/s) and its warm steady state
+    // gap between fucina's cold prefill (~1385 tok/s) and its warm steady state
     // (~1714 tok/s). Run one real batched prefill over a representative-width dummy
     // prompt here so all of it is paid BEFORE the server announces "listening", then
     // rewind the sequence so the warmup leaves no KV state behind. (Escape hatch:
-    // GEM4D_NO_WARMUP_PASS=1, mirroring GEM4D_NO_DECODE_GRAPH.)
-    const char *nw = getenv("GEM4D_NO_WARMUP_PASS");
+    // FUCINA_NO_WARMUP_PASS=1, mirroring FUCINA_NO_DECODE_GRAPH.)
+    const char *nw = getenv("FUCINA_NO_WARMUP_PASS");
     if (nw && nw[0] == '1') return 0;
 
     // (1) Pre-capture EVERY CUDA graph now (capture-only, no KV state touched) so

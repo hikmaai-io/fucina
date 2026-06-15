@@ -2,14 +2,14 @@
 
 Internal checklist for the first public release as `github.com/hikmaai-io/fucina`.
 
-> **State of this branch (`release-prep`):** the **docs and metadata are already fucina-branded**
-> (README, LICENSE, NOTICE, CONTRIBUTING, SECURITY, CI, templates). The **code rename is NOT done
-> yet** — the Go module path, binary, `cmd/` dir, cgo lib name, and `GEM4D_*` env vars still say
-> `gem4d`. Run the rename below on a **quiet tree** and **build-verify on the GB10** before tagging.
+> **State of this branch (`release-prep`):** the rename is **done** (module path
+> `github.com/hikmaai-io/fucina`, `cmd/fucina`, `libfucina.a`, `FUCINA_*` env vars), the diffusion
+> engine is folded in, personal paths are scrubbed, and the **full build + dense smoke passed on the
+> GB10**. What remains is the public push (step 3).
 
 ## 0 · Decisions (done)
 - [x] Name: **fucina** · Org: **hikmaai-io** → `github.com/hikmaai-io/fucina`
-- [x] First release scope: **dense Gemma 4 12B only** (DiffusionGemma held for v0.2)
+- [x] First release scope: **dense Gemma 4 12B + experimental DiffusionGemma 26B-A4B** (`-dm`)
 
 ## 1 · Code rename (run on a CLEAN tree; requires a GB10 to verify)
 
@@ -61,4 +61,4 @@ rewrites, and `git mv cmd/gem4d cmd/fucina`.
 
 ## 5 · Post-launch
 - [ ] Triage with the "experimental / no SLA" expectation set in SECURITY.md & CONTRIBUTING.md
-- [ ] Roadmap: sm_120 (RTX 50-series) port; DiffusionGemma as v0.2
+- [ ] Roadmap: harden the experimental DiffusionGemma path; sm_120 (RTX 50-series) port

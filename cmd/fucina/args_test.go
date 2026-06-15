@@ -4,13 +4,13 @@ import (
 	"flag"
 	"testing"
 
-	gemserver "github.com/mauromedda/gem4d/internal/server"
+	gemserver "github.com/hikmaai-io/fucina/internal/server"
 )
 
 // newTestFlagSet returns a fresh FlagSet that does NOT call os.Exit on error,
 // so parseArgs can be exercised in isolation.
 func newTestFlagSet() *flag.FlagSet {
-	return flag.NewFlagSet("gem4d-test", flag.ContinueOnError)
+	return flag.NewFlagSet("fucina-test", flag.ContinueOnError)
 }
 
 func mustParse(t *testing.T, argv []string) (CLIArgs, testFlags) {

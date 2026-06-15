@@ -5,14 +5,17 @@ import "fmt"
 // ─── Usage ────────────────────────────────────────────────────────
 
 func printUsage() {
-	fmt.Print(`gem4d - Gemma 4 12B inference engine for DGX Spark GB10
+	fmt.Print(`fucina - Gemma 4 12B inference engine for DGX Spark GB10
 
 Usage:
-  gem4d -m model.gguf [options]                  # Server mode (default)
-  gem4d -m model.gguf -p "Hello" -n 100          # One-shot prompt
+  fucina -m model.gguf [options]                  # Server mode (default)
+  fucina -m model.gguf -p "Hello" -n 100          # One-shot prompt
 
 Model options:
   -m, --model FILE           Path to GGUF model file (Q4_0-QAT or Q8_0; auto-detected)
+  -dm, --diffusion-model FILE  DiffusionGemma GGUF; like -m but also enables the NVFP4 MoE
+                             experts (CUTLASS grouped FP4 tensor cores, ~1.9x denoise)
+  --fp4-moe                  Enable DiffusionGemma NVFP4 MoE experts (use with -m)
   --assistant FILE           Gemma-4 MTP assistant GGUF (official draft head; ~2x decode)
 
 Inference options:
@@ -53,7 +56,7 @@ Other options:
   -h, --help                 Show this help
 
 Examples:
-  gem4d -m gemma-4-12b-it.gguf --ctx 32768 &
+  fucina -m gemma-4-12b-it.gguf --ctx 32768 &
   curl http://localhost:8080/v1/chat/completions \\
     -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 `)

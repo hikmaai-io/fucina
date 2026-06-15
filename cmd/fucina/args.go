@@ -12,6 +12,9 @@ type CLIArgs struct {
 	// Model
 	ModelPath     string
 	AssistantPath string // Gemma-4 MTP assistant GGUF (official draft head)
+	DiffModelPath string // -dm: diffusion model path; also enables the NVFP4 MoE experts
+	FP4MoE        bool   // --fp4-moe / implied by -dm: enable DiffusionGemma NVFP4 MoE experts
+	DenoiseSteps  int    // --denoise-steps: diffusion denoise-step cap per block (0 = default 48); lower = faster, lower quality
 
 	// Inference
 	ContextSize int
@@ -86,6 +89,12 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.StringVar(&a.ModelPath, "model", "", "Path to GGUF model file")
 	fs.StringVar(&a.AssistantPath, "assistant", "",
 		"Path to the Gemma-4 MTP assistant GGUF (official draft head; enables draft-mtp speculation)")
+	// -dm: like -m but for DiffusionGemma — sets the model path AND enables the NVFP4 MoE
+	// experts (CUTLASS grouped FP4 tensor cores, ~1.9× the dp4a denoise step).
+	fs.StringVar(&a.DiffModelPath, "dm", "", "Diffusion model GGUF path (implies --fp4-moe)")
+	fs.StringVar(&a.DiffModelPath, "diffusion-model", "", "Diffusion model GGUF path (implies --fp4-moe)")
+	fs.BoolVar(&a.FP4MoE, "fp4-moe", false, "Enable DiffusionGemma NVFP4 MoE experts (works with -m too)")
+	fs.IntVar(&a.DenoiseSteps, "denoise-steps", 0, "DiffusionGemma denoise steps per block (0=default 48; lower=faster, lower quality)")
 
 	// Default to the model's maximum trained context (262144). A coding agent
 	// injects large file contents via Read tool responses; a small window forces
@@ -139,7 +148,7 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.BoolVar(&a.Verbose, "v", false, "Verbose output")
 	fs.BoolVar(&a.Verbose, "verbose", false, "Verbose output")
 	fs.BoolVar(&a.Timings, "timings", false, "Show timing information")
-	fs.BoolVar(&a.Debug, "debug", false, "Dump full request bodies + rendered prompts to "+"/tmp/gem4d_debug.log")
+	fs.BoolVar(&a.Debug, "debug", false, "Dump full request bodies + rendered prompts to "+"/tmp/fucina_debug.log")
 	fs.StringVar(&a.LogLevel, "log-level", "info", "Log level: info|debug (debug also dumps requests)")
 	fs.IntVar(&a.DeviceID, "cuda-device", 0, "CUDA device ID")
 	fs.StringVar(&a.Memory, "mlock", "", "mlock model in memory (unused on CUDA)")
@@ -158,6 +167,11 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 
 	if err := fs.Parse(argv); err != nil {
 		return a, t, err
+	}
+	// -dm <model> is sugar for: -m <model> + --fp4-moe (DiffusionGemma NVFP4 MoE).
+	if a.DiffModelPath != "" {
+		a.ModelPath = a.DiffModelPath
+		a.FP4MoE = true
 	}
 	return a, t, nil
 }

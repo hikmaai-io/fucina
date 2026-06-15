@@ -41,7 +41,7 @@ type savedSeq struct {
 // Motivation: llama.cpp's server re-prefills the entire prompt on every request,
 // which is wasteful for multi-turn chat where each turn's prompt is the previous
 // conversation plus a new message. vLLM avoids this with automatic prefix
-// caching. This manager brings the same idea to gem4d.
+// caching. This manager brings the same idea to fucina.
 //
 // Model: the engine holds ONE physical KV cache for ONE logical sequence. We
 // track the exact token sequence currently materialized in that cache
@@ -224,7 +224,7 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 	// rewind-or-reset path. So we deliberately do not warn or truncate for it,
 	// preserving prefix reuse across such requests.
 	if n := c.engine.NTokens(); len(c.cachedTokens) > n {
-		log.Printf("gem4d: kvcache: engine KV (%d tokens) is behind cache bookkeeping (%d); truncating bookkeeping to the engine's length", n, len(c.cachedTokens))
+		log.Printf("fucina: kvcache: engine KV (%d tokens) is behind cache bookkeeping (%d); truncating bookkeeping to the engine's length", n, len(c.cachedTokens))
 		c.cachedTokens = c.cachedTokens[:n]
 	}
 
@@ -262,7 +262,7 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 		c.cachedTokens = c.cachedTokens[:0]
 	} else if lcp < engineTokens {
 		if !c.engine.Rewind(lcp) {
-			log.Printf("gem4d: kvcache: rewind to %d unsafe, full reset", lcp)
+			log.Printf("fucina: kvcache: rewind to %d unsafe, full reset", lcp)
 			c.engine.Reset()
 			c.cachedTokens = c.cachedTokens[:0]
 			lcp = 0
@@ -359,13 +359,13 @@ func (c *KVCache) maybeSwap(prompt []int32, liveLCP int) int {
 	if err := c.snap.KVRestore(pinned.state, len(pinned.tokens)); err != nil {
 		// A failed restore may have partially overwritten the live KV: the
 		// engine state is undefined, so fall back to a clean full prefill.
-		log.Printf("gem4d: kvcache: snapshot restore failed: %v", err)
+		log.Printf("fucina: kvcache: snapshot restore failed: %v", err)
 		c.engine.Reset()
 		c.cachedTokens = c.cachedTokens[:0]
 		return 0
 	}
 	c.cachedTokens = append(c.cachedTokens[:0], pinned.tokens...)
-	log.Printf("gem4d: kvcache: restored snapshot (%d tokens, lcp %d vs live %d)",
+	log.Printf("fucina: kvcache: restored snapshot (%d tokens, lcp %d vs live %d)",
 		len(pinned.tokens), bestLCP, liveLCP)
 	return bestLCP
 }
@@ -394,12 +394,12 @@ func (c *KVCache) saveLive() {
 			}
 		}
 		c.snapBytes -= int64(len(c.saved[lru].state))
-		log.Printf("gem4d: kvcache: evicted LRU snapshot (%d tokens)", len(c.saved[lru].tokens))
+		log.Printf("fucina: kvcache: evicted LRU snapshot (%d tokens)", len(c.saved[lru].tokens))
 		c.saved = append(c.saved[:lru], c.saved[lru+1:]...)
 	}
 	buf := make([]byte, size)
 	if err := c.snap.KVSave(buf, n); err != nil {
-		log.Printf("gem4d: kvcache: snapshot save failed: %v", err)
+		log.Printf("fucina: kvcache: snapshot save failed: %v", err)
 		return
 	}
 	c.snapClock++
@@ -407,7 +407,7 @@ func (c *KVCache) saveLive() {
 	copy(toks, c.cachedTokens)
 	c.saved = append(c.saved, &savedSeq{tokens: toks, state: buf, used: c.snapClock})
 	c.snapBytes += size
-	log.Printf("gem4d: kvcache: saved live sequence (%d tokens, %.0f MB; pool %d seqs / %.0f MB)",
+	log.Printf("fucina: kvcache: saved live sequence (%d tokens, %.0f MB; pool %d seqs / %.0f MB)",
 		n, float64(size)/(1<<20), len(c.saved), float64(c.snapBytes)/(1<<20))
 }
 

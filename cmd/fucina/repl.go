@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mauromedda/gem4d/internal/chat"
-	"github.com/mauromedda/gem4d/internal/engine/cuda"
-	"github.com/mauromedda/gem4d/internal/sampler"
-	gemserver "github.com/mauromedda/gem4d/internal/server"
-	"github.com/mauromedda/gem4d/internal/tokenizer"
+	"github.com/hikmaai-io/fucina/internal/chat"
+	"github.com/hikmaai-io/fucina/internal/engine/cuda"
+	"github.com/hikmaai-io/fucina/internal/sampler"
+	gemserver "github.com/hikmaai-io/fucina/internal/server"
+	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
 // ─── Interactive REPL ────────────────────────────────────────────
@@ -51,7 +51,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	ctxTokens := int(eng.ContextSize())
 
 	fmt.Fprintf(os.Stderr,
-		"gem4d: interactive mode (Gemma 4 12B-IT) — ctx=%d\n"+
+		"fucina: interactive mode (Gemma 4 12B-IT) — ctx=%d\n"+
 			"  /reset  clear conversation\n"+
 			"  /stats  show KV cache hit rate\n"+
 			"  /quit   exit (or Ctrl-D)\n\n",
@@ -61,7 +61,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		fmt.Fprint(os.Stderr, "\033[1;32m> \033[0m") // green prompt
 		if !scanner.Scan() {
 			// Ctrl-D / EOF
-			fmt.Fprintln(os.Stderr, "\ngem4d: bye")
+			fmt.Fprintln(os.Stderr, "\nfucina: bye")
 			break
 		}
 		input := strings.TrimSpace(scanner.Text())
@@ -72,7 +72,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		// Slash commands
 		switch input {
 		case "/quit", "/exit", "/q":
-			fmt.Fprintln(os.Stderr, "gem4d: bye")
+			fmt.Fprintln(os.Stderr, "fucina: bye")
 			return
 		case "/reset", "/clear":
 			history = history[:0]
@@ -89,12 +89,12 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			kv.Lock()
 			kv.Reset()
 			kv.Unlock()
-			fmt.Fprintln(os.Stderr, "gem4d: conversation cleared")
+			fmt.Fprintln(os.Stderr, "fucina: conversation cleared")
 			continue
 		case "/stats":
 			hits, misses, rate := kv.Stats()
 			fmt.Fprintf(os.Stderr,
-				"gem4d: KV cache — hits=%d misses=%d token_hit_rate=%.1f%% cached=%d/%d\n",
+				"fucina: KV cache — hits=%d misses=%d token_hit_rate=%.1f%% cached=%d/%d\n",
 				hits, misses, rate*100, eng.NTokens(), ctxTokens)
 			continue
 		}
@@ -107,7 +107,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		// Warn if we are close to the context limit.
 		if len(promptToks) > ctxTokens-64 {
 			fmt.Fprintf(os.Stderr,
-				"\033[33mgem4d: warning: prompt is %d tokens, near context limit %d\033[0m\n",
+				"\033[33mfucina: warning: prompt is %d tokens, near context limit %d\033[0m\n",
 				len(promptToks), ctxTokens)
 		}
 
@@ -117,7 +117,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		pf, err := kv.Prefill(promptToks)
 		if err != nil {
 			kv.Unlock()
-			fmt.Fprintf(os.Stderr, "gem4d: prefill error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "fucina: prefill error: %v\n", err)
 			history = history[:len(history)-1] // undo user turn
 			continue
 		}
@@ -127,7 +127,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			pfTPS = float64(pf.NewTokens) / pfElapsed.Seconds()
 		}
 		fmt.Fprintf(os.Stderr,
-			"\033[2mgem4d: prefill %d tokens (%d cached, %d new) %.2fs %.1f tok/s\033[0m\n",
+			"\033[2mfucina: prefill %d tokens (%d cached, %d new) %.2fs %.1f tok/s\033[0m\n",
 			pf.PromptTokens, pf.ReusedTokens, pf.NewTokens, pfElapsed.Seconds(), pfTPS)
 
 		// The speculative fast-path is a single blocking engine call: one weight
@@ -181,7 +181,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			if err != nil {
 				kv.Unlock()
 				fmt.Println()
-				fmt.Fprintf(os.Stderr, "gem4d: spec generate error: %v\n", err)
+				fmt.Fprintf(os.Stderr, "fucina: spec generate error: %v\n", err)
 				history = history[:len(history)-1] // undo user turn
 				continue
 			}
@@ -238,7 +238,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		}
 		fmt.Println() // newline after reply
 		fmt.Fprintf(os.Stderr,
-			"\033[2mgem4d: generated %d tokens %.2fs %.1f tok/s%s\033[0m\n\n",
+			"\033[2mfucina: generated %d tokens %.2fs %.1f tok/s%s\033[0m\n\n",
 			generated, genElapsed.Seconds(), genTPS, specStats)
 
 		// Add completed assistant reply to history so the NEXT turn's prompt

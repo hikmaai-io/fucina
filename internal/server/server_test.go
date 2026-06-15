@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mauromedda/gem4d/internal/tokenizer"
+	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
 // ─── minimal in-memory GGUF builder (duplicated from the tokenizer test, kept

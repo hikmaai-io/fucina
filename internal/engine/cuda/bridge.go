@@ -1,37 +1,37 @@
 // Package cuda provides the Go interface to the CUDA inference engine.
 //
-// This package uses CGO to call the C CUDA kernels compiled in libgem4d.a.
+// This package uses CGO to call the C CUDA kernels compiled in libfucina.a.
 // The engine is specific to Gemma 4 12B on DGX Spark GB10 (sm_121, CUDA 13.0).
 
 package cuda
 
-// #cgo LDFLAGS: -L${SRCDIR}/../../../cuda -lgem4d -lcudart -lcublas -lcuda -lpthread -lstdc++ -lm
+// #cgo LDFLAGS: -L${SRCDIR}/../../../cuda -L/usr/local/cuda/lib64 -lfucina -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 // #cgo CFLAGS: -I/usr/local/cuda-13/include -I${SRCDIR}/../../../cuda
 //
 // #include "gemma4_kernels.cuh"
 // #include <stdlib.h>
 //
 // // Thin C wrappers for CGO compatibility with graph API
-// static inline void _gem4d_set_graph_mode(struct gemma4_engine *eng, int mode) {
+// static inline void _fucina_set_graph_mode(struct gemma4_engine *eng, int mode) {
 //     gemma4_engine_set_graph_mode(eng, mode);
 // }
-// static inline void _gem4d_graph_stats(const struct gemma4_engine *eng,
+// static inline void _fucina_graph_stats(const struct gemma4_engine *eng,
 //     int *hits, int *misses, int *captures, int *launches) {
 //     gemma4_engine_graph_stats(eng, hits, misses, captures, launches);
 // }
 //
-// // Per-token streaming bridge: gem4dSpecTokenGo is the cgo-exported Go callback
+// // Per-token streaming bridge: fucinaSpecTokenGo is the cgo-exported Go callback
 // // (defined in callback.go); the engine invokes it once per emitted token. The
 // // uintptr is a runtime/cgo.Handle resolving to the request's emit closure.
-// extern int gem4dSpecTokenGo(int32_t tok, void *ud);
-// static inline int _gem4d_generate_spec_stream(gemma4_engine_t *eng,
+// extern int fucinaSpecTokenGo(int32_t tok, void *ud);
+// static inline int _fucina_generate_spec_stream(gemma4_engine_t *eng,
 //     const int32_t *hist, int n_hist, const float *first_logits,
 //     int32_t *out, int max_new, const int32_t *stops, int n_stop, int draft_k,
 //     float temp, int top_k, float top_p, float min_p, float repeat_penalty,
 //     uint64_t seed, int *n_accepted, uintptr_t handle) {
 //     return gemma4_engine_generate_spec_stream(eng, hist, n_hist, first_logits,
 //         out, max_new, stops, n_stop, draft_k, temp, top_k, top_p, min_p,
-//         repeat_penalty, seed, n_accepted, gem4dSpecTokenGo, (void *)handle);
+//         repeat_penalty, seed, n_accepted, fucinaSpecTokenGo, (void *)handle);
 // }
 import "C"
 
@@ -80,7 +80,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 		C.int(cfg.DeviceID),
 	)
 	if ptr == nil {
-		return nil, fmt.Errorf("gem4d: engine creation failed for %s", cfg.ModelPath)
+		return nil, fmt.Errorf("fucina: engine creation failed for %s", cfg.ModelPath)
 	}
 
 	eng := &Engine{
@@ -101,7 +101,7 @@ func (e *Engine) LoadAssistant(path string) error {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 	if C.gemma4_engine_load_assistant(e.ptr, cPath) != 0 {
-		return fmt.Errorf("gem4d: assistant load failed for %s", path)
+		return fmt.Errorf("fucina: assistant load failed for %s", path)
 	}
 	return nil
 }
@@ -165,7 +165,7 @@ func (e *Engine) Prefill(tokens []int32) ([]float32, error) {
 		return nil, prefillAborted{}
 	}
 	if ret != 0 {
-		return nil, fmt.Errorf("gem4d: prefill failed")
+		return nil, fmt.Errorf("fucina: prefill failed")
 	}
 
 	return logits, nil
@@ -178,7 +178,7 @@ func (e *Engine) Prefill(tokens []int32) ([]float32, error) {
 // interface{ Aborted() bool } — no cgo import needed there.
 type prefillAborted struct{}
 
-func (prefillAborted) Error() string { return "gem4d: prefill aborted" }
+func (prefillAborted) Error() string { return "fucina: prefill aborted" }
 func (prefillAborted) Aborted() bool { return true }
 
 // AbortPrefill asks an in-flight Prefill (on another goroutine) to stop at the
@@ -217,7 +217,7 @@ func (e *Engine) Decode(token int32) ([]float32, error) {
 		(*C.float)(unsafe.Pointer(&logits[0])),
 	)
 	if ret != 0 {
-		return nil, fmt.Errorf("gem4d: decode failed")
+		return nil, fmt.Errorf("fucina: decode failed")
 	}
 
 	return logits, nil
@@ -250,7 +250,7 @@ func (e *Engine) GenerateSpec(prompt []int32, maxNew int, stops []int32, draftK 
 		&nacc,
 	)
 	if ng < 0 {
-		return nil, 0, fmt.Errorf("gem4d: generate_spec failed")
+		return nil, 0, fmt.Errorf("fucina: generate_spec failed")
 	}
 	return out[:ng], int(nacc), nil
 }
@@ -261,7 +261,7 @@ func (e *Engine) DecodeNoCopy(token int32) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if C.gemma4_engine_decode(e.ptr, C.int32_t(token), nil) != 0 {
-		return fmt.Errorf("gem4d: decode failed")
+		return fmt.Errorf("fucina: decode failed")
 	}
 	return nil
 }
@@ -276,7 +276,7 @@ func (e *Engine) SampleDevice(temp float32, topK int, topP, minP, rnd float32) (
 	id := C.gemma4_engine_sample_device(e.ptr, C.float(temp), C.int(topK),
 		C.float(topP), C.float(minP), C.float(rnd))
 	if id < 0 {
-		return 0, fmt.Errorf("gem4d: device sample failed")
+		return 0, fmt.Errorf("fucina: device sample failed")
 	}
 	return int32(id), nil
 }
@@ -312,7 +312,7 @@ func (e *Engine) GenerateSpecContinue(history []int32, firstLogits []float32,
 		&nacc,
 	)
 	if ng < 0 {
-		return nil, 0, fmt.Errorf("gem4d: generate_spec_continue failed")
+		return nil, 0, fmt.Errorf("fucina: generate_spec_continue failed")
 	}
 	return out[:ng], int(nacc), nil
 }
@@ -342,7 +342,7 @@ func (e *Engine) GenerateSpecStream(history []int32, firstLogits []float32,
 	}
 	h := cgo.NewHandle(emit)
 	defer h.Delete()
-	ng := C._gem4d_generate_spec_stream(
+	ng := C._fucina_generate_spec_stream(
 		e.ptr,
 		histPtr, C.int(len(history)),
 		(*C.float)(unsafe.Pointer(&firstLogits[0])),
@@ -354,7 +354,7 @@ func (e *Engine) GenerateSpecStream(history []int32, firstLogits []float32,
 		&nacc, C.uintptr_t(h),
 	)
 	if ng < 0 {
-		return nil, 0, fmt.Errorf("gem4d: generate_spec_stream failed")
+		return nil, 0, fmt.Errorf("fucina: generate_spec_stream failed")
 	}
 	return out[:ng], int(nacc), nil
 }
@@ -427,10 +427,10 @@ func (e *Engine) KVSave(buf []byte, nTokens int) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if len(buf) == 0 {
-		return fmt.Errorf("gem4d: kv save: empty buffer")
+		return fmt.Errorf("fucina: kv save: empty buffer")
 	}
 	if C.gemma4_engine_kv_save(e.ptr, unsafe.Pointer(&buf[0]), C.int(nTokens)) != 0 {
-		return fmt.Errorf("gem4d: kv save failed (%d tokens)", nTokens)
+		return fmt.Errorf("fucina: kv save failed (%d tokens)", nTokens)
 	}
 	return nil
 }
@@ -441,10 +441,10 @@ func (e *Engine) KVRestore(buf []byte, nTokens int) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if len(buf) == 0 {
-		return fmt.Errorf("gem4d: kv restore: empty buffer")
+		return fmt.Errorf("fucina: kv restore: empty buffer")
 	}
 	if C.gemma4_engine_kv_restore(e.ptr, unsafe.Pointer(&buf[0]), C.int(nTokens)) != 0 {
-		return fmt.Errorf("gem4d: kv restore failed (%d tokens)", nTokens)
+		return fmt.Errorf("fucina: kv restore failed (%d tokens)", nTokens)
 	}
 	return nil
 }
@@ -491,7 +491,7 @@ func (e *Engine) Timing() TimingStats {
 func (e *Engine) SetGraphMode(mode int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	C._gem4d_set_graph_mode(e.ptr, C.int(mode))
+	C._fucina_set_graph_mode(e.ptr, C.int(mode))
 }
 
 // GraphStats returns CUDA graph statistics.
@@ -499,7 +499,7 @@ func (e *Engine) GraphStats() (hits, misses, captures, launches int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	var h, m, c, l C.int
-	C._gem4d_graph_stats(e.ptr, &h, &m, &c, &l)
+	C._fucina_graph_stats(e.ptr, &h, &m, &c, &l)
 	return int(h), int(m), int(c), int(l)
 }
 

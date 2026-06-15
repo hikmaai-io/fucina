@@ -6,9 +6,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/mauromedda/gem4d/internal/engine/cuda"
-	"github.com/mauromedda/gem4d/internal/sampler"
-	"github.com/mauromedda/gem4d/internal/tokenizer"
+	"github.com/hikmaai-io/fucina/internal/engine/cuda"
+	"github.com/hikmaai-io/fucina/internal/sampler"
+	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
 // ─── One-shot prompt ───────────────────────────────────────────────
@@ -22,23 +22,23 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	if args.PromptFile != "" {
 		data, err := os.ReadFile(args.PromptFile)
 		if err != nil {
-			log.Fatalf("gem4d: cannot read prompt file: %v", err)
+			log.Fatalf("fucina: cannot read prompt file: %v", err)
 		}
 		prompt = string(data)
 	}
 	if prompt == "" {
-		log.Fatalf("gem4d: empty prompt. Use -p or -f")
+		log.Fatalf("fucina: empty prompt. Use -p or -f")
 	}
 	if args.System != "" {
 		prompt = fmt.Sprintf("System: %s\n\n%s", args.System, prompt)
 	}
 	if tok == nil {
-		log.Fatalf("gem4d: tokenizer not available")
+		log.Fatalf("fucina: tokenizer not available")
 	}
 
 	// Tokenize
 	tokens := tok.Encode(prompt, true, false)
-	log.Printf("gem4d: prompt has %d tokens", len(tokens))
+	log.Printf("fucina: prompt has %d tokens", len(tokens))
 
 	// Spec enabled → prompt-lookup/MTP speculative decode. Works for greedy AND
 	// sampling — including repeat-penalty, which the engine applies on-GPU — with
@@ -58,7 +58,7 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			float32(args.Temperature), args.TopK, float32(args.TopP), float32(args.MinP),
 			float32(args.RepeatPenalty), seed)
 		if err != nil {
-			log.Fatalf("gem4d: spec generate failed: %v", err)
+			log.Fatalf("fucina: spec generate failed: %v", err)
 		}
 		genElapsed := time.Since(genStart)
 		fmt.Print(prompt)
@@ -70,7 +70,7 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		}
 		fmt.Println()
 		genTPS := float64(len(out)) / genElapsed.Seconds()
-		log.Printf("gem4d: [spec] generated %d tokens in %.2fs (%.1f tok/s), "+
+		log.Printf("fucina: [spec] generated %d tokens in %.2fs (%.1f tok/s), "+
 			"%d drafts accepted (avg %.2f tokens/step, draft-k=%d)",
 			len(out), genElapsed.Seconds(), genTPS, nAccepted,
 			float64(len(out))/float64(max(1, len(out)-nAccepted)), args.DraftK)
@@ -81,11 +81,11 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	prefillStart := time.Now()
 	logits, err := eng.Prefill(tokens)
 	if err != nil {
-		log.Fatalf("gem4d: prefill failed: %v", err)
+		log.Fatalf("fucina: prefill failed: %v", err)
 	}
 	prefillElapsed := time.Since(prefillStart)
 	prefillTPS := float64(len(tokens)) / prefillElapsed.Seconds()
-	log.Printf("gem4d: prefill %d tokens in %.2fs (%.1f tok/s)",
+	log.Printf("fucina: prefill %d tokens in %.2fs (%.1f tok/s)",
 		len(tokens), prefillElapsed.Seconds(), prefillTPS)
 
 	rng := newRNG(args.Seed)
@@ -137,13 +137,13 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	if genElapsed.Seconds() > 0 {
 		genTPS = float64(generated) / genElapsed.Seconds()
 	}
-	log.Printf("gem4d: generated %d tokens in %.2fs (%.1f tok/s)",
+	log.Printf("fucina: generated %d tokens in %.2fs (%.1f tok/s)",
 		generated, genElapsed.Seconds(), genTPS)
 
 	if args.Timings {
 		eng.PrintTiming()
 		ts := eng.Timing()
-		log.Printf("gem4d: [GPU] prefill %.1f tok/s, decode %.1f tok/s",
+		log.Printf("fucina: [GPU] prefill %.1f tok/s, decode %.1f tok/s",
 			ts.PrefillTokensPerSec(), ts.DecodeTokensPerSec())
 	}
 }

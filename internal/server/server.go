@@ -13,9 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mauromedda/gem4d/internal/chat"
-	"github.com/mauromedda/gem4d/internal/sampler"
-	"github.com/mauromedda/gem4d/internal/tokenizer"
+	"github.com/hikmaai-io/fucina/internal/chat"
+	"github.com/hikmaai-io/fucina/internal/sampler"
+	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
 // ─── Engine interface ──────────────────────────────────────────────
@@ -63,7 +63,7 @@ type Server struct {
 	specAccepted atomic.Int64
 	specEmitted  atomic.Int64
 	metrics      Metrics
-	httpServer      *http.Server
+	httpServer   *http.Server
 }
 
 // prefillAborter is satisfied by engines that support cooperative prefill
@@ -456,7 +456,7 @@ func (s *Server) SetThinkingDefault(on bool) { s.thinkingDefault = on }
 func (s *Server) SetDebug(on bool) { s.debug = on }
 
 // debugDumpPath is where SetDebug(true) appends request/prompt dumps.
-const debugDumpPath = "/tmp/gem4d_debug.log"
+const debugDumpPath = "/tmp/fucina_debug.log"
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	h := func(f http.HandlerFunc) http.HandlerFunc { return s.logRequest(f) }
@@ -530,7 +530,7 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 		start := time.Now()
 		next(rec, r)
 		if s.logEnabled(logLevelInfo) {
-			log.Printf("gem4d: %s %s -> %d (%.0fms)",
+			log.Printf("fucina: %s %s -> %d (%.0fms)",
 				r.Method, r.URL.Path, rec.status, float64(time.Since(start).Microseconds())/1000.0)
 		}
 	}
@@ -599,16 +599,16 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	}
 
 	// Per-request summary so the client's real footprint is visible (system-prompt
-	// size, tool count, thinking, streaming). GEM4D_DEBUG=1 also dumps the full
+	// size, tool count, thinking, streaming). FUCINA_DEBUG=1 also dumps the full
 	// request body + rendered prompt to /tmp for inspecting exactly what a client
 	// (e.g. pi) sends.
 	sysChars := 0
 	if len(req.Messages) > 0 && req.Messages[0].Role == "system" {
 		sysChars = len(req.Messages[0].Content)
 	}
-	log.Printf("gem4d: chat: %d msgs, %d tools, sys=%dch, %d prompt-tok, thinking=%v, stream=%v",
+	log.Printf("fucina: chat: %d msgs, %d tools, sys=%dch, %d prompt-tok, thinking=%v, stream=%v",
 		len(req.Messages), len(req.Tools), sysChars, len(tokens), enableThinking, req.Stream)
-	if s.debug || os.Getenv("GEM4D_DEBUG") == "1" {
+	if s.debug || os.Getenv("FUCINA_DEBUG") == "1" {
 		dump := fmt.Sprintf("\n========== %s  %d msgs / %d tools / %d tok / thinking=%v / stream=%v ==========\n"+
 			"--- REQUEST BODY ---\n%s\n--- RENDERED PROMPT ---\n%s\n",
 			time.Now().Format("15:04:05"), len(req.Messages), len(req.Tools), len(tokens),
@@ -678,7 +678,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			(len(kept) == 0 || kept[0] != s.tokenizer.BOS) {
 			kept = append([]int32{s.tokenizer.BOS}, kept...)
 		}
-		log.Printf("gem4d: context compaction: prompt %d + max_tokens %d > ctx %d; dropped %d oldest tokens",
+		log.Printf("fucina: context compaction: prompt %d + max_tokens %d > ctx %d; dropped %d oldest tokens",
 			len(tokens), params.MaxTokens, ctx, dropped)
 		tokens = kept
 	}
@@ -724,7 +724,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		} else {
 			http.Error(w, "client closed request", 499)
 		}
-		log.Printf("gem4d: request cancelled while queued; skipping prefill")
+		log.Printf("fucina: request cancelled while queued; skipping prefill")
 		return
 	}
 
@@ -750,7 +750,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	// both token ids and text. This is the tool for diagnosing prefix-cache
 	// misses caused by re-render drift (a rendered turn that does not
 	// token-match what generation committed to the KV).
-	if s.debug || os.Getenv("GEM4D_DEBUG") == "1" {
+	if s.debug || os.Getenv("FUCINA_DEBUG") == "1" {
 		cached := s.kv.CurrentTokens()
 		lcp := longestCommonPrefix(cached, tokens)
 		if lcp < len(cached) && lcp < len(tokens) {
@@ -765,7 +765,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			if hiP > len(tokens) {
 				hiP = len(tokens)
 			}
-			log.Printf("gem4d: prefix diverges at %d/%d cached:\n  cache:  %v %q\n  prompt: %v %q",
+			log.Printf("fucina: prefix diverges at %d/%d cached:\n  cache:  %v %q\n  prompt: %v %q",
 				lcp, len(cached),
 				cached[lo:hiC], s.tokenizer.DecodeRaw(cached[lo:hiC]),
 				tokens[lo:hiP], s.tokenizer.DecodeRaw(tokens[lo:hiP]))
@@ -793,13 +793,13 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			// not a server fault. The prefix cache keeps the shared prefix
 			// (kvcache treats aborts as consistent), so the retry re-prefills
 			// only the suffix.
-			log.Printf("gem4d: prefill aborted by client disconnect")
+			log.Printf("fucina: prefill aborted by client disconnect")
 			if sse != nil {
 				s.finishStream(sse, "cancelled", len(tokens), 0)
 			}
 			return
 		}
-		log.Printf("gem4d: prefill failed: %v", err)
+		log.Printf("fucina: prefill failed: %v", err)
 		if sse != nil {
 			sse.errorEvent(fmt.Sprintf("prefill failed: %v", err))
 		} else {
@@ -816,7 +816,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	s.metrics.recordPrefill(pf.NewTokens, prefillElapsed.Seconds())
 	used := s.engine.NTokens()
 	s.lastUsed.Store(int64(used))
-	log.Printf("gem4d: prefill %d tokens (%d cached, %d new) in %.2fs (%.1f tok/s) | ctx %d/%d (%.0f%%)",
+	log.Printf("fucina: prefill %d tokens (%d cached, %d new) in %.2fs (%.1f tok/s) | ctx %d/%d (%.0f%%)",
 		promptTokens, pf.ReusedTokens, pf.NewTokens, prefillElapsed.Seconds(), prefillTPS,
 		used, ctx, 100.0*float64(used)/float64(ctx))
 
@@ -1044,7 +1044,7 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 		case stopCancelled:
 			return all, "cancelled", nil
 		case stopLoop:
-			log.Printf("gem4d: WARNING: repetition loop detected after %d tokens — cutting generation", len(all))
+			log.Printf("fucina: WARNING: repetition loop detected after %d tokens — cutting generation", len(all))
 			return all, "length", nil
 		case stopEmit:
 			return all, "", nil
@@ -1074,7 +1074,7 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 			if emit != nil && emit(chEnd) { // streaming state machine closes its channel
 				return all, "", nil // it asked to stop — honor it
 			}
-			log.Printf("gem4d: thinking budget (%d tokens) reached — force-closed the thought channel", budget)
+			log.Printf("fucina: thinking budget (%d tokens) reached — force-closed the thought channel", budget)
 			logits = lg
 			continue
 		default:
@@ -1162,7 +1162,7 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 				return
 			}
 			// Partial output: deliver what exists, but make the failure visible.
-			log.Printf("gem4d: generation error after %d tokens: %v", len(toks), err)
+			log.Printf("fucina: generation error after %d tokens: %v", len(toks), err)
 		}
 		if specFinish != "" {
 			finish = specFinish
@@ -1203,7 +1203,7 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			toks = append(toks, token)
 			generated++
 			if detector.push(token) {
-				log.Printf("gem4d: WARNING: repetition loop detected after %d tokens — cutting generation", generated)
+				log.Printf("fucina: WARNING: repetition loop detected after %d tokens — cutting generation", generated)
 				finish = "length"
 				capExit = false
 				break
@@ -1392,7 +1392,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 				return completedCalls >= maxToolCalls
 			}
 			if toolToks > maxToolToks {
-				log.Printf("gem4d: WARNING: unterminated tool call exceeded %d buffered tokens — cutting generation (runaway inside a tool-call span)", maxToolToks)
+				log.Printf("fucina: WARNING: unterminated tool call exceeded %d buffered tokens — cutting generation (runaway inside a tool-call span)", maxToolToks)
 				finish = "length"
 				return true
 			}
@@ -1492,7 +1492,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
 		_, specFinish, err := s.runSpec(ctx, params, logits, stops, processToken)
 		if err != nil {
-			log.Printf("gem4d: generation error after %d tokens: %v", generated, err)
+			log.Printf("fucina: generation error after %d tokens: %v", generated, err)
 		}
 		if specFinish != "" {
 			finish = specFinish
@@ -1527,7 +1527,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 			// The stream ended inside an unterminated tool-call span and nothing
 			// parseable was recovered: ~toolToks tokens of model output are being
 			// dropped. Without this line the turn dies silently (the Req3 mode).
-			log.Printf("gem4d: WARNING: generation ended inside an unterminated tool call (%d tokens buffered, finish=%s) — no tool_calls emitted", toolToks, finish)
+			log.Printf("fucina: WARNING: generation ended inside an unterminated tool call (%d tokens buffered, finish=%s) — no tool_calls emitted", toolToks, finish)
 		}
 	}
 
@@ -1543,7 +1543,7 @@ func (s *Server) logGenSpeed(start time.Time, generated int) {
 		tps = float64(generated) / elapsed.Seconds()
 	}
 	s.metrics.recordDecode(generated, elapsed.Seconds())
-	log.Printf("gem4d: generated %d tokens in %.2fs (%.1f tok/s)",
+	log.Printf("fucina: generated %d tokens in %.2fs (%.1f tok/s)",
 		generated, elapsed.Seconds(), tps)
 }
 
@@ -1605,7 +1605,7 @@ func (s *Server) Start(addr string) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	log.Printf("gem4d: server listening on %s", addr)
+	log.Printf("fucina: server listening on %s", addr)
 	// ErrServerClosed is the normal result of a graceful Stop()/Shutdown — report it
 	// as a clean return so the caller falls through to its deferred engine teardown
 	// (rather than os.Exit-ing mid-CUDA-call).
@@ -1625,7 +1625,7 @@ func (s *Server) Stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := s.httpServer.Shutdown(ctx); err != nil {
-		log.Printf("gem4d: graceful shutdown failed (%v), forcing close", err)
+		log.Printf("fucina: graceful shutdown failed (%v), forcing close", err)
 		s.httpServer.Close()
 	}
 }

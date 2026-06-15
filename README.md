@@ -89,12 +89,36 @@ LM head — loaded from **Q4_0 (QAT)** or **Q8_0** GGUF weights.
 make
 ```
 
-`make` compiles the CUDA static library (`nvcc -arch=sm_121a` → `cuda/libfucina.a`) and then the Go
-binary, verifying the cubin arch and the device-upload code path along the way.
+`make` compiles the CUDA static libraries (`nvcc -arch=sm_121a` → `cuda/libfucina.a` for the dense
+engine and `cuda/libdg.a` for the [DiffusionGemma](#-diffusiongemma) engine) and then the Go binary,
+verifying the cubin arch and the device-upload code path along the way.
 
 > [!NOTE]
 > Requires the [supported toolchain](#requirements): CUDA 13.0 at `/usr/local/cuda-13` and Go 1.26
 > at `/usr/local/go`, on a DGX Spark GB10.
+
+#### Build configuration (no hardcoded paths)
+
+All machine-specific locations are overridable — nothing personal is baked in. Pass them as `make`
+variables (or environment variables for the helper scripts):
+
+| Setting | Used by | Default | Purpose |
+|---------|---------|---------|---------|
+| `NVCC`, `CUDA_HOME` | `make` | `/usr/local/cuda-13` | CUDA 13 toolchain location |
+| `GO` | `make` | `/usr/local/go/bin/go` | Go 1.26 toolchain |
+| `CUTLASS_DIR` | `make` (diffusion) | `/path/to/cutlass` | CUTLASS include dir for the NVFP4 MoE GEMM |
+| `DG_GGUF` | `make` (diffusion targets) · `scripts/dg_dump_tensor.py` (env) | `./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf` | DiffusionGemma GGUF |
+| `DG_NVFP4_CKPT` | `scripts/dg_nvfp4_convert.py` (env / `--ckpt`) | — (required) | NVFP4 safetensors snapshot dir |
+| `LLAMA_GGUF_PY` | `scripts/dg_dump_tensor.py` (env) | auto (only if `gguf` isn't importable) | path to llama.cpp's `gguf-py` |
+
+```sh
+# Example: build with your own CUTLASS and model locations
+make CUTLASS_DIR=/opt/cutlass DG_GGUF=/data/diffusiongemma.gguf
+
+# Helper scripts read env vars / flags — no editing required
+DG_NVFP4_CKPT=/data/dg-nvfp4-snapshot python3 scripts/dg_nvfp4_convert.py --inspect
+DG_GGUF=/data/dg.gguf python3 scripts/dg_dump_tensor.py /tmp/out
+```
 
 ### 2. Get a model
 
@@ -423,8 +447,8 @@ best-effort. The Gemma 4 weights you supply are governed by the
 [Gemma license](https://ai.google.dev/gemma/docs/gemma_4_license).
 
 - **Code:** [Apache-2.0](LICENSE) · **Third-party notices:** [NOTICE](NOTICE)
-- **Roadmap:** dense 12B first; an sm_120 (RTX 50-series) port and the DiffusionGemma engine are
-  later milestones.
+- **Roadmap:** harden the experimental DiffusionGemma path; an sm_120 (RTX 50-series) port to
+  loosen the single-hardware constraint.
 
 ## 🙏 Acknowledgements
 

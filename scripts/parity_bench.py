@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parity + prefill-throughput harness for gem4d kernel changes.
+"""Parity + prefill-throughput harness for fucina kernel changes.
 
 Drives the server deterministically (temp 0) so output is bit-stable, and
 reports the prefill metrics that the dequant work targets. Two workloads:
@@ -48,7 +48,7 @@ class Srv:
         self.ctx = http_json(self.base + "/metrics")["context"]["capacity"]
     def metrics(self): return http_json(self.base + "/metrics")
     def chat(self, messages, tools=None, thinking=False):
-        p = {"model": "gem4d", "messages": messages, "temperature": 0.0,
+        p = {"model": "fucina", "messages": messages, "temperature": 0.0,
              "stream": False, "thinking": thinking}
         if tools: p["tools"] = tools
         return p

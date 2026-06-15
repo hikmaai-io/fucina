@@ -1,4 +1,4 @@
-# gem4d - Gemma 4 12B inference engine for DGX Spark GB10
+# fucina - Gemma 4 12B inference engine for DGX Spark GB10
 # Q4_0 (QAT) and Q8_0 GGUFs, CUDA only (sm_121 Blackwell GB10)
 
 # ─── Toolchain ─────────────────────────────────────────────────────────
@@ -13,32 +13,39 @@ GO     := /usr/local/go/bin/go
 # (FP8/NVFP4 block-scaled MMA, tcgen05). Superset of sm_121; this project is
 # GB10-only so the arch-specific cubin is strictly better.
 CUDA_ARCH := sm_121a
+# BLACKWELL_NATIVE_FP4 gates the native Q4_0 (FP4-class) tiled-MMQ prefill path: the
+# projection GEMMs read native Q4_0 weights once via dp4a (no BF16 materialize, no
+# per-layer dequant) for small/mid token batches — the agentic suffix-prefill hot path.
+# Default ON for GB10; build with BLACKWELL_NATIVE_FP4=0 to fall back to the BF16 path.
+BLACKWELL_NATIVE_FP4 ?= 1
 NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo --use_fast_math \
+             -DBLACKWELL_NATIVE_FP4=$(BLACKWELL_NATIVE_FP4) \
              -Xcompiler -O3 -Xcompiler -pthread \
              --threads 8
 
 CGO_CFLAGS   := -I$(CUDA_HOME)/include
-CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcuda -lpthread -lstdc++ -lm
+CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 
-.PHONY: all clean test cuda lib gem4d smoke profile \
-        go-test go-test-race go-test-cgo vet lint check
+.PHONY: all clean test cuda lib libdg fucina smoke profile \
+        go-test go-test-race go-test-cgo vet lint check \
+        dg dg-dequant-test dg-forward-test dg-generate
 
 # `make` with no arguments builds everything (CUDA archive + Go binary).
 .DEFAULT_GOAL := all
 
-all: lib gem4d
+all: lib libdg fucina
 
-# lib builds the CUDA static archive explicitly (also a prerequisite of gem4d,
-# but exposed so `make all` / `make lib` always produce cuda/libgem4d.a even
+# lib builds the CUDA static archive explicitly (also a prerequisite of fucina,
+# but exposed so `make all` / `make lib` always produce cuda/libfucina.a even
 # if the Go link step is skipped or fails).
-lib: cuda/libgem4d.a
+lib: cuda/libfucina.a
 
 # ─── CUDA Kernel Library ───────────────────────────────────────────────
 # Two-step compilation: device code + link
 #
 # The objects depend on the Makefile itself: an arch/flag change (e.g.
 # sm_121 → sm_121a) MUST force a recompile, otherwise `ar rcs` would bundle
-# a stale cubin built with the old flags into libgem4d.a.
+# a stale cubin built with the old flags into libfucina.a.
 
 cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
@@ -46,69 +53,69 @@ cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh Makefile
 cuda/gemma4_kernels_link.o: cuda/gemma4_kernels.o Makefile
 	$(NVCC) $(NVCCFLAGS) -dlink -o $@ $<
 
-cuda/libgem4d.a: cuda/gemma4_kernels.o cuda/gemma4_kernels_link.o
+cuda/libfucina.a: cuda/gemma4_kernels.o cuda/gemma4_kernels_link.o
 	ar rcs $@ $^
 	@arches="$$($(CUDA_HOME)/bin/cuobjdump --list-elf $@ 2>/dev/null | sed -n 's/.*\.\(sm_[0-9a-z]*\)\.cubin/\1/p' | sort -u)"; \
-	echo "libgem4d.a cubin arch(es): $$arches"; \
+	echo "libfucina.a cubin arch(es): $$arches"; \
 	if [ "$$arches" != "$(CUDA_ARCH)" ]; then \
-		echo "libgem4d.a: ERROR — expected only $(CUDA_ARCH) cubin, got: $$arches (stale object?)"; \
+		echo "libfucina.a: ERROR — expected only $(CUDA_ARCH) cubin, got: $$arches (stale object?)"; \
 		exit 1; \
 	fi
 
 # ─── Go Binary ──────────────────────────────────────────────────────────
-# IMPORTANT: cgo does NOT hash the contents of the `-lgem4d` static archive, so
+# IMPORTANT: cgo does NOT hash the contents of the `-lfucina` static archive, so
 # a plain `go build` happily relinks a STALE binary against an updated
-# libgem4d.a (this caused weights to be read over unified memory → a ~4s cold
+# libfucina.a (this caused weights to be read over unified memory → a ~4s cold
 # page-fault charged to prefill). Force a relink every time: remove the old
-# binary and rebuild the cgo package with -a. Verify with `strings gem4d | grep
+# binary and rebuild the cgo package with -a. Verify with `strings fucina | grep
 # uploading` (must print the device-upload banner).
-gem4d: cuda/libgem4d.a
+fucina: cuda/libfucina.a cuda/libdg.a
 	rm -f $@
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	$(GO) build -a -ldflags="-s -w" -o $@ ./cmd/gem4d/
+	$(GO) build -a -ldflags="-s -w" -o $@ ./cmd/fucina/
 	@strings $@ | grep -q "uploading.*weights to device" \
-		&& echo "gem4d: OK — device weight-upload path linked" \
-		|| { echo "gem4d: ERROR — stale link, upload path missing"; exit 1; }
+		&& echo "fucina: OK — device weight-upload path linked" \
+		|| { echo "fucina: ERROR — stale link, upload path missing"; exit 1; }
 
 # ─── Standalone CUDA Test (without Go) ──────────────────────────────────
-cuda/test_engine: cuda/test_engine.cu cuda/libgem4d.a
-	$(NVCC) $(NVCCFLAGS) -o $@ $< cuda/libgem4d.a -lcudart -lcublas
+cuda/test_engine: cuda/test_engine.cu cuda/libfucina.a
+	$(NVCC) $(NVCCFLAGS) -o $@ $< cuda/libfucina.a -lcudart -lcublas -lcublasLt
 
 # ─── Testing ────────────────────────────────────────────────────────────
 # Full test suite: pure-Go unit tests, cgo-dependent tests (needs the CUDA
 # archive), then the binary's built-in self-tests on the GPU.
-test: gem4d go-test go-test-cgo
-	./gem4d --test-parser
-	CUDA_VISIBLE_DEVICES=0 ./gem4d --test-cuda
+test: fucina go-test go-test-cgo
+	./fucina --test-parser
+	CUDA_VISIBLE_DEVICES=0 ./fucina --test-cuda
 
-test-vectors: gem4d
-	./gem4d --test-vectors tests/vectors/official.vec
+test-vectors: fucina
+	./fucina --test-vectors tests/vectors/official.vec
 
 # ─── Quick smoke test ───────────────────────────────────────────────────
-smoke: gem4d
-	./gem4d --prompt "Hello, world!" --predict 32 --temp 0
+smoke: fucina
+	./fucina --prompt "Hello, world!" --predict 32 --temp 0
 
 # ─── LoRA smoke test ────────────────────────────────────────────────────
-lora-smoke: gem4d
-	./gem4d --model model.gguf --lora-scaled lora.gguf \
+lora-smoke: fucina
+	./fucina --model model.gguf --lora-scaled lora.gguf \
 		--prompt "Test prompt" --predict 32 --temp 0
 
 # ─── Profiling ──────────────────────────────────────────────────────────
-profile: gem4d
-	nsys profile -o gem4d_profile -t cuda,nvtx ./gem4d \
+profile: fucina
+	nsys profile -o fucina_profile -t cuda,nvtx ./fucina \
 		--prompt "Write a haiku about CUDA." --predict 128 --temp 0
 
 # ─── Go quality / unit tests (no CUDA required) ───────────────────────────
 # NOTE: ./internal/engine/cuda and ./cmd/... are intentionally excluded from
 # the pure-Go targets below — the cgo engine package links against
-# cuda/libgem4d.a, so `go test`/`go vet` there fails to build/link unless the
+# cuda/libfucina.a, so `go test`/`go vet` there fails to build/link unless the
 # CUDA archive has been compiled with nvcc on a GB10 box. The server,
 # tokenizer, sampler and chat packages are pure Go and run anywhere.
 GO_TEST_PKGS := ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 
-# cgo-dependent Go tests (cmd/gem4d: CLI parsing tests). Requires
-# cuda/libgem4d.a to link, hence the `lib` prerequisite.
+# cgo-dependent Go tests (cmd/fucina: CLI parsing tests). Requires
+# cuda/libfucina.a to link, hence the `lib` prerequisite.
 GO_TEST_CGO_PKGS := ./cmd/...
 
 go-test-cgo: lib
@@ -123,8 +130,8 @@ go-test-race:
 	$(GO) test $(GO_TEST_PKGS) -race -count=1
 
 # vet: restricted to non-cgo packages. `go vet ./cmd/...` is avoided because
-# cmd/gem4d pulls in the cgo engine package which cannot link without
-# libgem4d.a; vetting it here would fail on a CUDA-less machine.
+# cmd/fucina pulls in the cgo engine package which cannot link without
+# libfucina.a; vetting it here would fail on a CUDA-less machine.
 vet:
 	$(GO) vet $(GO_TEST_PKGS)
 
@@ -138,8 +145,76 @@ lint:
 # Convenience: static analysis + unit tests in one shot.
 check: vet go-test
 
+# ─── DiffusionGemma (26B-A4B text-diffusion MoE) engine ───────────────────
+# Separate from the autoregressive gemma4 engine: own kernels, own forward, own
+# static archive (cuda/libdg.a) consumed by the internal/engine/diffusion cgo
+# package. DG_NVCCFLAGS omits --use_fast_math (the forward/generation were
+# validated vs llama.cpp / coherent text with default-math transcendentals).
+DG_GGUF ?= ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
+DG_NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo -Xcompiler -O3 -Xcompiler -pthread --threads 8
+# CUTLASS (vendored under flashinfer) for the grouped NVFP4 expert GEMM (cuda/dg_fp4_moe.cu).
+CUTLASS_DIR ?= /path/to/cutlass
+DG_FP4_NVCCFLAGS := -arch=$(CUDA_ARCH) -std=c++17 -O3 -lineinfo --expt-relaxed-constexpr \
+	--expt-extended-lambda -DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 \
+	-I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include -Xcompiler -O3 -Xcompiler -pthread
+
+cuda/diffusion_gemma_kernels.o: cuda/diffusion_gemma_kernels.cu cuda/diffusion_gemma_kernels.cuh Makefile
+	$(NVCC) $(DG_NVCCFLAGS) -dc -o $@ cuda/diffusion_gemma_kernels.cu
+
+cuda/diffusion_gemma_engine.o: cuda/diffusion_gemma_engine.cu cuda/diffusion_gemma_engine.h cuda/diffusion_gemma_kernels.cuh Makefile
+	$(NVCC) $(DG_NVCCFLAGS) -dc -o $@ cuda/diffusion_gemma_engine.cu
+
+cuda/dg_fp4_moe.o: cuda/dg_fp4_moe.cu Makefile
+	$(NVCC) $(DG_FP4_NVCCFLAGS) -dc -o $@ cuda/dg_fp4_moe.cu
+
+cuda/libdg_link.o: cuda/diffusion_gemma_kernels.o cuda/diffusion_gemma_engine.o cuda/dg_fp4_moe.o Makefile
+	$(NVCC) $(DG_NVCCFLAGS) -dlink -o $@ cuda/diffusion_gemma_kernels.o cuda/diffusion_gemma_engine.o cuda/dg_fp4_moe.o
+
+cuda/libdg.a: cuda/diffusion_gemma_kernels.o cuda/diffusion_gemma_engine.o cuda/dg_fp4_moe.o cuda/libdg_link.o
+	ar rcs $@ $^
+
+libdg: cuda/libdg.a
+
+# Standalone DiffusionGemma test/dev binaries (no Go).
+dg-dequant-test:
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) cuda/diffusion_gemma_kernels.cu cuda/test_diffusion_dequant.cu -o /tmp/dg_dequant_test
+dg-forward-test:
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) cuda/diffusion_gemma_kernels.cu cuda/test_diffusion_forward.cu -lcublas -o /tmp/dg_forward_test
+dg-generate:
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) cuda/diffusion_gemma_kernels.cu cuda/dg_generate.cu -lcublas -o /tmp/dg_gen
+dg-matmul-test:
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) cuda/diffusion_gemma_kernels.cu cuda/test_diffusion_matmul.cu -lcublas -o /tmp/dg_matmul_test
+dg-moe-stream:
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) cuda/diffusion_gemma_kernels.cu cuda/test_diffusion_moe_stream.cu -lcublas -o /tmp/dg_moe_stream
+dg-moe-grouped:
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) cuda/diffusion_gemma_kernels.cu cuda/test_diffusion_moe_grouped.cu -lcublas -o /tmp/dg_moe_grouped
+dg-bf16-test:
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) cuda/test_diffusion_bf16.cu -lcublas -o /tmp/dg_bf16
+dg-sampler-test:
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) cuda/diffusion_gemma_kernels.cu cuda/test_diffusion_sampler.cu -o /tmp/dg_samp
+dg: dg-dequant-test dg-forward-test dg-generate dg-matmul-test dg-moe-stream dg-moe-grouped dg-bf16-test dg-sampler-test
+
+# NVFP4 FP4-tensor-core probes (FUCINA_FP4 / DG_FP4 development harnesses).
+fp4-probe:        # cuBLASLt FP4 support matrix (NVFP4 vec16 vs MXFP4 vec32, FP8/BF16 controls)
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) cuda/test_fp4_probe2.cu -lcublasLt -o /tmp/fp4_probe2
+fp4-gemm-test:    # NVFP4 scale-swizzle validation + speed/accuracy vs BF16 on real shapes
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) cuda/test_fp4_gemm.cu -lcublasLt -lcublas -o /tmp/fp4_gemm
+# Grouped NVFP4 expert-GEMM (DiffusionGemma MoE) — CUTLASS sm120, needs the libdg objects.
+dg-fp4-grouped:   # CUTLASS grouped FP4 microbench (speed vs dp4a); run: /tmp/dg_fp4_grouped bench
+	$(NVCC) -std=c++17 -O3 -arch=$(CUDA_ARCH) --expt-relaxed-constexpr --expt-extended-lambda \
+		-DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include \
+		cuda/test_dg_fp4_grouped.cu -o /tmp/dg_fp4_grouped
+dg-fp4-parity: cuda/diffusion_gemma_kernels.o cuda/dg_fp4_moe.o   # FP4 grouped vs dequant ref on real weights
+	$(NVCC) -std=c++17 -O3 -arch=$(CUDA_ARCH) -dc --expt-relaxed-constexpr --expt-extended-lambda \
+		-DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include \
+		cuda/test_dg_fp4_parity.cu -o /tmp/parity.o
+	$(NVCC) -arch=$(CUDA_ARCH) -dlink /tmp/parity.o cuda/diffusion_gemma_kernels.o cuda/dg_fp4_moe.o -o /tmp/parity_link.o
+	$(NVCC) -arch=$(CUDA_ARCH) /tmp/parity.o cuda/diffusion_gemma_kernels.o cuda/dg_fp4_moe.o /tmp/parity_link.o -lcublas -lcublasLt -o /tmp/dg_fp4_parity
+	@echo "run: /tmp/dg_fp4_parity $(DG_GGUF)"
+fp4: fp4-probe fp4-gemm-test
+
 # ─── Clean ──────────────────────────────────────────────────────────────
 clean:
-	rm -f gem4d cuda/*.o cuda/*.a cuda/test_engine tests/test_parser
+	rm -f fucina cuda/*.o cuda/*.a cuda/test_engine tests/test_parser cuda/libdg.a
 	$(GO) clean
 	rm -rf tests/vectors/tmp/
