@@ -14,46 +14,26 @@ Internal checklist for the first public release as `github.com/hikmaai-io/fucina
 
 ## 1 · Code rename (run on a CLEAN tree; requires a GB10 to verify)
 
-Commit or stash all WIP first (`git status` must be clean), then:
+Commit or stash all WIP first (`git status` must be clean), then run the rename script and
+verify on the GB10:
 
 ```sh
-set -e
-
-# a) module path: org + name, across every file that references it
-git grep -lZ 'github.com/mauromedda/gem4d' \
-  | xargs -0 sed -i 's#github.com/mauromedda/gem4d#github.com/hikmaai-io/fucina#g'
-
-# b) all remaining brand tokens. SAFE: the literal "gem4d" never occurs inside
-#    "gemma4" / "gemma-4" / "scripts/benchmark_gem4.py", so the model name and the
-#    benchmark script are untouched. (Verify with the grep in step d.)
-git grep -lZ 'gem4d'  | xargs -0 sed -i 's/gem4d/fucina/g'
-git grep -lZ 'GEM4D_' | xargs -0 sed -i 's/GEM4D_/FUCINA_/g'
-
-# c) rename the command package directory (binary output already became `fucina` via (b))
-git mv cmd/gem4d cmd/fucina
-
-# d) scrub hardcoded personal paths in the Makefile DEFAULTS (keep them ?= overridable):
-#      DG_GGUF     ?= /home/mauromedda/unsloth/...    ->  ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
-#      CUTLASS_DIR ?= /home/mauromedda/.venv/...      ->  /path/to/cutlass   (documented in README)
-#    (edit by hand; they are build-config defaults, not code)
-
-# e) tidy + CPU verification
-gofmt -w .
-go vet ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
-go test ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/ -count=1
-
-# f) confirm nothing stale remains, and the model name survived intact
-git grep -n 'gem4d\|GEM4D_\|mauromedda' || echo "no stale brand tokens ✅"
-git grep -c 'gemma4\|gemma-4' | tail -1   # model refs must still be present
-
-# g) FULL build + smoke — ON THE GB10 ONLY
-make clean && make
-strings fucina | grep -q 'uploading.*weights to device' && echo "device-upload path linked ✅"
-make smoke
+./scripts/release/rename.sh        # rewrites code/build files only (docs already say fucina)
+# then follow its printed steps:
+#   - scrub the Makefile DG_GGUF / CUTLASS_DIR defaults (personal paths)
+#   - gofmt -w .  &&  go vet + go test on the pure-Go packages
+#   - make clean && make            # GB10 ONLY
+#   - strings fucina | grep -q 'uploading.*weights to device'
+#   - make smoke
 ```
 
+The script is scoped to `*.go *.cu *.cuh *.h go.mod Makefile scripts/*.py`, does the module-path
+move (`mauromedda/gem4d` → `hikmaai-io/fucina`), the `gem4d`→`fucina` and `GEM4D_`→`FUCINA_`
+rewrites, and `git mv cmd/gem4d cmd/fucina`.
+
 **Keep unchanged (do NOT rename):** the `gemma4_*` C symbols, `gemma4-assistant` arch id, and all
-`gemma-4` / `Gemma 4` model identifiers — those name the *model*, not the project.
+`gemma-4` / `Gemma 4` model identifiers — those name the *model*, not the project. (The literal
+`gem4d` is never a substring of `gemma4`/`gemma-4`, so the rewrite leaves them intact.)
 
 ## 2 · Pre-flight (done on this branch)
 - [x] `LICENSE` (Apache-2.0) + `NOTICE` (Gemma / llama.cpp / CUTLASS / unsloth attributions)
@@ -62,16 +42,22 @@ make smoke
 - [x] `.github/` issue + PR templates (hardware gate), `config.yml` (no blank issues), CI (CPU tests)
 - [x] `.gitignore` covers models, GGUFs, sqlite, runs/, data/, build artifacts
 - [x] History clean: linear, no committed binaries, no co-author trailers
+- [x] `CHANGELOG.md` (v0.1.0) + `docs/launch/RELEASE_NOTES_v0.1.0.md` + `docs/launch/announcement.md`
+- [x] `scripts/release/rename.sh` and `scripts/release/publish.sh` (executable)
 
-## 3 · Ship
-- [ ] Create/confirm repo `github.com/hikmaai-io/fucina` (description: "Gemma 4 inference forged for the NVIDIA DGX Spark GB10 — experimental, no support")
-- [ ] Set topics: `gemma`, `cuda`, `llm-inference`, `dgx-spark`, `blackwell`, `go`
-- [ ] Enable Discussions; enable private vulnerability reporting (for SECURITY.md)
-- [ ] Push `main`; verify CI is green
-- [ ] Tag **`v0.1.0`** + GitHub Release (source release — no universal binary; optionally attach a GB10 build)
+## 3 · Ship (after sign-off + the rename + a green GB10 build)
+- [ ] Merge `release-prep` (+ the rename commit) into `main`; ensure the tree is clean
+- [ ] `./scripts/release/publish.sh` — creates the **public** repo `hikmaai-io/fucina`, sets the
+      description + topics, enables Issues/Discussions + private vuln reporting, and pushes. (It
+      prompts for confirmation; publishing is irreversible.)
+- [ ] Verify CI is green on `main`
+- [ ] Tag + release (the script prints these):
+      `git tag -a v0.1.0 -m 'fucina v0.1.0' && git push origin v0.1.0`
+      `gh release create v0.1.0 --title 'fucina v0.1.0' --notes-file docs/launch/RELEASE_NOTES_v0.1.0.md`
 
 ## 4 · Launch (optional)
-- [ ] Short post leaning on the real hook: *parity-to-ahead of llama.cpp on the DGX Spark GB10*
+- [ ] Use the drafts in [`docs/launch/announcement.md`](docs/launch/announcement.md) (blog · Show HN
+      · X thread · r/LocalLLaMA) — hook: *parity-to-ahead of llama.cpp on the DGX Spark GB10*
 - [ ] Be explicit everywhere: experimental, single-hardware, best-effort support
 
 ## 5 · Post-launch
