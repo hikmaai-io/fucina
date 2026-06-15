@@ -345,8 +345,11 @@ fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 | `POST /v1/completions` | Legacy raw-prompt completions (handled by the chat path) |
 | `GET  /v1/models` | Lists the loaded model id |
 | `POST /v1/embeddings` | Stub — returns an empty data list |
-| `GET  /health` | Liveness + KV-cache stats (hits, misses, hit rate, cached tokens) |
-| `GET  /metrics` | KV/context utilization, prefix-cache hit rate, prefill/decode throughput, `speculation` block |
+| `GET  /health`, `/healthz` | Liveness + KV-cache stats (hits, misses, hit rate, cached tokens) |
+| `GET  /readyz` | Readiness — checks the tokenizer + engine are loaded; `503` when not serviceable |
+| `GET  /metrics` | KV/context utilization, prefix-cache hit rate, prefill/decode throughput, `speculation`, `requests_detail` (total, errors, avg latency, avg TTFT), `saturation` (in-flight / max) |
+
+`/v1/*` routes accept an optional `Authorization: Bearer <key>` (see `--api-key`); `/health`, `/healthz`, `/readyz`, `/metrics` are always open. Every response carries an `X-Request-Id` (echoed from the request when present) for log correlation.
 
 ---
 
@@ -402,6 +405,9 @@ fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 | `--draft-k` | `6` | Max speculative draft length per step |
 | `--host` | `127.0.0.1` | Server listen address |
 | `--port` | `8080` | Server port |
+| `--api-key` | (none) | Bearer token required on `/v1/*` (constant-time; reads `FUCINA_API_KEY` if unset). Empty = auth off (localhost dev) |
+| `--max-concurrent` | `4` | Admission-queue depth (in-flight + waiting); excess requests get `503` |
+| `--max-output-tokens` | `0` | Absolute per-request output-token ceiling (independent of context window); `0` = no extra cap |
 
 </details>
 

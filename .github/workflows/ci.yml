@@ -40,7 +40,8 @@ jobs:
         run: go vet $PKGS
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v7 is required for golangci-lint v2 (v6 only supports v1.x).
+        uses: golangci/golangci-lint-action@v7
         with:
           version: v2.1.6
           # Lint only the pure-Go packages (same set as $PKGS). The cgo engine and
