@@ -43,7 +43,9 @@ jobs:
         # v7 is required for golangci-lint v2 (v6 only supports v1.x).
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.1.6
+          # Must be built with Go >= the go.mod target (1.26): older builds refuse
+          # to lint a newer language version. v2.11.4 is built with go1.26.
+          version: v2.11.4
           # Lint only the pure-Go packages (same set as $PKGS). The cgo engine and
           # cmd/ need libfucina.a and are excluded, mirroring the Makefile.
           args: ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
