@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ⚠️ Read first — experimental, no support, single hardware
+    url: https://github.com/hikmaai-io/fucina#-status
+    about: >
+      fucina is an experimental hikmaai.io lab project provided as-is with no support, and runs
+      only on the NVIDIA DGX Spark GB10. Please confirm your hardware before filing.
+  - name: Questions & ideas
+    url: https://github.com/hikmaai-io/fucina/discussions
+    about: Use Discussions for questions, ideas, and "does it run on X" (GPU support) threads.

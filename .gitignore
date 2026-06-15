@@ -1,11 +1,20 @@
-# ─── gem4d build artifacts ───────────────────────────────────────────────
-# Compiled binary (built via `make gem4d`)
+# ─── fucina build artifacts ──────────────────────────────────────────────
+# Compiled binary (built via `make`) — new and legacy names
+/fucina
 /gem4d
 
 # CUDA object / archive artifacts (built via `make lib`)
 cuda/*.o
 cuda/*.a
 cuda/test_engine
+
+# ─── Models & data (never commit weights or run output) ───────────────────
+/models/
+*.safetensors
+*.sqlite
+/runs/
+/data/
+scripts/__pycache__/
 
 # ─── Profiling output ─────────────────────────────────────────────────────
 # nsys / Nsight Systems profiles

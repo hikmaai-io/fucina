@@ -1,12 +1,14 @@
 <div align="center">
 
-# gem4d
+# fucina
 
-### Gemma 4 inference for the NVIDIA DGX Spark — in Go + CUDA C++
+### Gemma 4, forged for the NVIDIA DGX Spark
 
-A from-scratch **Gemma 4 12B** inference engine, hand-tuned for exactly one accelerator: the
+***fucina*** *— Italian for **forge**: the smithy where raw Gemma 4 weights are hammered into a fast engine for one machine.*
+
+A from-scratch **Gemma 4 12B** inference engine, hand-tuned for exactly one accelerator — the
 **DGX Spark GB10** (Blackwell, `sm_121a`, CUDA 13). FP8 Tensor-Core attention, CUDA-graph decode,
-MTP speculative decoding, and an OpenAI-compatible server — all in a single static binary.
+MTP speculative decoding, and an OpenAI-compatible server, all in a single static binary.
 
 [Features](#-features) · [Quick start](#-quick-start) · [Performance](#-performance) ·
 [Models](#-models) · [Speculative decoding](#-speculative-decoding-mtp) · [HTTP API](#-http-api) ·
@@ -22,16 +24,17 @@ MTP speculative decoding, and an OpenAI-compatible server — all in a single st
 </div>
 
 > [!WARNING]
-> **gem4d is hardware-specific and experimental.** It is built and tested for a single accelerator
-> — the NVIDIA DGX Spark GB10 — with paths hardcoded to `/usr/local/cuda-13` and `/usr/local/go`.
-> It is **not portable** to other GPUs or toolchains as-is, and ships **no license**. Use at your
-> own risk. See [Hardware support](#-hardware-support) and [Status](#-status).
+> **fucina is experimental, hardware-specific, and provided with no support.** It is built and
+> tested for a single accelerator — the NVIDIA DGX Spark GB10 — with a toolchain expected at
+> `/usr/local/cuda-13` and `/usr/local/go`. It is **not portable** to other GPUs as-is. Licensed
+> **Apache-2.0** and shipped **as-is, with no warranty and no support**. See
+> [Hardware support](#-hardware-support) and [Status](#-status).
 
 ---
 
 ## About
 
-**gem4d** runs Google's **Gemma 4 12B** entirely on the GPU and serves it over an
+**fucina** runs Google's **Gemma 4 12B** entirely on the GPU and serves it over an
 OpenAI-compatible HTTP API, plus one-shot and interactive CLI modes. It is a focused experiment in
 *how fast a single Blackwell GB10 can drive a dense 12B model* — so instead of portability, it bets
 everything on one architecture: FP8/NVFP4 Tensor Cores, position-independent CUDA-graph decode, an
@@ -48,7 +51,7 @@ LM head — loaded from **Q4_0 (QAT)** or **Q8_0** GGUF weights.
 
 ## ✨ Features
 
-**gem4d is fast with:**
+**fucina is fast with:**
 
 - ⚡ **CUDA-graph decode** — single-token decode *and* the K-row batched speculative-verify forward
   are captured as **position-independent** graphs (device-resident position, KV writes *inside* the
@@ -63,7 +66,7 @@ LM head — loaded from **Q4_0 (QAT)** or **Q8_0** GGUF weights.
 - 🧠 **On-GPU sampling** — the next token is selected on the device; no 262k-element logit copy back
   to the host when no repeat penalty is set.
 
-**gem4d gives you:**
+**fucina gives you:**
 
 - 🔁 **Prefix-reuse KV cache** — instead of re-prefilling the whole prompt each request, the server
   rewinds the single physical KV cache to the longest common prefix and prefills only the divergent
@@ -86,7 +89,7 @@ LM head — loaded from **Q4_0 (QAT)** or **Q8_0** GGUF weights.
 make
 ```
 
-`make` compiles the CUDA static library (`nvcc -arch=sm_121a` → `cuda/libgem4d.a`) and then the Go
+`make` compiles the CUDA static library (`nvcc -arch=sm_121a` → `cuda/libfucina.a`) and then the Go
 binary, verifying the cubin arch and the device-upload code path along the way.
 
 > [!NOTE]
@@ -109,13 +112,13 @@ See [Models](#-models) for Q8_0, the MTP draft head, and DiffusionGemma.
 
 ```sh
 # Server (OpenAI-compatible)
-gem4d -m ./models/gemma-4-12b-it-qat-q4_0.gguf --ctx 32768 --host 0.0.0.0 --port 8080
+fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --ctx 32768 --host 0.0.0.0 --port 8080
 
 # One-shot prompt
-gem4d -m ./models/gemma-4-12b-it-qat-q4_0.gguf -p "Write a haiku about CUDA." -n 100
+fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf -p "Write a haiku about CUDA." -n 100
 
 # Interactive REPL (/reset, /stats, /quit)
-gem4d -m ./models/gemma-4-12b-it-qat-q4_0.gguf --interactive
+fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --interactive
 ```
 
 ```sh
@@ -147,7 +150,7 @@ wider (128-bit) loads change instruction count but not bytes and do not help. Wa
 
 ## 🖥️ Hardware support
 
-gem4d is built and tested for **exactly one accelerator**: the **NVIDIA DGX Spark GB10**.
+fucina is built and tested for **exactly one accelerator**: the **NVIDIA DGX Spark GB10**.
 
 | | |
 |---|---|
@@ -182,7 +185,7 @@ paths depend on GB10-class tensor-core features:
 
 ## 📥 Models
 
-gem4d loads **local GGUF files** and has **no model-download logic of its own** — fetch the weights
+fucina loads **local GGUF files** and has **no model-download logic of its own** — fetch the weights
 with `hf` (or `huggingface-cli download …`, equivalent) and pass the path with `-m`. Only **Q4_0
 (QAT)** and **Q8_0** quantizations are accepted for the dense 12B; other formats are rejected at
 load. *Repo ids and filenames below are verified against Hugging Face.*
@@ -224,9 +227,9 @@ hf download unsloth/diffusiongemma-26B-A4B-it-GGUF \
 
 > [!NOTE]
 > Google's `google/gemma-4-12B-it-assistant` is the canonical MTP head but is published as
-> **safetensors**; gem4d's `--assistant` needs a **GGUF** build (the unsloth file above).
+> **safetensors**; fucina's `--assistant` needs a **GGUF** build (the unsloth file above).
 > If you place a dense model at `./gemma-4-12b-it.gguf`, `./model.gguf`, or `./gguf/model.gguf`,
-> gem4d finds it automatically when `-m` is omitted. The reported model id is derived from the
+> fucina finds it automatically when `-m` is omitted. The reported model id is derived from the
 > GGUF filename.
 
 ---
@@ -252,7 +255,7 @@ draft displace it; draft length adapts per step from each drafter's running acce
 
 ```sh
 # Enable MTP (server, one-shot, or REPL — just add --assistant)
-gem4d -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
+fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
       --assistant ./models/MTP/gemma-4-12b-it-Q8_0-MTP.gguf \
       --ctx 32768 --host 0.0.0.0 --port 8080
 ```
@@ -261,8 +264,8 @@ gem4d -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 - **Observe it live** — `/metrics` → `speculation` (`accept_rate`, `tokens_per_forward`); CLI runs
   print `[mtp]` / `[lookup]` stats at the end.
 - **Falls back** to per-token decode for requests with text `stop` strings (host-side trimming).
-- **Disable:** `--spec=false`. Graph escape hatches: `GEM4D_NO_DECODE_GRAPH=1`,
-  `GEM4D_NO_BATCHED_GRAPH=1`. The draft head adds ~0.4 GB VRAM.
+- **Disable:** `--spec=false`. Graph escape hatches: `FUCINA_NO_DECODE_GRAPH=1`,
+  `FUCINA_NO_BATCHED_GRAPH=1`. The draft head adds ~0.4 GB VRAM.
 
 > The `--spec` flag's built-in help still reads *"greedy/temp=0 only"* — that wording is stale; the
 > engine fully supports sampling, including on-GPU repeat-penalty at `--temp > 0`.
@@ -286,7 +289,7 @@ gem4d -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  cmd/gem4d            CLI: server / one-shot / interactive    │
+│  cmd/fucina           CLI: server / one-shot / interactive    │
 ├─────────────────────────────────────────────────────────────┤
 │  internal/server      OpenAI-compatible HTTP API + KV cache   │
 │  internal/tokenizer   SentencePiece / Unigram (Gemma 4 vocab) │
@@ -299,18 +302,18 @@ gem4d -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 
 - **`cuda/`** — the entire Gemma 4 12B forward pass: quantized GEMV/GEMM (Q4_0/Q6_K/Q8_0 `dp4a`),
   FP8 flash attention, RoPE, RMSNorm, GeGLU, GPU sampling, and CUDA-graph capture/replay. Compiled
-  to `libgem4d.a`.
+  to `libfucina.a`.
 - **`internal/engine/cuda`** — the CGO bridge, wrapping the opaque CUDA engine as a Go `Engine`
   (`NewEngine`, `Prefill`, `Decode`, `GenerateSpec`, `LoadAssistant`, …).
 - **`internal/tokenizer`** — Gemma 4 SentencePiece/Unigram tokenizer (vocab 262144), loaded from
   the GGUF's tokenizer section; knows the turn / channel / tool-calling control tokens.
 - **`internal/server`** — the HTTP server, chat-template renderer, tool-call parsing, thinking
   channel, and prefix-reuse KV cache.
-- **`cmd/gem4d`** — CLI entry point and the three run modes.
+- **`cmd/fucina`** — CLI entry point and the three run modes.
 
 > [!IMPORTANT]
-> cgo does **not** hash the contents of the `-lgem4d` static archive, so a plain `go build` can
-> silently relink a stale binary against an updated `libgem4d.a`. The Makefile defends against this:
+> cgo does **not** hash the contents of the `-lfucina` static archive, so a plain `go build` can
+> silently relink a stale binary against an updated `libfucina.a`. The Makefile defends against this:
 > it removes the old binary, rebuilds with `go build -a`, and asserts the device-upload path is
 > present in the binary.
 
@@ -319,7 +322,7 @@ gem4d -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 ## ⚙️ Configuration
 
 <details>
-<summary><b>Important flags</b> (run <code>gem4d --help</code> for the full list)</summary>
+<summary><b>Important flags</b> (run <code>fucina --help</code> for the full list)</summary>
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -342,11 +345,11 @@ gem4d -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 
 | Variable | Effect |
 |----------|--------|
-| `GEM4D_NO_DECODE_GRAPH=1` | Disable CUDA-graph capture for single-token decode |
-| `GEM4D_NO_BATCHED_GRAPH=1` | Disable CUDA-graph capture for the K-row batched verify |
-| `GEM4D_NO_PACKED=1` | Disable the repacked-Q4_0 coalesced-load decode GEMV |
-| `GEM4D_NO_WARMUP_PASS=1` | Skip the one-time startup warmup pass |
-| `GEM4D_DEBUG=1` | Dump request bodies + rendered prompts to `/tmp/gem4d_debug.log` |
+| `FUCINA_NO_DECODE_GRAPH=1` | Disable CUDA-graph capture for single-token decode |
+| `FUCINA_NO_BATCHED_GRAPH=1` | Disable CUDA-graph capture for the K-row batched verify |
+| `FUCINA_NO_PACKED=1` | Disable the repacked-Q4_0 coalesced-load decode GEMV |
+| `FUCINA_NO_WARMUP_PASS=1` | Skip the one-time startup warmup pass |
+| `FUCINA_DEBUG=1` | Dump request bodies + rendered prompts to `/tmp/fucina_debug.log` |
 
 </details>
 
@@ -363,13 +366,13 @@ modes and the OpenAI API work exactly as for the dense model.
 
 ```sh
 # Server
-gem4d -dm ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --ctx 8192 --host 0.0.0.0 --port 8080
+fucina -dm ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --ctx 8192 --host 0.0.0.0 --port 8080
 
 # One-shot
-gem4d -dm ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf -p "Write a haiku about the ocean."
+fucina -dm ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf -p "Write a haiku about the ocean."
 
 # Faster generation, lower quality: fewer denoise steps per block (default 48)
-gem4d -dm ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --denoise-steps 16 -p "Explain hashing."
+fucina -dm ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --denoise-steps 16 -p "Explain hashing."
 ```
 
 **How it differs from the dense model:**
@@ -400,7 +403,7 @@ gem4d -dm ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --denoise-steps 16 -p "
 go test ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 
 # GPU smoke test (requires the DGX Spark GB10)
-make smoke      # builds, then: gem4d --prompt "Hello, world!" --predict 32 --temp 0
+make smoke      # builds, then: fucina --prompt "Hello, world!" --predict 32 --temp 0
 ```
 
 The CUDA engine is validated for **bit-exactness** against reference paths (greedy byte-identical
@@ -412,15 +415,23 @@ output, `compute-sanitizer` memcheck clean) and benchmarked with the `scripts/` 
 
 ## 📌 Status
 
-**Experimental and hardware-specific.** gem4d targets exactly one platform — the NVIDIA DGX Spark
-GB10 (Blackwell `sm_121a`) with CUDA 13.0 — and is not portable to other GPUs or toolchains as-is.
-There is **no license file**: the source carries no license grant, and the Gemma 4 weights are
-governed by the [Gemma license](https://ai.google.dev/gemma/docs/gemma_4_license). Use at your own
-risk.
+**Experimental, hardware-specific, no support.** fucina targets exactly one platform — the NVIDIA
+DGX Spark GB10 (Blackwell `sm_121a`) with CUDA 13.0 — and is not portable to other GPUs or
+toolchains as-is. It is an open research/lab project from **[hikmaai.io](https://hikmaai.io)**,
+provided **as-is with no warranty and no support commitment**; issues and PRs are handled
+best-effort. The Gemma 4 weights you supply are governed by the
+[Gemma license](https://ai.google.dev/gemma/docs/gemma_4_license).
+
+- **Code:** [Apache-2.0](LICENSE) · **Third-party notices:** [NOTICE](NOTICE)
+- **Roadmap:** dense 12B first; an sm_120 (RTX 50-series) port and the DiffusionGemma engine are
+  later milestones.
 
 ## 🙏 Acknowledgements
 
+- The name **fucina** is Italian for *forge* — a smithy, and figuratively a *crucible of ideas*.
 - **Google** for [Gemma 4](https://ai.google.dev/gemma) and the QAT GGUF / MTP assistant releases.
 - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — the GGUF format, quantized `dp4a`
   kernels, and the `draft-mtp` speculation design that this project measures itself against.
 - **[unsloth](https://huggingface.co/unsloth)** for the GGUF conversions used here.
+
+<div align="center"><sub>Built by <a href="https://hikmaai.io">hikmaai.io</a> · formerly <code>gem4d</code></sub></div>

@@ -1,0 +1,41 @@
+fucina
+Copyright 2026 Hikma AI (hikmaai.io)
+
+This product includes software developed at Hikma AI (https://hikmaai.io).
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------
+Third-party notices and attributions
+------------------------------------------------------------------------
+
+This project interoperates with, is inspired by, or builds upon the
+following works. fucina does not redistribute their source or weights;
+you obtain those separately under their own terms.
+
+* Gemma 4 (Google)
+  The model weights this engine runs (and the QAT GGUF / MTP assistant
+  builds it loads) are Google's Gemma 4 and are governed by the Gemma
+  Terms of Use: https://ai.google.dev/gemma/docs/gemma_4_license
+  "Gemma" is a trademark of Google LLC. fucina is not affiliated with,
+  endorsed by, or sponsored by Google.
+
+* llama.cpp (ggml-org) — MIT License
+  https://github.com/ggml-org/llama.cpp
+  The GGUF file format, several quantized dp4a kernel formulations
+  (e.g. Q4_0 / Q6_K / Q8_0 vec-dot), and the draft-mtp speculative
+  decoding design informed this project, which is also benchmarked
+  against it.
+
+* NVIDIA CUTLASS — BSD-3-Clause
+  https://github.com/NVIDIA/cutlass
+  Used (when building the optional DiffusionGemma engine) for the grouped
+  NVFP4 expert GEMM. Provided by the user's local toolchain; not vendored.
+
+* unsloth GGUF conversions
+  https://huggingface.co/unsloth
+  Referenced for downloadable GGUF builds of the Gemma 4 weights and the
+  MTP draft head used during development.
+
+Trademarks referenced (NVIDIA, DGX Spark, Blackwell, CUDA; Google, Gemma;
+OpenAI) are the property of their respective owners and are used only for
+identification.

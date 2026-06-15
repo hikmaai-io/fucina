@@ -1,0 +1,43 @@
+name: ci
+
+# CPU-only checks. The CUDA engine (cuda/, internal/engine/cuda, cmd/...) links
+# against libfucina.a and can only be built/validated on a DGX Spark GB10, so it
+# is intentionally NOT built here — see CONTRIBUTING.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: gofmt · vet · test (pure-Go packages)
+    runs-on: ubuntu-latest
+    env:
+      # Pure-Go packages only (mirrors the Makefile GO_TEST_PKGS). The cgo engine
+      # package and cmd/ require the CUDA toolchain and are excluded.
+      PKGS: ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet $PKGS
+
+      - name: go test
+        run: go test $PKGS -count=1
