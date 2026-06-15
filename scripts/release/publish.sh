@@ -3,7 +3,6 @@
 # publish.sh — create the PUBLIC GitHub repo and cut the first release.
 #
 # RUN ONLY AFTER:
-#   - cofounder / board sign-off (this is a company-owned OSS release),
 #   - the code rename (scripts/release/rename.sh) is done, and
 #   - the FULL build + `make smoke` passed on the GB10.
 #

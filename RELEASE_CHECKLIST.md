@@ -10,7 +10,6 @@ Internal checklist for the first public release as `github.com/hikmaai-io/fucina
 ## 0 · Decisions (done)
 - [x] Name: **fucina** · Org: **hikmaai-io** → `github.com/hikmaai-io/fucina`
 - [x] First release scope: **dense Gemma 4 12B only** (DiffusionGemma held for v0.2)
-- [ ] Cofounder / board sign-off that this is a company-owned OSS release (IP)
 
 ## 1 · Code rename (run on a CLEAN tree; requires a GB10 to verify)
 
@@ -45,7 +44,7 @@ rewrites, and `git mv cmd/gem4d cmd/fucina`.
 - [x] `CHANGELOG.md` (v0.1.0) + `docs/launch/RELEASE_NOTES_v0.1.0.md` + `docs/launch/announcement.md`
 - [x] `scripts/release/rename.sh` and `scripts/release/publish.sh` (executable)
 
-## 3 · Ship (after sign-off + the rename + a green GB10 build)
+## 3 · Ship (after the rename + a green GB10 build)
 - [ ] Merge `release-prep` (+ the rename commit) into `main`; ensure the tree is clean
 - [ ] `./scripts/release/publish.sh` — creates the **public** repo `hikmaai-io/fucina`, sets the
       description + topics, enables Issues/Discussions + private vuln reporting, and pushes. (It
