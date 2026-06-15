@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -652,9 +655,27 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	// Lock-free: read the mirrored spec counters (refreshed under the kv lock at
 	// end-of-generation), NOT engine.SpecStats() which would take the engine mutex.
-	writeJSON(w, http.StatusOK, s.metrics.snapshot(
+	snap := s.metrics.snapshot(
 		s.modelName, used, ctxCap, slidingMB, globalMB, hits, misses, reused, reqTok,
-		s.specSteps.Load(), s.specDrafted.Load(), s.specAccepted.Load(), s.specEmitted.Load()))
+		s.specSteps.Load(), s.specDrafted.Load(), s.specAccepted.Load(), s.specEmitted.Load())
+	// Saturation gauge: how many admission slots are taken vs the cap. Reading the
+	// channel's len/cap is lock-free and shows queueing before it becomes latency.
+	snap["saturation"] = map[string]interface{}{
+		"in_flight":     len(s.inflight),
+		"max_in_flight": cap(s.inflight),
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+// newRequestID returns a short random hex id for request correlation. crypto/rand
+// keeps it dependency-free; on the vanishingly rare read error it falls back to a
+// timestamp so a request is never left without an id.
+func newRequestID() string {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return "req-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // statusRecorder captures the response status so the access log can report it.
@@ -704,6 +725,14 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: 200}
 		start := time.Now()
+		// Correlation: honor an inbound X-Request-Id (cross-service tracing) or
+		// mint one, echo it back, and tag every log line for this request so a
+		// 500 can be tied to its access line under concurrency.
+		reqID := r.Header.Get("X-Request-Id")
+		if reqID == "" {
+			reqID = newRequestID()
+		}
+		rec.Header().Set("X-Request-Id", reqID)
 		// Recover so one request's panic cannot take down the shared process.
 		// net/http recovers per-connection, but this also covers panics that
 		// escape into helper paths and gives a uniform 500 + access-log line.
@@ -711,15 +740,21 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 		// has already sent 200 + bytes; then we can only log).
 		defer func() {
 			if rv := recover(); rv != nil {
-				log.Printf("fucina: PANIC in %s %s: %v", r.Method, r.URL.Path, rv)
+				log.Printf("fucina: [%s] PANIC in %s %s: %v", reqID, r.Method, r.URL.Path, rv)
 				if !rec.wroteHeader {
 					rec.status = http.StatusInternalServerError
 					http.Error(rec, "internal server error", http.StatusInternalServerError)
 				}
 			}
+			dur := time.Since(start)
+			// Only the inference endpoints count toward SLO metrics; /metrics and
+			// /health self-scrapes would otherwise dominate the averages.
+			if strings.HasPrefix(r.URL.Path, "/v1/") {
+				s.metrics.recordRequest(rec.status, dur)
+			}
 			if s.logEnabled(logLevelInfo) {
-				log.Printf("fucina: %s %s -> %d (%.0fms)",
-					r.Method, r.URL.Path, rec.status, float64(time.Since(start).Microseconds())/1000.0)
+				log.Printf("fucina: [%s] %s %s -> %d (%.0fms)",
+					reqID, r.Method, r.URL.Path, rec.status, float64(dur.Microseconds())/1000.0)
 			}
 		}()
 		next(rec, r)
@@ -1566,10 +1601,17 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	legacy := sse.legacy
 	generated := 0
 	genStart := time.Now()
+	ttftRecorded := false
 
 	// emitContent streams a piece of visible text in the right wire shape for the
 	// active endpoint (chat delta vs legacy text).
 	emitContent := func(text string) {
+		// First visible token marks time-to-first-token (the latency the user
+		// actually feels). Recorded once per request.
+		if !ttftRecorded {
+			s.metrics.recordTTFT(time.Since(genStart))
+			ttftRecorded = true
+		}
 		if legacy {
 			sse.event(CompletionStreamResponse{
 				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,

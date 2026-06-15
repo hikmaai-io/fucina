@@ -219,6 +219,28 @@ func TestReadyz503WhenTokenizerMissing(t *testing.T) {
 	}
 }
 
+// ─── request-id correlation (M8) ─────────────────────────────────────────────
+
+func TestRequestIDGeneratedAndEchoed(t *testing.T) {
+	srv, _ := newTestServer(t, 8192, nil)
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
+	if rec.Header().Get("X-Request-Id") == "" {
+		t.Error("response missing generated X-Request-Id")
+	}
+}
+
+func TestRequestIDHonorsInbound(t *testing.T) {
+	srv, _ := newTestServer(t, 8192, nil)
+	req := httptest.NewRequest("GET", "/health", nil)
+	req.Header.Set("X-Request-Id", "trace-abc-123")
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	if got := rec.Header().Get("X-Request-Id"); got != "trace-abc-123" {
+		t.Errorf("X-Request-Id=%q want trace-abc-123 (inbound id not honored)", got)
+	}
+}
+
 // ─── panic-recovery middleware (C2) ──────────────────────────────────────────
 
 func TestLogRequestRecoversPanicBeforeHeaders(t *testing.T) {

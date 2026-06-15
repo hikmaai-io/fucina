@@ -40,8 +40,14 @@ import (
 	"runtime"
 	"runtime/cgo"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
+
+// vocabSize is the gemma-4 logits width (the device writes exactly this many
+// floats per Prefill/Decode). Kept as a const so the scratch buffer and the C
+// side agree.
+const vocabSize = 262144
 
 // Engine wraps the C inference engine.
 type Engine struct {
@@ -49,6 +55,21 @@ type Engine struct {
 	ptr  *C.gemma4_engine_t
 	ctx  uint32
 	path string
+
+	// closing is set true BEFORE Close() destroys e.ptr, so AbortPrefill (which
+	// reads e.ptr lock-free to avoid deadlocking the prefilling goroutine that
+	// holds e.mu) can detect a shutdown-in-progress and skip the C call rather
+	// than dereferencing a pointer Close() is about to / has freed.
+	closing atomic.Bool
+
+	// logitsBuf is a single reusable last-token logits buffer (vocabSize floats,
+	// 1 MiB). Prefill/Decode previously allocated a fresh 1 MiB slice per call; on
+	// the token-by-token decode path that churned GBs of GC garbage per request.
+	// Reuse is safe because e.mu serializes every engine call, so only one logits
+	// result is ever live at a time. CONTRACT: the returned slice is valid only
+	// until the next Prefill/Decode call — callers must sample/consume it before
+	// re-entering the engine (which the single-flight server does).
+	logitsBuf []float32
 }
 
 // Config holds engine configuration. The weight format (Q4_0-QAT or Q8_0) is
@@ -84,9 +105,10 @@ func NewEngine(cfg Config) (*Engine, error) {
 	}
 
 	eng := &Engine{
-		ptr:  ptr,
-		ctx:  ctxSize,
-		path: cfg.ModelPath,
+		ptr:       ptr,
+		ctx:       ctxSize,
+		path:      cfg.ModelPath,
+		logitsBuf: make([]float32, vocabSize),
 	}
 
 	return eng, nil
@@ -108,6 +130,9 @@ func (e *Engine) LoadAssistant(path string) error {
 
 // Close destroys the engine and frees all GPU resources.
 func (e *Engine) Close() {
+	// Signal shutdown BEFORE taking the lock so a concurrent lock-free
+	// AbortPrefill sees closing=true and skips its C call (see Engine.closing).
+	e.closing.Store(true)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.ptr != nil {
@@ -144,8 +169,9 @@ func (e *Engine) Prefill(tokens []int32) ([]float32, error) {
 		return nil, nil
 	}
 
-	// Only get logits for the last token
-	logits := make([]float32, 262144)
+	// Only get logits for the last token. Reuse the per-engine scratch (valid only
+	// until the next engine call — see Engine.logitsBuf).
+	logits := e.logitsBuf
 
 	// Fast path: batched BF16 tensor-core prefill (one weight pass for the whole
 	// prompt). It defers (-2) for very large prompts (the [HEADS][N×N] score buffer
@@ -188,6 +214,12 @@ func (prefillAborted) Aborted() bool { return true }
 // lock, so a stale call can never outlive its request; the residual e.ptr read
 // vs Close() race is confined to process shutdown.
 func (e *Engine) AbortPrefill() {
+	// closing is checked first (and set before Close() frees e.ptr) so a shutdown
+	// race cannot pass a freed pointer to C. The non-atomic e.ptr read remains, but
+	// it is only reached when closing==false, i.e. before Close() runs.
+	if e.closing.Load() {
+		return
+	}
 	if e.ptr != nil {
 		C.gemma4_engine_abort_prefill(e.ptr)
 	}
@@ -204,12 +236,14 @@ func (e *Engine) Warmup() {
 	C.gemma4_engine_warmup(e.ptr)
 }
 
-// Decode processes a single token and returns logits.
+// Decode processes a single token and returns logits. The returned slice is the
+// per-engine scratch (Engine.logitsBuf) and is valid only until the next engine
+// call — the single-flight server samples it before re-entering the engine.
 func (e *Engine) Decode(token int32) ([]float32, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	logits := make([]float32, 262144)
+	logits := e.logitsBuf
 
 	ret := C.gemma4_engine_decode(
 		e.ptr,
