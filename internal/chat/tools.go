@@ -204,6 +204,77 @@ func IsToolChoiceNone(tc interface{}) bool {
 	return ok && s == "none"
 }
 
+// DroppedCall records a tool call rejected by ValidateToolCalls because a
+// required parameter was missing or empty.
+type DroppedCall struct {
+	Name  string // function name
+	Param string // the missing/empty required parameter
+}
+
+// ValidateToolCalls splits calls into those that satisfy their tool's declared
+// `required` parameters and those that do not. A call is dropped when a required
+// property is absent, or present but "empty" (empty string / empty array /
+// empty object / null) — e.g. web_search{"query":""}. Calls whose tool is
+// unknown or declares no required params pass through unchanged.
+//
+// The engine uses this to refuse to dispatch a schema-violating tool call
+// (returning a clarification instead), rather than forwarding a malformed call.
+func ValidateToolCalls(calls []ToolCall, tools []Tool) (valid []ToolCall, dropped []DroppedCall) {
+	type spec struct{ required []string }
+	byName := make(map[string]spec, len(tools))
+	for _, t := range tools {
+		if t.Function.Name == "" || len(t.Function.Parameters) == 0 {
+			continue
+		}
+		var p struct {
+			Required []string `json:"required"`
+		}
+		if json.Unmarshal(t.Function.Parameters, &p) == nil && len(p.Required) > 0 {
+			byName[t.Function.Name] = spec{required: p.Required}
+		}
+	}
+	for _, c := range calls {
+		sc, ok := byName[c.Function.Name]
+		if !ok {
+			valid = append(valid, c)
+			continue
+		}
+		var args map[string]interface{}
+		_ = json.Unmarshal([]byte(c.Function.Arguments), &args)
+		missing := ""
+		for _, req := range sc.required {
+			if v, present := args[req]; !present || isEmptyArg(v) {
+				missing = req
+				break
+			}
+		}
+		if missing != "" {
+			dropped = append(dropped, DroppedCall{Name: c.Function.Name, Param: missing})
+		} else {
+			valid = append(valid, c)
+		}
+	}
+	return valid, dropped
+}
+
+// isEmptyArg reports whether a decoded JSON argument value counts as "empty" for
+// a required parameter. Numbers and booleans (including 0 and false) are NEVER
+// empty — only null, "", [], and {}.
+func isEmptyArg(v interface{}) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(x) == ""
+	case []interface{}:
+		return len(x) == 0
+	case map[string]interface{}:
+		return len(x) == 0
+	default:
+		return false
+	}
+}
+
 func sortedKeys(m map[string]interface{}) []string {
 	ks := make([]string, 0, len(m))
 	for k := range m {

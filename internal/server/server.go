@@ -112,6 +112,7 @@ type GenerationParams struct {
 	MaxTokens        int      `json:"max_tokens"`
 	Stream           bool     `json:"stream"`
 	Stop             []string `json:"stop,omitempty"`
+	Tools            []Tool   `json:"-"` // request tool schemas, for required-param validation
 }
 
 type ChatMessage struct {
@@ -620,6 +621,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	}
 
 	params := s.genParams
+	params.Tools = req.Tools // for required-parameter validation of emitted calls
 	if req.Temperature != nil {
 		params.Temperature = *req.Temperature
 	}
@@ -1253,10 +1255,19 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			}
 		}
 		content, calls := parseToolCalls(rest)
+		// Refuse to dispatch a call that violates its required-parameter schema
+		// (e.g. web_search{"query":""}); answer with a clarification instead.
+		var clar string
+		if len(calls) > 0 {
+			calls, clar = validateToolCalls(calls, params.Tools)
+		}
 		// parseToolCalls leaves non-call text as-is; with generation running to
 		// end-of-turn the literal "<turn|>" marker would otherwise leak into
 		// message.content (streaming never emits markers — keep parity).
 		msg.Content = strings.TrimSpace(stripMarkers(content))
+		if msg.Content == "" && clar != "" {
+			msg.Content = clar
+		}
 		if len(calls) > 0 {
 			msg.ToolCalls = calls
 			if finish != "cancelled" {
@@ -1512,16 +1523,26 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 			}
 		}
 		if _, calls := parseToolCalls(raw); len(calls) > 0 {
-			deltas := make([]DeltaToolCall, len(calls))
-			for i, c := range calls {
-				deltas[i] = DeltaToolCall{Index: i, ID: c.ID, Type: c.Type, Function: c.Function}
-			}
-			sse.event(StreamResponse{
-				ID: sse.id, Object: "chat.completion.chunk", Created: sse.created, Model: s.modelName,
-				Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: deltas}}},
-			})
-			if finish != "cancelled" {
-				finish = "tool_calls"
+			// Drop calls that violate their required-parameter schema; if every
+			// call is dropped, stream a clarification instead of a malformed call.
+			calls, clar := validateToolCalls(calls, params.Tools)
+			if len(calls) > 0 {
+				deltas := make([]DeltaToolCall, len(calls))
+				for i, c := range calls {
+					deltas[i] = DeltaToolCall{Index: i, ID: c.ID, Type: c.Type, Function: c.Function}
+				}
+				sse.event(StreamResponse{
+					ID: sse.id, Object: "chat.completion.chunk", Created: sse.created, Model: s.modelName,
+					Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: deltas}}},
+				})
+				if finish != "cancelled" {
+					finish = "tool_calls"
+				}
+			} else if clar != "" {
+				sse.event(StreamResponse{
+					ID: sse.id, Object: "chat.completion.chunk", Created: sse.created, Model: s.modelName,
+					Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: clar}}},
+				})
 			}
 		} else if inTool {
 			// The stream ended inside an unterminated tool-call span and nothing

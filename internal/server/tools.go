@@ -18,5 +18,19 @@ func renderToolResponse(name, content string) string { return chat.RenderToolRes
 func renderAssistantToolCalls(c []ToolCall) string   { return chat.RenderAssistantToolCalls(c) }
 func parseToolCalls(raw string) (string, []ToolCall) { return chat.ParseToolCalls(raw) }
 func isToolChoiceNone(tc interface{}) bool           { return chat.IsToolChoiceNone(tc) }
-func splitReasoning(s string) (string, string)       { return chat.SplitReasoning(s) }
-func stripMarkers(s string) string                   { return chat.StripMarkers(s) }
+
+// validateToolCalls drops calls that violate their tool's required-parameter
+// schema (missing or empty required arg) and returns a clarification string when
+// every call was dropped, so the turn answers instead of dispatching a malformed
+// call. clar is "" when at least one call is valid (or nothing was dropped).
+func validateToolCalls(calls []ToolCall, tools []Tool) (valid []ToolCall, clar string) {
+	valid, dropped := chat.ValidateToolCalls(calls, tools)
+	if len(valid) == 0 && len(dropped) > 0 {
+		d := dropped[0]
+		clar = "I can't call " + d.Name + " without the required parameter \"" + d.Param +
+			"\". Please provide it."
+	}
+	return valid, clar
+}
+func splitReasoning(s string) (string, string) { return chat.SplitReasoning(s) }
+func stripMarkers(s string) string             { return chat.StripMarkers(s) }
