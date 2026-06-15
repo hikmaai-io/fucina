@@ -28,7 +28,11 @@
 
 // ─── Compile-time constants ────────────────────────────────────────────
 
-#define GEMMA4_MAX_LAYERS        48
+// GEMMA4_MAX_LAYERS is the static-array CAPACITY (sizes layer_types[], layers[], the
+// per-layer device-pointer arrays, …). It must cover the LARGEST supported geometry: 60
+// for the 31B. The ACTUAL layer count is the runtime eng->n_layers (48 on the 12B). The
+// other dims here are the GEOM_12B defaults; the engine reads the real values from the GGUF.
+#define GEMMA4_MAX_LAYERS        60
 #define GEMMA4_HIDDEN_SIZE       3840
 #define GEMMA4_INTERMEDIATE      15360   // 4× hidden
 #define GEMMA4_HEADS             16
