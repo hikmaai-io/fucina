@@ -1602,6 +1602,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	generated := 0
 	genStart := time.Now()
 	ttftRecorded := false
+	lastWrite := time.Now() // last time any bytes hit the wire (for the keep-alive)
 
 	// emitContent streams a piece of visible text in the right wire shape for the
 	// active endpoint (chat delta vs legacy text).
@@ -1612,6 +1613,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 			s.metrics.recordTTFT(time.Since(genStart))
 			ttftRecorded = true
 		}
+		lastWrite = time.Now()
 		if legacy {
 			sse.event(CompletionStreamResponse{
 				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
@@ -1664,6 +1666,16 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 		if sse.stalled() {
 			finish = "cancelled"
 			return true
+		}
+
+		// Wall-clock keep-alive: a long run of SUPPRESSED tokens (reasoning-channel
+		// labels, a long tool-call buffer) emits no wire bytes, so an idle-timeout
+		// proxy could kill the connection mid-generation even though the server is
+		// working. Ping on the handler goroutine (single-writer-safe — the heartbeat
+		// goroutine was already joined before generation) when the gap grows.
+		if time.Since(lastWrite) > sseKeepAlive {
+			sse.ping()
+			lastWrite = time.Now()
 		}
 
 		// Tool-call handling: when the model opens a call, stop streaming content

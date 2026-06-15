@@ -47,6 +47,12 @@ type sseWriter struct {
 
 const sseWriteTimeout = 30 * time.Second
 
+// sseKeepAlive bounds how long generation may run WITHOUT writing any wire bytes
+// (a long suppressed-token span: reasoning labels, a buffered tool call) before
+// the handler emits a ": ping" comment, so idle-timeout proxies don't kill a
+// working connection. Well under the 30s write deadline.
+const sseKeepAlive = 10 * time.Second
+
 // newSSEWriter prepares (but does not start) an SSE session. ok=false when the
 // ResponseWriter cannot stream.
 func newSSEWriter(w http.ResponseWriter, legacy bool, model string) (*sseWriter, bool) {
