@@ -2553,12 +2553,13 @@ struct gemma4_engine {
     // these fields carry the ACTUAL model size so cudaMalloc / cuBLAS dims /
     // loop bounds scale to 31B without recompiling. head_dim / global_head_dim
     // / vocab are invariant across both geometries and stay macros.
-    gemma4_geom_t   geom;        // selects the templated attention kernels
-    int             n_layers;    // gemma4.block_count            (48 or 60)
-    int             hidden;      // gemma4.embedding_length        (3840 or 5376)
-    int             ffn;         // gemma4.feed_forward_length     (15360 or 21504)
-    int             n_heads;     // gemma4.attention.head_count    (16 or 32)
-    int             n_kv_heads;  // gemma4.attention.head_count_kv (8 or 16)
+    gemma4_geom_t   geom;          // selects the templated attention kernels
+    int             n_layers;      // gemma4.block_count               (48 or 60)
+    int             hidden;        // gemma4.embedding_length           (3840 or 5376)
+    int             ffn;           // gemma4.feed_forward_length        (15360 or 21504)
+    int             n_heads;       // gemma4.attention.head_count       (16 or 32)
+    int             n_kv_heads;    // KV heads on SLIDING layers        (8 or 16)
+    int             n_kv_heads_glob; // KV heads on GLOBAL layers       (1 or 4)
 
     // Layer index helpers: which layers are global
     int             global_layer_indices[GEMMA4_MAX_LAYERS];
@@ -3213,15 +3214,44 @@ gemma4_engine_t* gemma4_engine_create(
             "gemma4.block_count",            &v, GGUF_TYPE_UINT32) == 0) ? (int)v : 48;
         eng->n_heads    = (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
             "gemma4.attention.head_count",   &v, GGUF_TYPE_UINT32) == 0) ? (int)v : GEMMA4_HEADS;
-        eng->n_kv_heads = (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
-            "gemma4.attention.head_count_kv",&v, GGUF_TYPE_UINT32) == 0) ? (int)v : GEMMA4_KV_HEADS;
 
-        if      (eng->n_heads == 16 && eng->n_kv_heads == 8 ) eng->geom = GEOM_12B;
-        else if (eng->n_heads == 32 && eng->n_kv_heads == 16) eng->geom = GEOM_31B;
+        // head_count_kv differs per layer (sliding vs global) and the GGUF may
+        // store it either way: a SCALAR (older 12B exports = the sliding count)
+        // or an ARRAY[block_count] of per-layer KV counts (real Gemma-4: 16 on
+        // sliding, 4 on global for 31B). Derive BOTH the sliding and the global
+        // KV-head counts. For an array the two distinct values are max=sliding,
+        // min=global; for a scalar the global count is the architectural 1.
+        int kv_sliding = GEMMA4_KV_HEADS, kv_global = GEMMA4_GLOBAL_KV_HEADS;
+        {
+            uint32_t kv_scalar = 0;
+            gguf_array_t kv_arr;
+            if (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
+                    "gemma4.attention.head_count_kv", &kv_scalar, GGUF_TYPE_UINT32) == 0) {
+                kv_sliding = (int)kv_scalar;          // scalar export: sliding count
+                kv_global  = GEMMA4_GLOBAL_KV_HEADS;  // global is architecturally 1
+            } else if (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
+                    "gemma4.attention.head_count_kv", &kv_arr, GGUF_TYPE_ARRAY) == 0
+                    && (kv_arr.elem_type == GGUF_TYPE_INT32 || kv_arr.elem_type == GGUF_TYPE_UINT32)
+                    && kv_arr.count > 0) {
+                int lo = INT32_MAX, hi = 0;
+                for (uint64_t i = 0; i < kv_arr.count; i++) {
+                    int32_t kv; memcpy(&kv, kv_arr.data + i * 4, 4);
+                    if (kv < lo) lo = kv;
+                    if (kv > hi) hi = kv;
+                }
+                kv_sliding = hi;   // sliding layers carry the larger KV count
+                kv_global  = lo;   // global layers the smaller (1 on 12B, 4 on 31B)
+            }
+        }
+        eng->n_kv_heads      = kv_sliding;
+        eng->n_kv_heads_glob = kv_global;
+
+        if      (eng->n_heads == 16 && eng->n_kv_heads == 8  && eng->n_kv_heads_glob == 1) eng->geom = GEOM_12B;
+        else if (eng->n_heads == 32 && eng->n_kv_heads == 16 && eng->n_kv_heads_glob == 4) eng->geom = GEOM_31B;
         else {
-            fprintf(stderr, "fucina: unsupported gemma4 geometry head_count=%d "
-                    "head_count_kv=%d (only 16/8=12B and 32/16=31B supported)\n",
-                    eng->n_heads, eng->n_kv_heads);
+            fprintf(stderr, "fucina: unsupported gemma4 geometry heads=%d kv=%d kv_global=%d "
+                    "(only 16/8/1=12B and 32/16/4=31B supported)\n",
+                    eng->n_heads, eng->n_kv_heads, eng->n_kv_heads_glob);
             gemma4_engine_destroy(eng);
             return NULL;
         }
@@ -3234,17 +3264,16 @@ gemma4_engine_t* gemma4_engine_create(
             gemma4_engine_destroy(eng);
             return NULL;
         }
-        // The global flash-decode kernel launches n_heads*32 threads/block;
-        // CUDA caps a block at 1024 threads, so 32 heads is the ceiling.
-        if (eng->n_heads * 32 > 1024) {
-            fprintf(stderr, "fucina: n_heads=%d would need %d threads/block (>1024)\n",
-                    eng->n_heads, eng->n_heads * 32);
+        // The sliding flash-decode kernel launches n_kv_heads*32 threads/block
+        // and the global one n_kv_heads_glob*32; CUDA caps a block at 1024.
+        if (eng->n_kv_heads * 32 > 1024 || eng->n_kv_heads_glob * 32 > 1024) {
+            fprintf(stderr, "fucina: KV head count needs >1024 threads/block\n");
             gemma4_engine_destroy(eng);
             return NULL;
         }
-        fprintf(stderr, "fucina: loaded geometry: %s (%dL h=%d ffn=%d heads=%d kv=%d)\n",
-                eng->geom == GEOM_31B ? "31B" : "12B",
-                eng->n_layers, eng->hidden, eng->ffn, eng->n_heads, eng->n_kv_heads);
+        fprintf(stderr, "fucina: loaded geometry: %s (%dL h=%d ffn=%d heads=%d kv=%d kvg=%d)\n",
+                eng->geom == GEOM_31B ? "31B" : "12B", eng->n_layers, eng->hidden,
+                eng->ffn, eng->n_heads, eng->n_kv_heads, eng->n_kv_heads_glob);
     }
 
     // Default layer types: 5 sliding + 1 global cadence across all n_layers
