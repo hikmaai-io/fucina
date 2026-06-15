@@ -40,6 +40,13 @@
 #define GEMMA4_GLOBAL_KV_HEADS   1
 #define GEMMA4_HEAD_DIM          256
 #define GEMMA4_GLOBAL_HEAD_DIM   512
+// GEOM_31B template-instantiation constants. The 31B has 32 query heads, 16 sliding KV
+// heads, and 4 global KV heads (vs the 12B's 16/8/1). These pin the second set of attention
+// kernel instantiations the load-time dispatch selects via eng->geom; the engine still reads
+// the real per-model counts into eng->n_heads / n_kv_heads / n_kv_heads_glob at load.
+#define GEMMA4_HEADS_31B          32
+#define GEMMA4_KV_HEADS_31B       16
+#define GEMMA4_GLOBAL_KV_HEADS_31B 4
 #define GEMMA4_SLIDING_WINDOW    1024
 #define GEMMA4_VOCAB_SIZE        262144
 #define GEMMA4_MAX_CTX           262144

@@ -1736,6 +1736,212 @@ __global__ void global_attn_splitk_rows_kernel(
     if (lane == 0) { part_m[slot*NH + h] = m; part_l[slot*NH + h] = l; }
 }
 
+// ─── Global GQA flash-decode (Gemma-4 31B: NKVG>1 global KV heads) ─────────
+//
+// Forked from global_attn_splitk_kernel (MQA) + sliding_attn_splitk_kernel (GQA warp map).
+// The 12B's global path has ONE KV head broadcast to all query heads (warp-per-query-head,
+// smem-staged); the 31B has NKVG=4 distinct global KV heads (GQA group GQ=NH/NKVG=8). This
+// kernel uses the sliding kernel's WARP-PER-KV-HEAD mapping — each warp owns one KV head,
+// reads its row from DRAM ONCE per key (uint4 FP8, lane-strided) and reuses it across its GQ
+// query heads IN REGISTERS — so it is smem-free (a [TILE][NKVG][HD] stage would be 128 KB at
+// HD=512, over the 96 KB cap). It keeps the global kernel's HD=512 E=HD/128 uint4 FP8 unpack.
+// HD/NKVG/NH are TEMPLATE params so #pragma unroll over GQW/E stays compile-time and qreg/acc
+// stay register-resident. WPK warps cooperate per KV head: each handles GQW = GQ/WPK query
+// heads, so the register arrays are qreg[GQW][E][4]/acc[GQW][E][4]. ONE warp per KV head (WPK=1)
+// at GQ=8 spilled (255 regs + 236 B spill, measured); WPK=2 halves GQW to 4 → register-resident.
+// The WPK warps of a KV head re-read its row (L2-hot) and write disjoint query-head partials.
+// Partials use the [n_splits][NH][HD] layout flash_decode_combine_kernel<NH> expects.
+// The 12B MQA kernel above is left UNTOUCHED — this is reachable only via the GEOM_31B branch.
+template<int NH, int NKVG, int HD, int WPK>
+__global__ void __launch_bounds__(NKVG * WPK * 32, 1)
+global_attn_gqa_splitk_kernel(
+    float *part_acc,                          // [n_splits][NH][HD] (unnormalized)
+    float *part_m, float *part_l,             // [n_splits][NH]
+    const float *q,                           // [NH][HD]
+    const kv_t *k_cache, const kv_t *v_cache, // FLAT [ctx_len][NKVG][HD] FP8 E4M3
+    int head_dim, int ctx_len, int n_splits)
+{
+    (void)head_dim;                            // HD is the compile-time truth
+    constexpr int GQ  = NH / NKVG;             // query heads per KV head (= 8 for 31B)
+    constexpr int GQW = GQ / WPK;              // query heads per WARP (= 4 at WPK=2)
+    constexpr int E   = HD / 128;              // uint words per lane (= 4 at HD 512)
+    static_assert(HD % 128 == 0, "uint lane slices require HD multiple of 128");
+    static_assert(NH % NKVG == 0, "GQA group must divide query heads");
+    static_assert(GQ % WPK == 0, "WPK must divide the GQA group");
+
+    int warp    = threadIdx.x >> 5;            // 0 .. NKVG*WPK-1
+    int kv_head = warp / WPK;                  // which GLOBAL KV head this warp serves
+    int wsub    = warp % WPK;                  // which half of the GQA group (0..WPK-1)
+    int lane    = threadIdx.x & 31;
+    int split   = blockIdx.x;
+
+    int per = (ctx_len + n_splits - 1) / n_splits;
+    int t0  = split * per;
+    int t1  = min(t0 + per, ctx_len);
+
+    float qreg[GQW][E][4], acc[GQW][E][4], m[GQW], l[GQW];
+    #pragma unroll
+    for (int g = 0; g < GQW; g++) {
+        int qh = kv_head * GQ + wsub * GQW + g;            // this warp's slice of the GQA group
+        const float *qp = q + (size_t)qh * HD;
+        #pragma unroll
+        for (int e = 0; e < E; e++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { qreg[g][e][j] = qp[4*(lane + 32*e) + j]; acc[g][e][j] = 0.0f; }
+        m[g] = -INFINITY; l[g] = 0.0f;
+    }
+
+    for (int t = t0; t < t1; t++) {
+        size_t pos = (size_t)t;
+        // This KV head's row, read ONCE per warp, reused for the warp's GQW query heads.
+        const unsigned int *kw =
+            (const unsigned int *)(k_cache + (pos * NKVG + kv_head) * (size_t)HD);
+        const unsigned int *vw =
+            (const unsigned int *)(v_cache + (pos * NKVG + kv_head) * (size_t)HD);
+        unsigned int kpk[E], vpk[E];
+        #pragma unroll
+        for (int e = 0; e < E; e++) { kpk[e] = kw[lane + 32*e]; vpk[e] = vw[lane + 32*e]; }
+        float kd[E][4], vd[E][4];
+        #pragma unroll
+        for (int e = 0; e < E; e++) {
+            unsigned int k4 = kpk[e], v4 = vpk[e];
+            kd[e][0] = fp8_to_float((kv_t)( k4        & 0xFF));
+            kd[e][1] = fp8_to_float((kv_t)((k4 >>  8) & 0xFF));
+            kd[e][2] = fp8_to_float((kv_t)((k4 >> 16) & 0xFF));
+            kd[e][3] = fp8_to_float((kv_t)( k4 >> 24        ));
+            vd[e][0] = fp8_to_float((kv_t)( v4        & 0xFF));
+            vd[e][1] = fp8_to_float((kv_t)((v4 >>  8) & 0xFF));
+            vd[e][2] = fp8_to_float((kv_t)((v4 >> 16) & 0xFF));
+            vd[e][3] = fp8_to_float((kv_t)( v4 >> 24        ));
+        }
+        #pragma unroll
+        for (int g = 0; g < GQW; g++) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < E; e++)
+                dot += qreg[g][e][0]*kd[e][0] + qreg[g][e][1]*kd[e][1]
+                     + qreg[g][e][2]*kd[e][2] + qreg[g][e][3]*kd[e][3];
+            float s  = warp_reduce_sum_all(dot);          // __shfl only — no block sync
+            float mn = fmaxf(m[g], s), al = __expf(m[g] - mn), p = __expf(s - mn);
+            l[g] = l[g]*al + p;
+            #pragma unroll
+            for (int e = 0; e < E; e++) {
+                acc[g][e][0] = acc[g][e][0]*al + p*vd[e][0];
+                acc[g][e][1] = acc[g][e][1]*al + p*vd[e][1];
+                acc[g][e][2] = acc[g][e][2]*al + p*vd[e][2];
+                acc[g][e][3] = acc[g][e][3]*al + p*vd[e][3];
+            }
+            m[g] = mn;
+        }
+    }
+
+    #pragma unroll
+    for (int g = 0; g < GQW; g++) {
+        int h = kv_head * GQ + wsub * GQW + g;             // same GQA mapping as q-head load
+        float *pa = part_acc + ((size_t)split * NH + h) * HD;
+        #pragma unroll
+        for (int e = 0; e < E; e++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) pa[4*(lane + 32*e) + j] = acc[g][e][j];
+        if (lane == 0) { part_m[split*NH + h] = m[g]; part_l[split*NH + h] = l[g]; }
+    }
+}
+
+// Row-batched (spec-verify / CUDA-graph) twin of global_attn_gqa_splitk_kernel: r=blockIdx.y,
+// per-row split recompute via attn_row_splits, slot = r*MAX_SPLITS+split. Same WPK warp map.
+template<int NH, int NKVG, int HD, int WPK>
+__global__ void __launch_bounds__(NKVG * WPK * 32, 1)
+global_attn_gqa_splitk_rows_kernel(
+    float *part_acc, float *part_m, float *part_l,   // slot r*MAX_SPLITS+split
+    const float *q,                                  // [K][NH*HD] (row-major)
+    const kv_t *k_cache, const kv_t *v_cache,        // FLAT [capacity][NKVG][HD]
+    int n_tokens0,
+    const int *n_tokens0_ptr)                        // non-NULL: device override (graph path)
+{
+    constexpr int GQ  = NH / NKVG;
+    constexpr int GQW = GQ / WPK;
+    constexpr int E   = HD / 128;
+    static_assert(HD % 128 == 0, "uint lane slices require HD multiple of 128");
+    static_assert(NH % NKVG == 0, "GQA group must divide query heads");
+    static_assert(GQ % WPK == 0, "WPK must divide the GQA group");
+
+    int r = blockIdx.y;
+    if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
+    int ctx_len  = n_tokens0 + r;
+    int n_splits = attn_row_splits(ctx_len, GEMMA4_GLOBAL_SPLIT_CHUNK);
+    int split    = blockIdx.x;
+    if (split >= n_splits) return;                   // tail blocks of shorter rows
+
+    int warp    = threadIdx.x >> 5;
+    int kv_head = warp / WPK;
+    int wsub    = warp % WPK;
+    int lane    = threadIdx.x & 31;
+    int per = (ctx_len + n_splits - 1) / n_splits;
+    int t0  = split * per;
+    int t1  = min(t0 + per, ctx_len);
+
+    float qreg[GQW][E][4], acc[GQW][E][4], m[GQW], l[GQW];
+    #pragma unroll
+    for (int g = 0; g < GQW; g++) {
+        int qh = kv_head * GQ + wsub * GQW + g;
+        const float *qp = q + (size_t)r * NH * HD + (size_t)qh * HD;
+        #pragma unroll
+        for (int e = 0; e < E; e++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { qreg[g][e][j] = qp[4*(lane + 32*e) + j]; acc[g][e][j] = 0.0f; }
+        m[g] = -INFINITY; l[g] = 0.0f;
+    }
+
+    for (int t = t0; t < t1; t++) {
+        size_t pos = (size_t)t;
+        const unsigned int *kw =
+            (const unsigned int *)(k_cache + (pos * NKVG + kv_head) * (size_t)HD);
+        const unsigned int *vw =
+            (const unsigned int *)(v_cache + (pos * NKVG + kv_head) * (size_t)HD);
+        unsigned int kpk[E], vpk[E];
+        #pragma unroll
+        for (int e = 0; e < E; e++) { kpk[e] = kw[lane + 32*e]; vpk[e] = vw[lane + 32*e]; }
+        float kd[E][4], vd[E][4];
+        #pragma unroll
+        for (int e = 0; e < E; e++) {
+            unsigned int k4 = kpk[e], v4 = vpk[e];
+            kd[e][0]=fp8_to_float((kv_t)( k4      &0xFF)); kd[e][1]=fp8_to_float((kv_t)((k4>> 8)&0xFF));
+            kd[e][2]=fp8_to_float((kv_t)((k4>>16)&0xFF));  kd[e][3]=fp8_to_float((kv_t)( k4>>24      ));
+            vd[e][0]=fp8_to_float((kv_t)( v4      &0xFF)); vd[e][1]=fp8_to_float((kv_t)((v4>> 8)&0xFF));
+            vd[e][2]=fp8_to_float((kv_t)((v4>>16)&0xFF));  vd[e][3]=fp8_to_float((kv_t)( v4>>24      ));
+        }
+        #pragma unroll
+        for (int g = 0; g < GQW; g++) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < E; e++)
+                dot += qreg[g][e][0]*kd[e][0] + qreg[g][e][1]*kd[e][1]
+                     + qreg[g][e][2]*kd[e][2] + qreg[g][e][3]*kd[e][3];
+            float s = warp_reduce_sum_all(dot);
+            float mn = fmaxf(m[g], s), al = __expf(m[g] - mn), p = __expf(s - mn);
+            l[g] = l[g]*al + p;
+            #pragma unroll
+            for (int e = 0; e < E; e++) {
+                acc[g][e][0]=acc[g][e][0]*al+p*vd[e][0]; acc[g][e][1]=acc[g][e][1]*al+p*vd[e][1];
+                acc[g][e][2]=acc[g][e][2]*al+p*vd[e][2]; acc[g][e][3]=acc[g][e][3]*al+p*vd[e][3];
+            }
+            m[g] = mn;
+        }
+    }
+
+    size_t slot = (size_t)r * GEMMA4_GLOBAL_MAX_SPLITS + split;
+    #pragma unroll
+    for (int g = 0; g < GQW; g++) {
+        int h = kv_head * GQ + wsub * GQW + g;
+        float *pa = part_acc + (slot * NH + h) * HD;
+        #pragma unroll
+        for (int e = 0; e < E; e++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) pa[4*(lane + 32*e) + j] = acc[g][e][j];
+        if (lane == 0) { part_m[slot*NH + h] = m[g]; part_l[slot*NH + h] = l[g]; }
+    }
+}
+
 template<int NH, int NKV, int HD>
 __global__ void sliding_attn_splitk_rows_kernel(
     float *part_acc, float *part_m, float *part_l,   // slot r*MAX_SPLITS+split
@@ -3167,6 +3373,15 @@ static unsigned char* convert_q4_1_to_q8_0(const unsigned char *src, int64_t n_e
 
 static int build_packed_q4(gemma4_engine_t *eng);  // FUCINA_PACKED: lazy/eager repack (body below)
 
+// Per-layer stride of the global KV cache: capacity positions, each holding n_kv_heads_glob
+// heads of GEMMA4_GLOBAL_HEAD_DIM. Centralized so the alloc, the writes, and every read use
+// ONE formula — a single site left at the old *GLOBAL_HEAD_DIM (1-head) stride while the cache
+// is allocated *n_kv_heads_glob would desync read/write into silent garbage on the 31B. For
+// the 12B (n_kv_heads_glob=1) this is byte-identical to the previous capacity*GLOBAL_HEAD_DIM.
+static inline size_t global_layer_stride(const gemma4_engine_t *eng) {
+    return (size_t)eng->global_kv_capacity * eng->n_kv_heads_glob * GEMMA4_GLOBAL_HEAD_DIM;
+}
+
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
     tensor_format_t format,
@@ -3855,12 +4070,13 @@ gemma4_engine_t* gemma4_engine_create(
         return NULL;
     }
 
-    // Global K and V caches: float, separate K and V.
-    // Layout: [n_layers_global][ctx_size][head_dim] — only the global layers get
-    // a slot (not all 48), so this is ~6× smaller than indexing by absolute id.
+    // Global K and V caches (FP8). Layout per global layer: [ctx_size][n_kv_heads_glob][HD]
+    // — only the global layers get a slot (not all n_layers). The 31B has 4 global KV heads,
+    // the 12B has 1; global_layer_stride(eng) is the per-layer span (capacity*nkvg*HD), used
+    // identically by the alloc here and every read/write so they can't desync.
     eng->global_kv_capacity = context_size;
     size_t global_kv_size = (size_t)eng->n_layers_global *
-        context_size * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
+        global_layer_stride(eng) * sizeof(kv_t);
     if (cudaMalloc(&eng->d_global_k, global_kv_size) != cudaSuccess ||
         cudaMalloc(&eng->d_global_v, global_kv_size) != cudaSuccess) {
         fprintf(stderr, "fucina: failed to allocate global KV cache (%.1f MB ×2)\n",
@@ -4178,23 +4394,47 @@ static inline int embd_fmt(const gemma4_engine_t *eng) {
 // but each global K/V tile is read from DRAM ONCE (not n_heads×). Splits the context across
 // up to GEMMA4_GLOBAL_MAX_SPLITS blocks so one KV head still saturates bandwidth, then merges
 // the partials. Uses engine-resident scratch (d_fa_acc/m/l). n_heads must be GEMMA4_HEADS.
+// Warps-per-KV-head for the forked 31B global GQA kernel. At GQ = NH/NKVG = 8, one warp per
+// KV head spilled (measured on GB10: 255 regs + 236 B spill); WPK=2 (GQ-per-warp=4) kept it
+// register-resident (178 regs, 0 spill). NKVG*WPK*32 = 256 threads/block.
+#define GEMMA4_GLOBAL_GQA_WPK 2
+
+// Geometry dispatch is done with explicit if (eng->geom == GEOM_12B) {…} else {…} at each
+// attention launch site (NOT a macro): the CUDA <<<…>>> chevron carries commas that a macro
+// argument can't cleanly wrap, and the 12B/31B branches differ in block dim and (for the
+// global path) in WHICH kernel runs (MQA vs forked GQA). The kernels stay compile-time
+// templated (<16,…> vs <32,…>) so there is no register spill; the branch only selects the
+// pre-compiled instantiation. For the 12B every branch picks the original <16,…> kernels with
+// the original grids, so its path is byte-identical.
+
 static inline void global_attn_decode_broadcast(
     gemma4_engine_t *eng, float *out, const float *q,
     const kv_t *kc, const kv_t *vc, int n_heads, int head_dim, int ctx_len,
     cudaStream_t stream)
 {
-    // Warp-per-head kernel: NH warps/block (512 threads at NH=16), head_dim is the
-    // compile-time HD template param (global layers are always GEMMA4_GLOBAL_HEAD_DIM).
-    // No shared memory, no __syncthreads — see kernel comment.
+    // 12B: warp-per-query-head MQA kernel (1 KV head broadcast, NH*32 threads). 31B: forked
+    // GQA kernel, warp-per-KV-head with WPK warps/KV-head (NKVG*WPK*32 threads). No smem, no
+    // __syncthreads in either — see the kernel comments. head_dim is the compile-time HD.
     int splits = (ctx_len + GEMMA4_GLOBAL_SPLIT_CHUNK - 1) / GEMMA4_GLOBAL_SPLIT_CHUNK;
     if (splits < 1) splits = 1;
     if (splits > GEMMA4_GLOBAL_MAX_SPLITS) splits = GEMMA4_GLOBAL_MAX_SPLITS;
     if (splits > ctx_len) splits = ctx_len;       // never launch an empty split
-    global_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
-        <<<splits, GEMMA4_HEADS*32, 0, stream>>>(
-        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, head_dim, ctx_len, splits);
-    flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
-        out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    if (eng->geom == GEOM_12B) {
+        global_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
+            <<<splits, GEMMA4_HEADS*32, 0, stream>>>(
+            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, head_dim, ctx_len, splits);
+    } else {
+        global_attn_gqa_splitk_kernel<GEMMA4_HEADS_31B, GEMMA4_GLOBAL_KV_HEADS_31B,
+                                      GEMMA4_GLOBAL_HEAD_DIM, GEMMA4_GLOBAL_GQA_WPK>
+            <<<splits, GEMMA4_GLOBAL_KV_HEADS_31B*GEMMA4_GLOBAL_GQA_WPK*32, 0, stream>>>(
+            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, head_dim, ctx_len, splits);
+    }
+    if (eng->geom == GEOM_12B)
+        flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    else
+        flash_decode_combine_kernel<GEMMA4_HEADS_31B><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
 }
 
 // Split-K sliding flash-decode for a single query token. Drop-in replacement for
@@ -4219,17 +4459,27 @@ static inline void sliding_attn_decode_broadcast(
     const kv_t *kc, const kv_t *vc, int n_heads, int n_kv_heads, int head_dim,
     int window, int n_tokens, cudaStream_t stream)
 {
-    (void)n_kv_heads;  // GEMMA4_KV_HEADS by contract (warps/block below)
+    (void)n_kv_heads;  // template-fixed per geom below
     int window_len = (n_tokens < window) ? n_tokens : window;
     int splits = (window_len + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
     if (splits < 1) splits = 1;   // window_len==0 ⇒ one empty split ⇒ combine writes zeros
     if (splits > GEMMA4_GLOBAL_MAX_SPLITS) splits = GEMMA4_GLOBAL_MAX_SPLITS; // scratch cap
-    sliding_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
-        <<<splits, GEMMA4_KV_HEADS * 32, 0, stream>>>(
-            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc,
-            window, n_tokens, splits);
-    flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
-        out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    // 12B: <16,8,256> (8 KV-head warps). 31B: <32,16,256> (16 KV-head warps).
+    if (eng->geom == GEOM_12B) {
+        sliding_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
+            <<<splits, GEMMA4_KV_HEADS * 32, 0, stream>>>(
+                eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, window, n_tokens, splits);
+    } else {
+        sliding_attn_splitk_kernel<GEMMA4_HEADS_31B, GEMMA4_KV_HEADS_31B, GEMMA4_HEAD_DIM>
+            <<<splits, GEMMA4_KV_HEADS_31B * 32, 0, stream>>>(
+                eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, window, n_tokens, splits);
+    }
+    if (eng->geom == GEOM_12B)
+        flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    else
+        flash_decode_combine_kernel<GEMMA4_HEADS_31B><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -4267,13 +4517,15 @@ static int decode_layer(
     const int       *d_pos = NULL)
 {
     layer_type_t ltype = eng->layer_types[layer];
+    // Head counts come from the runtime geometry (12B: 16 q / 8 sliding-kv / 1 global-kv;
+    // 31B: 32 q / 16 sliding-kv / 4 global-kv). head_dim is invariant per layer type.
     int n_heads, n_kv_heads, head_dim, out_dim_q, out_dim_kv;
     if (ltype == LAYER_SLIDING) {
-        n_heads    = GEMMA4_HEADS;       head_dim = GEMMA4_HEAD_DIM;
-        n_kv_heads = GEMMA4_KV_HEADS;
+        n_heads    = eng->n_heads;       head_dim = GEMMA4_HEAD_DIM;
+        n_kv_heads = eng->n_kv_heads;
     } else {
-        n_heads    = GEMMA4_HEADS;       head_dim = GEMMA4_GLOBAL_HEAD_DIM;
-        n_kv_heads = GEMMA4_GLOBAL_KV_HEADS;
+        n_heads    = eng->n_heads;       head_dim = GEMMA4_GLOBAL_HEAD_DIM;
+        n_kv_heads = eng->n_kv_heads_glob;
     }
     out_dim_q  = n_heads    * head_dim;
     out_dim_kv = n_kv_heads * head_dim;
@@ -4354,15 +4606,18 @@ static int decode_layer(
     } else {
         int n = pos;   // == eng->global_n_tokens at every call site
         int slot = eng->global_slot[layer];
-        size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+        size_t layer_stride = global_layer_stride(eng);
         kv_t *base_k = eng->d_global_k + (size_t)slot * layer_stride;
         kv_t *base_v = eng->d_global_v + (size_t)slot * layer_stride;
+        // Per-token stride is kv_size = n_kv_heads_glob*HD, so a token's nkvg heads land
+        // contiguously as [head0..head_{nkvg-1}][HD] (the [pos][NKVG][HD] read layout). For
+        // the 12B (nkvg=1) kv_size == GEMMA4_GLOBAL_HEAD_DIM, byte-identical to before.
         if (d_pos) {
-            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size);
-            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, kv_size, eng->d_attn_k, kv_size);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, kv_size, eng->d_attn_v, kv_size);
         } else {
-            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size);
-            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size);
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)n*kv_size, eng->d_attn_k, kv_size);
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)n*kv_size, eng->d_attn_v, kv_size);
         }
     }
 
@@ -4374,16 +4629,29 @@ static int decode_layer(
             // Max sliding splits = ceil(WINDOW/CHUNK); shorter windows tail-return.
             const int max_splits =
                 (GEMMA4_SLIDING_WINDOW + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
-            sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
-                <<<dim3(max_splits, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
-                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
-                    eng->d_sliding_k + (size_t)layer * lstride,
-                    eng->d_sliding_v + (size_t)layer * lstride,
-                    GEMMA4_SLIDING_WINDOW, 0, d_pos + 1);
-            flash_decode_combine_rows_kernel<GEMMA4_HEADS>
-                <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
-                    eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
-                    head_dim, GEMMA4_SLIDING_WINDOW, 0, d_pos + 1, n_heads*head_dim);
+            if (eng->geom == GEOM_12B) {
+                sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
+                    <<<dim3(max_splits, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                        eng->d_sliding_k + (size_t)layer * lstride,
+                        eng->d_sliding_v + (size_t)layer * lstride,
+                        GEMMA4_SLIDING_WINDOW, 0, d_pos + 1);
+                flash_decode_combine_rows_kernel<GEMMA4_HEADS>
+                    <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                        eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                        head_dim, GEMMA4_SLIDING_WINDOW, 0, d_pos + 1, n_heads*head_dim);
+            } else {
+                sliding_attn_splitk_rows_kernel<GEMMA4_HEADS_31B, GEMMA4_KV_HEADS_31B, GEMMA4_HEAD_DIM>
+                    <<<dim3(max_splits, 1), GEMMA4_KV_HEADS_31B*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                        eng->d_sliding_k + (size_t)layer * lstride,
+                        eng->d_sliding_v + (size_t)layer * lstride,
+                        GEMMA4_SLIDING_WINDOW, 0, d_pos + 1);
+                flash_decode_combine_rows_kernel<GEMMA4_HEADS_31B>
+                    <<<dim3(GEMMA4_HEADS_31B, 1), head_dim, 0, stream>>>(
+                        eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                        head_dim, GEMMA4_SLIDING_WINDOW, 0, d_pos + 1, n_heads*head_dim);
+            }
         } else {
         // Split-K warp-per-KV-head (no per-key __syncthreads — see sliding_attn_splitk_kernel).
         sliding_attn_decode_broadcast(
@@ -4402,19 +4670,34 @@ static int decode_layer(
         // ctx at ~25K and failed silently past it).
         int n_ctx = pos + 1;   // pos == eng->global_n_tokens at every call site
         int slot = eng->global_slot[layer];
-        size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+        size_t layer_stride = global_layer_stride(eng);
         if (d_pos) {
             // Graph path: fixed-grid rows kernels (r=0) with device n_tokens = d_pos[1].
-            global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
-                <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
-                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
-                    eng->d_global_k + (size_t)slot * layer_stride,
-                    eng->d_global_v + (size_t)slot * layer_stride,
-                    0, d_pos + 1);
-            flash_decode_combine_rows_kernel<GEMMA4_HEADS>
-                <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
-                    eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
-                    head_dim, /*window=*/0, 0, d_pos + 1, n_heads*head_dim);
+            if (eng->geom == GEOM_12B) {
+                global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
+                    <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                        eng->d_global_k + (size_t)slot * layer_stride,
+                        eng->d_global_v + (size_t)slot * layer_stride,
+                        0, d_pos + 1);
+                flash_decode_combine_rows_kernel<GEMMA4_HEADS>
+                    <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                        eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                        head_dim, /*window=*/0, 0, d_pos + 1, n_heads*head_dim);
+            } else {
+                global_attn_gqa_splitk_rows_kernel<GEMMA4_HEADS_31B, GEMMA4_GLOBAL_KV_HEADS_31B,
+                                                   GEMMA4_GLOBAL_HEAD_DIM, GEMMA4_GLOBAL_GQA_WPK>
+                    <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1),
+                       GEMMA4_GLOBAL_KV_HEADS_31B*GEMMA4_GLOBAL_GQA_WPK*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                        eng->d_global_k + (size_t)slot * layer_stride,
+                        eng->d_global_v + (size_t)slot * layer_stride,
+                        0, d_pos + 1);
+                flash_decode_combine_rows_kernel<GEMMA4_HEADS_31B>
+                    <<<dim3(GEMMA4_HEADS_31B, 1), head_dim, 0, stream>>>(
+                        eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                        head_dim, /*window=*/0, 0, d_pos + 1, n_heads*head_dim);
+            }
         } else {
         // GQA-broadcast split-K (Step 1): reads each global K/V tile ONCE (was 16×).
         global_attn_decode_broadcast(
@@ -5191,7 +5474,7 @@ int gemma4_engine_prefill_batched(
                 kc, vc, d_k, d_v, base, 0, N, kvhd, GEMMA4_SLIDING_WINDOW);
         } else {
             int slot = eng->global_slot[l];
-            size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+            size_t stride = global_layer_stride(eng);
             kv_write_global_kernel<<<dim3(grid1d(hd),N),256,0,stream>>>(
                 eng->d_global_k + slot*stride, eng->d_global_v + slot*stride,
                 d_k, d_v, base, N, hd);
@@ -5503,7 +5786,7 @@ int gemma4_engine_prefill_flash(
                     hv = eng->d_sliding_v + (size_t)l*lstride;
                 } else {
                     int slot = eng->global_slot[l];
-                    size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+                    size_t stride = global_layer_stride(eng);
                     hk = eng->d_global_k + (size_t)slot*stride;
                     hv = eng->d_global_v + (size_t)slot*stride;
                 }
@@ -5546,7 +5829,7 @@ int gemma4_engine_prefill_flash(
                     d_k, d_v, abs0, 0, cn, kvhd, GEMMA4_SLIDING_WINDOW);
             } else {
                 int slot = eng->global_slot[l];
-                size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+                size_t stride = global_layer_stride(eng);
                 kv_write_global_kernel<<<dim3(grid1d(hd),cn),256,0,stream>>>(
                     eng->d_global_k + slot*stride, eng->d_global_v + slot*stride,
                     d_k, d_v, abs0, cn, hd);
@@ -6051,7 +6334,7 @@ static void decode_batched_forward(
                 hd, GEMMA4_SLIDING_WINDOW, pos + 1, d_ntok, oq);
         } else {
             int slot = eng->global_slot[l];
-            size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+            size_t lstride = global_layer_stride(eng);
             kv_t *kc = eng->d_global_k + (size_t)slot*lstride;
             kv_t *vc = eng->d_global_v + (size_t)slot*lstride;
             kv_write_global_kernel<<<dim3(grid1d(hd),K),256,0,stream>>>(
@@ -6430,7 +6713,7 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
             // Fixed-grid split-K with device n_tokens (= *pos_ptr): same split formula
             // as global_attn_decode_broadcast, so the math is bit-identical to it.
             int slot = eng->global_slot[GEMMA4_MAX_LAYERS - 1];
-            size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+            size_t lstride = global_layer_stride(eng);
             global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
