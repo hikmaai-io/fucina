@@ -104,7 +104,10 @@ typedef enum {
     GGML_TYPE_F32  = 0,
     GGML_TYPE_F16  = 1,
     GGML_TYPE_Q4_0 = 2,
+    GGML_TYPE_Q4_1 = 3,   // 32-elem block: fp16 d + fp16 m + 16 nibble bytes (value = d*q + m)
     GGML_TYPE_Q8_0 = 8,
+    GGML_TYPE_Q4_K = 12,  // 256-elem super-block, 144 B: fp16 d + fp16 dmin + 12 B 6-bit
+                          // scales/mins (K_SCALE_SIZE) + 128 B 4-bit quants
     GGML_TYPE_Q6_K = 14,
 } ggml_type_t;
 
@@ -2438,12 +2441,19 @@ struct gemma4_engine {
     // memory reads on every GEMV.
     uint8_t  *d_weights;
     uint64_t  tdata_start;   // file offset where tensor data begins
-    unsigned char *d_token_embd;  // QAT Q4_0 model: token_embd (Q6_K) converted to Q8_0 (for embed lookup)
+    unsigned char *d_token_embd;  // token_embd (Q6_K on 12B / Q4_K on 31B) converted to Q8_0
     // Step 8: native-Q6_K tied LM head. d_lmhead_q6k points at the RAW Q6_K bytes in the device
     // weight blob (d_weights + output_weight offset); the output projection reads it directly
     // instead of the Q8_0 d_token_embd, cutting ~0.24 GB/token. lmhead_q6k=1 enables it.
     unsigned char *d_lmhead_q6k;
     int            lmhead_q6k;
+
+    // Mixed-quant upcast (31B): a few ffn_down tensors ship as Q4_1 inside an otherwise
+    // Q4_0 model. They are converted to Q8_0 at load into these per-layer device buffers so
+    // the layer GEMV stays monomorphic (no native Q4_1 kernel). NULL = the layer's ffn_down
+    // is the native Q4_0 in d_weights; weight_fp8() redirects to this buffer when set.
+    unsigned char *d_ffn_down_q8[GEMMA4_MAX_LAYERS];
+    int            has_ffn_down_q8;  // model-wide "any ffn_down upcast" (gates the Q4_0-only MMQ path)
 
     // ROTATING per-layer BF16 dequant scratch for batched cuBLAS prefill (Step 2).
     // The 7 projection weights of the CURRENT layer only are dequantized Q8_0/FP8 →
@@ -3018,6 +3028,22 @@ static inline uint16_t f2h_host(float x) {
     return h;
 }
 
+// Requantize one 32-float block to a 34-byte Q8_0 block (fp16 scale + 32 int8). Shared by
+// every convert_*_to_q8_0 path — they differ only in how they dequant the source to f[32].
+static inline void quantize_block_q8_0(const float f[32], unsigned char *ob)
+{
+    float amax = 0.0f;
+    for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(f[j]));
+    float scale = amax / 127.0f, iscale = (scale > 0.0f) ? 1.0f/scale : 0.0f;
+    uint16_t hb = f2h_host(scale);
+    ob[0] = (unsigned char)(hb & 0xFF); ob[1] = (unsigned char)(hb >> 8);
+    for (int j = 0; j < 32; j++) {
+        int q = (int)lrintf(f[j] * iscale);
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        ob[2+j] = (unsigned char)(int8_t)q;
+    }
+}
+
 // Convert a Q6_K tensor (token_embd in the QAT model) to Q8_0, host-side, once at load.
 // Q6_K super-block = 256 elems (ql[128] + qh[64] + scales[16](int8) + d(fp16) = 210 B);
 // we dequant to float then requantize each 32-subblock to Q8_0 (fp16 scale + 32 int8).
@@ -3052,19 +3078,89 @@ static unsigned char* convert_q6k_to_q8_0(const unsigned char *src, int64_t n_el
                 f[n+l+96] = d * sc[is+6] * q4;
             }
         }
-        for (int sb = 0; sb < 8; sb++) {
-            float amax = 0.0f;
-            for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(f[sb*32+j]));
-            float scale = amax / 127.0f, iscale = (scale > 0.0f) ? 1.0f/scale : 0.0f;
-            unsigned char *ob = dst + (size_t)(s*8 + sb) * 34;
-            uint16_t hb = f2h_host(scale);
-            ob[0] = (unsigned char)(hb & 0xFF); ob[1] = (unsigned char)(hb >> 8);
-            for (int j = 0; j < 32; j++) {
-                int q = (int)lrintf(f[sb*32+j] * iscale);
-                q = q < -127 ? -127 : (q > 127 ? 127 : q);
-                ob[2+j] = (unsigned char)(int8_t)q;
+        for (int sb = 0; sb < 8; sb++)
+            quantize_block_q8_0(f + sb*32, dst + (size_t)(s*8 + sb) * 34);
+    }
+    return dst;
+}
+
+// Q4_K 6-bit (scale,min) unpack for sub-block j (0..7), matching ggml get_scale_min_k4:
+// the 12 scale bytes hold 8 pairs as 6-bit values, the low 6 in scales[0..7] and the
+// spilled high 2 bits in scales[8..11]. Writes *sc and *mn (0..63 each).
+static inline void q4k_get_scale_min(int j, const unsigned char *q, unsigned char *sc, unsigned char *mn)
+{
+    if (j < 4) {
+        *sc = q[j]     & 63;
+        *mn = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *mn = (q[j + 4] >>  4) | ((q[j    ] >> 6) << 4);
+    }
+}
+
+// Convert a Q4_K tensor (token_embd in the 31B mixed-quant model) to Q8_0, host-side,
+// once at load — the same trick as convert_q6k_to_q8_0 so the existing Q8_0 embed-lookup
+// and LM-head GEMV paths handle it with no native Q4_K kernel. Q4_K super-block = 256
+// elems in 144 B: d(fp16) + dmin(fp16) + scales[12] + qs[128]; per 32-elem sub-block j the
+// value is d*sc[j]*q - dmin*mn[j]. Returns a malloc'd Q8_0 buffer ((n_elem/32)*34 B) or NULL.
+static unsigned char* convert_q4k_to_q8_0(const unsigned char *src, int64_t n_elem)
+{
+    const int64_t n_super = n_elem / 256;
+    const int64_t n_q8blk = n_elem / 32;
+    unsigned char *dst = (unsigned char*)malloc((size_t)n_q8blk * 34);
+    if (!dst) return NULL;
+    for (int64_t s = 0; s < n_super; s++) {
+        const unsigned char *blk = src + (size_t)s * 144;
+        uint16_t draw, mraw;
+        memcpy(&draw, blk + 0, 2);
+        memcpy(&mraw, blk + 2, 2);
+        float d    = h2f_host(draw);
+        float dmin = h2f_host(mraw);
+        const unsigned char *scales = blk + 4;       // 12 B of packed 6-bit (sc,min)
+        const unsigned char *qs     = blk + 16;      // 128 B of 4-bit quants
+        float f[256];
+        for (int j = 0; j < 8; j++) {                // 8 sub-blocks of 32 elems
+            unsigned char sc, mn;
+            q4k_get_scale_min(j, scales, &sc, &mn);
+            float dl = d * (float)sc, ml = dmin * (float)mn;
+            // ggml interleaves two 32-elem sub-blocks per 32 qs bytes: low nibble = even
+            // sub-block, high nibble = odd. Sub-block j reads qs[(j/2)*32 .. +32], nibble (j&1).
+            const unsigned char *qb = qs + (size_t)(j / 2) * 32;
+            int shift = (j & 1) ? 4 : 0;
+            for (int l = 0; l < 32; l++) {
+                int q = (qb[l] >> shift) & 0xF;
+                f[j * 32 + l] = dl * (float)q - ml;
             }
         }
+        for (int sb = 0; sb < 8; sb++)
+            quantize_block_q8_0(f + sb*32, dst + (size_t)(s*8 + sb) * 34);
+    }
+    return dst;
+}
+
+// Convert a Q4_1 tensor (the 7 anomalous ffn_down in the 31B mixed-quant model) to Q8_0,
+// host-side at load, so the layer GEMV stays monomorphic on Q8_0 (no native Q4_1 kernel,
+// no per-tensor type tracking). Q4_1 block = 32 elems in 20 B: d(fp16) + m(fp16) + 16 nibble
+// bytes (low nibble = elem l, high = elem l+16); value = d*q + m, q unsigned 0..15.
+// Returns a malloc'd Q8_0 buffer ((n_elem/32)*34 B) or NULL.
+static unsigned char* convert_q4_1_to_q8_0(const unsigned char *src, int64_t n_elem)
+{
+    const int64_t n_blk = n_elem / 32;
+    unsigned char *dst = (unsigned char*)malloc((size_t)n_blk * 34);
+    if (!dst) return NULL;
+    for (int64_t b = 0; b < n_blk; b++) {
+        const unsigned char *blk = src + (size_t)b * 20;
+        uint16_t draw, mraw;
+        memcpy(&draw, blk + 0, 2);
+        memcpy(&mraw, blk + 2, 2);
+        float d = h2f_host(draw), m = h2f_host(mraw);
+        const unsigned char *qs = blk + 4;
+        float f[32];
+        for (int l = 0; l < 16; l++) {
+            f[l]      = d * (float)(qs[l] & 0xF) + m;
+            f[l + 16] = d * (float)(qs[l] >>  4) + m;
+        }
+        quantize_block_q8_0(f, dst + (size_t)b * 34);
     }
     return dst;
 }
@@ -3169,31 +3265,37 @@ gemma4_engine_t* gemma4_engine_create(
     fprintf(stderr, "fucina: loaded %s (%.2f GB)\n",
             model_path, eng->gguf_size / (1024.0 * 1024.0 * 1024.0));
 
-    // Auto-detect the weight format from the GGUF tensor table. Trusting the CLI flag
-    // is dangerous (decoding Q8_0 blocks as FP8 bytes yields NaNs). Detect from a LAYER
-    // tensor (ffn_down) — token_embd may be a different type (Q6_K in the QAT Q4_0 model).
-    int embd_is_q6k = 0;
+    // Auto-detect the dominant LAYER weight format from a tensor that is UNIFORM across
+    // the model: attn_q (always Q4_0 in both the QAT 12B and the mixed-quant 31B). Trusting
+    // the CLI flag is dangerous (decoding Q8_0 blocks as FP8 bytes yields NaNs). ffn_down is
+    // NOT uniform in the 31B (7 layers are Q4_1) so it can't be the format probe — those are
+    // upcast to Q8_0 at load below (see embd/ffn_down conversion). token_embd is a third type
+    // again (Q6_K on 12B, Q4_K on 31B), also handled below.
+    int embd_is_q6k = 0, embd_is_q4k = 0;
     {
         uint64_t _off = 0, _n = 0; uint32_t gtype = 0;
-        const char *names[] = {"blk.0.ffn_down.weight", "blk.0.attn_q.weight"};
-        for (int t = 0; t < 2; t++) {
-            if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, names[t], &_off, &_n, &gtype) == 0) {
-                if (gtype != GGML_TYPE_Q4_0 && gtype != GGML_TYPE_Q8_0) {
-                    fprintf(stderr, "fucina: unsupported GGUF layer tensor type %u — "
-                            "only Q4_0 (QAT) and Q8_0 models are supported\n", gtype);
-                    gemma4_engine_destroy(eng);
-                    return NULL;
-                }
-                eng->format = (gtype == GGML_TYPE_Q4_0) ? FORMAT_Q4_0 : FORMAT_Q8_0;
-                break;
+        if (gguf_find_tensor(eng->gguf_data, eng->gguf_size,
+                "blk.0.attn_q.weight", &_off, &_n, &gtype) == 0) {
+            if (gtype != GGML_TYPE_Q4_0 && gtype != GGML_TYPE_Q8_0) {
+                fprintf(stderr, "fucina: unsupported attn_q tensor type %u — "
+                        "only Q4_0 (QAT) and Q8_0 base formats are supported\n", gtype);
+                gemma4_engine_destroy(eng);
+                return NULL;
             }
+            eng->format = (gtype == GGML_TYPE_Q4_0) ? FORMAT_Q4_0 : FORMAT_Q8_0;
         }
-        // token_embd / tied LM head type (Q6_K in the QAT model → convert to Q8_0 at load)
+        // token_embd / tied LM head type: Q6_K (QAT 12B) or Q4_K (mixed 31B) → both
+        // converted to Q8_0 at load so the embed-lookup and LM-head GEMV stay on Q8_0.
         uint32_t etype = 0;
         if (gguf_find_tensor(eng->gguf_data, eng->gguf_size,
-                "token_embd.weight", &_off, &_n, &etype) == 0 && etype == GGML_TYPE_Q6_K) {
-            embd_is_q6k = 1;
-            fprintf(stderr, "fucina: token_embd is Q6_K — will convert to Q8_0 at load\n");
+                "token_embd.weight", &_off, &_n, &etype) == 0) {
+            if (etype == GGML_TYPE_Q6_K) {
+                embd_is_q6k = 1;
+                fprintf(stderr, "fucina: token_embd is Q6_K — will convert to Q8_0 at load\n");
+            } else if (etype == GGML_TYPE_Q4_K) {
+                embd_is_q4k = 1;
+                fprintf(stderr, "fucina: token_embd is Q4_K — will convert to Q8_0 at load\n");
+            }
         }
     }
 
@@ -3636,23 +3738,62 @@ gemma4_engine_t* gemma4_engine_create(
         }
     }
 
-    // QAT Q4_0 model: convert the Q6_K token_embd (= tied LM head) to a Q8_0 device
-    // buffer so the existing Q8_0 embed/LM-head kernels handle it (layers stay Q4_0).
+    // Convert the token_embd (= tied LM head) to a Q8_0 device buffer so the existing
+    // Q8_0 embed/LM-head kernels handle it while the layers stay Q4_0. The QAT 12B ships
+    // it as Q6_K, the mixed-quant 31B as Q4_K — both upcast to Q8_0 here.
     eng->d_token_embd = NULL;
-    if (eng->format == FORMAT_Q4_0 && embd_is_q6k) {
-        int64_t n_elem = (int64_t)GEMMA4_VOCAB_SIZE * GEMMA4_HIDDEN_SIZE;
-        const unsigned char *q6 = (const unsigned char*)(eng->gguf_data + eng->tensors.token_embd);
-        unsigned char *q8 = convert_q6k_to_q8_0(q6, n_elem);
+    if (eng->format == FORMAT_Q4_0 && (embd_is_q6k || embd_is_q4k)) {
+        int64_t n_elem = (int64_t)GEMMA4_VOCAB_SIZE * eng->hidden;
+        const unsigned char *src = (const unsigned char*)(eng->gguf_data + eng->tensors.token_embd);
+        unsigned char *q8 = embd_is_q6k ? convert_q6k_to_q8_0(src, n_elem)
+                                        : convert_q4k_to_q8_0(src, n_elem);
         if (q8) {
             size_t q8bytes = (size_t)(n_elem/32) * 34;
             if (cudaMalloc(&eng->d_token_embd, q8bytes) == cudaSuccess)
                 cudaMemcpy(eng->d_token_embd, q8, q8bytes, cudaMemcpyHostToDevice);
             free(q8);
-            fprintf(stderr, "fucina: token_embd Q6_K->Q8_0 converted (%.2f GB)\n",
-                    q8bytes / (1024.0*1024.0*1024.0));
+            fprintf(stderr, "fucina: token_embd %s->Q8_0 converted (%.2f GB)\n",
+                    embd_is_q6k ? "Q6_K" : "Q4_K", q8bytes / (1024.0*1024.0*1024.0));
         }
         if (!eng->d_token_embd)
             fprintf(stderr, "fucina: WARNING token_embd conversion failed\n");
+    }
+
+    // Mixed-quant 31B: a few ffn_down tensors are Q4_1 inside an otherwise Q4_0 model.
+    // Upcast each to a per-layer Q8_0 device buffer at load so the layer GEMV stays
+    // monomorphic (no native Q4_1 kernel, no per-tensor type tracking in the hot path —
+    // see ffn_down_fmt / weight_fp8). ~50 MB per tensor; only the anomalous layers pay it.
+    eng->has_ffn_down_q8 = 0;
+    for (int l = 0; l < eng->n_layers; l++) eng->d_ffn_down_q8[l] = NULL;
+    {
+        int n_conv = 0;
+        for (int l = 0; l < eng->n_layers; l++) {
+            char tname[64];
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
+            uint64_t toff = 0, tn = 0; uint32_t ttype = 0;
+            if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, tname, &toff, &tn, &ttype) != 0)
+                continue;
+            if (ttype != GGML_TYPE_Q4_1) continue;          // Q4_0 layers use d_weights directly
+            int64_t n_elem = (int64_t)eng->ffn * eng->hidden;
+            const unsigned char *q41 = (const unsigned char*)(eng->gguf_data + eng->tensors.layers[l].ffn_down);
+            unsigned char *q8 = convert_q4_1_to_q8_0(q41, n_elem);
+            if (q8) {
+                size_t q8bytes = (size_t)(n_elem/32) * 34;
+                if (cudaMalloc(&eng->d_ffn_down_q8[l], q8bytes) == cudaSuccess) {
+                    cudaMemcpy(eng->d_ffn_down_q8[l], q8, q8bytes, cudaMemcpyHostToDevice);
+                    eng->has_ffn_down_q8 = 1;
+                    n_conv++;
+                }
+                free(q8);
+            }
+            if (!eng->d_ffn_down_q8[l]) {
+                fprintf(stderr, "fucina: ERROR ffn_down[%d] Q4_1->Q8_0 conversion failed\n", l);
+                gemma4_engine_destroy(eng);
+                return NULL;
+            }
+        }
+        if (n_conv)
+            fprintf(stderr, "fucina: %d Q4_1 ffn_down tensor(s) upcast to Q8_0\n", n_conv);
     }
 
     // Step 8 (native Q6_K head), dp4a edition. The first fp32-scalar Q6_K kernel was
@@ -3798,6 +3939,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_weights);
     CUDA_FREE(eng->d_weights_packed);
     CUDA_FREE(eng->d_token_embd);
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) CUDA_FREE(eng->d_ffn_down_q8[l]);
     for (int b = 0; b < 2; b++)
         for (int p = 0; p < 7; p++)
             CUDA_FREE(eng->d_bf16_layer[b][p]);
@@ -3911,6 +4053,18 @@ static inline const unsigned char* weight_fp8(
 
 // ─── Format-dispatching GEMV / embed launchers ─────────────────────────
 #define FMT(eng)  ((int)(eng)->format)
+
+// ffn_down weight POINTER and FORMAT for a layer, resolved together so a GEMV call site
+// can't take one without the other (the pointer and format are two channels that must stay
+// in lockstep). Mixed-quant 31B upcasts a few Q4_1 ffn_down to per-layer Q8_0 buffers; every
+// other layer is the native model format in d_weights. O(1) by layer index — no scan.
+static inline const unsigned char* ffn_down_w(
+    const gemma4_engine_t *eng, int layer, int *fmt)
+{
+    if (eng->d_ffn_down_q8[layer]) { *fmt = (int)FORMAT_Q8_0; return eng->d_ffn_down_q8[layer]; }
+    *fmt = FMT(eng);
+    return weight_fp8(eng, eng->tensors.layers[layer].ffn_down);
+}
 
 // FUCINA_PACKED gate (built eagerly at create when FUCINA_PACKED=1, so this is a pure read —
 // no allocation in the hot/graph-captured path). Only Q4_0 layer projections live in
@@ -4315,9 +4469,11 @@ static int decode_layer(
         (int)eng->format, stream);
 
     // ── 12. FFN down projection ───────────────────────────────────────────
-    gemv_w(eng, eng->d_x,
-        weight_fp8(eng, eng->tensors.layers[layer].ffn_down),
-        eng->d_ffn_out, GEMMA4_INTERMEDIATE, GEMMA4_HIDDEN_SIZE, stream);
+    // Mixed-quant 31B: a Q4_1 ffn_down was upcast to a Q8_0 buffer → pointer+format together.
+    int ffn_down_format;
+    const unsigned char *ffn_down_weight = ffn_down_w(eng, layer, &ffn_down_format);
+    gemv_w(eng, eng->d_x, ffn_down_weight,
+        eng->d_ffn_out, GEMMA4_INTERMEDIATE, GEMMA4_HIDDEN_SIZE, stream, ffn_down_format);
 
     // ── 13. Post-FFN sandwich norm → residual add ─────────────────────────
     rms_norm_kernel<<<1, block, smem32, stream>>>(
@@ -4432,6 +4588,9 @@ static int build_packed_q4(gemma4_engine_t *eng)
         for (int p = 0; p < PJ_COUNT; p++) {
             uint64_t off; int in_dim, out_dim;
             if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;
+            // Skip ffn_down tensors upcast to a separate Q8_0 buffer — they are not Q4_0
+            // and live outside d_weights, so the packed-Q4_0 decode path never reads them.
+            if (p == PJ_DOWN && eng->d_ffn_down_q8[l]) continue;
             const uint8_t *src  = weight_fp8(eng, off);                 // native Q4_0 bytes
             uint8_t       *base = eng->d_weights_packed + (off - eng->tdata_start);
             size_t nb = (size_t)(in_dim >> 5);
@@ -4466,9 +4625,13 @@ static void dequant_layer_bf16_buf(gemma4_engine_t *eng, int l, int buf, cudaStr
         uint64_t off; int in_dim, out_dim;
         if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;
         uint64_t n = (uint64_t)in_dim * out_dim;
-        const uint8_t *src = weight_fp8(eng, off);
+        // ffn_down resolves pointer+format together (a Q4_1 upcast to Q8_0 must dequant as
+        // Q8_0); the other six projections are the native model format in d_weights.
+        int fmt; const uint8_t *src;
+        if (p == PJ_DOWN) src = ffn_down_w(eng, l, &fmt);
+        else { src = weight_fp8(eng, off); fmt = FMT(eng); }
         dequant_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(
-                eng->d_bf16_layer[buf][p], src, n, FMT(eng));
+                eng->d_bf16_layer[buf][p], src, n, fmt);
     }
 }
 
@@ -4766,6 +4929,9 @@ static inline bool mmq_enabled(gemma4_engine_t *eng, int N)
     static int opt = -1;
     if (opt < 0) { const char *e = getenv("FUCINA_MMQ"); opt = (e && e[0] == '1') ? 1 : 0; }
     if (!opt) return false;
+    // The opt-in MMQ path is Q4_0-only; a mixed model with Q8_0-upcast ffn_down tensors
+    // would be misread, so fall back to the format-aware BF16 prefill for those models.
+    if (eng->has_ffn_down_q8) return false;
     return (FMT(eng) == FORMAT_Q4_0) && (N <= GEMMA4_MMQ_MAX_N)
            && ensure_mmq_scratch(eng) == 0;
 #else
@@ -5916,7 +6082,9 @@ static void decode_batched_forward(
         gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, K, stream);
         gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, K, stream);
         geglu_kernel<<<grid1d((size_t)K*I),256,0,stream>>>(d_inf, d_gate, d_up, K*I);
-        gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, K, stream);
+        // ffn_down pointer+format resolved together (Q8_0-upcast Q4_1 on the 31B verify path).
+        int fd_fmt; const unsigned char *fd_w = ffn_down_w(eng, l, &fd_fmt);
+        gemv_batched_w(eng, d_o, fd_w, d_inf, I, H, K, stream, fd_fmt);
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_f, H, K, GEMMA4_RMS_EPS);
         residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
         if (eng->h_out_scale[l] != 1.0f)
