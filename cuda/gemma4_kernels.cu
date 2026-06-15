@@ -2857,14 +2857,16 @@ static int gguf_find_tensor(
     uint32_t      *ggml_type_out)
 {
     const gguf_header_t *hdr = (const gguf_header_t *)data;
+    if (size < sizeof(gguf_header_t)) return -1;
     if (hdr->magic != 0x46554747) return -1;
+    if (hdr->version != 3) return -1; // forward-compat guard: reject unknown GGUF versions
 
     const uint8_t *end = data + size;
     const uint8_t *p = gguf_skip_metadata(data, size);
     if (!p) return -1;
 
     uint64_t tdata_start = gguf_tensor_data_start(data, size);
-    if (tdata_start == 0) return -1;
+    if (tdata_start == 0 || tdata_start > size) return -1;
 
     for (uint64_t t = 0; t < hdr->tensor_count; t++) {
         uint64_t nlen = 0;
@@ -2882,6 +2884,13 @@ static int gguf_find_tensor(
         uint64_t toff;  memcpy(&toff, p, 8);  p += 8;
 
         if (gguf_str_eq(tname, nlen, name)) {
+            // Validate the tensor's data region lies within the file. toff is
+            // relative to tdata_start; a corrupt offset (or one that, with the
+            // tensor bytes, escapes the mapping) would otherwise drive an OOB
+            // device read at inference. Exact byte size is quant-dependent, so we
+            // bound the start here; the per-tensor byte span is re-checked at
+            // upload where wrow_bytes() knows the format.
+            if (toff > size - tdata_start) return -1;
             if (offset_out)    *offset_out = tdata_start + toff;
             if (n_el_out)      *n_el_out = n_el;
             if (ggml_type_out) *ggml_type_out = gtype;
@@ -3244,8 +3253,16 @@ gemma4_engine_t* gemma4_engine_create(
                         "using default 5-sliding/1-global cadence\n");
     }
 
-    // Parse tensor offsets via gguf_find_tensor_offset
-    // Helper macro: find tensor, store offset
+    // Parse tensor offsets via gguf_find_tensor_offset.
+    // A missing tensor leaves the field at its calloc'd 0 — but offset 0 is a
+    // VALID offset (the first tensor's data), so a silent miss runs that layer
+    // against the wrong bytes (garbage output, no error). LOAD_TENSOR_OFFSET
+    // warns on a miss; LOAD_TENSOR_REQUIRED additionally marks the load as failed.
+    // Only the model-defining tensors that EVERY valid gemma-4 GGUF must carry are
+    // marked required — the per-layer loop runs to GEMMA4_MAX_LAYERS and a model
+    // with fewer layers legitimately lacks the upper-layer tensors, so those stay
+    // warnings (they read offset 0 but are never reached for absent layers).
+    bool missing_required = false;
     #define LOAD_TENSOR_OFFSET(name, field) do { \
         uint64_t _off, _n; \
         if (gguf_find_tensor_offset(eng->gguf_data, eng->gguf_size, \
@@ -3255,9 +3272,19 @@ gemma4_engine_t* gemma4_engine_create(
             fprintf(stderr, "fucina: tensor '%s' not found in GGUF\n", name); \
         } \
     } while(0)
+    #define LOAD_TENSOR_REQUIRED(name, field) do { \
+        uint64_t _off, _n; \
+        if (gguf_find_tensor_offset(eng->gguf_data, eng->gguf_size, \
+                name, &_off, &_n) == 0) { \
+            eng->tensors.field = _off; \
+        } else { \
+            fprintf(stderr, "fucina: required tensor '%s' missing from GGUF\n", name); \
+            missing_required = true; \
+        } \
+    } while(0)
 
-    // Load embedding
-    LOAD_TENSOR_OFFSET("token_embd.weight", token_embd);
+    // Load embedding (required — also the tied LM head)
+    LOAD_TENSOR_REQUIRED("token_embd.weight", token_embd);
 
     // Load per-layer tensors
     char tname[128];
@@ -3310,7 +3337,7 @@ gemma4_engine_t* gemma4_engine_create(
         LOAD_TENSOR_OFFSET(tname, layers[l].layer_out_scale);
     }
 
-    LOAD_TENSOR_OFFSET("output_norm.weight", output_norm);
+    LOAD_TENSOR_REQUIRED("output_norm.weight", output_norm);
 
     // Output (LM head) projection. Gemma-4 ties the output projection to the
     // input embedding, so most GGUF exports do NOT contain a separate
@@ -3331,6 +3358,17 @@ gemma4_engine_t* gemma4_engine_create(
     }
 
     #undef LOAD_TENSOR_OFFSET
+    #undef LOAD_TENSOR_REQUIRED
+
+    // A model-defining tensor was missing: the GGUF is corrupt or not a gemma-4
+    // model. Fail the load rather than run inference against offset-0 garbage.
+    // This is gemma4_engine_create, which returns the engine pointer — free it
+    // and return NULL so the Go side sees a clean load failure.
+    if (missing_required) {
+        fprintf(stderr, "fucina: aborting load — required tensor(s) missing\n");
+        free(eng);
+        return NULL;
+    }
 
     // Allocate device memory
     // Scratch (1M floats = 4 MB)

@@ -136,16 +136,40 @@ extern "C" dg_engine_t *dg_engine_create(const char *path, int max_prompt, int f
     e->N_max=max_prompt+e->canvas_length;
 
     int fd=open(path,O_RDONLY); if(fd<0){delete e;return nullptr;}
-    struct stat st; fstat(fd,&st); e->mmap_size=st.st_size;
+    struct stat st; if(fstat(fd,&st)!=0||st.st_size<24){ close(fd); delete e; return nullptr; }
+    e->mmap_size=st.st_size;
     e->mmap_base=(uint8_t*)mmap(nullptr,st.st_size,PROT_READ,MAP_PRIVATE,fd,0); close(fd);
     if(e->mmap_base==MAP_FAILED){delete e;return nullptr;}
-    const uint8_t *p=e->mmap_base+8; uint64_t nt=*(uint64_t*)p; p+=8; uint64_t nkv=*(uint64_t*)p; p+=8;
-    auto rd_str=[&](const uint8_t*&q){ uint64_t l=*(uint64_t*)q; q+=8; std::string s((const char*)q,l); q+=l; return s; };
-    auto skip_val=[&](const uint8_t*&q,uint32_t vt){ if(vt==GTYPE_STR){uint64_t l=*(uint64_t*)q;q+=8+l;} else if(vt==GTYPE_ARR){uint32_t at=*(uint32_t*)q;q+=4;uint64_t c=*(uint64_t*)q;q+=8; if(at==GTYPE_STR){for(uint64_t i=0;i<c;i++){uint64_t l=*(uint64_t*)q;q+=8+l;}} else q+=c*dg_scalar_sz(at);} else q+=dg_scalar_sz(vt); };
-    for(uint64_t i=0;i<nkv;i++){ rd_str(p); uint32_t vt=*(uint32_t*)p; p+=4; skip_val(p,vt); }
-    for(uint64_t i=0;i<nt;i++){ std::string nm=rd_str(p); DGTensor t; t.ndim=*(uint32_t*)p; p+=4; for(int d=0;d<t.ndim;d++){t.ne[d]=*(int64_t*)p;p+=8;} t.type=*(uint32_t*)p;p+=4; t.offset=*(uint64_t*)p;p+=8; t.nelem=1; for(int d=0;d<t.ndim;d++)t.nelem*=t.ne[d]; int64_t rb=dg_row_bytes(t.type,t.ne[0]),rows=1; for(int d=1;d<t.ndim;d++)rows*=t.ne[d]; t.nbytes=rb*rows; e->T[nm]=t; }
-    uint64_t off=(uint64_t)(p-e->mmap_base); off=(off+31)&~31ull; const uint8_t *data=e->mmap_base+off;
-    for(auto&kv:e->T){ DGTensor&t=kv.second; CKR(cudaMalloc(&t.dev,t.nbytes),nullptr); CKR(cudaMemcpy(t.dev,data+t.offset,t.nbytes,cudaMemcpyHostToDevice),nullptr); }
+    // Bounds-checked parse: a truncated/hostile GGUF must fail the load, not walk
+    // off the mmap (segfault) or drive an OOB cudaMemcpy. `end` is the hard limit;
+    // FAIL_LOAD unmaps and returns. Every read checks it has room BEFORE reading.
+    const uint8_t *base=e->mmap_base, *end=base+e->mmap_size;
+    #define DG_FAIL_LOAD() do{ munmap(e->mmap_base,e->mmap_size); e->mmap_base=nullptr; delete e; return nullptr; }while(0)
+    #define DG_NEED(q,n) do{ if((n)>(uint64_t)(end-(q))) DG_FAIL_LOAD(); }while(0)
+    // magic 'GGUF' (0x46554747) + version 3.
+    DG_NEED(base,8);
+    if(*(const uint32_t*)base!=0x46554747u){ DG_FAIL_LOAD(); }
+    if(*(const uint32_t*)(base+4)!=3u){ DG_FAIL_LOAD(); }
+    const uint8_t *p=base+8;
+    DG_NEED(p,16); uint64_t nt=*(uint64_t*)p; p+=8; uint64_t nkv=*(uint64_t*)p; p+=8;
+    bool ok=true; // set false by a guarded read that would overrun (checked after each loop)
+    auto rd_str=[&](const uint8_t*&q)->std::string{ if(8>(uint64_t)(end-q)){ok=false;return std::string();} uint64_t l=*(uint64_t*)q; q+=8; if(l>(uint64_t)(end-q)){ok=false;return std::string();} std::string s((const char*)q,l); q+=l; return s; };
+    auto rd_u32=[&](const uint8_t*&q)->uint32_t{ if(4>(uint64_t)(end-q)){ok=false;return 0;} uint32_t v=*(uint32_t*)q; q+=4; return v; };
+    auto rd_u64=[&](const uint8_t*&q)->uint64_t{ if(8>(uint64_t)(end-q)){ok=false;return 0;} uint64_t v=*(uint64_t*)q; q+=8; return v; };
+    auto rd_i64=[&](const uint8_t*&q)->int64_t{ if(8>(uint64_t)(end-q)){ok=false;return 0;} int64_t v=*(int64_t*)q; q+=8; return v; };
+    auto skip_val=[&](const uint8_t*&q,uint32_t vt){ if(vt==GTYPE_STR){uint64_t l=rd_u64(q); if(!ok||l>(uint64_t)(end-q)){ok=false;return;} q+=l;} else if(vt==GTYPE_ARR){uint32_t at=rd_u32(q); uint64_t c=rd_u64(q); if(!ok)return; if(at==GTYPE_STR){for(uint64_t i=0;i<c&&ok;i++){uint64_t l=rd_u64(q); if(!ok||l>(uint64_t)(end-q)){ok=false;return;} q+=l;}} else {uint64_t n=c*dg_scalar_sz(at); if(n>(uint64_t)(end-q)){ok=false;return;} q+=n;}} else {uint64_t n=dg_scalar_sz(vt); if(n>(uint64_t)(end-q)){ok=false;return;} q+=n;} };
+    for(uint64_t i=0;i<nkv&&ok;i++){ rd_str(p); uint32_t vt=rd_u32(p); if(!ok)break; skip_val(p,vt); }
+    if(!ok) DG_FAIL_LOAD();
+    for(uint64_t i=0;i<nt&&ok;i++){ std::string nm=rd_str(p); DGTensor t; t.ndim=rd_u32(p); if(!ok||t.ndim>4){DG_FAIL_LOAD();} for(int d=0;d<t.ndim;d++){t.ne[d]=rd_i64(p);} t.type=rd_u32(p); t.offset=rd_u64(p); if(!ok)break; t.nelem=1; for(int d=0;d<t.ndim;d++)t.nelem*=t.ne[d]; int64_t rb=dg_row_bytes(t.type,t.ne[0]),rows=1; for(int d=1;d<t.ndim;d++)rows*=t.ne[d]; t.nbytes=rb*rows; e->T[nm]=t; }
+    if(!ok) DG_FAIL_LOAD();
+    uint64_t off=(uint64_t)(p-base); off=(off+31)&~31ull; if(off>(uint64_t)e->mmap_size) DG_FAIL_LOAD();
+    const uint8_t *data=base+off; uint64_t avail=(uint64_t)(end-data);
+    for(auto&kv:e->T){ DGTensor&t=kv.second;
+        // Reject any tensor whose data region escapes the mmap (corrupt offset/size).
+        if(t.nbytes<0||t.offset>avail||(uint64_t)t.nbytes>avail-t.offset) DG_FAIL_LOAD();
+        CKR(cudaMalloc(&t.dev,t.nbytes),nullptr); CKR(cudaMemcpy(t.dev,data+t.offset,t.nbytes,cudaMemcpyHostToDevice),nullptr); }
+    #undef DG_NEED
+    #undef DG_FAIL_LOAD
 
     if(cublasCreate(&e->cub)!=CUBLAS_STATUS_SUCCESS){delete e;return nullptr;}
     cublasSetMathMode(e->cub,CUBLAS_DEFAULT_MATH);    // enables bf16 tensor-core gemmEx; sgemm stays fp32
