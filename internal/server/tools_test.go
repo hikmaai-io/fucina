@@ -87,7 +87,9 @@ func TestToolCallRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip calls = %+v", got)
 	}
 	var args map[string]interface{}
-	json.Unmarshal([]byte(got[0].Function.Arguments), &args)
+	if err := json.Unmarshal([]byte(got[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("unmarshal args: %v", err)
+	}
 	if args["q"] != "golang" {
 		t.Errorf("q = %v", args["q"])
 	}

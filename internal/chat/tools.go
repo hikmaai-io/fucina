@@ -109,7 +109,8 @@ func renderProperty(p map[string]interface{}) string {
 	if ts, ok := p["type"].(string); ok {
 		typ = strings.ToUpper(ts)
 	}
-	if typ == "STRING" {
+	switch typ {
+	case "STRING":
 		if en, ok := p["enum"].([]interface{}); ok && len(en) > 0 {
 			var es []string
 			for _, e := range en {
@@ -117,11 +118,11 @@ func renderProperty(p map[string]interface{}) string {
 			}
 			parts = append(parts, "enum:["+strings.Join(es, ",")+"]")
 		}
-	} else if typ == "ARRAY" {
+	case "ARRAY":
 		if items, ok := p["items"].(map[string]interface{}); ok {
 			parts = append(parts, "items:"+renderProperty(items))
 		}
-	} else if typ == "OBJECT" {
+	case "OBJECT":
 		if _, ok := p["properties"]; ok {
 			return renderParamSchema(p) // nested object reuses the object renderer
 		}
@@ -434,7 +435,21 @@ func stripChannels(s string) string {
 
 // ─── gemma-4 value parser (dict/array/string/number/bool/null) ─────────
 
+// maxParseDepth bounds the recursive-descent nesting. The value body comes from
+// model output (attacker-influenceable), and the recursion value→dict/array→value
+// is otherwise unbounded: a deeply nested payload (~2M brackets) overflows the
+// goroutine stack with a FATAL error that no recover can catch. This cap turns
+// that crash into a graceful parse failure. Real tool calls nest only a few deep.
+const maxParseDepth = 256
+
 func parseGemmaValue(s string, i int) (interface{}, int, bool) {
+	return parseGemmaValueDepth(s, i, 0)
+}
+
+func parseGemmaValueDepth(s string, i, depth int) (interface{}, int, bool) {
+	if depth > maxParseDepth {
+		return nil, i, false
+	}
 	i = skipSpace(s, i)
 	if i >= len(s) {
 		return nil, i, false
@@ -477,9 +492,9 @@ func parseGemmaValue(s string, i int) (interface{}, int, bool) {
 	}
 	switch s[i] {
 	case '{':
-		return parseGemmaDict(s, i)
+		return parseGemmaDict(s, i, depth)
 	case '[':
-		return parseGemmaArray(s, i)
+		return parseGemmaArray(s, i, depth)
 	}
 	if strings.HasPrefix(s[i:], "true") {
 		return true, i + 4, true
@@ -502,7 +517,7 @@ func parseGemmaValue(s string, i int) (interface{}, int, bool) {
 	return tok, j, true // fall back to bare string
 }
 
-func parseGemmaDict(s string, i int) (interface{}, int, bool) {
+func parseGemmaDict(s string, i, depth int) (interface{}, int, bool) {
 	m := map[string]interface{}{}
 	i++ // consume '{'
 	i = skipSpace(s, i)
@@ -521,7 +536,7 @@ func parseGemmaDict(s string, i int) (interface{}, int, bool) {
 		}
 		key := strings.TrimSpace(s[i:k])
 		i = k + 1 // consume ':'
-		v, ni, ok := parseGemmaValue(s, i)
+		v, ni, ok := parseGemmaValueDepth(s, i, depth+1)
 		if !ok {
 			return m, ni, false
 		}
@@ -539,7 +554,7 @@ func parseGemmaDict(s string, i int) (interface{}, int, bool) {
 	return m, i, true
 }
 
-func parseGemmaArray(s string, i int) (interface{}, int, bool) {
+func parseGemmaArray(s string, i, depth int) (interface{}, int, bool) {
 	var arr []interface{}
 	i++ // consume '['
 	i = skipSpace(s, i)
@@ -547,7 +562,7 @@ func parseGemmaArray(s string, i int) (interface{}, int, bool) {
 		return arr, i + 1, true
 	}
 	for i < len(s) {
-		v, ni, ok := parseGemmaValue(s, i)
+		v, ni, ok := parseGemmaValueDepth(s, i, depth+1)
 		if !ok {
 			return arr, ni, false
 		}

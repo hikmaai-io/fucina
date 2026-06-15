@@ -32,9 +32,6 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	if args.System != "" {
 		prompt = fmt.Sprintf("System: %s\n\n%s", args.System, prompt)
 	}
-	if tok == nil {
-		log.Fatalf("fucina: tokenizer not available")
-	}
 
 	// Tokenize
 	tokens := tok.Encode(prompt, true, false)

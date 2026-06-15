@@ -111,11 +111,13 @@ func main() {
 
 	tok, err := tokenizer.New(ggufData, int64(len(ggufData)))
 	if err != nil {
-		log.Printf("fucina: warning: tokenizer init (will use fallback): %v", err)
-		tok = nil
+		// There is no tokenizer fallback: every mode (server, REPL, one-shot)
+		// needs Encode/Decode. A nil tokenizer in server mode would serve every
+		// request blind, so fail fast and loud rather than start broken.
+		log.Fatalf("fucina: tokenizer init failed: %v", err)
 	}
 
-	if args.Verbose && tok != nil {
+	if args.Verbose {
 		log.Printf("fucina: tokenizer loaded (%d tokens)", tok.NumTokens())
 	}
 
@@ -142,6 +144,19 @@ func main() {
 		srv.SetDraftK(args.DraftK)
 		srv.SetThinkBudget(args.ThinkBudget)
 		srv.SetKVSnapshotBudget(int64(args.KVSnapshotGB * (1 << 30)))
+		// Auth: flag wins, else FUCINA_API_KEY. Empty leaves auth disabled.
+		apiKey := args.APIKey
+		if apiKey == "" {
+			apiKey = os.Getenv("FUCINA_API_KEY")
+		}
+		srv.SetAPIKey(apiKey)
+		if apiKey != "" {
+			log.Printf("fucina: API-key auth ENABLED on /v1/*")
+		} else if args.Host != "127.0.0.1" && args.Host != "localhost" {
+			log.Printf("fucina: WARNING — binding %s with NO API key; /v1/* is unauthenticated. Set --api-key or FUCINA_API_KEY.", args.Host)
+		}
+		srv.SetMaxConcurrent(args.MaxConcurrent) // 0 ignored (keeps default)
+		srv.SetMaxOutputTokens(args.MaxOutputToks)
 		// Debug request dumping: --debug or --log-level debug.
 		if args.Debug || strings.EqualFold(args.LogLevel, "debug") {
 			srv.SetDebug(true)
@@ -170,9 +185,6 @@ func main() {
 		}
 	} else if args.Interactive {
 		// ── Interactive REPL ─────────────────────────────────────────────
-		if tok == nil {
-			log.Fatalf("fucina: tokenizer not available")
-		}
 		runInteractive(eng, tok, args)
 	} else {
 		// ── One-shot prompt ───────────────────────────────────────────────

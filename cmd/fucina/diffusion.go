@@ -341,8 +341,25 @@ func runDiffusionServer(args CLIArgs, tok *tokenizer.Tokenizer, eng *diffusion.E
 	// Requests echo back whatever `model` the client sends, so any pi/OpenAI provider id works.
 	modelID := strings.TrimSuffix(filepath.Base(args.ModelPath), ".gguf")
 
+	// Auth, matching the dense server: flag wins, else FUCINA_API_KEY. /v1/* routes
+	// are wrapped with the same bearer check so a configured key is NOT silently
+	// ignored on the diffusion path (an unauthenticated GPU otherwise).
+	apiKey := args.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("FUCINA_API_KEY")
+	}
+	authed := func(f http.HandlerFunc) http.HandlerFunc { return gemserver.BearerAuth(apiKey, f) }
+	if apiKey != "" {
+		log.Printf("fucina: API-key auth ENABLED on /v1/*")
+	} else if args.Host != "127.0.0.1" && args.Host != "localhost" {
+		log.Printf("fucina: WARNING — binding %s with NO API key; /v1/* is unauthenticated. Set --api-key or FUCINA_API_KEY.", args.Host)
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/chat/completions", authed(func(w http.ResponseWriter, r *http.Request) {
+		// Bound the body: without this any client could OOM the process that owns
+		// the GPU (the dense server caps at the same 64 MiB).
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
 		var req gemserver.ChatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Messages) == 0 {
 			http.Error(w, `{"error":{"message":"invalid request","type":"invalid_request_error"}}`, http.StatusBadRequest)
@@ -446,21 +463,33 @@ func runDiffusionServer(args CLIArgs, tok *tokenizer.Tokenizer, eng *diffusion.E
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
-	})
+	}))
 	// OpenAI model discovery (shared gemserver types). Any id under /v1/models/{id} → the served model.
 	modelObj := gemserver.ModelInfo{ID: modelID, Object: "model", Created: time.Now().Unix(), OwnedBy: "fucina"}
-	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/models", authed(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(gemserver.ModelsResponse{Object: "list", Data: []gemserver.ModelInfo{modelObj}})
-	})
-	mux.HandleFunc("/v1/models/", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("/v1/models/", authed(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(modelObj)
-	})
+	}))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
 
 	log.Printf("fucina: diffusion server on http://%s (OpenAI: POST /v1/chat/completions [+stream], GET /v1/models)", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	// Hardened server (mirrors the dense server): a header read timeout defeats
+	// slowloris and an idle timeout reaps dead keep-alive connections. No
+	// WriteTimeout: generations stream for many seconds and a write deadline
+	// would kill long responses.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("fucina: server: %v", err)
 	}
 }

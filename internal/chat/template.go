@@ -95,7 +95,39 @@ func (r Renderer) turnExtra(i int) string {
 	return r.TurnExtra(i)
 }
 
-// Render builds the full gemma-4 prompt from messages.
+// controlMarkers are the gemma-4 turn/channel/tool literals that only the SERVER
+// may emit. If they appear verbatim in caller-supplied content they tokenize to
+// the real control ids, letting a user/tool message spoof a turn boundary or
+// fabricate a tool call (role confusion). sanitizeContent neutralizes them in
+// untrusted content by inserting a zero-width space after the leading '<' so the
+// literal no longer matches; assistant turns are NOT sanitized (their content is
+// the model's own output and must stay byte-exact for KV prefix-cache reuse).
+var controlMarkers = []string{
+	"<|turn>", "<turn|>", "<|channel>", "<channel|>", "<|think|>",
+	"<|tool>", "<tool|>", "<|tool_call>", "<tool_call|>",
+	"<|tool_response>", "<tool_response|>", `<|"|>`,
+}
+
+// zeroWidthSpace breaks a control-marker literal when inserted after its leading
+// '<' (so it no longer tokenizes to the control id) while staying visually
+// invisible if the content is ever displayed.
+const zeroWidthSpace = "\u200b"
+
+func sanitizeContent(s string) string {
+	if !strings.Contains(s, "<") {
+		return s // fast path: no marker can be present
+	}
+	for _, m := range controlMarkers {
+		if strings.Contains(s, m) {
+			s = strings.ReplaceAll(s, m, "<"+zeroWidthSpace+m[1:])
+		}
+	}
+	return s
+}
+
+// Render builds the full gemma-4 prompt from messages. Untrusted content
+// (system/user/tool) is run through sanitizeContent to prevent control-marker
+// injection; assistant turns are reproduced verbatim for KV prefix-cache match.
 func (r Renderer) Render(messages []Message) string {
 	var sb strings.Builder
 	open := r.modelTurnOpen()
@@ -106,7 +138,7 @@ func (r Renderer) Render(messages []Message) string {
 	sysContent := ""
 	start := 0
 	if len(messages) > 0 && messages[0].Role == "system" {
-		sysContent = messages[0].Content
+		sysContent = sanitizeContent(messages[0].Content)
 		start = 1
 	}
 	if sysContent != "" || r.SystemExtra != "" || r.EnableThinking {
@@ -123,14 +155,14 @@ func (r Renderer) Render(messages []Message) string {
 		msg := messages[i]
 		switch msg.Role {
 		case "system":
-			fmt.Fprintf(&sb, "<|turn>system\n%s<turn|>\n", msg.Content)
+			fmt.Fprintf(&sb, "<|turn>system\n%s<turn|>\n", sanitizeContent(msg.Content))
 		case "user":
-			fmt.Fprintf(&sb, "<|turn>user\n%s<turn|>\n", msg.Content)
+			fmt.Fprintf(&sb, "<|turn>user\n%s<turn|>\n", sanitizeContent(msg.Content))
 		case "tool":
 			if r.ToolResponse != nil {
 				sb.WriteString(r.ToolResponse(i))
 			} else {
-				sb.WriteString(msg.Content)
+				sb.WriteString(sanitizeContent(msg.Content))
 			}
 		case "assistant":
 			extra := r.turnExtra(i)

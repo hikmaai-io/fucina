@@ -140,6 +140,12 @@ type fakeServerEngine struct {
 	decodeNoCopy     int
 	sampleDeviceHits int
 	specCalls        int
+	lastMaxNew       int // maxNew passed to the last GenerateSpecStream call
+
+	// test hooks for concurrency tests: onGenStart fires when generation begins,
+	// blockGen (if non-nil) blocks generation until the channel is closed/sent to.
+	onGenStart func()
+	blockGen   chan struct{}
 }
 
 func (f *fakeServerEngine) scriptAt(i int) int32 {
@@ -197,6 +203,13 @@ func (f *fakeServerEngine) GenerateSpecStream(history []int32, firstLogits []flo
 	stops []int32, draftK int, temp float32, topK int, topP, minP, repeatPenalty float32, seed uint64,
 	emit func(int32) bool) ([]int32, int, error) {
 	f.specCalls++
+	f.lastMaxNew = maxNew
+	if f.onGenStart != nil {
+		f.onGenStart()
+	}
+	if f.blockGen != nil {
+		<-f.blockGen
+	}
 	isStop := func(t int32) bool {
 		for _, s := range stops {
 			if s == t {

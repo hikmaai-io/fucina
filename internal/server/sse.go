@@ -47,6 +47,12 @@ type sseWriter struct {
 
 const sseWriteTimeout = 30 * time.Second
 
+// sseKeepAlive bounds how long generation may run WITHOUT writing any wire bytes
+// (a long suppressed-token span: reasoning labels, a buffered tool call) before
+// the handler emits a ": ping" comment, so idle-timeout proxies don't kill a
+// working connection. Well under the 30s write deadline.
+const sseKeepAlive = 10 * time.Second
+
 // newSSEWriter prepares (but does not start) an SSE session. ok=false when the
 // ResponseWriter cannot stream.
 func newSSEWriter(w http.ResponseWriter, legacy bool, model string) (*sseWriter, bool) {
@@ -126,16 +132,22 @@ func (e *sseWriter) stopHeartbeat() {
 	e.hbStop = nil
 }
 
-// ping writes an SSE comment line (invisible to SSE parsers) and flushes.
+// ping writes an SSE comment line (invisible to SSE parsers) and flushes. A
+// raw-write error (broken pipe before any flush deadline fires) marks the writer
+// dead so generation can stop instead of writing into a closed socket.
 func (e *sseWriter) ping() {
-	fmt.Fprint(e.w, ": ping\n\n")
+	if _, err := fmt.Fprint(e.w, ": ping\n\n"); err != nil {
+		e.writeErr.Store(true)
+	}
 	e.flush()
 }
 
 // writeEvent marshals v as one `data:` event (no flush — pair with flush()).
 func (e *sseWriter) writeEvent(v interface{}) {
 	data, _ := json.Marshal(v)
-	fmt.Fprintf(e.w, "data: %s\n\n", data)
+	if _, err := fmt.Fprintf(e.w, "data: %s\n\n", data); err != nil {
+		e.writeErr.Store(true)
+	}
 }
 
 // event writes + flushes one data event.
@@ -155,7 +167,9 @@ func (e *sseWriter) errorEvent(msg string) {
 
 // done writes the terminal [DONE] sentinel and flushes.
 func (e *sseWriter) done() {
-	fmt.Fprint(e.w, "data: [DONE]\n\n")
+	if _, err := fmt.Fprint(e.w, "data: [DONE]\n\n"); err != nil {
+		e.writeErr.Store(true)
+	}
 	e.flush()
 }
 

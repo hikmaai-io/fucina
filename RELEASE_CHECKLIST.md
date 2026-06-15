@@ -41,7 +41,7 @@ rewrites, and `git mv cmd/gem4d cmd/fucina`.
 - [x] `.github/` issue + PR templates (hardware gate), `config.yml` (no blank issues), CI (CPU tests)
 - [x] `.gitignore` covers models, GGUFs, sqlite, runs/, data/, build artifacts
 - [x] History clean: linear, no committed binaries, no co-author trailers
-- [x] `CHANGELOG.md` (v0.1.0) + `docs/launch/RELEASE_NOTES_v0.1.0.md` + `docs/launch/announcement.md`
+- [x] `CHANGELOG.md` (v0.1.0) + `docs/launch/RELEASE_NOTES_v0.1.0.md`
 - [x] `scripts/release/rename.sh` and `scripts/release/publish.sh` (executable)
 
 ## 3 · Ship (after the rename + a green GB10 build)
@@ -55,8 +55,8 @@ rewrites, and `git mv cmd/gem4d cmd/fucina`.
       `gh release create v0.1.0 --title 'fucina v0.1.0' --notes-file docs/launch/RELEASE_NOTES_v0.1.0.md`
 
 ## 4 · Launch (optional)
-- [ ] Use the drafts in [`docs/launch/announcement.md`](docs/launch/announcement.md) (blog · Show HN
-      · X thread · r/LocalLLaMA) — hook: *parity-to-ahead of llama.cpp on the DGX Spark GB10*
+- [ ] Draft the launch posts (blog · Show HN · X thread · r/LocalLLaMA) — hook: *parity-to-ahead of
+      llama.cpp on the DGX Spark GB10*
 - [ ] Be explicit everywhere: experimental, single-hardware, best-effort support
 
 ## 5 · Post-launch

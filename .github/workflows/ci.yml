@@ -39,5 +39,21 @@ jobs:
       - name: go vet
         run: go vet $PKGS
 
-      - name: go test
-        run: go test $PKGS -count=1
+      - name: golangci-lint
+        # v7 is required for golangci-lint v2 (v6 only supports v1.x).
+        uses: golangci/golangci-lint-action@v7
+        with:
+          # Must be built with Go >= the go.mod target (1.26): older builds refuse
+          # to lint a newer language version. v2.11.4 is built with go1.26.
+          version: v2.11.4
+          # Lint only the pure-Go packages (same set as $PKGS). The cgo engine and
+          # cmd/ need libfucina.a and are excluded, mirroring the Makefile.
+          args: ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+
+      - name: go test (race)
+        run: go test $PKGS -race -count=1
+
+      - name: go test (coverage)
+        run: |
+          go test $PKGS -count=1 -coverprofile=cover.out
+          go tool cover -func=cover.out | tail -1
