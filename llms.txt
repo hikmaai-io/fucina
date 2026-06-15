@@ -1,60 +1,110 @@
-# gem4d
+# fucina
 
 > A Gemma 4 12B inference engine in Go + CUDA C++, built for exactly one target: the NVIDIA DGX
 > Spark **GB10** (Blackwell, `sm_121a`, CUDA 13.0). Loads Q4_0 (QAT) / Q8_0 GGUF weights, runs the
-> full forward pass on-GPU with FP8 Tensor-Core attention, and serves an OpenAI-compatible HTTP
-> API plus one-shot and interactive CLI modes. Hardware-specific and experimental.
+> full forward pass on-GPU with FP8 Tensor-Core attention, and serves an OpenAI-compatible HTTP API
+> plus one-shot and interactive CLI modes. It also runs the experimental DiffusionGemma 26B-A4B
+> MoE model via `-dm`. Apache-2.0, **experimental, hardware-specific, no support**.
+> *fucina* is Italian for **forge**. Repo: `github.com/hikmaai-io/fucina` (formerly `gem4d`).
 
-The model is Gemma 4 12B: 48 layers (40 sliding-window + 8 global attention), GeGLU FFN
-(`gelu_pytorch_tanh`, intermediate 15360), RoPE/p-RoPE, logit softcap 30.0, vocab 262144, a Q6_K
-tied LM head, hidden 3840. Decode on GB10 is **memory-bandwidth-bound on total weight bytes**: the
-levers that move it are CUDA-graph launch-bubble removal and speculation acceptance (τ), not
-weight-load width.
+This file orients an LLM/coding agent so it can answer questions about the repo AND actually run
+inference. Module path: `github.com/hikmaai-io/fucina`. Binary: `fucina`.
 
-## Architecture (bottom-up)
+## Hard constraints (read before doing anything)
+
+- **Hardware:** runs ONLY on the DGX Spark GB10 (`sm_121` / built as `sm_121a`). It will NOT build
+  or run on other GPUs (RTX 30xx/40xx/50xx, A100, H100, B100/B200) — the Makefile pins `CUDA_ARCH`
+  and the hot paths use GB10 FP8/NVFP4 tensor-core features. Do not attempt ports casually.
+- **Toolchain:** CUDA 13.0 at `/usr/local/cuda-13`, Go 1.26 at `/usr/local/go` (override via
+  `NVCC`/`CUDA_HOME`/`GO` make vars). `build-essential` (gcc/g++, make, ar).
+- **Quant:** only **Q4_0 (QAT)** or **Q8_0** GGUF for the dense 12B; other formats are rejected.
+- **Never commit/push model weights** — `*.gguf`, `*.safetensors`, `/models/` are git-ignored.
+
+## Run inference (copy-paste)
+
+```sh
+# 1. install deps (DGX OS / Ubuntu)
+sudo apt-get install -y build-essential
+pip install -U "huggingface_hub[cli]"
+
+# 2. build the dense engine (add CUTLASS_DIR=... only if you also want DiffusionGemma)
+make                       # -> ./fucina  (asserts cubin sm_121a + device-upload path)
+
+# 3. download a model (Q4_0 QAT recommended; optional MTP draft head)
+hf download google/gemma-4-12B-it-qat-q4_0-gguf gemma-4-12b-it-qat-q4_0.gguf --local-dir ./models
+hf download unsloth/gemma-4-12b-it-GGUF MTP/gemma-4-12b-it-Q8_0-MTP.gguf --local-dir ./models
+
+# 4a. run as an OpenAI-compatible server
+./fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --ctx 32768 --host 0.0.0.0 --port 8080
+curl http://localhost:8080/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# 4b. run as an interactive REPL (commands: /reset /stats /quit)
+./fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --interactive
+
+# 4c. one-shot
+./fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf -p "Write a haiku about CUDA." -n 100
+
+# 5. MTP speculative decoding (faster; works in all 3 modes) — add the draft head:
+./fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
+         --assistant ./models/MTP/gemma-4-12b-it-Q8_0-MTP.gguf --interactive
+```
+
+- **Gotcha:** a *raw* `-p` prompt on this instruction-tuned model degenerates into repetition. For
+  coherent output use the chat path (server `/v1/chat/completions`, or the REPL) — both apply the
+  gemma-4 chat template. `make smoke` uses a raw prompt on purpose (it only checks the engine runs).
+- Watch speculation live at `/metrics` → `speculation` (`accept_rate`, `tokens_per_forward`). Decode
+  on GB10 is bandwidth-bound on weight bytes; the levers are CUDA-graph launch-bubble removal + τ.
+- Key flags: `--ctx` (default 262144; lower to save VRAM), `--temp`/`--top-k`/`--top-p`,
+  `--thinking off|on|low|mid|high|xhigh`, `--spec` (on), `--draft-k`, `--assistant`. `fucina --help`.
+
+## DiffusionGemma (optional, experimental)
+
+```sh
+make CUTLASS_DIR=/path/to/cutlass          # needs CUTLASS headers (pip install flashinfer vendors them)
+hf download unsloth/diffusiongemma-26B-A4B-it-GGUF diffusiongemma-26B-A4B-it-Q4_K_M.gguf --local-dir ./models
+./fucina -dm ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --denoise-steps 16 -p "Explain hashing."
+```
+Block text-diffusion (256-token canvas), not autoregressive; no token streaming; `-dm` implies the
+NVFP4 MoE experts. See README "DiffusionGemma".
+
+## Architecture (key files)
 
 - [cuda/gemma4_kernels.cu](cuda/gemma4_kernels.cu): the entire dense-12B forward pass — quantized
-  GEMV/GEMM (Q4_0/Q6_K/Q8_0 dp4a, warp-per-row), FP8 flash attention, RoPE, RMSNorm, GeGLU, GPU
-  sampling, and the CUDA-graph capture/replay. Compiled to `cuda/libgem4d.a`.
-- [cuda/gemma4_kernels.cuh](cuda/gemma4_kernels.cuh): model dimensions and the engine struct.
-- [internal/engine/cuda/bridge.go](internal/engine/cuda/bridge.go): the CGO bridge — wraps the
-  opaque CUDA engine as a Go `Engine` (`NewEngine`, `Prefill`, `Decode`, `DecodeNoCopy`,
-  `SampleDevice`, `GenerateSpec`, `LoadAssistant`, `SpecStats`, …).
-- [internal/server](internal/server): OpenAI-compatible HTTP server, gemma-4 chat template, tool-call
-  parsing, thinking channel, prefix-reuse KV cache.
-- [internal/tokenizer](internal/tokenizer): Gemma 4 SentencePiece/Unigram tokenizer.
-- [cmd/gem4d](cmd/gem4d): CLI entry point and the three run modes (`main.go`, `oneshot.go`, `args.go`).
+  GEMV/GEMM (Q4_0/Q6_K/Q8_0 dp4a), FP8 flash attention, RoPE, RMSNorm, GeGLU, GPU sampling, CUDA
+  graphs, and the MTP draft head + speculative-verify loop. Compiled to `cuda/libfucina.a`.
+- [cuda/gemma4_kernels.cuh](cuda/gemma4_kernels.cuh): model dimensions + engine struct.
+- [internal/engine/cuda/bridge.go](internal/engine/cuda/bridge.go): cgo bridge (`NewEngine`,
+  `Prefill`, `Decode`, `GenerateSpec`, `LoadAssistant`, `SampleDevice`, …).
+- [internal/server](internal/server): OpenAI-compatible HTTP server, gemma-4 chat template, tool
+  calls, thinking channel, prefix-reuse KV cache, `/metrics` + `/health`.
+- [internal/tokenizer](internal/tokenizer): Gemma 4 SentencePiece/Unigram tokenizer (vocab 262144).
+- [cmd/fucina](cmd/fucina): CLI entry point + run modes (`main.go`, `args.go`, `oneshot.go`, `repl.go`).
+- DiffusionGemma (separate engine): [cuda/diffusion_gemma_engine.cu](cuda/diffusion_gemma_engine.cu),
+  [cuda/diffusion_gemma_kernels.cu](cuda/diffusion_gemma_kernels.cu),
+  [cuda/dg_fp4_moe.cu](cuda/dg_fp4_moe.cu) (CUTLASS NVFP4 expert GEMM),
+  [internal/engine/diffusion](internal/engine/diffusion), [cmd/fucina/diffusion.go](cmd/fucina/diffusion.go).
 
-## Build & run
+## Model facts
 
-- [Makefile](Makefile): `make` builds `cuda/libgem4d.a` (nvcc `-arch=sm_121a`) then the Go binary;
-  it verifies the cubin arch and the device-upload code path (cgo does not hash the static archive).
-- [README.md](README.md): full build, usage, flags, HTTP API, and performance summary.
-- Run: `gem4d -m model.gguf --ctx 32768 --port 8080` (server) or `gem4d -m model.gguf -p "Hi" -n 100`.
-- Smoke test: `make smoke`. CPU tests: `go test ./internal/server/ ./internal/tokenizer/`.
+Gemma 4 12B: 48 layers (40 sliding-window + 8 global), GeGLU FFN (`gelu_pytorch_tanh`, intermediate
+15360), RoPE/p-RoPE, logit softcap 30.0, vocab 262144, hidden 3840, Q6_K tied LM head. KV cache is
+FP8 E4M3 (~54 GiB at full 262144 ctx — fits GB10's 128 GB unified memory). The MTP draft head is a
+4-layer `gemma4-assistant` GGUF (~444 MB Q8_0), a build of `google/gemma-4-12B-it-assistant`.
 
-## Decode performance facts
+## Build / test / dev
 
-- **CUDA graphs** are position-independent (device-resident position, KV writes inside the graph)
-  and cover single-token decode + the K-row batched speculative-verify forward; both replayed every
-  step. Pre-captured at startup by `Warmup()`. Opt out: `GEM4D_NO_DECODE_GRAPH=1`,
-  `GEM4D_NO_BATCHED_GRAPH=1`.
-- **Packed-Q4_0** (`[16-B quants ‖ fp16 scales]`, coalesced `uint4` loads) is default-on, bit-exact,
-  opt out `GEM4D_NO_PACKED=1`. Net ~neutral on single-token decode — decode is bandwidth-bound, so
-  wider loads cut instruction count but not bytes. Do not expect a speedup from load width here.
-- **FP8 E4M3 KV cache** (1 B/elem). Attention is not the gap; weight-load bandwidth is.
-- Observe speculation acceptance live in `/metrics` → `speculation` block (`accept_rate`,
-  `tokens_per_forward`). τ is the highest-leverage decode tunable.
+- [Makefile](Makefile): `make` (dense + diffusion), `make smoke` (build + raw-prompt run),
+  `make check` (vet + pure-Go tests), `make test` (adds GPU self-tests). Overridable paths:
+  `NVCC` `CUDA_HOME` `GO` `CUTLASS_DIR` `DG_GGUF`.
+- CPU-only tests (no GPU): `go test ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/`.
+- Correctness bar: greedy output bit-exact vs reference; `compute-sanitizer` clean. Harnesses:
+  [scripts/pi_bench.py](scripts/pi_bench.py), [scripts/parity_bench.py](scripts/parity_bench.py),
+  [scripts/benchmark_gem4.py](scripts/benchmark_gem4.py).
 
-## Benchmarks
+## More
 
-- [scripts/pi_bench.py](scripts/pi_bench.py): fair side-by-side vs an OpenAI-compatible server
-  (divergence-free transcript) — the canonical decode/prefill head-to-head.
-- [scripts/parity_bench.py](scripts/parity_bench.py): bit-exact fingerprint + suffix-prefill parity.
-- [scripts/benchmark_gem4.py](scripts/benchmark_gem4.py): prefill-decay, decode-rate, tool-loop.
-
-## Optional / separate efforts
-
-- DiffusionGemma (block text-diffusion MoE) is a **separate, in-progress** engine (`cuda/diffusion_*`,
-  `internal/engine/diffusion/`, `cmd/gem4d/diffusion.go`) — not part of the dense-12B path above.
-- NVFP4 / FP4 tensor-core GEMM (`GEM4D_FP4`) is experimental prefill work, separate from dense decode.
+- [README.md](README.md): full install, models, usage, MTP, HTTP API, hardware, status.
+- [CHANGELOG.md](CHANGELOG.md) · [LICENSE](LICENSE) (Apache-2.0) · [NOTICE](NOTICE) ·
+  [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md).
+- Status: experimental, single-hardware (GB10), best-effort support only.

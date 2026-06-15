@@ -83,7 +83,23 @@ LM head — loaded from **Q4_0 (QAT)** or **Q8_0** GGUF weights.
 
 ## 🚀 Quick start
 
-### 1. Build
+### 1. Install dependencies
+
+fucina runs on a **DGX Spark GB10** (see [Hardware support](#-hardware-support)). You need:
+
+| Dependency | Version | How |
+|---|---|---|
+| **CUDA Toolkit** | **13.0** | Expected at `/usr/local/cuda-13`; else pass `NVCC=`/`CUDA_HOME=` to `make`. [NVIDIA CUDA downloads](https://developer.nvidia.com/cuda-downloads) |
+| **Go** | **1.26** | Expected at `/usr/local/go`; else pass `GO=` to `make`. [go.dev/dl](https://go.dev/dl/) |
+| **Build tools** | gcc/g++, make, binutils | `sudo apt-get install build-essential` (DGX OS / Ubuntu) |
+| **huggingface_hub** | Python 3.10+ | To download GGUF weights: `pip install -U "huggingface_hub[cli]"` |
+| **CUTLASS** *(DiffusionGemma only)* | sm_120-capable headers | `pip install flashinfer` vendors them, or `git clone https://github.com/NVIDIA/cutlass`; pass `CUTLASS_DIR=` to `make` |
+
+> [!NOTE]
+> The dense Gemma 4 engine needs only CUDA + Go + build tools. **CUTLASS is required only for the
+> optional [DiffusionGemma](#-diffusiongemma) engine** — skip it if you only want the 12B.
+
+### 2. Build
 
 ```sh
 make
@@ -120,36 +136,61 @@ DG_NVFP4_CKPT=/data/dg-nvfp4-snapshot python3 scripts/dg_nvfp4_convert.py --insp
 DG_GGUF=/data/dg.gguf python3 scripts/dg_dump_tensor.py /tmp/out
 ```
 
-### 2. Get a model
+### 3. Download a model
 
 ```sh
-pip install -U "huggingface_hub[cli]"
-
 # Gemma 4 12B — Q4_0 QAT (recommended; official Google QAT GGUF)
 hf download google/gemma-4-12B-it-qat-q4_0-gguf \
   gemma-4-12b-it-qat-q4_0.gguf --local-dir ./models
+
+# Optional: the MTP draft head for faster decode (see step 4 / MTP)
+hf download unsloth/gemma-4-12b-it-GGUF \
+  MTP/gemma-4-12b-it-Q8_0-MTP.gguf --local-dir ./models
 ```
 
-See [Models](#-models) for Q8_0, the MTP draft head, and DiffusionGemma.
+See [Models](#-models) for the Q8_0 dense build and the DiffusionGemma weights.
 
-### 3. Run
+### 4. Run
+
+**As an OpenAI-compatible server:**
 
 ```sh
-# Server (OpenAI-compatible)
 fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --ctx 32768 --host 0.0.0.0 --port 8080
-
-# One-shot prompt
-fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf -p "Write a haiku about CUDA." -n 100
-
-# Interactive REPL (/reset, /stats, /quit)
-fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --interactive
 ```
 
 ```sh
-# Talk to the server
+# then, from another shell:
 curl http://localhost:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
+
+See [HTTP API](#-http-api) for every endpoint.
+
+**As an interactive REPL:**
+
+```sh
+fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --interactive
+```
+
+A multi-turn chat with prefix-reuse caching. Commands: `/reset` (clear the conversation),
+`/stats` (KV-cache hit rate), `/quit` (or Ctrl-D).
+
+**As a one-shot prompt:**
+
+```sh
+fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf -p "Write a haiku about CUDA." -n 100
+```
+
+**With MTP speculative decoding** — add the draft head for faster decode; works in *all three*
+modes (here, the REPL):
+
+```sh
+fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
+       --assistant ./models/MTP/gemma-4-12b-it-Q8_0-MTP.gguf --interactive
+```
+
+See [Speculative decoding (MTP)](#-speculative-decoding-mtp) for how it works and how to observe
+acceptance live.
 
 ---
 
