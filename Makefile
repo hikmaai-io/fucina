@@ -142,8 +142,11 @@ lint:
 		echo "lint: golangci-lint not installed — skipping"; \
 	fi
 
-# Convenience: static analysis + unit tests in one shot.
-check: vet go-test
+# Convenience: the full pure-Go correctness bar — static analysis, lint, and the
+# unit tests under the race detector. This is the gate CI mirrors; keep them in
+# sync. `lint` soft-skips if golangci-lint is absent locally, but CI installs it
+# so a missing-tool skip can never hide a real finding on main.
+check: vet lint go-test-race
 
 # ─── DiffusionGemma (26B-A4B text-diffusion MoE) engine ───────────────────
 # Separate from the autoregressive gemma4 engine: own kernels, own forward, own

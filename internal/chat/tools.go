@@ -109,7 +109,8 @@ func renderProperty(p map[string]interface{}) string {
 	if ts, ok := p["type"].(string); ok {
 		typ = strings.ToUpper(ts)
 	}
-	if typ == "STRING" {
+	switch typ {
+	case "STRING":
 		if en, ok := p["enum"].([]interface{}); ok && len(en) > 0 {
 			var es []string
 			for _, e := range en {
@@ -117,11 +118,11 @@ func renderProperty(p map[string]interface{}) string {
 			}
 			parts = append(parts, "enum:["+strings.Join(es, ",")+"]")
 		}
-	} else if typ == "ARRAY" {
+	case "ARRAY":
 		if items, ok := p["items"].(map[string]interface{}); ok {
 			parts = append(parts, "items:"+renderProperty(items))
 		}
-	} else if typ == "OBJECT" {
+	case "OBJECT":
 		if _, ok := p["properties"]; ok {
 			return renderParamSchema(p) // nested object reuses the object renderer
 		}

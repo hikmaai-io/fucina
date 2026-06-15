@@ -39,5 +39,18 @@ jobs:
       - name: go vet
         run: go vet $PKGS
 
-      - name: go test
-        run: go test $PKGS -count=1
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.1.6
+          # Lint only the pure-Go packages (same set as $PKGS). The cgo engine and
+          # cmd/ need libfucina.a and are excluded, mirroring the Makefile.
+          args: ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+
+      - name: go test (race)
+        run: go test $PKGS -race -count=1
+
+      - name: go test (coverage)
+        run: |
+          go test $PKGS -count=1 -coverprofile=cover.out
+          go tool cover -func=cover.out | tail -1

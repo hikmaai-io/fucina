@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -64,6 +66,23 @@ type Server struct {
 	specEmitted  atomic.Int64
 	metrics      Metrics
 	httpServer   *http.Server
+
+	debugDumpFull atomic.Bool // set once the debug dump file hits its size cap
+
+	// apiKey, when non-empty, is required as `Authorization: Bearer <key>` on all
+	// /v1/* routes (constant-time compared). Empty = auth disabled (localhost dev).
+	apiKey string
+
+	// maxOutputTokens is an absolute ceiling on tokens generated per request,
+	// independent of the context window, so one client cannot monopolize the
+	// single-flight GPU for a 130k-token generation. 0 = no extra cap.
+	maxOutputTokens int
+
+	// inflight bounds concurrent inference. The engine is single-flight, so this
+	// is a small buffered channel acting as an admission queue: a full channel
+	// means the server is saturated and new requests get 503 instead of piling
+	// up unbounded goroutines (each holding a buffered body) behind the kv lock.
+	inflight chan struct{}
 }
 
 // prefillAborter is satisfied by engines that support cooperative prefill
@@ -404,6 +423,62 @@ func DefaultParams() GenerationParams {
 	}
 }
 
+// validateAndClampParams sanitizes sampling parameters before they cross into the
+// CUDA C kernels (where there is no bounds checking). It clamps in-range values
+// and returns a non-empty message for values that cannot be safely coerced
+// (NaN/Inf), so the caller can reject the request with 400. vocab is the
+// tokenizer vocabulary size (the upper bound for top_k).
+func validateAndClampParams(p *GenerationParams, vocab int) string {
+	// NaN/Inf cannot be clamped meaningfully — reject rather than guess. A fixed
+	// array (not a map) keeps this stack-allocated on the per-request hot path and
+	// makes the reported field deterministic (map iteration order is random).
+	for _, f := range [...]struct {
+		name string
+		v    float64
+	}{
+		{"temperature", p.Temperature}, {"top_p", p.TopP},
+		{"min_p", p.MinP}, {"repeat_penalty", p.RepeatPenalty},
+	} {
+		if math.IsNaN(f.v) || math.IsInf(f.v, 0) {
+			return "invalid " + f.name + ": must be a finite number"
+		}
+	}
+	// top_k: negative is nonsense to the device kernel; 0 means "no top-k". Cap at
+	// the vocabulary size so it can never index past the logits buffer.
+	if p.TopK < 0 {
+		p.TopK = 0
+	}
+	if vocab > 0 && p.TopK > vocab {
+		p.TopK = vocab
+	}
+	// Probabilities live in [0,1]; temperature must be non-negative (0 = greedy).
+	p.TopP = clamp01(p.TopP)
+	p.MinP = clamp01(p.MinP)
+	if p.Temperature < 0 {
+		p.Temperature = 0
+	}
+	if p.RepeatPenalty < 0 {
+		p.RepeatPenalty = 0
+	}
+	return ""
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// defaultInflight is the admission-queue depth: the engine runs one request at a
+// time, so this is 1 in-flight plus a small wait queue. Beyond it, requests get
+// 503 instead of stacking unbounded goroutines (each pinning a buffered body)
+// behind the kv lock. Tunable via SetMaxConcurrent.
+const defaultInflight = 4
+
 func New(eng serverEngine, tok *tokenizer.Tokenizer) *Server {
 	s := &Server{
 		engine:    eng,
@@ -412,9 +487,31 @@ func New(eng serverEngine, tok *tokenizer.Tokenizer) *Server {
 		modelName: "gemma-4-12b-it",
 		genParams: DefaultParams(),
 		draftK:    6,
+		inflight:  make(chan struct{}, defaultInflight),
 	}
 	s.logLevel.Store(int32(logLevelInfo))
 	return s
+}
+
+// SetAPIKey enables bearer-token auth on /v1/* routes. Empty disables auth
+// (localhost dev default). The key is compared in constant time.
+func (s *Server) SetAPIKey(key string) { s.apiKey = key }
+
+// SetMaxOutputTokens sets an absolute ceiling on generated tokens per request,
+// independent of the context window, so one client cannot monopolize the
+// single-flight GPU for a 130k-token generation. 0 = no extra cap.
+func (s *Server) SetMaxOutputTokens(n int) {
+	if n >= 0 {
+		s.maxOutputTokens = n
+	}
+}
+
+// SetMaxConcurrent sets the admission-queue depth (in-flight + waiting requests).
+// Values < 1 are ignored. The engine is single-flight, so 2-8 is the useful range.
+func (s *Server) SetMaxConcurrent(n int) {
+	if n >= 1 {
+		s.inflight = make(chan struct{}, n)
+	}
 }
 
 // SetDraftK sets the speculative draft length used by the server generation
@@ -456,18 +553,83 @@ func (s *Server) SetThinkingDefault(on bool) { s.thinkingDefault = on }
 // summary is logged). Use to inspect exactly what a client like pi sends.
 func (s *Server) SetDebug(on bool) { s.debug = on }
 
-// debugDumpPath is where SetDebug(true) appends request/prompt dumps.
+// debugDumpPath is where SetDebug(true) appends request/prompt dumps. It is
+// created 0600 (owner-only): the dump contains raw prompts, which for a coding
+// agent include file contents and pasted secrets — it must not be world-readable.
 const debugDumpPath = "/tmp/fucina_debug.log"
 
+// debugDumpMaxBytes caps the dump file so an enabled --debug session cannot fill
+// the disk. Once the file reaches this size, writes are skipped (a one-line
+// notice is logged on the first skip per process).
+const debugDumpMaxBytes = 256 << 20 // 256 MiB
+
+// writeDebugDump appends s to the owner-only debug file, honoring the size cap.
+// All errors are logged rather than ignored.
+func (s *Server) writeDebugDump(dump string) {
+	if fi, err := os.Stat(debugDumpPath); err == nil && fi.Size() >= debugDumpMaxBytes {
+		if !s.debugDumpFull.Swap(true) {
+			log.Printf("fucina: debug dump %s reached %d bytes — further dumps skipped", debugDumpPath, debugDumpMaxBytes)
+		}
+		return
+	}
+	f, err := os.OpenFile(debugDumpPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Printf("fucina: debug dump open failed: %v", err)
+		return
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("fucina: debug dump close failed: %v", cerr)
+		}
+	}()
+	if _, err := f.WriteString(dump); err != nil {
+		log.Printf("fucina: debug dump write failed: %v", err)
+	}
+}
+
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	h := func(f http.HandlerFunc) http.HandlerFunc { return s.logRequest(f) }
-	mux.HandleFunc("/v1/models", h(s.handleModels))
-	mux.HandleFunc("/v1/chat/completions", h(s.handleChatCompletions))
-	mux.HandleFunc("/v1/completions", h(s.handleCompletions))
-	mux.HandleFunc("/v1/embeddings", h(s.handleEmbeddings))
-	mux.HandleFunc("/health", h(s.handleHealth))
-	mux.HandleFunc("/metrics", h(s.handleMetrics))
-	mux.HandleFunc("/", h(s.handleNotFound))
+	// /v1/* routes carry auth; health/metrics stay open for probes/scrapers. All
+	// routes get the recover + access-log middleware.
+	open := func(f http.HandlerFunc) http.HandlerFunc { return s.logRequest(f) }
+	authed := func(f http.HandlerFunc) http.HandlerFunc { return s.logRequest(s.requireAuth(f)) }
+	mux.HandleFunc("/v1/models", authed(s.handleModels))
+	mux.HandleFunc("/v1/chat/completions", authed(s.handleChatCompletions))
+	mux.HandleFunc("/v1/completions", authed(s.handleCompletions))
+	mux.HandleFunc("/v1/embeddings", authed(s.handleEmbeddings))
+	mux.HandleFunc("/health", open(s.handleHealth))
+	mux.HandleFunc("/healthz", open(s.handleHealth))
+	mux.HandleFunc("/readyz", open(s.handleReady))
+	mux.HandleFunc("/metrics", open(s.handleMetrics))
+	mux.HandleFunc("/", open(s.handleNotFound))
+}
+
+// requireAuth enforces a constant-time bearer-token check when an API key is
+// configured. With no key set (the localhost dev default) it is a pass-through.
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return BearerAuth(s.apiKey, next)
+}
+
+// BearerAuth wraps a handler with a constant-time `Authorization: Bearer <key>`
+// check. An empty key disables auth (pass-through). It is exported so the
+// separate diffusion-server mux (cmd/fucina) gets the same auth as the dense
+// server rather than silently serving unauthenticated when a key is configured.
+func BearerAuth(key string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if key == "" {
+			next(w, r)
+			return
+		}
+		const prefix = "Bearer "
+		h := r.Header.Get("Authorization")
+		if !strings.HasPrefix(h, prefix) ||
+			subtle.ConstantTimeCompare([]byte(h[len(prefix):]), []byte(key)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+				"error": map[string]string{"message": "invalid or missing API key", "type": "invalid_request_error"},
+			})
+			return
+		}
+		next(w, r)
+	}
 }
 
 // handleMetrics reports live KV/context utilization, prefix-cache hit rate, and
@@ -496,12 +658,25 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 // statusRecorder captures the response status so the access log can report it.
+// wroteHeader lets the panic recover decide whether a 500 can still be sent.
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status      int
+	wroteHeader bool
 }
 
-func (r *statusRecorder) WriteHeader(code int) { r.status = code; r.ResponseWriter.WriteHeader(code) }
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.wroteHeader = true
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// Write marks the header as sent (implicit 200) so the recover knows a body is
+// already on the wire and it can only log, not rewrite the status.
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	r.wroteHeader = true
+	return r.ResponseWriter.Write(b)
+}
 
 // Flush is needed because the streaming handler type-asserts http.Flusher.
 func (r *statusRecorder) Flush() {
@@ -529,11 +704,25 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: 200}
 		start := time.Now()
+		// Recover so one request's panic cannot take down the shared process.
+		// net/http recovers per-connection, but this also covers panics that
+		// escape into helper paths and gives a uniform 500 + access-log line.
+		// wroteHeader tracks whether we can still set a 500 (a streaming handler
+		// has already sent 200 + bytes; then we can only log).
+		defer func() {
+			if rv := recover(); rv != nil {
+				log.Printf("fucina: PANIC in %s %s: %v", r.Method, r.URL.Path, rv)
+				if !rec.wroteHeader {
+					rec.status = http.StatusInternalServerError
+					http.Error(rec, "internal server error", http.StatusInternalServerError)
+				}
+			}
+			if s.logEnabled(logLevelInfo) {
+				log.Printf("fucina: %s %s -> %d (%.0fms)",
+					r.Method, r.URL.Path, rec.status, float64(time.Since(start).Microseconds())/1000.0)
+			}
+		}()
 		next(rec, r)
-		if s.logEnabled(logLevelInfo) {
-			log.Printf("fucina: %s %s -> %d (%.0fms)",
-				r.Method, r.URL.Path, rec.status, float64(time.Since(start).Microseconds())/1000.0)
-		}
 	}
 }
 
@@ -556,6 +745,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy bool) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Admission control: the engine is single-flight, so without a bound, K
+	// concurrent clients spawn K goroutines that each buffer a body and park on
+	// the kv lock — unbounded memory + unbounded tail latency. Acquire a slot or
+	// shed load with 503 + Retry-After. The slot is released in all exit paths.
+	select {
+	case s.inflight <- struct{}{}:
+		defer func() { <-s.inflight }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error": map[string]string{"message": "server busy: too many concurrent requests", "type": "overloaded"},
+		})
 		return
 	}
 	// Bound the body read: an agent context is large (hundreds of KB) but finite;
@@ -614,10 +817,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			"--- REQUEST BODY ---\n%s\n--- RENDERED PROMPT ---\n%s\n",
 			time.Now().Format("15:04:05"), len(req.Messages), len(req.Tools), len(tokens),
 			enableThinking, req.Stream, string(body), prompt)
-		if f, err := os.OpenFile(debugDumpPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
-			f.WriteString(dump)
-			f.Close()
-		}
+		s.writeDebugDump(dump)
 	}
 
 	params := s.genParams
@@ -667,6 +867,22 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	}
 	params.Stream = req.Stream
 	params.Stop = req.Stop
+
+	// Absolute output ceiling (independent of the context window): one client must
+	// not be able to monopolize the single-flight GPU for a ctx/2 (up to ~131k)
+	// token generation. 0 = no extra cap (the ctx/2 clamp above still applies).
+	if s.maxOutputTokens > 0 && params.MaxTokens > s.maxOutputTokens {
+		params.MaxTokens = s.maxOutputTokens
+	}
+
+	// Sanitize sampling knobs BEFORE they cross into CUDA C kernels. Unvalidated
+	// values (negative/huge top_k, NaN/Inf temp) reach the device sampler raw on
+	// the spec path; clamp them here so a malformed request cannot crash or
+	// corrupt the engine. Rejects the request rather than guessing on NaN/Inf.
+	if msg := validateAndClampParams(&params, s.tokenizer.NumTokens()); msg != "" {
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
 
 	// Context budgeting ("compaction"): the engine holds a fixed KV window
 	// (ContextSize). Guarantee room for the prompt AND the requested completion
@@ -889,6 +1105,31 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"cached_tokens":  s.lastUsed.Load(),
 			"context_size":   s.engine.ContextSize(),
 		},
+	})
+}
+
+// handleReady is a readiness probe: unlike /health (liveness — "the process is
+// up"), it confirms the server can actually serve a request. It checks the
+// tokenizer is loaded and the engine reports a usable context window. An
+// orchestrator routes traffic only when this returns 200; a 503 means "up but
+// not serviceable" (e.g. tokenizer init failed and the server is running blind).
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	var reasons []string
+	if s.tokenizer == nil {
+		reasons = append(reasons, "tokenizer not loaded")
+	}
+	if s.engine == nil || s.engine.ContextSize() == 0 {
+		reasons = append(reasons, "engine not initialized")
+	}
+	if len(reasons) > 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status": "not_ready", "reasons": reasons,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":       "ready",
+		"context_size": s.engine.ContextSize(),
 	})
 }
 
@@ -1590,7 +1831,12 @@ func (s *Server) sampleToken(logits []float32, params GenerationParams, rng *ran
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	// The status line is already written, so a mid-encode socket error can only
+	// be logged, not recovered into a different response. Surface it so a
+	// truncated /metrics, /health, or completion response isn't silent.
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("fucina: writeJSON encode failed: %v", err)
+	}
 }
 
 // stopHit reports whether `text` contains any of the stop strings. If so it
@@ -1625,6 +1871,9 @@ func (s *Server) Start(addr string) error {
 		// deadlines (sseWriter.flush) bound stalled clients instead.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		// Explicit (matches net/http's 1 MiB default) so the bound is intentional
+		// rather than implicit — header size is part of the connection-flood surface.
+		MaxHeaderBytes: 1 << 20,
 	}
 	log.Printf("fucina: server listening on %s", addr)
 	// ErrServerClosed is the normal result of a graceful Stop()/Shutdown — report it
@@ -1647,6 +1896,8 @@ func (s *Server) Stop() {
 	defer cancel()
 	if err := s.httpServer.Shutdown(ctx); err != nil {
 		log.Printf("fucina: graceful shutdown failed (%v), forcing close", err)
-		s.httpServer.Close()
+		if cerr := s.httpServer.Close(); cerr != nil {
+			log.Printf("fucina: forced close failed: %v", cerr)
+		}
 	}
 }

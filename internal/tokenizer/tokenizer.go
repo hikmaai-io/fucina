@@ -32,9 +32,6 @@ type Tokenizer struct {
 	// (replaces the previous O(vocab) linear scan).
 	tokenToID map[string]int32
 
-	// Byte-fallback: for unknown bytes, each byte becomes \x<hex>
-	byteFallback bool
-
 	// Special token IDs (read from the GGUF vocab by string when present).
 	BOS int32
 	EOS int32
@@ -71,13 +68,6 @@ type Tokenizer struct {
 type specialToken struct {
 	str string
 	id  int32
-}
-
-// Score represents a token candidate during decoding.
-type Score struct {
-	id    int32
-	score float32
-	str   string
 }
 
 // ─── GGUF value type tags (v3 spec) ───────────────────────────────

@@ -44,11 +44,14 @@ type CLIArgs struct {
 	CudaGraphs   bool    // --cuda-graphs (experimental, off by default)
 
 	// Server
-	Host     string
-	Port     int
-	Timeout  int
-	Slots    int
-	Thinking string // gemma-4 reasoning channel default: off/on/low/mid/high/xhigh
+	Host          string
+	Port          int
+	Timeout       int
+	Slots         int
+	Thinking      string // gemma-4 reasoning channel default: off/on/low/mid/high/xhigh
+	APIKey        string // optional bearer token required on /v1/* (empty = auth off)
+	MaxConcurrent int    // admission-queue depth (in-flight + waiting); 0 = default
+	MaxOutputToks int    // absolute per-request output-token ceiling; 0 = no extra cap
 
 	// System
 	System   string
@@ -142,6 +145,12 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.IntVar(&a.Slots, "n-slots", 1, "Number of processing slots")
 	fs.StringVar(&a.Thinking, "thinking", "off",
 		"Default gemma-4 reasoning channel: off|on|low|mid|high|xhigh (per-request reasoning_effort overrides)")
+	fs.StringVar(&a.APIKey, "api-key", "",
+		"Bearer token required on /v1/* (constant-time check). Empty = auth disabled (localhost dev). Reads FUCINA_API_KEY if unset.")
+	fs.IntVar(&a.MaxConcurrent, "max-concurrent", 0,
+		"Admission-queue depth (in-flight + waiting requests); excess requests get 503. 0 = default (4).")
+	fs.IntVar(&a.MaxOutputToks, "max-output-tokens", 0,
+		"Absolute per-request output-token ceiling (independent of context window). 0 = no extra cap.")
 
 	fs.StringVar(&a.System, "s", "", "System prompt")
 	fs.StringVar(&a.System, "system", "", "System prompt")
