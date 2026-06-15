@@ -2548,6 +2548,18 @@ struct gemma4_engine {
     int             n_layers_sliding;
     int             n_layers_global;
 
+    // Runtime geometry read from the GGUF at load (see gemma4_geom_t). The
+    // #defines remain the GEOM_12B defaults and the compile-time array CAP;
+    // these fields carry the ACTUAL model size so cudaMalloc / cuBLAS dims /
+    // loop bounds scale to 31B without recompiling. head_dim / global_head_dim
+    // / vocab are invariant across both geometries and stay macros.
+    gemma4_geom_t   geom;        // selects the templated attention kernels
+    int             n_layers;    // gemma4.block_count            (48 or 60)
+    int             hidden;      // gemma4.embedding_length        (3840 or 5376)
+    int             ffn;         // gemma4.feed_forward_length     (15360 or 21504)
+    int             n_heads;     // gemma4.attention.head_count    (16 or 32)
+    int             n_kv_heads;  // gemma4.attention.head_count_kv (8 or 16)
+
     // Layer index helpers: which layers are global
     int             global_layer_indices[GEMMA4_MAX_LAYERS];
     int             n_global;
@@ -3082,18 +3094,9 @@ gemma4_engine_t* gemma4_engine_create(
         return NULL;
     }
 
-    // Default layer types: 5 sliding + 1 global, repeated 8 times
-    for (int i = 0; i < 48; i++) {
-        int pos_in_block = i % 6;
-        if (pos_in_block == 5) {
-            eng->layer_types[i] = LAYER_GLOBAL;
-            eng->global_layer_indices[eng->n_global++] = i;
-        } else {
-            eng->layer_types[i] = LAYER_SLIDING;
-            eng->n_layers_sliding++;
-        }
-    }
-    eng->n_layers_global = eng->n_global;
+    // NOTE: the default layer-type cadence and the GGUF attention-pattern parse
+    // both run AFTER the geometry is read from the mmap'd file below, since they
+    // iterate to eng->n_layers (which the GGUF metadata supplies).
 
     // CUDA setup
     cudaSetDevice(device_id);
@@ -3192,6 +3195,71 @@ gemma4_engine_t* gemma4_engine_create(
             fprintf(stderr, "fucina: token_embd is Q6_K — will convert to Q8_0 at load\n");
         }
     }
+
+    // ── Read the model geometry from the GGUF (see gemma4_geom_t) ──────────
+    // The scalar dims drive every cudaMalloc / cuBLAS dim / loop bound; the
+    // head COUNTS select the templated attention kernels via eng->geom. Each
+    // key falls back to the GEOM_12B default so an older export without the
+    // metadata still loads as 12B. This MUST run before the default layer-type
+    // cadence, the pattern parse, and every allocation below — they read
+    // eng->n_layers / eng->hidden / eng->ffn.
+    {
+        uint32_t v;
+        eng->hidden     = (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
+            "gemma4.embedding_length",       &v, GGUF_TYPE_UINT32) == 0) ? (int)v : GEMMA4_HIDDEN_SIZE;
+        eng->ffn        = (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
+            "gemma4.feed_forward_length",    &v, GGUF_TYPE_UINT32) == 0) ? (int)v : GEMMA4_INTERMEDIATE;
+        eng->n_layers   = (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
+            "gemma4.block_count",            &v, GGUF_TYPE_UINT32) == 0) ? (int)v : 48;
+        eng->n_heads    = (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
+            "gemma4.attention.head_count",   &v, GGUF_TYPE_UINT32) == 0) ? (int)v : GEMMA4_HEADS;
+        eng->n_kv_heads = (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
+            "gemma4.attention.head_count_kv",&v, GGUF_TYPE_UINT32) == 0) ? (int)v : GEMMA4_KV_HEADS;
+
+        if      (eng->n_heads == 16 && eng->n_kv_heads == 8 ) eng->geom = GEOM_12B;
+        else if (eng->n_heads == 32 && eng->n_kv_heads == 16) eng->geom = GEOM_31B;
+        else {
+            fprintf(stderr, "fucina: unsupported gemma4 geometry head_count=%d "
+                    "head_count_kv=%d (only 16/8=12B and 32/16=31B supported)\n",
+                    eng->n_heads, eng->n_kv_heads);
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+        // Hard-fail instead of silently truncating: the per-layer loops below
+        // run to eng->n_layers, which must fit the GEMMA4_MAX_LAYERS-sized
+        // static arrays (layer_types[], layers[], global_slot[], ...).
+        if (eng->n_layers <= 0 || eng->n_layers > GEMMA4_MAX_LAYERS) {
+            fprintf(stderr, "fucina: block_count=%d out of range (1..%d)\n",
+                    eng->n_layers, GEMMA4_MAX_LAYERS);
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+        // The global flash-decode kernel launches n_heads*32 threads/block;
+        // CUDA caps a block at 1024 threads, so 32 heads is the ceiling.
+        if (eng->n_heads * 32 > 1024) {
+            fprintf(stderr, "fucina: n_heads=%d would need %d threads/block (>1024)\n",
+                    eng->n_heads, eng->n_heads * 32);
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+        fprintf(stderr, "fucina: loaded geometry: %s (%dL h=%d ffn=%d heads=%d kv=%d)\n",
+                eng->geom == GEOM_31B ? "31B" : "12B",
+                eng->n_layers, eng->hidden, eng->ffn, eng->n_heads, eng->n_kv_heads);
+    }
+
+    // Default layer types: 5 sliding + 1 global cadence across all n_layers
+    // (overridden below by the explicit GGUF pattern when present).
+    for (int i = 0; i < eng->n_layers; i++) {
+        int pos_in_block = i % 6;
+        if (pos_in_block == 5) {
+            eng->layer_types[i] = LAYER_GLOBAL;
+            eng->global_layer_indices[eng->n_global++] = i;
+        } else {
+            eng->layer_types[i] = LAYER_SLIDING;
+            eng->n_layers_sliding++;
+        }
+    }
+    eng->n_layers_global = eng->n_global;
 
     // Parse the per-layer attention pattern from GGUF metadata, overriding the
     // defaults computed above. The real Gemma-4 GGUF exposes this as:
@@ -7160,7 +7228,7 @@ void gemma4_engine_print_timing(const gemma4_engine_t *eng) {
 }
 
 int gemma4_engine_get_n_layers(const gemma4_engine_t *eng) {
-    return eng ? GEMMA4_MAX_LAYERS : 0;
+    return eng ? eng->n_layers : 0;
 }
 
 // ─── Timing accessors (for Go-side speed logging) ─────────────────────

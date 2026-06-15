@@ -90,6 +90,22 @@ typedef enum {
     LAYER_GLOBAL  = 1,
 } layer_type_t;
 
+// ─── Model geometry ────────────────────────────────────────────────────
+//
+// The attention kernels are templated on the head counts (<NH, NKV, HD>) so
+// the per-lane register slices stay compile-time sized (see the note above
+// sliding_attn_splitk_kernel). Two Gemma-4 geometries share this engine and
+// differ only in head COUNT (head_dim/global_head_dim are invariant), so the
+// launch sites dispatch over this enum to the matching template instantiation:
+//   GEOM_12B: 16 q / 8  kv heads  (Gemma 4 12B, 48 layers, hidden 3840)
+//   GEOM_31B: 32 q / 16 kv heads  (Gemma 4 31B, 60 layers, hidden 5376)
+// Every other size (layers, hidden, intermediate) is read from the GGUF at
+// load and carried as a runtime field on the engine.
+typedef enum {
+    GEOM_12B = 0,
+    GEOM_31B = 1,
+} gemma4_geom_t;
+
 // ─── Engine state (opaque, passed to Go via CGO) ──────────────────────
 
 #ifdef __cplusplus
