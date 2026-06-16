@@ -26,6 +26,15 @@ First public release as `github.com/hikmaai-io/fucina` (formerly the internal `g
   **parity-to-ahead overall and +15–20% at high context (≥5k tokens)**; prefill steady-state tied.
   All changes validated bit-exact (greedy byte-identical, `compute-sanitizer` clean).
 
+### Changed
+- **Sliding-window KV cache is now a capped ring buffer** instead of a flat per-position cache.
+  Sliding-layer memory no longer scales with `--ctx`: ~1.5 GiB at the default ring size
+  (`FUCINA_SLIDING_RING`, 8192 slots) vs ~21 GiB flat at 131072. Total FP8 KV cache drops to
+  ~2.5 GiB at 131072 / ~3.5 GiB at 262144 (was ~27 / ~54 GiB). Decode/spec/MTP output is
+  **bit-identical** to the flat cache (verified at 30k-token context with heavy ring wrap). Prefix-
+  reuse stays exact within the ring window; a deeper rewind falls back to a full re-prefill. With
+  `FUCINA_NO_PACKED=1` the engine fits in **~23 GiB at 131072** — hostable off the 128 GB GB10.
+
 ### Known limitations
 - Runs **only** on the DGX Spark GB10; not portable to other GPUs as built.
 - Single logical sequence / single slot; the server has **no authentication**.
