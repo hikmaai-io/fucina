@@ -257,6 +257,29 @@ func (e *Engine) Decode(token int32) ([]float32, error) {
 	return logits, nil
 }
 
+// DecodeBatched forwards K tokens in one weight pass and returns K×vocab logits
+// (row i = logits after token i), advancing the cache by K. Used by the logit
+// self-test to compare the batched spec-verify path against single-token decode.
+func (e *Engine) DecodeBatched(tokens []int32) ([]float32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	k := len(tokens)
+	if k == 0 {
+		return nil, fmt.Errorf("fucina: decode_batched needs at least one token")
+	}
+	out := make([]float32, k*vocabSize)
+	ret := C.gemma4_engine_decode_batched(
+		e.ptr,
+		(*C.int32_t)(unsafe.Pointer(&tokens[0])), C.int(k),
+		(*C.float)(unsafe.Pointer(&out[0])),
+	)
+	if ret != 0 {
+		return nil, fmt.Errorf("fucina: decode_batched failed (ret=%d)", int(ret))
+	}
+	return out, nil
+}
+
 // GenerateSpec runs greedy generation with prompt-lookup speculative decoding.
 // It prefills `prompt` internally and generates up to maxNew tokens, stopping at
 // any id in stops. Returns the generated tokens and the total number of drafts
@@ -404,6 +427,12 @@ func Argmax(logits []float32) int {
 // ContextSize returns the engine's configured context window.
 func (e *Engine) ContextSize() uint32 {
 	return e.ctx
+}
+
+// NumLayers returns the model's actual block count (48 for the 12B, 60 for the 31B),
+// read from the GGUF at load. Used to label the geometry in the logit self-test.
+func (e *Engine) NumLayers() int {
+	return int(C.gemma4_engine_get_n_layers(e.ptr))
 }
 
 // NTokens returns how many tokens are currently materialized in the KV cache.

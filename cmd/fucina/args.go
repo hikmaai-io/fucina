@@ -222,7 +222,7 @@ func parseFlags() CLIArgs {
 		os.Exit(runTestParser())
 	}
 	if t.cuda {
-		os.Exit(runTestCUDA())
+		os.Exit(runTestCUDA(a))
 	}
 	if t.vectors != "" {
 		os.Exit(runTestVectors(t.vectors))

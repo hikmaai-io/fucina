@@ -6506,14 +6506,17 @@ static int decode_batched_dev(
 
     cudaStream_t stream = eng->stream;
     const int pos = eng->global_n_tokens;            // captured; advanced only at end
-    int32_t *d_tok = (int32_t*)eng->d_sb[0];
 
     // Engine-resident scratch (allocated once, sized for GEMMA4_SPEC_MAX rows), so
     // repeated/probe calls pay no per-call cudaMalloc/free. All fp32: the batched
     // GEMV reads Q8_0 directly (no BF16 dequant), K tokens cost ~one token's weight BW.
+    // MUST run before reading eng->d_sb[*]: on the first call those are NULL until this
+    // allocates them (a cold decode_batched without a prior spec/warmup pass would
+    // otherwise capture d_tok = d_sb[0] = NULL and pass it to cudaMemcpyAsync).
     if (ensure_spec_scratch(eng) != 0) {
         return -1;
     }
+    int32_t *d_tok = (int32_t*)eng->d_sb[0];
 
     // ── Graph fast path (spec-verify keep_dev only) ──────────────────────────────────
     // The K=1 single-token decode already graphs its forward; this graphs the K>1 verify
