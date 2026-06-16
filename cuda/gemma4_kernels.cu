@@ -3111,6 +3111,7 @@ static unsigned char* convert_q6k_to_q8_0(const unsigned char *src, int64_t n_el
 }
 
 static int build_packed_q4(gemma4_engine_t *eng);  // FUCINA_PACKED: lazy/eager repack (body below)
+static void gemma4_engine_paged_selftest(gemma4_engine_t *eng);  // Phase 2 inc 3 (body below)
 
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
@@ -3718,14 +3719,18 @@ gemma4_engine_t* gemma4_engine_create(
     // VRAM after weights+contiguous-KV are resident. Dormant for now: nothing
     // reads/writes them until the paged write/read paths are wired (inc 2/3), so
     // with the flag OFF (default) this is skipped and behaviour is unchanged.
-    // Pool element layout per class: [layer_in_class][block_id][offset][elems].
+    // Pool element layout per class: [layer][block_id][offset][elems]. The
+    // sliding pool is indexed by ABSOLUTE layer id (GEMMA4_MAX_LAYERS slots, 8 of
+    // them unused for the global layers) so the KV-write mirror can index it with
+    // the same `layer` the contiguous cache uses — no sliding-slot map. The global
+    // pool is indexed by the compact global_slot[layer] (n_layers_global slots).
     if (getenv("FUCINA_PAGED_KV")) {
         const int BT = PAGED_KV_BLOCK_TOKENS;
         const int slid_elems = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;          // 8×256 = 2048
         const int glob_elems = GEMMA4_GLOBAL_KV_HEADS * GEMMA4_GLOBAL_HEAD_DIM; // 1×512 = 512
         // Per-block bytes for K (== V) across all layers of the class.
-        size_t slid_block_k = (size_t)eng->n_layers_sliding * BT * slid_elems * sizeof(kv_t);
-        size_t glob_block_k = (size_t)eng->n_layers_global  * BT * glob_elems * sizeof(kv_t);
+        size_t slid_block_k = (size_t)GEMMA4_MAX_LAYERS    * BT * slid_elems * sizeof(kv_t);
+        size_t glob_block_k = (size_t)eng->n_layers_global * BT * glob_elems * sizeof(kv_t);
         // K+V together = the cost of one block in each class.
         uint64_t slid_block_kv = 2ull * slid_block_k;
         uint64_t glob_block_kv = 2ull * glob_block_k;
@@ -3798,6 +3803,10 @@ gemma4_engine_t* gemma4_engine_create(
         const char *off = getenv("FUCINA_NO_PACKED");
         if (!(off && off[0] == '1')) build_packed_q4(eng);   // non-fatal: falls back if it fails
     }
+
+    // Paged KV mirror validation (opt-in): decode a fixed run and assert the
+    // paged pool matches the contiguous cache byte-for-byte. Non-fatal.
+    if (getenv("FUCINA_PAGED_KV_SELFTEST")) gemma4_engine_paged_selftest(eng);
 
     return eng;
 }
@@ -4165,6 +4174,60 @@ static void decode_timing_lap(gemma4_engine_t *eng);   // defined with the decod
 // attention uses the *_rows kernels (r = 0) with a FIXED grid + n_tokens0_ptr — they
 // recompute the split partition in-kernel with the exact host-launcher formula, so the
 // two paths produce identical partials.
+// ── Paged KV mirror-write (Phase 2 inc 3) ────────────────────────────────────
+// Writes element e of logical position `pos` into ONE layer's paged pool
+// sub-range, resolving (block,offset) through the active sequence's device block
+// table. Runs ALONGSIDE the contiguous write while the paged read path is being
+// validated; once the read path flips to paged, the contiguous write is dropped.
+__global__ void paged_mirror_write_kernel(
+        kv_t *pool_k, kv_t *pool_v,          // this layer's pool sub-range base
+        const float *kb, const float *vb,    // projected K/V [elems]
+        const int *block_table, int base, int n_blocks,
+        int pos, int block_tokens, int elems)
+{
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= elems) return;
+    PagedSeqView v; v.block_table = block_table; v.n_blocks = n_blocks;
+    v.base = base; v.n_tokens = pos + 1;
+    size_t idx = paged_elem_index(v, pos, e, block_tokens, elems);
+    if (idx == (size_t)-1) return;
+    pool_k[idx] = pkv_float_to_fp8(kb[e]);
+    pool_v[idx] = pkv_float_to_fp8(vb[e]);
+}
+
+// (Re)upload a host block table's id array to device, growing the device buffer
+// if the host table outgrew it. The array is small (sliding ~5, global ~ctx/256)
+// and changes each step (growth/recycle), so re-uploading it whole is cheap.
+static int paged_upload_blocks(PagedBlockTable *t, int **d_blocks, int *d_cap,
+                               cudaStream_t stream) {
+    if (t->n <= 0) return 0;
+    if (*d_cap < t->n) {
+        if (*d_blocks) { cudaStreamSynchronize(stream); cudaFree(*d_blocks); }
+        int newcap = (t->cap > t->n) ? t->cap : t->n;
+        if (cudaMalloc(d_blocks, (size_t)newcap * sizeof(int)) != cudaSuccess) {
+            *d_blocks = NULL; *d_cap = 0; cudaGetLastError(); return -1;
+        }
+        *d_cap = newcap;
+    }
+    cudaMemcpyAsync(*d_blocks, t->blocks, (size_t)t->n * sizeof(int),
+                    cudaMemcpyHostToDevice, stream);
+    return 0;
+}
+
+// Grow/recycle the active sequence's paged block tables to cover logical position
+// `pos`, then refresh the device block-id arrays. Returns 0 / -1 on pool
+// exhaustion or device error. No-op when paging is disabled.
+static int paged_seq_sync(gemma4_engine_t *eng, int pos) {
+    if (!eng->paged_enabled) return 0;
+    gemma4_seq *s = &eng->cur;
+    if (paged_table_ensure(&eng->slid_pool, &s->slid_bt, pos + 1) != 0) return -1;
+    paged_table_advance_sliding(&eng->slid_pool, &s->slid_bt, pos + 1, GEMMA4_SLIDING_WINDOW);
+    if (paged_table_ensure(&eng->glob_pool, &s->glob_bt, pos + 1) != 0) return -1;
+    if (paged_upload_blocks(&s->slid_bt, &s->d_slid_blocks, &s->d_slid_cap, eng->stream) != 0) return -1;
+    if (paged_upload_blocks(&s->glob_bt, &s->d_glob_blocks, &s->d_glob_cap, eng->stream) != 0) return -1;
+    return 0;
+}
+
 static int decode_layer(
     gemma4_engine_t *eng,
     int              layer,
@@ -4258,6 +4321,16 @@ static int decode_layer(
             size_t rslot = (size_t)(pos % eng->sliding_kv_capacity) * kv_size;  // ring slot
             copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + rslot, eng->d_attn_k, kv_size);
             copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + rslot, eng->d_attn_v, kv_size);
+            // Mirror into the paged pool (sliding indexed by absolute layer id).
+            if (eng->paged_enabled) {
+                size_t pls = (size_t)eng->slid_pool.n_blocks * PAGED_KV_BLOCK_TOKENS * kv_size;
+                paged_mirror_write_kernel<<<kvg, 256, 0, stream>>>(
+                    eng->d_slid_pool_k + (size_t)layer * pls,
+                    eng->d_slid_pool_v + (size_t)layer * pls,
+                    eng->d_attn_k, eng->d_attn_v,
+                    eng->cur.d_slid_blocks, eng->cur.slid_bt.base, eng->cur.slid_bt.n,
+                    pos, PAGED_KV_BLOCK_TOKENS, kv_size);
+            }
         }
     } else {
         int n = pos;   // == eng->cur.n_tokens at every call site
@@ -4271,6 +4344,16 @@ static int decode_layer(
         } else {
             copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size);
             copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size);
+            // Mirror into the paged pool (global indexed by compact global_slot).
+            if (eng->paged_enabled) {
+                size_t pls = (size_t)eng->glob_pool.n_blocks * PAGED_KV_BLOCK_TOKENS * kv_size;
+                paged_mirror_write_kernel<<<kvg, 256, 0, stream>>>(
+                    eng->d_glob_pool_k + (size_t)slot * pls,
+                    eng->d_glob_pool_v + (size_t)slot * pls,
+                    eng->d_attn_k, eng->d_attn_v,
+                    eng->cur.d_glob_blocks, eng->cur.glob_bt.base, eng->cur.glob_bt.n,
+                    pos, PAGED_KV_BLOCK_TOKENS, kv_size);
+            }
         }
     }
 
@@ -5751,6 +5834,10 @@ int gemma4_engine_decode(
           scale_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
                 eng->d_x, GEMMA4_HIDDEN_SIZE, sc); }
 
+        // Paged KV: ensure the active sequence's block tables cover `pos` and
+        // the device block ids are fresh BEFORE any layer mirrors its KV write.
+        if (eng->paged_enabled) paged_seq_sync(eng, pos);
+
         // Run all 48 layers
         for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
             decode_layer(eng, l, pos, eng->cur.n_tokens + 1, stream);
@@ -5810,6 +5897,89 @@ int gemma4_engine_decode(
     }
 
     return 0;
+}
+
+// ── Paged KV self-test (Phase 2 inc 3) ───────────────────────────────────────
+// Compare one layer's contiguous KV against its paged-pool mirror at every live
+// position; atomically count mismatching fp8 elements.
+__global__ void paged_compare_layer_kernel(
+        const kv_t *ck, const kv_t *cv, int contig_pos_stride,
+        const kv_t *pk, const kv_t *pv,
+        const int *block_table, int base, int n_blocks,
+        int n_pos, int elems, int block_tokens, int *mismatch)
+{
+    int pos = blockIdx.x;
+    PagedSeqView v; v.block_table = block_table; v.n_blocks = n_blocks;
+    v.base = base; v.n_tokens = n_pos;
+    for (int e = threadIdx.x; e < elems; e += blockDim.x) {
+        size_t ci = (size_t)pos * contig_pos_stride + e;
+        size_t po = paged_elem_index(v, pos, e, block_tokens, elems);
+        if (po == (size_t)-1) continue;
+        if (ck[ci] != pk[po] || cv[ci] != pv[po]) atomicAdd(mismatch, 1);
+    }
+}
+
+// Decode a fixed token run with the paged mirror active, then assert the pool is
+// byte-identical to the contiguous cache at every live position, both classes.
+// Triggered at create when FUCINA_PAGED_KV_SELFTEST is set. Non-fatal: it logs
+// PASS/FAIL and restores engine state.
+static void gemma4_engine_paged_selftest(gemma4_engine_t *eng) {
+    if (!eng->paged_enabled) return;
+    const int BT = PAGED_KV_BLOCK_TOKENS;
+    const int K  = 300;   // < GEMMA4_SLIDING_WINDOW ⇒ sliding doesn't recycle (all live)
+    const int slid_elems = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
+    const int glob_elems = GEMMA4_GLOBAL_KV_HEADS * GEMMA4_GLOBAL_HEAD_DIM;
+
+    int saved_failed = eng->decode_graph_failed;
+    eng->decode_graph_failed = 1;               // force the non-graph path (has the mirror)
+    gemma4_engine_reset(eng);
+    paged_table_release(&eng->slid_pool, &eng->cur.slid_bt);
+    paged_table_release(&eng->glob_pool, &eng->cur.glob_bt);
+
+    for (int i = 0; i < K; i++) {
+        if (gemma4_engine_decode(eng, (int32_t)(100 + i), NULL) != 0) {
+            fprintf(stderr, "fucina: paged self-test: decode failed at %d\n", i);
+            eng->decode_graph_failed = saved_failed; return;
+        }
+    }
+    cudaStreamSynchronize(eng->stream);
+
+    int *d_mm = NULL;
+    if (cudaMalloc(&d_mm, sizeof(int)) != cudaSuccess) { eng->decode_graph_failed = saved_failed; return; }
+    cudaMemset(d_mm, 0, sizeof(int));
+    size_t slid_cstride = (size_t)eng->sliding_kv_capacity * slid_elems;
+    size_t slid_pstride = (size_t)eng->slid_pool.n_blocks  * BT * slid_elems;
+    size_t glob_cstride = (size_t)eng->global_kv_capacity  * glob_elems;
+    size_t glob_pstride = (size_t)eng->glob_pool.n_blocks  * BT * glob_elems;
+    for (int L = 0; L < GEMMA4_MAX_LAYERS; L++) {
+        if (eng->layer_types[L] == LAYER_SLIDING) {
+            paged_compare_layer_kernel<<<K, 256>>>(
+                eng->d_sliding_k + (size_t)L*slid_cstride, eng->d_sliding_v + (size_t)L*slid_cstride, slid_elems,
+                eng->d_slid_pool_k + (size_t)L*slid_pstride, eng->d_slid_pool_v + (size_t)L*slid_pstride,
+                eng->cur.d_slid_blocks, eng->cur.slid_bt.base, eng->cur.slid_bt.n,
+                K, slid_elems, BT, d_mm);
+        } else {
+            int slot = eng->global_slot[L];
+            paged_compare_layer_kernel<<<K, 256>>>(
+                eng->d_global_k + (size_t)slot*glob_cstride, eng->d_global_v + (size_t)slot*glob_cstride, glob_elems,
+                eng->d_glob_pool_k + (size_t)slot*glob_pstride, eng->d_glob_pool_v + (size_t)slot*glob_pstride,
+                eng->cur.d_glob_blocks, eng->cur.glob_bt.base, eng->cur.glob_bt.n,
+                K, glob_elems, BT, d_mm);
+        }
+    }
+    int mm = -1;
+    cudaMemcpy(&mm, d_mm, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(d_mm);
+    if (mm == 0)
+        fprintf(stderr, "fucina: paged self-test PASSED — pool == contiguous over %d tokens × %d layers\n",
+                K, GEMMA4_MAX_LAYERS);
+    else
+        fprintf(stderr, "fucina: paged self-test FAILED — %d mismatching fp8 elements\n", mm);
+
+    gemma4_engine_reset(eng);
+    paged_table_release(&eng->slid_pool, &eng->cur.slid_bt);
+    paged_table_release(&eng->glob_pool, &eng->cur.glob_bt);
+    eng->decode_graph_failed = saved_failed;
 }
 
 // =========================================================================
