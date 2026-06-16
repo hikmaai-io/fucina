@@ -28,6 +28,14 @@
 
 // NVFP4 safetensors loading (FORMAT_NVFP4): container parser, dequant math, name mapping, and
 // the fused decode GEMV. All header-only; the decode kernel lives in nvfp4_gemv.cuh.
+//
+// Style note (rooted in fucina's "lean where it counts" rule): the engine parses GGUF in pure
+// C (the gguf_* helpers above — const uint8_t*, no STL) because that path is exercised on the
+// hot side. The NVFP4 LOADER, by contrast, leans on std::string/std::vector/unordered_map — but
+// ONLY inside gemma4_engine_create and nvfp4_load_from_safetensors, both of which run exactly
+// ONCE at startup. A safetensors header is JSON + a sharded index; hand-rolling that in C buys
+// nothing but bug surface here. Every per-token/decode path (nvfp4_gemv, the routing in
+// decode_layer) stays raw-pointer C-style — no STL ever crosses into the hot loop.
 #include "safetensors.h"
 #include "nvfp4.h"
 #include "nvfp4_loader.h"
