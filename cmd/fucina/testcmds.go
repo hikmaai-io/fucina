@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"github.com/hikmaai-io/fucina/internal/engine/cuda"
+	"github.com/hikmaai-io/fucina/internal/sampler"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
@@ -49,7 +50,6 @@ func runTestCUDA(args CLIArgs) int {
 		fmt.Fprintln(os.Stderr, "fucina: empty prompt encoding")
 		return 1
 	}
-	const steps = 6
 
 	// ONE engine: prefill, then at each step compare Decode(t) against the row-0 logits
 	// of DecodeBatched([t]) from the SAME post-prefill state, using Rewind(n) to restore
@@ -66,20 +66,20 @@ func runTestCUDA(args CLIArgs) int {
 		fmt.Fprintf(os.Stderr, "fucina: prefill: %v\n", err)
 		return 1
 	}
-	fmt.Printf("  [diag] prefill argmax=%d (the first generated token); prompt=%v\n", argmax(pl), pt)
+	fmt.Printf("  [diag] prefill argmax=%d (the first generated token); prompt=%v\n", sampler.Argmax(pl), pt)
 	// Replicate the generate loop: greedy-decode 5 tokens via Decode (host argmax) and print
 	// the ids. If these go degenerate while the prefill argmax was sane, the decode-after-
 	// prefill continuation (KV state) is the bug, not the kernels.
 	{
 		gtoks := []int32{}
-		nt := int32(argmax(pl))
+		nt := int32(sampler.Argmax(pl))
 		for i := 0; i < 5; i++ {
 			gtoks = append(gtoks, nt)
 			dl, e := eng.Decode(nt)
 			if e != nil {
 				break
 			}
-			nt = int32(argmax(dl))
+			nt = int32(sampler.Argmax(dl))
 		}
 		fmt.Printf("  [diag] greedy decode chain (Decode+argmax): %v\n", gtoks)
 		eng.Reset()
@@ -93,56 +93,41 @@ func runTestCUDA(args CLIArgs) int {
 	// A divergence means the batched path corrupts row 0 when extra rows are present — the
 	// exact failure mode (first spec token correct, later tokens wrong). Two fixed tokens.
 	t0 := int32(pt[len(pt)-1])
-	t1 := int32(argmax(must(eng.DecodeBatched([]int32{t0})))) // 1 step to get a plausible 2nd token
+	t1 := int32(sampler.Argmax(must(eng.DecodeBatched([]int32{t0})))) // 1 step to get a plausible 2nd token
 	eng.Rewind(nKeep)
 
-	tokIDs := []int32{}
-	maxAbs, maxRel := 0.0, 0.0
+	// The K-invariance check is deterministic, so a single comparison suffices.
+	maxAbs := 0.0
 	argmaxMismatch := 0
-	for s := 0; s < steps; s++ {
-		_ = s
-		l1, err := eng.DecodeBatched([]int32{t0})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "fucina: K=1 batched: %v\n", err)
-			return 1
+	l1, err := eng.DecodeBatched([]int32{t0})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fucina: K=1 batched: %v\n", err)
+		return 1
+	}
+	ls := append([]float32(nil), l1...) // row 0 of K=1 (reference)
+	eng.Rewind(nKeep)
+	l2, err := eng.DecodeBatched([]int32{t0, t1})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fucina: K=2 batched: %v\n", err)
+		return 1
+	}
+	lb := l2[:len(ls)] // row 0 of K=2 (must equal row 0 of K=1)
+	eng.Rewind(nKeep)
+	if da, db := sampler.Argmax(ls), sampler.Argmax(lb); da != db {
+		argmaxMismatch++
+		fmt.Printf("  ROW0 MISMATCH K1=%d K2row0=%d\n", da, db)
+	}
+	for i := range ls {
+		if d := math.Abs(float64(ls[i] - lb[i])); d > maxAbs {
+			maxAbs = d
 		}
-		ls := append([]float32(nil), l1...) // row 0 of K=1 (reference)
-		eng.Rewind(nKeep)
-		l2, err := eng.DecodeBatched([]int32{t0, t1})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "fucina: K=2 batched: %v\n", err)
-			return 1
-		}
-		lb := l2[:len(ls)] // row 0 of K=2 (must equal row 0 of K=1)
-		eng.Rewind(nKeep)
-		da, db := argmax(ls), argmax(lb)
-		if da != db {
-			argmaxMismatch++
-			fmt.Printf("  step %d: ROW0 MISMATCH K1=%d K2row0=%d\n", s, da, db)
-		}
-		var sumSq, refSq float64
-		for i := range ls {
-			d := math.Abs(float64(ls[i] - lb[i]))
-			if d > maxAbs {
-				maxAbs = d
-			}
-			sumSq += d * d
-			refSq += float64(ls[i]) * float64(ls[i])
-		}
-		if refSq > 0 {
-			if rel := math.Sqrt(sumSq / refSq); rel > maxRel {
-				maxRel = rel
-			}
-		}
-		_ = tokIDs
-		break // the K-invariance check is deterministic; one iteration suffices
 	}
 
 	// Row>0 CORRECTNESS: row 1 of DecodeBatched([t0,t1]) must equal the row-0 logits of a
 	// DecodeBatched([t1]) issued AFTER t0 has advanced the cache by one (i.e. the same token
 	// at the same absolute position with the same causal context). A mismatch is the spec bug:
 	// the verify rows past row 0 produce wrong logits, so wrong tokens get accepted.
-	l2, err := eng.DecodeBatched([]int32{t0, t1})
+	l2, err = eng.DecodeBatched([]int32{t0, t1})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fucina: K=2 row1: %v\n", err)
 		return 1
@@ -159,7 +144,7 @@ func runTestCUDA(args CLIArgs) int {
 		return 1
 	}
 	r1max := 0.0
-	row1Mismatch := argmax(row1) != argmax(ref1)
+	row1Mismatch := sampler.Argmax(row1) != sampler.Argmax(ref1)
 	for i := range ref1 {
 		if d := math.Abs(float64(row1[i] - ref1[i])); d > r1max {
 			r1max = d
@@ -195,17 +180,6 @@ func must(v []float32, err error) []float32 {
 		panic(err)
 	}
 	return v
-}
-
-// argmax returns the index of the maximum logit.
-func argmax(v []float32) int {
-	best, bi := float32(math.Inf(-1)), 0
-	for i, x := range v {
-		if x > best {
-			best, bi = x, i
-		}
-	}
-	return bi
 }
 
 func runTestVectors(path string) int {

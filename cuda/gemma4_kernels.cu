@@ -4423,6 +4423,23 @@ static inline int embd_fmt(const gemma4_engine_t *eng) {
 // pre-compiled instantiation. For the 12B every branch picks the original <16,…> kernels with
 // the original grids, so its path is byte-identical.
 
+// Flash-decode combine over the split-K partials (d_fa_acc/m/l), templated on the q-head
+// count so the partials stride (part_m[s*NH + h]) matches the layout the splitk kernel
+// wrote. Dispatched by geom — the ONLY difference between the two branches is the NH
+// template arg, so both decode-broadcast wrappers funnel their combine through here
+// instead of repeating the if/else. head_dim/n_heads stay runtime args.
+static inline void launch_combine(
+    const gemma4_engine_t *eng, float *out,
+    int n_heads, int head_dim, int splits, cudaStream_t stream)
+{
+    if (eng->geom == GEOM_12B)
+        flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    else
+        flash_decode_combine_kernel<GEMMA4_HEADS_31B><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+}
+
 static inline void global_attn_decode_broadcast(
     gemma4_engine_t *eng, float *out, const float *q,
     const kv_t *kc, const kv_t *vc, int n_heads, int head_dim, int ctx_len,
@@ -4445,12 +4462,7 @@ static inline void global_attn_decode_broadcast(
             <<<splits, GEMMA4_GLOBAL_KV_HEADS_31B*GEMMA4_GLOBAL_GQA_WPK*32, 0, stream>>>(
             eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, head_dim, ctx_len, splits);
     }
-    if (eng->geom == GEOM_12B)
-        flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
-            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
-    else
-        flash_decode_combine_kernel<GEMMA4_HEADS_31B><<<n_heads, head_dim, 0, stream>>>(
-            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    launch_combine(eng, out, n_heads, head_dim, splits, stream);
 }
 
 // Split-K sliding flash-decode for a single query token. Drop-in replacement for
@@ -4490,12 +4502,7 @@ static inline void sliding_attn_decode_broadcast(
             <<<splits, GEMMA4_KV_HEADS_31B * 32, 0, stream>>>(
                 eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, window, n_tokens, splits);
     }
-    if (eng->geom == GEOM_12B)
-        flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
-            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
-    else
-        flash_decode_combine_kernel<GEMMA4_HEADS_31B><<<n_heads, head_dim, 0, stream>>>(
-            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    launch_combine(eng, out, n_heads, head_dim, splits, stream);
 }
 
 // ═════════════════════════════════════════════════════════════════════════
