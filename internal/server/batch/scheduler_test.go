@@ -558,7 +558,7 @@ func TestAddSeqErrorRejects(t *testing.T) {
 	}
 }
 
-// (e) Speculative runs: StepBatch returns a RUN of tokens per slot per step. The
+// (f) Speculative runs: StepBatch returns a RUN of tokens per slot per step. The
 // scheduler must emit every token in a row's run, in order, and count each one
 // against the sequence's budget — i.e. a row generates runLen tokens per step,
 // so MaxNew is reached in MaxNew/runLen steps with every token delivered.
@@ -595,7 +595,7 @@ func TestSpeculativeRunsDeliverEveryToken(t *testing.T) {
 	}
 }
 
-// (f) Stop mid-run truncates: when a stop token lands in the MIDDLE of a row's
+// (g) Stop mid-run truncates: when a stop token lands in the MIDDLE of a row's
 // speculative run, the scheduler must emit the stop token and then STOP — the
 // drafted tokens after the stop are past the boundary and must not be delivered.
 func TestSpeculativeRunStopsMidRun(t *testing.T) {

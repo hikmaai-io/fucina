@@ -75,12 +75,12 @@ type BatchEngine interface {
 // (see server.GenerationParams) but is decoupled from the HTTP types so the
 // CUDA side does not import the server package.
 type SeqParams struct {
-	Temperature float32
-	TopK        int
-	TopP        float32
-	MinP        float32
+	Temperature   float32
+	TopK          int
+	TopP          float32
+	MinP          float32
 	RepeatPenalty float32
-	Seed        uint64
+	Seed          uint64
 }
 
 // ─── Public request type ───────────────────────────────────────────
@@ -157,12 +157,12 @@ var ErrQueueFull = errors.New("batch: submit queue full")
 // seq is the scheduler's private bookkeeping for one admitted sequence. It is
 // touched only by the scheduler goroutine, so it needs no synchronization.
 type seq struct {
-	req      Request
-	slot     int   // engine slot id (valid once admitted)
-	next     int32 // the input token to feed this slot on the next StepBatch
-	remaining int  // generation budget left (counts down from MaxNew)
-	generated int  // tokens emitted so far
-	stops    map[int32]struct{}
+	req       Request
+	slot      int   // engine slot id (valid once admitted)
+	next      int32 // the input token to feed this slot on the next StepBatch
+	remaining int   // generation budget left (counts down from MaxNew)
+	generated int   // tokens emitted so far
+	stops     map[int32]struct{}
 }
 
 // stopHit reports whether t is one of this sequence's stop tokens.

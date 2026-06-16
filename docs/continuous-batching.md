@@ -37,8 +37,8 @@ step OUTSIDE the capture (same trick as `d_specpos`), so one captured graph repl
 at any position; attention launches at the full split grid (`GEMMA4_GLOBAL_MAX_SPLITS`, each row
 tail-returns past its own n_splits → bit-identical to the per-kernel split-K path). Logs
 "multiseq batch graph captured (B=%d)" once per distinct B. Temperature rows (any `temp>0`),
-capture failure, or `FUCINA_NO_BATCH_GRAPH` fall back to the per-kernel body (which also runs the
-per-row sampler). Verified: batch self-test 32/32 unchanged with B=1 and B=3 graphs exercised;
+capture failure, or `FUCINA_NO_BATCHED_GRAPH` fall back to the per-kernel body (which also runs
+the per-row sampler; the same env var also disables the spec-verify `batched_graph`). Verified: batch self-test 32/32 unchanged with B=1 and B=3 graphs exercised;
 4 concurrent greedy requests replay B=1/3/4 with correct deterministic output.
 
 Known limitations: no spec decode / TTFT metrics in the batch path. (Per-sequence sampling

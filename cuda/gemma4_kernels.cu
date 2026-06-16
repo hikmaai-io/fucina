@@ -2785,7 +2785,7 @@ struct gemma4_engine {
     // attention launches at FIXED max split grids (each row tail-returns past its
     // own n_splits — bit-identical to the per-kernel path). Indexed by B
     // (1..GEMMA4_MAX_SEQS); [0] unused. NULL/failed at a B → that B uses per-kernel
-    // launches. FUCINA_NO_BATCH_GRAPH disables capture globally.
+    // launches. FUCINA_NO_BATCHED_GRAPH disables capture globally.
     cudaGraphExec_t multiseq_graph[GEMMA4_MAX_SEQS + 1];
     int      multiseq_graph_failed;    // global disable (env or capture failure)
     unsigned multiseq_graph_logged;    // per-B "captured" log guard (bit b set once logged)
@@ -3254,6 +3254,8 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_decpos = NULL; eng->d_dectok = NULL;
     for (int k = 0; k <= GEMMA4_SPEC_MAX; k++) eng->batched_graph[k] = NULL;
     eng->batched_graph_failed = 0; eng->d_specpos = NULL;
+    for (int b = 0; b <= GEMMA4_MAX_SEQS; b++) eng->multiseq_graph[b] = NULL;
+    eng->multiseq_graph_failed = 0; eng->multiseq_graph_logged = 0;
     eng->spec_steps = eng->spec_drafted = eng->spec_accepted = eng->spec_emitted = 0;
     eng->pf_scratch_ready = 0;
     eng->d_pf_x = eng->d_pf_norm = eng->d_pf_q = eng->d_pf_k = eng->d_pf_v = NULL;
@@ -6683,7 +6685,8 @@ static inline float *decode_batched_dev_logits(gemma4_engine_t *eng) {
 // independent sequences instead of consecutive positions of one sequence), but:
 //   - RoPE uses each row's own absolute position (rope_rows_pos_kernel),
 //   - KV mirror-writes scatter each row into ITS OWN block table (paged_kv_write),
-//   - attention reads each row through ITS OWN block table (paged_attn_decode_batched).
+//   - attention reads each row through ITS OWN block table (split-K paged kernels:
+//     paged_{sliding,global}_attn_splitk_batched + paged_flash_decode_combine_batched).
 // Requires paged mode. The contiguous d_sliding_*/d_global_* caches are NOT touched
 // (they belong to the single-seq eng->cur path); the batch lives entirely in the pool.
 
@@ -6764,7 +6767,6 @@ static void decode_multiseq_body(
     embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, B, H, stream);
     scale_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, B*H, sqrtf((float)H));
 
-    const int shmem_attn = 32 * sizeof(float);
     for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
         layer_type_t lt = eng->layer_types[l];
         int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
@@ -6848,7 +6850,6 @@ static void decode_multiseq_body(
                     d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, views,
                     hd, /*window=*/0, GEMMA4_GLOBAL_SPLIT_CHUNK);
         }
-        (void)shmem_attn; (void)g_splits;
 
         // O proj → post-attn norm → residual; FFN; post-FFN norm → residual; out scale.
         gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, B, stream);
@@ -6888,13 +6889,13 @@ static void decode_multiseq_body(
 // each step OUTSIDE the capture — collapsing the ~B-row, 48-layer launch storm to one
 // replay. Attention launches at the FULL split grid (every position fits). Greedy only
 // (argmax appended); temperature rows fall back to the per-kernel host path. Same escape
-// hatch as batched_graph_ensure. FUCINA_NO_BATCH_GRAPH disables.
+// hatch as batched_graph_ensure. FUCINA_NO_BATCHED_GRAPH disables.
 static int multiseq_graph_ensure(gemma4_engine_t *eng, int B)
 {
     if (B < 1 || B > GEMMA4_MAX_SEQS) return -1;
     if (eng->multiseq_graph[B]) return 0;
     if (eng->multiseq_graph_failed) return -1;
-    static const int disabled = (getenv("FUCINA_NO_BATCH_GRAPH") != NULL);
+    static const int disabled = (getenv("FUCINA_NO_BATCHED_GRAPH") != NULL);
     if (disabled) { eng->multiseq_graph_failed = 1; return -1; }
     if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) {
         eng->multiseq_graph_failed = 1; return -1;
@@ -6960,7 +6961,7 @@ static int multiseq_upload_inputs(
 //
 // Fast path: if every row is greedy (temp<=0) the captured per-B CUDA graph replays
 // the whole forward + argmax in one launch (device-resident positions/views/tokens
-// refreshed just above). Any temperature row, capture failure, or FUCINA_NO_BATCH_GRAPH
+// refreshed just above). Any temperature row, capture failure, or FUCINA_NO_BATCHED_GRAPH
 // falls back to the per-kernel body (which also runs the per-row temperature sampler).
 static int decode_multiseq_forward(
     gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *in_tok,
