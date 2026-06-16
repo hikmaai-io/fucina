@@ -4393,6 +4393,8 @@ static int paged_seq_sync(gemma4_engine_t *eng, int pos) {
     return 0;
 }
 
+static int ensure_ms_scratch(gemma4_engine_t *eng);   // fwd decl (body below decode_multiseq)
+
 static int decode_layer(
     gemma4_engine_t *eng,
     int              layer,
@@ -4402,6 +4404,7 @@ static int decode_layer(
     const int       *d_pos = NULL)
 {
     layer_type_t ltype = eng->layer_types[layer];
+    if (eng->paged_read && ensure_ms_scratch(eng) != 0) return -1;  // 1-elem view + fa scratch
     int n_heads, n_kv_heads, head_dim, out_dim_q, out_dim_kv;
     if (ltype == LAYER_SLIDING) {
         n_heads    = GEMMA4_HEADS;       head_dim = GEMMA4_HEAD_DIM;
@@ -4541,14 +4544,24 @@ static int decode_layer(
                     eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     head_dim, GEMMA4_SLIDING_WINDOW, 0, d_pos + 1, n_heads*head_dim);
         } else if (eng->paged_read) {
-            // Paged read: attend the pool through this sequence's block table.
+            // Paged read: attend the pool through this sequence's block table,
+            // via the SAME split-K kernels the batch path uses (B=1 view) — so the
+            // paged read is now bit-identical to the contiguous split-K decode.
             size_t pls = (size_t)eng->slid_pool.n_blocks * PAGED_KV_BLOCK_TOKENS * kv_size;
-            paged_attn_decode_kernel<<<n_heads, head_dim, 32*sizeof(float), stream>>>(
-                eng->d_attn_out, eng->d_attn_q,
-                eng->d_slid_pool_k + (size_t)layer * pls, eng->d_slid_pool_v + (size_t)layer * pls,
-                eng->cur.d_slid_blocks, eng->cur.slid_bt.base, eng->cur.slid_bt.n,
-                n_heads, n_kv_heads, head_dim, pos + 1, GEMMA4_SLIDING_WINDOW,
-                PAGED_KV_BLOCK_TOKENS, kv_size);
+            PagedSeqView hv; hv.block_table = eng->cur.d_slid_blocks; hv.n_blocks = eng->cur.slid_bt.n;
+            hv.base = eng->cur.slid_bt.base; hv.n_tokens = pos + 1;
+            cudaMemcpyAsync(eng->d_ms_views_slid, &hv, sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
+            paged_sliding_attn_splitk_batched<GEMMA4_HEADS, GEMMA4_KV_HEADS,
+                                              GEMMA4_HEAD_DIM, GEMMA4_GLOBAL_MAX_SPLITS>
+                <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                    eng->d_slid_pool_k + (size_t)layer * pls, eng->d_slid_pool_v + (size_t)layer * pls,
+                    eng->d_ms_views_slid, GEMMA4_SLIDING_WINDOW, GEMMA4_SLIDING_SPLIT_CHUNK,
+                    PAGED_KV_BLOCK_TOKENS, kv_size);
+            paged_flash_decode_combine_batched<GEMMA4_HEADS, GEMMA4_GLOBAL_MAX_SPLITS>
+                <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                    eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                    eng->d_ms_views_slid, head_dim, GEMMA4_SLIDING_WINDOW, GEMMA4_SLIDING_SPLIT_CHUNK);
         } else {
         // Split-K warp-per-KV-head (no per-key __syncthreads — see sliding_attn_splitk_kernel).
         sliding_attn_decode_broadcast(
@@ -4581,14 +4594,22 @@ static int decode_layer(
                     eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     head_dim, /*window=*/0, 0, d_pos + 1, n_heads*head_dim);
         } else if (eng->paged_read) {
-            // Paged read: attend the pool through this sequence's block table.
+            // Paged read: attend the pool through this sequence's block table,
+            // via the SAME split-K kernels the batch path uses (B=1 view).
             size_t pls = (size_t)eng->glob_pool.n_blocks * PAGED_KV_BLOCK_TOKENS * kv_size;
-            paged_attn_decode_kernel<<<n_heads, head_dim, 32*sizeof(float), stream>>>(
-                eng->d_attn_out, eng->d_attn_q,
-                eng->d_glob_pool_k + (size_t)slot * pls, eng->d_glob_pool_v + (size_t)slot * pls,
-                eng->cur.d_glob_blocks, eng->cur.glob_bt.base, eng->cur.glob_bt.n,
-                n_heads, GEMMA4_GLOBAL_KV_HEADS, head_dim, n_ctx, 0,
-                PAGED_KV_BLOCK_TOKENS, kv_size);
+            PagedSeqView hv; hv.block_table = eng->cur.d_glob_blocks; hv.n_blocks = eng->cur.glob_bt.n;
+            hv.base = eng->cur.glob_bt.base; hv.n_tokens = n_ctx;
+            cudaMemcpyAsync(eng->d_ms_views_glob, &hv, sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
+            paged_global_attn_splitk_batched<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM,
+                                             GEMMA4_GLOBAL_MAX_SPLITS>
+                <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                    eng->d_glob_pool_k + (size_t)slot * pls, eng->d_glob_pool_v + (size_t)slot * pls,
+                    eng->d_ms_views_glob, GEMMA4_GLOBAL_SPLIT_CHUNK, PAGED_KV_BLOCK_TOKENS, kv_size);
+            paged_flash_decode_combine_batched<GEMMA4_HEADS, GEMMA4_GLOBAL_MAX_SPLITS>
+                <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                    eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                    eng->d_ms_views_glob, head_dim, /*window=*/0, GEMMA4_GLOBAL_SPLIT_CHUNK);
         } else {
         // GQA-broadcast split-K (Step 1): reads each global K/V tile ONCE (was 16×).
         global_attn_decode_broadcast(
@@ -6290,13 +6311,13 @@ static void gemma4_engine_paged_e2e_selftest(gemma4_engine_t *eng) {
         fprintf(stderr, "fucina: paged E2E self-test PASSED — %d-step next-token prediction identical "
                         "(paged read vs contiguous)\n", K);
     else
-        // Numerically equivalent: the paged read (sequential online-softmax) and the
-        // contiguous read (split-K) sum in a different order, so a few top-2 near-ties
-        // flip. The READ self-test (≈1e-6) is the correctness bar; bit-identity awaits
-        // the split-K paged port (Phase 3).
-        fprintf(stderr, "fucina: paged E2E self-test PASSED (numerically equivalent) — %d/%d "
-                        "predictions agree, %d near-tie flip(s) vs split-K (first step %d)\n",
-                        K - mism, K, mism, first);
+        // BIT-IDENTITY EXPECTED: both the paged and the contiguous read now run the
+        // SAME split-K flash decode (paged just resolves K/V through the block table),
+        // matching the contiguous summation order exactly. Any mismatch is a real
+        // regression in that equivalence, not a benign near-tie flip — flag it loudly.
+        fprintf(stderr, "fucina: paged E2E self-test FAILED — split-K paged read should be "
+                        "BIT-IDENTICAL to contiguous, but only %d/%d agree (%d mismatch(es), "
+                        "first step %d)\n", K - mism, K, mism, first);
 
     gemma4_engine_reset(eng);
     paged_table_release(&eng->slid_pool, &eng->cur.slid_bt);
@@ -6793,9 +6814,48 @@ static int decode_multiseq_forward(
         paged_kv_write<<<dim3(grid1d(okv),B),256,0,stream>>>(
             pk, pv, d_k, d_v, wb, PAGED_KV_BLOCK_TOKENS, okv);
         int window = (lt==LAYER_SLIDING) ? GEMMA4_SLIDING_WINDOW : 0;
-        paged_attn_decode_batched<<<dim3(HEADS,B),hd,shmem_attn,stream>>>(
-            d_attn, d_q, pk, pv, views, HEADS, nkv, hd, window,
-            PAGED_KV_BLOCK_TOKENS, okv);
+        // Split-K paged attention (bit-identical to the contiguous split-K path:
+        // same per-row n_splits/per/scan order/combine order, only the K/V address
+        // is resolved through the block table). Per-(split,seq) partials into the
+        // shared d_fa_acc/m/l scratch (slot seq*MAX_SPLITS+split), merged by the
+        // paged combine. Replaces the sequential per-(head,seq) online-softmax.
+        // Launch only as many split blocks as the LONGEST row in the batch needs
+        // (grid.x = max_splits over rows). Each row still tail-returns past its own
+        // n_splits, so the per-row partition/scan/combine order is unchanged and the
+        // result stays bit-identical — this only avoids launching the full 128-block
+        // grid when the batch's contexts are short. max_len comes from positions[].
+        int max_len = 0;
+        for (int r = 0; r < B; r++) { int np = positions[r] + 1; if (np > max_len) max_len = np; }
+        int g_splits;
+        if (lt == LAYER_SLIDING) {
+            int wl = (max_len < GEMMA4_SLIDING_WINDOW) ? max_len : GEMMA4_SLIDING_WINDOW;
+            g_splits = (wl + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
+            if (g_splits < 1) g_splits = 1;
+            if (g_splits > GEMMA4_GLOBAL_MAX_SPLITS) g_splits = GEMMA4_GLOBAL_MAX_SPLITS;
+            paged_sliding_attn_splitk_batched<GEMMA4_HEADS, GEMMA4_KV_HEADS,
+                                              GEMMA4_HEAD_DIM, GEMMA4_GLOBAL_MAX_SPLITS>
+                <<<dim3(g_splits, B), GEMMA4_KV_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, pk, pv, views,
+                    window, GEMMA4_SLIDING_SPLIT_CHUNK, PAGED_KV_BLOCK_TOKENS, okv);
+            paged_flash_decode_combine_batched<GEMMA4_HEADS, GEMMA4_GLOBAL_MAX_SPLITS>
+                <<<dim3(HEADS, B), hd, 0, stream>>>(
+                    d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, views,
+                    hd, window, GEMMA4_SLIDING_SPLIT_CHUNK);
+        } else {
+            g_splits = (max_len + GEMMA4_GLOBAL_SPLIT_CHUNK - 1) / GEMMA4_GLOBAL_SPLIT_CHUNK;
+            if (g_splits < 1) g_splits = 1;
+            if (g_splits > GEMMA4_GLOBAL_MAX_SPLITS) g_splits = GEMMA4_GLOBAL_MAX_SPLITS;
+            paged_global_attn_splitk_batched<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM,
+                                             GEMMA4_GLOBAL_MAX_SPLITS>
+                <<<dim3(g_splits, B), GEMMA4_HEADS*32, 0, stream>>>(
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, pk, pv, views,
+                    GEMMA4_GLOBAL_SPLIT_CHUNK, PAGED_KV_BLOCK_TOKENS, okv);
+            paged_flash_decode_combine_batched<GEMMA4_HEADS, GEMMA4_GLOBAL_MAX_SPLITS>
+                <<<dim3(HEADS, B), hd, 0, stream>>>(
+                    d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, views,
+                    hd, /*window=*/0, GEMMA4_GLOBAL_SPLIT_CHUNK);
+        }
+        (void)shmem_attn; (void)g_splits;
 
         // O proj → post-attn norm → residual; FFN; post-FFN norm → residual; out scale.
         gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, B, stream);

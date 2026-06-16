@@ -284,4 +284,238 @@ __global__ void paged_attn_decode_batched(
     if (tid < head_dim) out[qbase + tid] = (l > 0.0f) ? acc / l : 0.0f;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SPLIT-K paged batched attention — the FAST continuous-batching primitive.
+//
+// paged_attn_decode_batched above is correctness-first: one block per (head,seq)
+// scans the whole sequence with a per-key __syncthreads block-reduce. These three
+// kernels replace it with the same flash-decoding split-K design the CONTIGUOUS
+// decode uses (sliding_attn_splitk_rows_kernel / global_attn_splitk_rows_kernel +
+// flash_decode_combine_rows_kernel in gemma4_kernels.cu), but reading K/V through
+// each row's block table instead of a flat ring/contiguous cache.
+//
+// BIT-IDENTICAL to the contiguous split-K path by construction: for a given row,
+//   - the split count n_splits is computed by the SAME formula (paged_row_splits,
+//     a copy of attn_row_splits),
+//   - `per`, `lo`, the i0..i1 partition, and the ascending-i scan order match the
+//     contiguous rows kernels exactly,
+//   - the per-lane register-slice dot/online-softmax recurrence is identical,
+//   - the combine pass merges splits in the SAME order s = 0..n_splits-1.
+// The only difference is the address of K[p]/V[p]: contiguous uses (p % cap), paged
+// resolves p through the block table (paged_elem_index). With identical fp8 values
+// at identical logical positions, every FP op reassociates identically → same bits.
+//
+// Geometry mirrors the contiguous kernels:
+//   sliding: grid (n_splits, n_kv_heads, n_seq), block = NKV warps? No — one warp
+//            per KV head like the contiguous kernel: block = NKV*32 threads, warp =
+//            kv_head, each warp serves its GQ = NH/NKV query heads. grid.x = split,
+//            grid.y = seq.  (NKV warps in ONE block; matches sliding_attn_splitk.)
+//   global : grid (n_splits, n_seq), block = NH*32 threads, warp = query head
+//            (GQA-broadcast over the single KV head).  (matches global_attn_splitk.)
+// Per-row scratch slot = (seq*MAX_SPLITS + split) — same layout the rows kernels +
+// combine use, so the engine reuses d_fa_acc/m/l unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Copy of attn_row_splits (gemma4_kernels.cu) so this header stays engine-free.
+static __device__ __forceinline__ int paged_row_splits(int len, int chunk, int max_splits) {
+    int s = (len + chunk - 1) / chunk;
+    if (s < 1) s = 1;
+    if (s > max_splits) s = max_splits;
+    if (s > len && len > 0) s = len;
+    return s;
+}
+
+// Sliding split-K, paged, batched over seqs. One warp per KV head; GQ query heads
+// per warp. grid = (max_splits, n_seq); tail blocks (split >= n_splits_row) return.
+template<int NH, int NKV, int HD, int MAX_SPLITS>
+__global__ void paged_sliding_attn_splitk_batched(
+    float *part_acc, float *part_m, float *part_l,   // slot (seq*MAX_SPLITS + split)
+    const float *q,                                  // [n_seq][NH*HD] row-major
+    const pkv_t *k_pool, const pkv_t *v_pool,        // ONE layer's pool
+    const PagedSeqView *views,
+    int window, int chunk, int block_tokens, int elems_per_token)
+{
+    constexpr int GQ = NH / NKV;
+    constexpr int slice = HD / 32;
+    static_assert(HD % 32 == 0, "lane-strided slices require HD multiple of warp size");
+    int seq   = blockIdx.y;
+    int split = blockIdx.x;
+    PagedSeqView v = views[seq];
+    int n_tokens   = v.n_tokens;
+    int window_len = (n_tokens < window) ? n_tokens : window;
+    int n_splits   = paged_row_splits(window_len, chunk, MAX_SPLITS);
+    if (split >= n_splits) return;                   // tail blocks
+    int kv_head = threadIdx.x >> 5;
+    int lane    = threadIdx.x & 31;
+
+    int lo  = n_tokens - window_len;
+    if (v.base > lo) {
+        // Recycled leading positions are unmapped; contiguous never hits this
+        // (ring keeps the whole window live). Clamp so we only scan mapped pos —
+        // the engine sizes the sliding pool to hold the full window, so in the
+        // batch this clamp is a no-op (lo >= base always); kept for safety.
+        lo = v.base;
+        window_len = n_tokens - lo;
+        n_splits   = paged_row_splits(window_len, chunk, MAX_SPLITS);
+        if (split >= n_splits) return;
+    }
+    int per = (window_len + n_splits - 1) / n_splits;
+    int i0  = split * per;
+    int i1  = min(i0 + per, window_len);
+
+    float qreg[GQ][slice], acc[GQ][slice], m[GQ], l[GQ];
+    #pragma unroll
+    for (int g = 0; g < GQ; g++) {
+        const float *qp = q + (size_t)seq * NH * HD + (size_t)(kv_head*GQ + g)*HD;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) { qreg[g][e] = qp[lane + 32*e]; acc[g][e] = 0.0f; }
+        m[g] = -INFINITY; l[g] = 0.0f;
+    }
+
+    int elem_off = kv_head * HD;   // this kv head's slice into the per-token stride
+    for (int i = i0; i < i1; i++) {
+        int p = lo + i;            // absolute logical position
+        float kd[slice], vd[slice];
+        #pragma unroll
+        for (int e = 0; e < slice; e++) {
+            size_t idx = paged_elem_index(v, p, elem_off + lane + 32*e, block_tokens, elems_per_token);
+            kd[e] = (idx != (size_t)-1) ? pkv_fp8_to_float(k_pool[idx]) : 0.0f;
+            vd[e] = (idx != (size_t)-1) ? pkv_fp8_to_float(v_pool[idx]) : 0.0f;
+        }
+        #pragma unroll
+        for (int g = 0; g < GQ; g++) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < slice; e++) dot += qreg[g][e] * kd[e];
+            for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            float s = dot;
+            float mn = fmaxf(m[g], s), al = __expf(m[g] - mn), pw = __expf(s - mn);
+            l[g] = l[g]*al + pw;
+            #pragma unroll
+            for (int e = 0; e < slice; e++) acc[g][e] = acc[g][e]*al + pw*vd[e];
+            m[g] = mn;
+        }
+    }
+
+    size_t slot = (size_t)seq * MAX_SPLITS + split;
+    #pragma unroll
+    for (int g = 0; g < GQ; g++) {
+        int h = kv_head*GQ + g;
+        float *pa = part_acc + (slot*NH + h)*HD;
+        #pragma unroll
+        for (int e = 0; e < slice; e++) pa[lane + 32*e] = acc[g][e];
+        if (lane == 0) { part_m[slot*NH + h] = m[g]; part_l[slot*NH + h] = l[g]; }
+    }
+}
+
+// Global split-K, paged, batched over seqs. One warp per query head (GQA-broadcast
+// over the single KV head). grid = (max_splits, n_seq); tail blocks return.
+//
+// LANE LAYOUT matches global_attn_splitk_rows_kernel EXACTLY (not the sliding
+// lane-per-element layout): each lane owns E = HD/128 groups of 4 CONTIGUOUS dims
+// (qreg[E][4], element 4*(lane+32*e)+j), and the per-lane dot accumulates those 4
+// terms per group BEFORE the warp reduce. Matching this grouping is what makes the
+// dot product bit-identical to the contiguous path (FP add reassociation order).
+template<int NH, int HD, int MAX_SPLITS>
+__global__ void paged_global_attn_splitk_batched(
+    float *part_acc, float *part_m, float *part_l,   // slot (seq*MAX_SPLITS + split)
+    const float *q,                                  // [n_seq][NH*HD] row-major
+    const pkv_t *k_pool, const pkv_t *v_pool,        // ONE layer's pool (nkv=1)
+    const PagedSeqView *views,
+    int chunk, int block_tokens, int elems_per_token)
+{
+    constexpr int E = HD / 128;      // groups of 4 dims per lane (4 at HD 512)
+    static_assert(HD % 128 == 0, "global lane slices require HD multiple of 128");
+    int seq   = blockIdx.y;
+    int split = blockIdx.x;
+    PagedSeqView v = views[seq];
+    int ctx_len  = v.n_tokens;
+    int lo = (v.base > 0) ? v.base : 0;   // global pool holds full ctx; base 0 normally
+    int len = ctx_len - lo;
+    int n_splits = paged_row_splits(len, chunk, MAX_SPLITS);
+    if (split >= n_splits) return;
+    int h    = threadIdx.x >> 5;     // warp = query head
+    int lane = threadIdx.x & 31;
+
+    int per = (len + n_splits - 1) / n_splits;
+    int t0  = lo + split * per;
+    int t1  = min(t0 + per, ctx_len);
+
+    float qreg[E][4], acc[E][4], m = -INFINITY, l = 0.0f;
+    const float *qp = q + (size_t)seq * NH * HD + (size_t)h * HD;
+    #pragma unroll
+    for (int e = 0; e < E; e++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { qreg[e][j] = qp[4*(lane + 32*e) + j]; acc[e][j] = 0.0f; }
+
+    for (int p = t0; p < t1; p++) {
+        float kd[E][4], vd[E][4];
+        #pragma unroll
+        for (int e = 0; e < E; e++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                size_t idx = paged_elem_index(v, p, 4*(lane + 32*e) + j, block_tokens, elems_per_token);
+                kd[e][j] = (idx != (size_t)-1) ? pkv_fp8_to_float(k_pool[idx]) : 0.0f;
+                vd[e][j] = (idx != (size_t)-1) ? pkv_fp8_to_float(v_pool[idx]) : 0.0f;
+            }
+        float dot = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < E; e++)
+            dot += qreg[e][0]*kd[e][0] + qreg[e][1]*kd[e][1]
+                 + qreg[e][2]*kd[e][2] + qreg[e][3]*kd[e][3];
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+        float s = dot;
+        float mn = fmaxf(m, s), al = __expf(m - mn), pw = __expf(s - mn);
+        l = l*al + pw;
+        #pragma unroll
+        for (int e = 0; e < E; e++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) acc[e][j] = acc[e][j]*al + pw*vd[e][j];
+        m = mn;
+    }
+
+    size_t slot = (size_t)seq * MAX_SPLITS + split;
+    float *pa = part_acc + (slot*NH + h)*HD;
+    #pragma unroll
+    for (int e = 0; e < E; e++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) pa[4*(lane + 32*e) + j] = acc[e][j];
+    if (lane == 0) { part_m[slot*NH + h] = m; part_l[slot*NH + h] = l; }
+}
+
+// Merge each seq-row's split partials into out[seq][NH*HD]. Mirrors
+// flash_decode_combine_rows_kernel: merge order s = 0..n_splits-1, scratch slot
+// (seq*MAX_SPLITS + split). window>0 ⇒ sliding (len=min(n_tokens,window)), else
+// global (len=n_tokens). grid = (NH, n_seq), block = HD threads.
+template<int NH, int MAX_SPLITS>
+__global__ void paged_flash_decode_combine_batched(
+    float *out,                                      // [n_seq][NH*HD]
+    const float *part_acc, const float *part_m, const float *part_l,
+    const PagedSeqView *views,
+    int head_dim, int window, int chunk)
+{
+    int seq = blockIdx.y;
+    int h   = blockIdx.x;
+    int tid = threadIdx.x;
+    PagedSeqView v = views[seq];
+    int len = v.n_tokens;
+    int lo  = 0;
+    if (window > 0) { int wl = (len < window) ? len : window; lo = len - wl; len = wl; }
+    if (v.base > lo) { len = v.n_tokens - v.base; }   // mirror the kernels' base clamp
+    int n_splits = paged_row_splits(len, chunk, MAX_SPLITS);
+    size_t base = (size_t)seq * MAX_SPLITS;
+    float M = -INFINITY;
+    for (int s = 0; s < n_splits; s++) M = fmaxf(M, part_m[(base + s)*NH + h]);
+    float L = 0.0f, accv = 0.0f;
+    for (int s = 0; s < n_splits; s++) {
+        float ms = part_m[(base + s)*NH + h];
+        if (ms == -INFINITY) continue;
+        float scale = __expf(ms - M);
+        L    += part_l[(base + s)*NH + h] * scale;
+        accv += part_acc[((base + s)*NH + h)*head_dim + tid] * scale;
+    }
+    if (tid < head_dim)
+        out[(size_t)seq*NH*head_dim + h*head_dim + tid] = (L > 0.0f) ? accv / L : 0.0f;
+}
+
 #endif // FUCINA_PAGED_KV_DEVICE_CUH

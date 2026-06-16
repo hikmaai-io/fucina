@@ -16,9 +16,21 @@ How it works end to end:
   samples one greedy token per row. Per-row admission: a slot that can't grow its KV is marked
   `-1` and excluded; the scheduler stops just that sequence (never the whole batch).
 
-Known limitations: greedy sampling only in the batch path (SeqParams forwarded, not yet honored
-by the kernels); no spec decode / TTFT metrics in the batch path; attention is correctness-first
-(not split-K) so it agrees with the contiguous path to ~1e-5, not bit-identically.
+Paged batched attention is now SPLIT-K and BIT-IDENTICAL to the contiguous split-K decode
+(`paged_sliding_attn_splitk_batched` / `paged_global_attn_splitk_batched` +
+`paged_flash_decode_combine_batched` in cuda/paged_kv_device.cuh): per (head,seq,split)
+online-softmax partials reading K/V through each row's block table, merged in the same
+split order — so the per-row n_splits/per/scan/combine all match the contiguous rows
+kernels, and only the K/V *address* (block-table lookup vs ring modulo) differs. The single-
+seq paged_read path uses the same kernels (B=1 view), so FUCINA_PAGED_E2E_SELFTEST now agrees
+on all 64/64 tokens (was "numerically equivalent", a few top-2 near-tie flips). Tradeoff: at
+batch decode the attention is not the bottleneck (weight GEMV bandwidth is), so split-K's extra
+combine launch costs ~10% aggregate tok/s vs the old sequential kernel at short/medium contexts
+(measured 4×512 long-gen: 57.0 → ~51 tok/s on the GB10). Kept because bit-identity to the
+contiguous path is structurally impossible with a single-scan kernel (different summation order).
+
+Known limitations: no spec decode / TTFT metrics in the batch path. (Per-sequence sampling
+params are now honored; see the sampling-params phase note.)
 
 ---
 Original plan (branch `perf/continuous-batching-paged-kv`).
