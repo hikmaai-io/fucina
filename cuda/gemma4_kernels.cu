@@ -12,6 +12,9 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>         // __nv_fp8_storage_t, conversion functions
+#include "paged_kv_device.cuh" // paged KV: host block-table bookkeeping + device access kernels
+                              // (Phase 2 continuous batching). Pulls paged_kv.h. Kernels are
+                              // compiled into the engine TU but stay dormant until wired.
 #include <cuda_fp4.h>         // __nv_fp4_storage_t, NVFP4 E2M1 conversion (FUCINA_FP4)
 #include <cublasLt.h>         // NVFP4 block-scaled tensor-core GEMM (FUCINA_FP4)
 #include <cooperative_groups.h>
@@ -2428,6 +2431,35 @@ __global__ void scale_kernel(float *x, int n, float s) {
 // because NVFP4 weight arrays are dimensioned [layer][PJ_COUNT].
 enum { PJ_Q = 0, PJ_K, PJ_V, PJ_O, PJ_GATE, PJ_UP, PJ_DOWN, PJ_COUNT };
 
+// ── Per-sequence state (continuous batching, Phase 1) ────────────────────────
+// State that is logically OWNED BY ONE SEQUENCE, as opposed to the shared
+// per-step compute scratch (d_x, d_attn_*, d_sb[...]) which is reused by
+// whatever sequence is being stepped. Today the engine holds exactly one of
+// these (`cur`), so behaviour is identical to the previous single `int
+// global_n_tokens`; Phase 2+ grows this to an array (one slot per in-flight
+// sequence) plus per-class KV block tables, and Phase 5 moves the MTP recurrent
+// draft state (d_mtp_h / mtp_h_valid) in here so each sequence drafts from its
+// own hidden. Keeping it in a named struct now lets the rest of the engine name
+// the owner of a position without another wide rename later.
+typedef struct gemma4_seq {
+    int n_tokens;   // absolute position == count of tokens committed to this seq's KV
+
+    // ── Paged KV (Phase 2, dormant until the write/read paths are wired) ──
+    // Per-sequence block tables mapping logical token positions to physical pool
+    // blocks. One table per cache CLASS (the logical→physical mapping differs:
+    // the sliding table recycles leading blocks as the window advances; the
+    // global table never recycles). The mapping is shared across all layers of a
+    // class (a block reserves those 256 positions in EVERY layer of the class).
+    // d_slid_blocks / d_glob_blocks mirror the host tables' block-id arrays on
+    // device, refreshed when a table grows/recycles, for the kernels to index.
+    PagedBlockTable slid_bt;     // sliding-class block table (host bookkeeping)
+    PagedBlockTable glob_bt;     // global-class  block table (host bookkeeping)
+    int            *d_slid_blocks;   // device copy of slid_bt.blocks (or NULL)
+    int            *d_glob_blocks;   // device copy of glob_bt.blocks (or NULL)
+    int             d_slid_cap;      // capacity of d_slid_blocks (elems)
+    int             d_glob_cap;      // capacity of d_glob_blocks (elems)
+} gemma4_seq;
+
 struct gemma4_engine {
     // GGUF data (mmap'd)
     const uint8_t *gguf_data;
@@ -2701,8 +2733,27 @@ struct gemma4_engine {
     // RMSNorm+RoPE while V gets only plain (weightless) RMSNorm.
     kv_t   *d_global_k;  // [n_layers_global × ctx_size × 512]
     kv_t   *d_global_v;
-    int     global_n_tokens;
+    gemma4_seq cur;      // the active sequence (Phase 1: the only one). cur.n_tokens
+                         // is the absolute KV position, formerly `global_n_tokens`.
     int     global_kv_capacity;
+
+    // ── Paged KV pools (Phase 2; allocated only when paged mode is enabled) ──
+    // The continuous-batching KV store: one physical block pool per cache class,
+    // shared by all in-flight sequences (each holds a per-seq block table into
+    // these pools — see gemma4_seq). A block reserves PAGED_KV_BLOCK_TOKENS (256)
+    // positions across EVERY layer of the class; layout per class is
+    // [block_id][layer][offset][elems_per_token] (sliding elems=8×256, global
+    // elems=1×512). d_*_pool_* are device storage; *_pool are the host free-lists
+    // (paged_kv.h). NULL/zero when paged mode is off — the contiguous d_sliding_*
+    // / d_global_* path above stays the default until the paged read/write paths
+    // are wired and validated against it.
+    int            paged_enabled;       // 1 once the pools are allocated
+    PagedBlockPool slid_pool;           // sliding-class block free-list (host)
+    PagedBlockPool glob_pool;           // global-class  block free-list (host)
+    kv_t          *d_slid_pool_k;       // [n_blocks × 40 sliding-layers × 256 × 2048] fp8
+    kv_t          *d_slid_pool_v;
+    kv_t          *d_glob_pool_k;       // [n_blocks × n_global-layers × 256 × 512] fp8
+    kv_t          *d_glob_pool_v;
     // Max dynamic shared memory (bytes) the global-attn kernel may use, after
     // opting in past the 48 KB static cap. Used to bound n_ctx and to produce a
     // clear error instead of a silent kernel no-op when the cache outgrows it.
@@ -3662,6 +3713,83 @@ gemma4_engine_t* gemma4_engine_create(
             sliding_kv_size / (1024.0*1024.0),
             global_kv_size / (1024.0*1024.0));
 
+    // ── Paged KV pools (Phase 2, opt-in via FUCINA_PAGED_KV) ──────────────
+    // Allocate the shared block pools for continuous batching, sized to free
+    // VRAM after weights+contiguous-KV are resident. Dormant for now: nothing
+    // reads/writes them until the paged write/read paths are wired (inc 2/3), so
+    // with the flag OFF (default) this is skipped and behaviour is unchanged.
+    // Pool element layout per class: [layer_in_class][block_id][offset][elems].
+    if (getenv("FUCINA_PAGED_KV")) {
+        const int BT = PAGED_KV_BLOCK_TOKENS;
+        const int slid_elems = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;          // 8×256 = 2048
+        const int glob_elems = GEMMA4_GLOBAL_KV_HEADS * GEMMA4_GLOBAL_HEAD_DIM; // 1×512 = 512
+        // Per-block bytes for K (== V) across all layers of the class.
+        size_t slid_block_k = (size_t)eng->n_layers_sliding * BT * slid_elems * sizeof(kv_t);
+        size_t glob_block_k = (size_t)eng->n_layers_global  * BT * glob_elems * sizeof(kv_t);
+        // K+V together = the cost of one block in each class.
+        uint64_t slid_block_kv = 2ull * slid_block_k;
+        uint64_t glob_block_kv = 2ull * glob_block_k;
+
+        // Capacity-based sizing (NOT a raw VRAM fraction): the pool is dimensioned
+        // by how many concurrent sequences fit. Per sequence:
+        //   - sliding RECYCLES, so it only ever holds the window: a small, FIXED
+        //     ceil(window/BT)+1 blocks regardless of sequence length.
+        //   - global does NOT recycle, so it grows to ceil(maxctx/BT) blocks.
+        // max_seqs = budget / per-seq cost, capped. maxctx defaults to a practical
+        // serving context (env FUCINA_PAGED_MAXCTX), not the full 262k window.
+        int slid_per_seq = (GEMMA4_SLIDING_WINDOW + BT - 1) / BT + 1;     // window blocks (+1 spill)
+        int maxctx = 32768;
+        if (const char *mc = getenv("FUCINA_PAGED_MAXCTX")) { int v = atoi(mc); if (v > 0) maxctx = v; }
+        if (maxctx > (int)context_size) maxctx = (int)context_size;
+        int glob_per_seq = (maxctx + BT - 1) / BT;                         // ctx blocks (no recycle)
+        uint64_t per_seq_kv = (uint64_t)slid_per_seq * slid_block_kv +
+                              (uint64_t)glob_per_seq * glob_block_kv;
+
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const uint64_t reserve = 3ull << 30;   // 3 GiB headroom for activations/graphs
+        uint64_t budget = (free_b > reserve) ? (free_b - reserve) : 0;
+        int max_seqs = (per_seq_kv > 0) ? (int)(budget / per_seq_kv) : 0;
+        if (max_seqs < 1)  max_seqs = 1;
+        if (max_seqs > 64) max_seqs = 64;       // sane concurrency cap (tunable later)
+        if (const char *ms = getenv("FUCINA_PAGED_MAXSEQS")) { int v = atoi(ms); if (v > 0) max_seqs = v; }
+        // +1 sequence of slack so a brief over-subscription doesn't wedge admission.
+        int slid_blocks = slid_per_seq * (max_seqs + 1);
+        int glob_blocks = glob_per_seq * (max_seqs + 1);
+
+        int ok = (slid_blocks > 0 && glob_blocks > 0) &&
+                 paged_pool_init(&eng->slid_pool, slid_blocks, BT) == 0 &&
+                 paged_pool_init(&eng->glob_pool, glob_blocks, BT) == 0;
+        if (ok) {
+            size_t slid_pool_bytes = (size_t)slid_blocks * slid_block_k;
+            size_t glob_pool_bytes = (size_t)glob_blocks * glob_block_k;
+            ok = cudaMalloc(&eng->d_slid_pool_k, slid_pool_bytes) == cudaSuccess &&
+                 cudaMalloc(&eng->d_slid_pool_v, slid_pool_bytes) == cudaSuccess &&
+                 cudaMalloc(&eng->d_glob_pool_k, glob_pool_bytes) == cudaSuccess &&
+                 cudaMalloc(&eng->d_glob_pool_v, glob_pool_bytes) == cudaSuccess;
+            if (ok) {
+                eng->paged_enabled = 1;
+                fprintf(stderr,
+                    "fucina: paged KV ENABLED — ~%d concurrent seqs @ maxctx %d "
+                    "(block=%d tok): sliding %d blk %.1f GB, global %d blk %.1f GB\n",
+                    max_seqs, maxctx, BT,
+                    slid_blocks, (2.0*slid_pool_bytes) / (1024.0*1024.0*1024.0),
+                    glob_blocks, (2.0*glob_pool_bytes) / (1024.0*1024.0*1024.0));
+            }
+        }
+        if (!ok) {
+            // Allocation failed → fall back to the contiguous path cleanly.
+            cudaGetLastError();
+            CUDA_FREE(eng->d_slid_pool_k); CUDA_FREE(eng->d_slid_pool_v);
+            CUDA_FREE(eng->d_glob_pool_k); CUDA_FREE(eng->d_glob_pool_v);
+            paged_pool_destroy(&eng->slid_pool);
+            paged_pool_destroy(&eng->glob_pool);
+            eng->paged_enabled = 0;
+            fprintf(stderr, "fucina: paged KV requested but allocation failed — "
+                            "using contiguous KV\n");
+        }
+    }
+
     // Repacked-Q4_0 decode GEMV: DEFAULT-ON for dense 12B+MTP (bit-exact, ~+2-3% decode
     // via coalesced uint4 weight loads; costs +6.96 GB weight VRAM — fine on GB10's 128 GB
     // unified memory). Built eagerly now — before any request or CUDA-graph capture — so
@@ -3709,6 +3837,17 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_sliding_v);
     CUDA_FREE(eng->d_global_k);
     CUDA_FREE(eng->d_global_v);
+    // Paged KV pools + the active sequence's block tables (no-ops when paged off).
+    CUDA_FREE(eng->d_slid_pool_k);
+    CUDA_FREE(eng->d_slid_pool_v);
+    CUDA_FREE(eng->d_glob_pool_k);
+    CUDA_FREE(eng->d_glob_pool_v);
+    paged_pool_destroy(&eng->slid_pool);
+    paged_pool_destroy(&eng->glob_pool);
+    CUDA_FREE(eng->cur.d_slid_blocks);
+    CUDA_FREE(eng->cur.d_glob_blocks);
+    paged_table_free_struct(&eng->cur.slid_bt);
+    paged_table_free_struct(&eng->cur.glob_bt);
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -4121,7 +4260,7 @@ static int decode_layer(
             copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + rslot, eng->d_attn_v, kv_size);
         }
     } else {
-        int n = pos;   // == eng->global_n_tokens at every call site
+        int n = pos;   // == eng->cur.n_tokens at every call site
         int slot = eng->global_slot[layer];
         size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
         kv_t *base_k = eng->d_global_k + (size_t)slot * layer_stride;
@@ -4169,7 +4308,7 @@ static int decode_layer(
         // Flash kernel uses a constant 32-float scratch, so there is no longer any
         // context-length shared-memory cap (the old (32+n_ctx)-float buffer capped
         // ctx at ~25K and failed silently past it).
-        int n_ctx = pos + 1;   // pos == eng->global_n_tokens at every call site
+        int n_ctx = pos + 1;   // pos == eng->cur.n_tokens at every call site
         int slot = eng->global_slot[layer];
         size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
         if (d_pos) {
@@ -4716,7 +4855,7 @@ int gemma4_engine_prefill_batched(
                             // (the -2 fallthroughs to flash/chunked keep it live)
 
     if (!eng->loaded || n_tokens <= 0) return -1;
-    if (eng->global_n_tokens != 0) return -2;             // need fresh sequence
+    if (eng->cur.n_tokens != 0) return -2;             // need fresh sequence
     if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
     // Batched attention materializes [HEADS][N×N] score buffers (fp32+bf16, ~6 B/elem).
     // At large N that is many GB (e.g. ~14 GB @ 11.7k tokens) — the giant per-request
@@ -4976,7 +5115,7 @@ int gemma4_engine_prefill_batched(
 
     } // if (!graph_replay)
 
-    eng->global_n_tokens += N;
+    eng->cur.n_tokens += N;
 
     if (!graph_replay) {
     // ── Output norm + LM head + softcap on the LAST token only ──
@@ -5052,7 +5191,7 @@ int gemma4_engine_prefill_flash(
     eng->mtp_h_valid = 0;   // prefill invalidates the MTP drafter's recurrent h
 
     if (!eng->loaded || n_tokens <= 0) return -1;
-    const int base0 = eng->global_n_tokens;               // 0 = fresh, >0 = suffix
+    const int base0 = eng->cur.n_tokens;               // 0 = fresh, >0 = suffix
     if (base0 + n_tokens > eng->global_kv_capacity) return -2;  // would overflow cache
     // Tiny suffixes stay on the chunked dp4a fallback: this path pays a fixed
     // per-chunk full-model BF16 dequant (~28 GB of traffic, ~125 ms) that only
@@ -5350,7 +5489,7 @@ int gemma4_engine_prefill_flash(
         cudaStreamSynchronize(stream);                    // chunk boundary (cache state advanced)
     }
     if (!aborted) {
-        eng->global_n_tokens = base0 + N;
+        eng->cur.n_tokens = base0 + N;
         // The last chunk's output-normed last-token hidden (d_norm) is exactly the
         // recurrent h the MTP drafter pairs with the first sampled token — restore it
         // (parity with the chunked-decode suffix path and gemma4_engine_decode) so
@@ -5401,9 +5540,9 @@ int gemma4_engine_prefill(
     cudaEventCreate(&stop);
     cudaEventRecord(start, eng->stream);
 
-    if (eng->global_n_tokens + n_tokens > eng->global_kv_capacity) {
+    if (eng->cur.n_tokens + n_tokens > eng->global_kv_capacity) {
         fprintf(stderr, "fucina: prefill of %d tokens exceeds context (%d/%d used)\n",
-                n_tokens, eng->global_n_tokens, eng->global_kv_capacity);
+                n_tokens, eng->cur.n_tokens, eng->global_kv_capacity);
         cudaEventDestroy(start); cudaEventDestroy(stop);
         return -1;
     }
@@ -5579,7 +5718,7 @@ int gemma4_engine_decode(
 
     decode_timing_lap(eng);
     cudaStream_t stream = eng->stream;
-    int pos = eng->global_n_tokens;
+    int pos = eng->cur.n_tokens;
     int timing = !eng->ev_pending;     // events free → time this step (lazy readout)
     if (timing) cudaEventRecord(eng->ev_start, stream);
 
@@ -5614,7 +5753,7 @@ int gemma4_engine_decode(
 
         // Run all 48 layers
         for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
-            decode_layer(eng, l, pos, eng->global_n_tokens + 1, stream);
+            decode_layer(eng, l, pos, eng->cur.n_tokens + 1, stream);
         }
 
         // Output norm + projection + softcap
@@ -5658,7 +5797,7 @@ int gemma4_engine_decode(
         eng->ev_pending_tokens = 1;
     }
 
-    eng->global_n_tokens++;
+    eng->cur.n_tokens++;
 
     // The pageable-host logits copy must be complete before the caller reads it.
     // The fast paths (logits_out == NULL: device sampling) skip this drain entirely.
@@ -5918,7 +6057,7 @@ static int decode_batched_dev(
     if (K > GEMMA4_SPEC_MAX) return -1;
 
     cudaStream_t stream = eng->stream;
-    const int pos = eng->global_n_tokens;            // captured; advanced only at end
+    const int pos = eng->cur.n_tokens;            // captured; advanced only at end
     int32_t *d_tok = (int32_t*)eng->d_sb[0];
 
     // Engine-resident scratch (allocated once, sized for GEMMA4_SPEC_MAX rows), so
@@ -5938,7 +6077,7 @@ static int decode_batched_dev(
         int pv[2] = { pos, pos + 1 };
         cudaMemcpyAsync(eng->d_specpos, pv, sizeof(pv), cudaMemcpyHostToDevice, stream);
         if (cudaGraphLaunch(eng->batched_graph[K], stream) == cudaSuccess) {
-            eng->global_n_tokens += K;
+            eng->cur.n_tokens += K;
             return 0;
         }
         // Replay failed: retire the graph and fall through to per-kernel launches.
@@ -5973,7 +6112,7 @@ static int decode_batched_dev(
                         (size_t)K*GEMMA4_VOCAB_SIZE*sizeof(float),
                         cudaMemcpyDeviceToHost, stream);
 
-    eng->global_n_tokens += K;
+    eng->cur.n_tokens += K;
 
     if (timing) {
         cudaEventRecord(eng->ev_stop, stream);
@@ -6357,7 +6496,7 @@ static int mtp_graph_ensure(gemma4_engine_t *eng)
 static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int max_draft)
 {
     if (!eng->mtp.loaded || !eng->mtp_h_valid || max_draft <= 0) return 0;
-    if (eng->global_n_tokens <= 0) return 0;
+    if (eng->cur.n_tokens <= 0) return 0;
     if (max_draft > GEMMA4_SPEC_MAX - 1) max_draft = GEMMA4_SPEC_MAX - 1;
     if (!eng->d_mtp_ids || !eng->d_mtp_conf) return 0;
     if (!eng->d_mtp_tok || !eng->d_mtp_pos) return 0;
@@ -6365,7 +6504,7 @@ static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int ma
     // Per-call device state: the chain position (n_past, same for every draft token)
     // and the first input token. Chained tokens are written into d_mtp_tok on-device
     // by mtp_argmax_conf_kernel — no id ever crosses the bus mid-chain.
-    int posv = eng->global_n_tokens;
+    int posv = eng->cur.n_tokens;
     cudaMemcpyAsync(eng->d_mtp_pos, &posv, sizeof(int), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(eng->d_mtp_tok, &g, sizeof(int32_t), cudaMemcpyHostToDevice, stream);
     int use_graph = (mtp_graph_ensure(eng) == 0);
@@ -6655,7 +6794,7 @@ static int run_spec_loop(
         if (cb && cb(g, cb_ud)) break;   // streaming consumer asked to stop here
         if (is_stop(g)) break;
 
-        int pos = eng->global_n_tokens;
+        int pos = eng->cur.n_tokens;
         // FLAT KV (Step 3): rewind is now exact at ANY ctx, so the draft is no longer clamped
         // to the 1024 sliding window — only to the cache capacity (don't write past the buffer).
         // This is what re-enables speculation past 1024 ctx.
@@ -6821,7 +6960,7 @@ static int run_spec_loop(
         }
         int keep = pos + 1 + a;
         // FLAT KV (Step 3): rewind is exact now; check the return defensively (design :4756).
-        if (keep < eng->global_n_tokens && gemma4_engine_rewind(eng, keep) != 0) {
+        if (keep < eng->cur.n_tokens && gemma4_engine_rewind(eng, keep) != 0) {
             fprintf(stderr, "fucina: spec rewind to %d failed — stopping spec\n", keep);
             stop = 1; break;
         }
@@ -7231,12 +7370,12 @@ int gemma4_engine_get_context_size(const gemma4_engine_t *eng) {
 // Resetting does NOT free or zero device memory; it only rewinds the cursors,
 // which is sufficient because attention reads are bounded by these counters.
 int gemma4_engine_n_tokens(const gemma4_engine_t *eng) {
-    return eng ? eng->global_n_tokens : 0;
+    return eng ? eng->cur.n_tokens : 0;
 }
 
 void gemma4_engine_reset(gemma4_engine_t *eng) {
     if (!eng) return;
-    eng->global_n_tokens = 0;
+    eng->cur.n_tokens = 0;
     eng->mtp_h_valid = 0;
 }
 
@@ -7255,21 +7394,21 @@ void gemma4_engine_reset(gemma4_engine_t *eng) {
 // Returns 0 on success, -1 only on a bad argument.
 int gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep) {
     if (!eng) return -1;
-    if (n_keep < 0 || n_keep > eng->global_n_tokens) return -1;
-    if (n_keep == eng->global_n_tokens) return 0; // nothing to discard
+    if (n_keep < 0 || n_keep > eng->cur.n_tokens) return -1;
+    if (n_keep == eng->cur.n_tokens) return 0; // nothing to discard
 
     // Ring sliding cache: once the sequence has exceeded the ring capacity, only the
     // last `cap` positions survive, so the sliding window for n_keep is intact only if
     // n_keep >= H - (cap - window). A deeper rewind cannot be served exactly — report
     // failure so KVCache.Prefill falls back to a full re-prefill (Rewind()==false). When
     // H <= cap nothing has been overwritten and every rewind is exact, as before.
-    if (eng->global_n_tokens > eng->sliding_kv_capacity &&
-        n_keep < eng->global_n_tokens -
+    if (eng->cur.n_tokens > eng->sliding_kv_capacity &&
+        n_keep < eng->cur.n_tokens -
                  (eng->sliding_kv_capacity - GEMMA4_SLIDING_WINDOW)) {
         return -1;
     }
 
-    eng->global_n_tokens = n_keep;
+    eng->cur.n_tokens = n_keep;
     return 0;
 }
 
@@ -7427,7 +7566,7 @@ static int kv_seq_copy(gemma4_engine_t *eng, char *buf, int n_tokens,
 }
 
 int gemma4_engine_kv_save(gemma4_engine_t *eng, void *buf, int n_tokens) {
-    if (!eng || !buf || n_tokens <= 0 || n_tokens > eng->global_n_tokens) return -1;
+    if (!eng || !buf || n_tokens <= 0 || n_tokens > eng->cur.n_tokens) return -1;
     return kv_seq_copy(eng, (char *)buf, n_tokens, cudaMemcpyDeviceToHost);
 }
 
@@ -7437,7 +7576,7 @@ int gemma4_engine_kv_restore(gemma4_engine_t *eng, const void *buf, int n_tokens
         return -1;
     if (kv_seq_copy(eng, (char *)buf, n_tokens, cudaMemcpyHostToDevice) != 0)
         return -1;
-    eng->global_n_tokens = n_tokens;
+    eng->cur.n_tokens = n_tokens;
     eng->mtp_h_valid = 0; // the MTP draft state belonged to the replaced sequence
     return 0;
 }
