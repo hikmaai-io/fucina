@@ -229,4 +229,59 @@ __global__ void paged_attn_gather(
         out[tid] = (l > 0.0f) ? acc / l : 0.0f;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel: paged_attn_decode_batched — the CONTINUOUS-BATCHING primitive. One
+// batched decode forward attends B INDEPENDENT sequences at once: block (h, s)
+// computes query head h of sequence s, attending s's own KV through views[s]'s
+// block table (its own length/base). This is what lets one forward pass serve
+// many in-flight requests — the core of the scheduler's StepBatch. Correctness
+// reference (per-head online softmax); split-K perf is a later optimisation.
+//
+//   out : float [n_seq][n_heads*head_dim] row-major.
+//   q   : float [n_seq][n_heads*head_dim] row-major (each seq's query row).
+//   k_pool/v_pool : ONE layer's pool (shared by all sequences; each indexes its
+//         own blocks via views[s]). elems_per_token = nkv*head_dim.
+//   views : [n_seq] PagedSeqView (per-seq block table + length + base).
+//   GQA: query head h reads kv head h/(n_heads/n_kv_heads). window>0 ⇒ sliding.
+//   grid = (n_heads, n_seq), block = head_dim.
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void paged_attn_decode_batched(
+        float       *out,
+        const float *q,
+        const pkv_t *k_pool,
+        const pkv_t *v_pool,
+        const PagedSeqView *views,
+        int n_heads, int n_kv_heads, int head_dim,
+        int window, int block_tokens, int elems_per_token)
+{
+    extern __shared__ float smem[];
+    int h   = blockIdx.x;            // query head
+    int s   = blockIdx.y;            // sequence (row)
+    int tid = threadIdx.x;
+    PagedSeqView v = views[s];
+    int group    = n_heads / n_kv_heads;
+    int elem_off = (h / group) * head_dim;
+    int lo = (window > 0 && v.n_tokens > window) ? (v.n_tokens - window) : 0;
+    if (v.base > lo) lo = v.base;   // never scan recycled (unmapped) leading positions
+
+    size_t qbase = ((size_t)s * n_heads + h) * head_dim;
+    float q_d = (tid < head_dim) ? q[qbase + tid] : 0.0f;
+    float acc = 0.0f, m = -INFINITY, l = 0.0f;
+    for (int p = lo; p < v.n_tokens; p++) {
+        float k_d = 0.0f, val_d = 0.0f;
+        if (tid < head_dim) {
+            size_t idx = paged_elem_index(v, p, elem_off + tid, block_tokens, elems_per_token);
+            if (idx != (size_t)-1) { k_d = pkv_fp8_to_float(k_pool[idx]); val_d = pkv_fp8_to_float(v_pool[idx]); }
+        }
+        float s_dot = pkv_block_reduce_sum(q_d * k_d, smem);
+        float m_new = fmaxf(m, s_dot);
+        float alpha = __expf(m - m_new);
+        float p_w   = __expf(s_dot - m_new);
+        l   = l * alpha + p_w;
+        acc = acc * alpha + p_w * val_d;
+        m   = m_new;
+    }
+    if (tid < head_dim) out[qbase + tid] = (l > 0.0f) ? acc / l : 0.0f;
+}
+
 #endif // FUCINA_PAGED_KV_DEVICE_CUH
