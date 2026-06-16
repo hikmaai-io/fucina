@@ -63,6 +63,47 @@ func samplerParams(args CLIArgs) sampler.Params {
 
 // ─── Main ─────────────────────────────────────────────────────────
 
+// loadTokenizer resolves the tokenizer for a model. NVFP4 safetensors checkpoints ship a
+// HuggingFace tokenizer.json (BPE) and no GGUF vocab, so we auto-detect one next to / inside the
+// model; GGUF models carry their vocab inline. An explicit --tokenizer (override) wins and may be
+// either a .json (HF BPE) or a .gguf (vocab). No silent fallback — a missing tokenizer is fatal.
+func loadTokenizer(modelPath, override string) (*tokenizer.Tokenizer, error) {
+	if override != "" {
+		if strings.HasSuffix(override, ".json") {
+			return tokenizer.NewFromHFJSON(override)
+		}
+		data, err := os.ReadFile(override)
+		if err != nil {
+			return nil, fmt.Errorf("read --tokenizer %s: %w", override, err)
+		}
+		return tokenizer.New(data, int64(len(data)))
+	}
+	if j := siblingTokenizerJSON(modelPath); j != "" {
+		return tokenizer.NewFromHFJSON(j)
+	}
+	data, err := os.ReadFile(modelPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read tokenizer source %s: %w "+
+			"(an NVFP4 dir needs a tokenizer.json, or pass --tokenizer <gemma-4.gguf|tokenizer.json>)",
+			modelPath, err)
+	}
+	return tokenizer.New(data, int64(len(data)))
+}
+
+// siblingTokenizerJSON returns a tokenizer.json located in the model directory (when modelPath
+// is a dir) or alongside the model file (NVFP4 single-file .safetensors), or "" if none.
+func siblingTokenizerJSON(modelPath string) string {
+	dir := modelPath
+	if fi, err := os.Stat(modelPath); err != nil || !fi.IsDir() {
+		dir = filepath.Dir(modelPath)
+	}
+	cand := filepath.Join(dir, "tokenizer.json")
+	if _, err := os.Stat(cand); err == nil {
+		return cand
+	}
+	return ""
+}
+
 func main() {
 	runtime.LockOSThread() // CUDA requires thread affinity
 
@@ -116,23 +157,13 @@ func main() {
 		eng.PrintInfo()
 	}
 
-	// Load the tokenizer vocab. It lives in a GGUF; an NVFP4 safetensors checkpoint carries
-	// no GGUF vocab, so --tokenizer must point at a Gemma-4 GGUF (same vocab) in that case.
-	tokSrc := args.ModelPath
-	if args.TokenizerPath != "" {
-		tokSrc = args.TokenizerPath
-	}
-	ggufData, err := os.ReadFile(tokSrc)
+	// Load the tokenizer. NVFP4 safetensors checkpoints ship a HuggingFace tokenizer.json
+	// (BPE, no GGUF vocab) which loadTokenizer resolves from the model dir/sibling automatically
+	// — so an NVFP4 model is self-contained; GGUF models carry their vocab inline. --tokenizer
+	// overrides with either a .json or a .gguf. There is no tokenizer fallback: every mode
+	// (server, REPL, one-shot) needs Encode/Decode, so fail fast and loud rather than start blind.
+	tok, err := loadTokenizer(args.ModelPath, args.TokenizerPath)
 	if err != nil {
-		log.Fatalf("fucina: cannot read GGUF for tokenizer (%s): %v "+
-			"(for an NVFP4 checkpoint pass --tokenizer <gemma-4.gguf>)", tokSrc, err)
-	}
-
-	tok, err := tokenizer.New(ggufData, int64(len(ggufData)))
-	if err != nil {
-		// There is no tokenizer fallback: every mode (server, REPL, one-shot)
-		// needs Encode/Decode. A nil tokenizer in server mode would serve every
-		// request blind, so fail fast and loud rather than start broken.
 		log.Fatalf("fucina: tokenizer init failed: %v", err)
 	}
 

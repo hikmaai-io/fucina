@@ -61,7 +61,19 @@ type Tokenizer struct {
 	// produced — re-encoded prompts then token-mismatch the generated sequence
 	// and silently break KV prefix reuse.
 	specials []specialToken
+
+	// BPE mode (HF tokenizer.json, used by the NVFP4 safetensors checkpoints which
+	// ship no GGUF vocab). When set, Encode merges adjacent symbols by merge RANK
+	// instead of the unigram longest-prefix match — the two algorithms disagree, so
+	// the model's own tokenizer.json is the only faithful encoder. Populated by
+	// NewFromHFJSON; Decode is algorithm-agnostic and shared. See hf_bpe.go.
+	bpe          bool
+	byteFallback bool
+	bpeMerges    map[mergePair]int32 // ordered merge → rank (lower rank applied first)
 }
+
+// mergePair keys the BPE merge table: the adjacent (left,right) symbol pair.
+type mergePair struct{ a, b string }
 
 // specialToken pairs a control-marker literal with its vocab id for Encode's
 // pre-split scan.
@@ -459,7 +471,7 @@ func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 		}
 		for _, sp := range t.specials {
 			if strings.HasPrefix(text[i:], sp.str) {
-				tokens = t.encodeGreedy(text[start:i], tokens)
+				tokens = t.encodeSegment(text[start:i], tokens)
 				tokens = append(tokens, sp.id)
 				i += len(sp.str) - 1 // -1: the loop increment adds it back
 				start = i + 1
@@ -467,13 +479,23 @@ func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 			}
 		}
 	}
-	tokens = t.encodeGreedy(text[start:], tokens)
+	tokens = t.encodeSegment(text[start:], tokens)
 
 	if addEos {
 		tokens = append(tokens, t.EOS)
 	}
 
 	return tokens
+}
+
+// encodeSegment encodes one control-marker-free, ▁-normalized text segment with
+// whichever model this tokenizer carries: BPE merge-by-rank (HF tokenizer.json) or
+// the unigram longest-prefix match (GGUF).
+func (t *Tokenizer) encodeSegment(text string, tokens []int32) []int32 {
+	if t.bpe {
+		return t.bpeEncode(text, tokens)
+	}
+	return t.encodeGreedy(text, tokens)
 }
 
 // encodeGreedy runs the longest-prefix-match loop over a text segment that
