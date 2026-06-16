@@ -2459,6 +2459,19 @@ typedef struct gemma4_seq {
     int             d_slid_cap;      // capacity of d_slid_blocks (elems)
     int             d_glob_cap;      // capacity of d_glob_blocks (elems)
     int             used;            // 1 if this slot is allocated to a live sequence
+
+    // ── Per-sequence sampling params (continuous-batching batch path) ──────
+    // Stored once at seq_add and applied on-device to THIS row's logits each
+    // step. temp<=0 → exact greedy (argmax), keeping the batch self-test
+    // byte-identical. seed + n_sampled give a reproducible per-row RNG stream:
+    // the draw for the i-th sampled token is hash(seed, i), so two runs with the
+    // same seed produce the same sequence regardless of batch composition.
+    float           samp_temp;       // temperature (<=0 ⇒ greedy)
+    int             samp_top_k;      // top-k (0 ⇒ disabled)
+    float           samp_top_p;      // nucleus top-p (0 or >=1 ⇒ disabled)
+    float           samp_min_p;      // min-p (0 ⇒ disabled)
+    uint64_t        samp_seed;       // per-sequence RNG seed
+    uint64_t        n_sampled;       // count of tokens sampled from this seq (RNG index)
 } gemma4_seq;
 
 // Max concurrent sequences in one multi-seq batched decode. Bounded by the
@@ -2756,6 +2769,12 @@ struct gemma4_engine {
     int          *d_ms_outtok;         // [MAX_SEQS] per-row sampled token id
     PagedSeqView *d_ms_views_slid;     // [MAX_SEQS] sliding-class per-seq views
     PagedSeqView *d_ms_views_glob;     // [MAX_SEQS] global-class per-seq views
+    // Per-row sampling params + RNG draw for the multiseq on-device sampler.
+    float        *d_ms_temp;           // [MAX_SEQS] per-row temperature
+    int          *d_ms_topk;           // [MAX_SEQS] per-row top-k
+    float        *d_ms_topp;           // [MAX_SEQS] per-row top-p
+    float        *d_ms_minp;           // [MAX_SEQS] per-row min-p
+    float        *d_ms_rnd;            // [MAX_SEQS] per-row uniform draw (host-hashed)
 
     // ── Paged KV pools (Phase 2; allocated only when paged mode is enabled) ──
     // The continuous-batching KV store: one physical block pool per cache class,
@@ -3910,6 +3929,11 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_ms_outtok);
     CUDA_FREE(eng->d_ms_views_slid);
     CUDA_FREE(eng->d_ms_views_glob);
+    CUDA_FREE(eng->d_ms_temp);
+    CUDA_FREE(eng->d_ms_topk);
+    CUDA_FREE(eng->d_ms_topp);
+    CUDA_FREE(eng->d_ms_minp);
+    CUDA_FREE(eng->d_ms_rnd);
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -6640,6 +6664,14 @@ static int paged_slot_sync(gemma4_engine_t *eng, gemma4_seq *s, int pos) {
     return 0;
 }
 
+// Per-row multiseq sampler (defined with the rest of the sampling code below the
+// spec loop; decode_multiseq_forward launches it). Greedy (temp<=0) is a
+// lowest-index argmax matching argmax_rows_kernel; temp>0 uses sample_logit_row.
+__global__ void sample_logits_ms_kernel(
+    const float *logits, int V,
+    const float *temps, const int *top_ks, const float *top_ps, const float *min_ps,
+    const float *rnds, int *out_ids);
+
 // Lazily allocate the multi-seq device scratch (positions, views, sampled ids).
 static int ensure_ms_scratch(gemma4_engine_t *eng) {
     if (eng->ms_ready) return 0;
@@ -6647,12 +6679,22 @@ static int ensure_ms_scratch(gemma4_engine_t *eng) {
     int ok = cudaMalloc(&eng->d_ms_pos,    (size_t)N*sizeof(int)) == cudaSuccess
           && cudaMalloc(&eng->d_ms_outtok, (size_t)N*sizeof(int)) == cudaSuccess
           && cudaMalloc(&eng->d_ms_views_slid, (size_t)N*sizeof(PagedSeqView)) == cudaSuccess
-          && cudaMalloc(&eng->d_ms_views_glob, (size_t)N*sizeof(PagedSeqView)) == cudaSuccess;
+          && cudaMalloc(&eng->d_ms_views_glob, (size_t)N*sizeof(PagedSeqView)) == cudaSuccess
+          && cudaMalloc(&eng->d_ms_temp, (size_t)N*sizeof(float)) == cudaSuccess
+          && cudaMalloc(&eng->d_ms_topk, (size_t)N*sizeof(int))   == cudaSuccess
+          && cudaMalloc(&eng->d_ms_topp, (size_t)N*sizeof(float)) == cudaSuccess
+          && cudaMalloc(&eng->d_ms_minp, (size_t)N*sizeof(float)) == cudaSuccess
+          && cudaMalloc(&eng->d_ms_rnd,  (size_t)N*sizeof(float)) == cudaSuccess;
     if (!ok) {
         if (eng->d_ms_pos)    { cudaFree(eng->d_ms_pos);    eng->d_ms_pos = NULL; }
         if (eng->d_ms_outtok) { cudaFree(eng->d_ms_outtok); eng->d_ms_outtok = NULL; }
         if (eng->d_ms_views_slid) { cudaFree(eng->d_ms_views_slid); eng->d_ms_views_slid = NULL; }
         if (eng->d_ms_views_glob) { cudaFree(eng->d_ms_views_glob); eng->d_ms_views_glob = NULL; }
+        if (eng->d_ms_temp) { cudaFree(eng->d_ms_temp); eng->d_ms_temp = NULL; }
+        if (eng->d_ms_topk) { cudaFree(eng->d_ms_topk); eng->d_ms_topk = NULL; }
+        if (eng->d_ms_topp) { cudaFree(eng->d_ms_topp); eng->d_ms_topp = NULL; }
+        if (eng->d_ms_minp) { cudaFree(eng->d_ms_minp); eng->d_ms_minp = NULL; }
+        if (eng->d_ms_rnd)  { cudaFree(eng->d_ms_rnd);  eng->d_ms_rnd  = NULL; }
         cudaGetLastError();
         return -1;
     }
@@ -6781,8 +6823,43 @@ static int decode_multiseq_forward(
             suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
                 d_logitsK + (size_t)i*vocab, eng->d_suppress, eng->n_suppress, vocab);
 
-    if (want_sample)
-        argmax_rows_kernel<<<B,32,0,stream>>>(d_logitsK, eng->d_ms_outtok, B, vocab);
+    if (want_sample) {
+        // Per-row sampling. If EVERY row is greedy (temp<=0), keep the exact
+        // argmax_rows_kernel path so the greedy batch self-test stays byte-
+        // identical. Otherwise dispatch the per-row sampler with each slot's own
+        // params + a reproducible draw hash(seed, n_sampled).
+        int any_sample = 0;
+        for (int r = 0; r < B; r++) if (slv[r]->samp_temp > 0.0f) { any_sample = 1; break; }
+        if (!any_sample) {
+            argmax_rows_kernel<<<B,32,0,stream>>>(d_logitsK, eng->d_ms_outtok, B, vocab);
+        } else {
+            float h_temp[GEMMA4_MAX_SEQS], h_topp[GEMMA4_MAX_SEQS], h_minp[GEMMA4_MAX_SEQS], h_rnd[GEMMA4_MAX_SEQS];
+            int   h_topk[GEMMA4_MAX_SEQS];
+            for (int r = 0; r < B; r++) {
+                gemma4_seq *s = slv[r];
+                h_temp[r] = s->samp_temp;
+                h_topk[r] = s->samp_top_k;
+                h_topp[r] = s->samp_top_p;
+                h_minp[r] = s->samp_min_p;
+                // splitmix64(seed ^ index): reproducible per (seed, token index),
+                // independent of batch position so two runs match regardless of
+                // how rows are grouped into steps.
+                uint64_t z = (s->samp_seed ? s->samp_seed : 0x9e3779b97f4a7c15ULL) + 0x9e3779b97f4a7c15ULL * (s->n_sampled + 1);
+                z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+                z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+                z =  z ^ (z >> 31);
+                h_rnd[r] = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+            }
+            cudaMemcpyAsync(eng->d_ms_temp, h_temp, (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(eng->d_ms_topk, h_topk, (size_t)B*sizeof(int),   cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(eng->d_ms_topp, h_topp, (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(eng->d_ms_minp, h_minp, (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(eng->d_ms_rnd,  h_rnd,  (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
+            sample_logits_ms_kernel<<<B,1024,0,stream>>>(
+                d_logitsK, vocab, eng->d_ms_temp, eng->d_ms_topk, eng->d_ms_topp,
+                eng->d_ms_minp, eng->d_ms_rnd, eng->d_ms_outtok);
+        }
+    }
 
     return 0;
 }
@@ -6794,7 +6871,8 @@ static int decode_multiseq_forward(
 // first: loop single-token multi-seq forwards over the slot alone), sample the
 // first token greedily, write it to *first_token_out. Returns slot id (>=0) or -1.
 extern "C" int gemma4_engine_seq_add(
-    gemma4_engine_t *eng, const int32_t *prompt, int n_prompt, int32_t *first_token_out)
+    gemma4_engine_t *eng, const int32_t *prompt, int n_prompt, int32_t *first_token_out,
+    float temp, int top_k, float top_p, float min_p, uint64_t seed)
 {
     if (!eng || !eng->loaded || !eng->paged_enabled || !prompt || n_prompt <= 0) return -1;
     int slot = -1;
@@ -6806,6 +6884,9 @@ extern "C" int gemma4_engine_seq_add(
     // Fresh tables (struct was zeroed at create / released on remove).
     s->n_tokens = 0; s->slid_bt.base = 0; s->slid_bt.n = 0; s->glob_bt.base = 0; s->glob_bt.n = 0;
     s->used = 1;
+    // Per-sequence sampling params (applied on-device every sampled token).
+    s->samp_temp = temp; s->samp_top_k = top_k; s->samp_top_p = top_p;
+    s->samp_min_p = min_p; s->samp_seed = seed; s->n_sampled = 0;
 
     gemma4_seq *one[1] = { s };
     int32_t last_tok = 0;
@@ -6822,6 +6903,7 @@ extern "C" int gemma4_engine_seq_add(
         if (want_sample) {
             cudaMemcpyAsync(&last_tok, eng->d_ms_outtok, sizeof(int32_t),
                             cudaMemcpyDeviceToHost, eng->stream);
+            s->n_sampled++;   // this seq has now produced one token (RNG index)
         }
     }
     cudaStreamSynchronize(eng->stream);
@@ -6869,6 +6951,7 @@ extern "C" int gemma4_engine_step_batch(
     if (cudaGetLastError() != cudaSuccess) return -1;
     for (int v = 0; v < Bv; v++) {
         slv[v]->n_tokens = positions[v] + 1;
+        slv[v]->n_sampled++;   // advance this seq's per-row RNG index
         if (out_tokens) out_tokens[rowmap[v]] = outs[v];
     }
     return 0;
@@ -6920,7 +7003,7 @@ static void gemma4_engine_batch_selftest(gemma4_engine_t *eng) {
     int32_t ref[NSEQ][KSTEP];
     for (int q = 0; q < NSEQ; q++) {
         int32_t first = 0;
-        int slot = gemma4_engine_seq_add(eng, prompt[q], NP, &first);
+        int slot = gemma4_engine_seq_add(eng, prompt[q], NP, &first, 0.0f, 0, 0.0f, 0.0f, 0);
         if (slot < 0) { fprintf(stderr, "fucina: batch self-test: seq_add(ref) failed\n"); return; }
         int32_t tok = first;
         for (int k = 0; k < KSTEP; k++) {
@@ -6939,7 +7022,7 @@ static void gemma4_engine_batch_selftest(gemma4_engine_t *eng) {
     int slots[NSEQ]; int32_t cur[NSEQ]; int32_t bat[NSEQ][KSTEP];
     for (int q = 0; q < NSEQ; q++) {
         int32_t first = 0;
-        slots[q] = gemma4_engine_seq_add(eng, prompt[q], NP, &first);
+        slots[q] = gemma4_engine_seq_add(eng, prompt[q], NP, &first, 0.0f, 0, 0.0f, 0.0f, 0);
         if (slots[q] < 0) { fprintf(stderr, "fucina: batch self-test: seq_add(batch) failed\n"); return; }
         cur[q] = first;
     }
@@ -6977,6 +7060,44 @@ static void gemma4_engine_batch_selftest(gemma4_engine_t *eng) {
     }
     fprintf(stderr, "fucina: batch self-test %s — batched(B=%d) decode vs %d single-seq decodes\n",
             all_pass ? "PASSED" : "FAILED", NSEQ, NSEQ);
+
+    // ── temp>0 per-row sampling: deterministic, reproducible, NON-greedy ──
+    // Run prompt[0] twice with a FIXED seed at temp>0 and assert: (a) the two
+    // runs are byte-identical (reproducible RNG stream keyed on seed+token idx),
+    // and (b) the sampled sequence DIFFERS from the greedy sequence ref[0]
+    // (proves the params are actually honored, not silently argmax). A high temp
+    // makes a divergence within KSTEP steps overwhelmingly likely.
+    {
+        const float TEMP = 1.3f; const int TOPK = 64; const uint64_t SEED = 1234567ULL;
+        int32_t s1[KSTEP], s2[KSTEP];
+        for (int pass = 0; pass < 2; pass++) {
+            int32_t *dst = pass ? s2 : s1;
+            int32_t first = 0;
+            int slot = gemma4_engine_seq_add(eng, prompt[0], NP, &first, TEMP, TOPK, 0.0f, 0.0f, SEED);
+            if (slot < 0) { fprintf(stderr, "fucina: batch self-test: seq_add(sample) failed\n"); return; }
+            int32_t tok = first;
+            for (int k = 0; k < KSTEP; k++) {
+                dst[k] = tok;
+                int32_t nxt = 0; int sl = slot;
+                if (gemma4_engine_step_batch(eng, &sl, &tok, 1, &nxt) != 0) {
+                    fprintf(stderr, "fucina: batch self-test: step(sample) failed\n");
+                    gemma4_engine_seq_remove(eng, slot); return;
+                }
+                tok = nxt;
+            }
+            gemma4_engine_seq_remove(eng, slot);
+        }
+        int reproducible = 1, differs_from_greedy = 0;
+        for (int k = 0; k < KSTEP; k++) {
+            if (s1[k] != s2[k]) reproducible = 0;
+            if (s1[k] != ref[0][k]) differs_from_greedy = 1;
+        }
+        fprintf(stderr,
+            "fucina: batch self-test sampling (temp=%.2f seed=%llu): reproducible=%s non-greedy=%s — %s\n",
+            TEMP, (unsigned long long)SEED,
+            reproducible ? "yes" : "NO", differs_from_greedy ? "yes" : "NO",
+            (reproducible && differs_from_greedy) ? "PASSED" : "FAILED");
+    }
 }
 
 // =========================================================================
@@ -7570,6 +7691,7 @@ __global__ void sample_logits_kernel(
 __global__ void sample_logits_batched_kernel(
     const float *logits, int V, float temp, int top_k, float top_p, float min_p,
     const float *rnds, int *out_ids);
+// (sample_logits_ms_kernel is forward-declared above decode_multiseq_forward.)
 
 static int run_spec_loop(
     gemma4_engine_t *eng, int32_t *hist, int n, float *logits,
@@ -8082,6 +8204,42 @@ __global__ void sample_logits_batched_kernel(
 {
     int row = blockIdx.x;
     sample_logit_row(logits + (size_t)row * V, V, temp, top_k, top_p, min_p,
+                     rnds[row], out_ids + row);
+}
+
+// Multi-sequence per-row sampler for the continuous-batching batch path: one
+// block samples row r of logits[B][V] with row r's OWN params (temp/top_k/top_p/
+// min_p) and its own uniform draw rnds[r]. Each row is an independent in-flight
+// sequence, so params differ across rows. temp<=0 takes a greedy argmax with the
+// SAME lowest-index tie-break as argmax_rows_kernel, so a temp==0 row is
+// byte-identical to the greedy batch path (the batch self-test stays 32/32);
+// temp>0 rows go through the shared sample_logit_row pipeline.
+__global__ void sample_logits_ms_kernel(
+    const float *logits, int V,
+    const float *temps, const int *top_ks, const float *top_ps, const float *min_ps,
+    const float *rnds, int *out_ids)
+{
+    int row = blockIdx.x;
+    const float *lr = logits + (size_t)row * V;
+    float temp = temps[row];
+    if (temp <= 0.0f) {
+        // Greedy: block-wide argmax, lowest index wins ties (== argmax_rows_kernel).
+        int tid = threadIdx.x, T = blockDim.x;
+        float best_val = -1e30f; int best_idx = 0;
+        for (int i = tid; i < V; i += T) { if (lr[i] > best_val) { best_val = lr[i]; best_idx = i; } }
+        __shared__ float vred[1024]; __shared__ int ired[1024];
+        vred[tid] = best_val; ired[tid] = best_idx; __syncthreads();
+        for (int s = T >> 1; s > 0; s >>= 1) {
+            if (tid < s) {
+                float ov = vred[tid+s]; int oi = ired[tid+s];
+                if (ov > vred[tid] || (ov == vred[tid] && oi < ired[tid])) { vred[tid] = ov; ired[tid] = oi; }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) out_ids[row] = ired[0];
+        return;
+    }
+    sample_logit_row(lr, V, temp, top_ks[row], top_ps[row], min_ps[row],
                      rnds[row], out_ids + row);
 }
 

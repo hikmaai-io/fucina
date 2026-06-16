@@ -544,9 +544,9 @@ func (e *Engine) GraphStats() (hits, misses, captures, launches int) {
 // These wrap the paged multi-sequence C ABI (gemma4_engine_seq_add /
 // _step_batch / _seq_remove / _seq_capacity). They require the engine to have
 // been created with FUCINA_PAGED_KV=1; otherwise every call returns an error
-// (the C side checks eng->paged_enabled). Sampling is greedy on-device per the
-// ABI — SeqParams sampling knobs are NOT yet honored by the C kernels (tracked
-// for a later phase); the adapter accepts them so the interface is stable.
+// (the C side checks eng->paged_enabled). Sampling is on-device per row: each
+// sequence's SeqParams (temperature/top_k/top_p/min_p/seed) are stored on its
+// slot at SeqAdd and applied to every token (temp<=0 ⇒ exact greedy argmax).
 //
 // maxBatchSeqs mirrors GEMMA4_MAX_SEQS (== GEMMA4_SPEC_MAX) in the kernels: the
 // fixed number of concurrent paged slots. seq_capacity() reports only the FREE
@@ -555,9 +555,11 @@ func (e *Engine) GraphStats() (hits, misses, captures, launches int) {
 const maxBatchSeqs = 16
 
 // SeqAdd prefills prompt into a fresh paged slot and returns the slot id and the
-// first greedily-sampled token. err is non-nil when no slot is free, the engine
-// is not in paged mode, or prefill failed.
-func (e *Engine) SeqAdd(prompt []int32) (slot int, first int32, err error) {
+// first sampled token. The per-sequence sampling params are stored on the slot
+// and applied on-device to every token of this sequence (temp<=0 ⇒ greedy). err
+// is non-nil when no slot is free, the engine is not in paged mode, or prefill
+// failed.
+func (e *Engine) SeqAdd(prompt []int32, p batch.SeqParams) (slot int, first int32, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if len(prompt) == 0 {
@@ -568,6 +570,8 @@ func (e *Engine) SeqAdd(prompt []int32) (slot int, first int32, err error) {
 		e.ptr,
 		(*C.int32_t)(unsafe.Pointer(&prompt[0])), C.int(len(prompt)),
 		&firstTok,
+		C.float(p.Temperature), C.int(p.TopK), C.float(p.TopP), C.float(p.MinP),
+		C.uint64_t(p.Seed),
 	)
 	if id < 0 {
 		return 0, 0, fmt.Errorf("fucina: seq_add failed (no slot / not paged / prefill error)")
@@ -647,10 +651,10 @@ func NewBatchAdapter(eng *Engine) *BatchAdapter { return &BatchAdapter{eng: eng}
 // count > 0 means paged mode is enabled (seq_capacity returns 0 when it is not).
 func (a *BatchAdapter) Supported() bool { return a.eng.SeqFreeCapacity() > 0 }
 
-// AddSeq admits a new sequence (prefill + first greedy token). On success it
-// records the slot so Capacity() stays accurate.
-func (a *BatchAdapter) AddSeq(prompt []int32, _ batch.SeqParams) (int, int32, error) {
-	slot, first, err := a.eng.SeqAdd(prompt)
+// AddSeq admits a new sequence (prefill + first token sampled with params). On
+// success it records the slot so Capacity() stays accurate.
+func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int32, error) {
+	slot, first, err := a.eng.SeqAdd(prompt, params)
 	if err != nil {
 		return 0, 0, err
 	}

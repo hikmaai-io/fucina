@@ -271,15 +271,19 @@ int    gemma4_engine_kv_restore(gemma4_engine_t *eng, const void *buf, int n_tok
 // independent sequences through ONE batched forward over the shared paged KV.
 //
 // seq_add: allocate a free slot, prefill `prompt` into that slot's paged KV, and
-//   sample the first token greedily into *first_token_out. Returns slot id (>=0)
+//   sample the first token into *first_token_out using the per-sequence params
+//   (temp<=0 ⇒ greedy argmax; temp>0 ⇒ top_k/top_p/min_p with a reproducible RNG
+//   stream seeded by `seed`). The params are stored on the slot and reused for
+//   every subsequent step_batch token of this sequence. Returns slot id (>=0)
 //   or -1 (no free slot / not paged / error).
 // step_batch: ONE batched forward over the B given slots — feed in_tokens[i] to
 //   slots[i] at its current position, advance each, sample one token/slot into
-//   out_tokens[i]. Returns 0 / -1.
+//   out_tokens[i] using THAT slot's stored params. Returns 0 / -1.
 // seq_remove: free a slot's block tables back to the pools, mark it free.
 // seq_capacity: number of free slots.
 int  gemma4_engine_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_prompt,
-                           int32_t *first_token_out);
+                           int32_t *first_token_out,
+                           float temp, int top_k, float top_p, float min_p, uint64_t seed);
 int  gemma4_engine_step_batch(gemma4_engine_t *eng, const int *slots,
                               const int32_t *in_tokens, int B, int32_t *out_tokens);
 void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot);
