@@ -3707,9 +3707,10 @@ gemma4_engine_t* gemma4_engine_create(
     // Load embedding (required — also the tied LM head)
     LOAD_TENSOR_REQUIRED("token_embd.weight", token_embd);
 
-    // Load per-layer tensors
+    // Load per-layer tensors (only the model's actual n_layers; the upper slots up to the
+    // GEMMA4_MAX_LAYERS cap are never read — iterating them would touch offset-0 garbage).
     char tname[128];
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->n_layers; l++) {
         snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].attn_q);
 
@@ -3915,7 +3916,7 @@ gemma4_engine_t* gemma4_engine_create(
             cudaMemcpy((dst), src, (n) * sizeof(float), cudaMemcpyHostToDevice); \
         } while (0)
 
-        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        for (int l = 0; l < eng->n_layers; l++) {
             int head_dim = (eng->layer_types[l] == LAYER_SLIDING)
                                ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
             UPLOAD_NORM(eng->d_w_attn_norm      + l * hs, eng->tensors.layers[l].attn_norm,      hs);
@@ -4833,7 +4834,7 @@ static int build_bf16_weights(gemma4_engine_t *eng)
     if (eng->bf16_ready) return 0;
 
     uint64_t maxn[PJ_COUNT] = {0};
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->n_layers; l++) {
         for (int p = 0; p < PJ_COUNT; p++) {
             uint64_t off; int in_dim, out_dim;
             if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;
@@ -4885,7 +4886,7 @@ static int build_packed_q4(gemma4_engine_t *eng)
         eng->d_weights_packed = NULL;
         return -1;
     }
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->n_layers; l++) {
         for (int p = 0; p < PJ_COUNT; p++) {
             uint64_t off; int in_dim, out_dim;
             if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;
@@ -5411,7 +5412,7 @@ int gemma4_engine_prefill_batched(
     scale_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, N*H, sqrtf((float)H));
 
     if (ovl) issue_dequant(0);   // pipeline fill: layer 0's weights (BF16 path only)
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->n_layers; l++) {
         layer_type_t lt = eng->layer_types[l];
         int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
         int nkv = (lt==LAYER_SLIDING)? eng->n_kv_heads : eng->n_kv_heads_glob;
@@ -5428,7 +5429,7 @@ int gemma4_engine_prefill_batched(
         // the native Q4_0 weights directly.
         if (ovl) {
             curbuf = l & 1;
-            if (l + 1 < GEMMA4_MAX_LAYERS) issue_dequant(l + 1);
+            if (l + 1 < eng->n_layers) issue_dequant(l + 1);
             cudaStreamWaitEvent(stream, eng->ev_dq_done[curbuf], 0);
         }
 
@@ -5684,7 +5685,7 @@ int gemma4_engine_prefill_flash(
         scale_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, cn*H, sqrtf((float)H));
 
         if (ovl) issue_dequant(0);   // pipeline fill for this chunk: layer 0's weights
-        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        for (int l = 0; l < eng->n_layers; l++) {
             // Abort granularity: one 8192-token chunk runs ~30s at long context,
             // so poll per LAYER (~0.7s). Mid-chunk abort is safe for the same
             // reason as mid-prefill: nothing is accounted until global_n_tokens
@@ -5704,7 +5705,7 @@ int gemma4_engine_prefill_flash(
             mmq_l = l;                       // MMQ: weight offset resolved per layer
             if (ovl) {
                 curbuf = l & 1;
-                if (l + 1 < GEMMA4_MAX_LAYERS) issue_dequant(l + 1);
+                if (l + 1 < eng->n_layers) issue_dequant(l + 1);
                 cudaStreamWaitEvent(stream, eng->ev_dq_done[curbuf], 0);
             }
             rms_norm_rows_bf16_kernel<<<cn,256,HD2,stream>>>(d_inb, d_x, w_attn, H, cn, GEMMA4_RMS_EPS);
@@ -6066,7 +6067,7 @@ static void decode_forward_device(gemma4_engine_t *eng, cudaStream_t stream)
     float sc = sqrtf((float)eng->hidden);
     scale_kernel<<<(eng->hidden+255)/256, 256, 0, stream>>>(
         eng->d_x, eng->hidden, sc);
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++)
+    for (int l = 0; l < eng->n_layers; l++)
         decode_layer(eng, l, /*pos=*/0, /*context_len=*/0, stream, eng->d_decpos);
     rms_norm_kernel<<<1, 256, 32*sizeof(float), stream>>>(
         eng->d_norm, eng->d_x, eng->d_w_out_norm, eng->hidden, GEMMA4_RMS_EPS);
@@ -6167,8 +6168,8 @@ int gemma4_engine_decode(
           scale_kernel<<<(eng->hidden+255)/256, 256, 0, stream>>>(
                 eng->d_x, eng->hidden, sc); }
 
-        // Run all 48 layers
-        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        // Run all layers (eng->n_layers: 48 for 12B, 60 for 31B)
+        for (int l = 0; l < eng->n_layers; l++) {
             decode_layer(eng, l, pos, eng->global_n_tokens + 1, stream);
         }
 
@@ -6308,7 +6309,7 @@ static void decode_batched_forward(
     embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, K, H, stream);
     scale_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, K*H, sqrtf((float)H));
 
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->n_layers; l++) {
         layer_type_t lt = eng->layer_types[l];
         int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
         int nkv = (lt==LAYER_SLIDING)? eng->n_kv_heads : eng->n_kv_heads_glob;
