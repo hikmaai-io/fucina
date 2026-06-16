@@ -1,6 +1,27 @@
 # Continuous batching + paged KV — design & plan
 
-Status: **in progress** (branch `perf/continuous-batching-paged-kv`).
+Status: **FUNCTIONAL** (on `main`). Behind `FUCINA_PAGED_KV=1 FUCINA_BATCH=1`; default
+path unchanged. Concurrent smoke: 4 parallel requests served concurrently (4.43s vs 5.56s
+sequential), correct outputs, no serialization. Remaining: perf (split-K paged attention),
+per-seq spec decode, sampling params in the batch kernels, CUDA graphs per batch size.
+
+How it works end to end:
+- `FUCINA_PAGED_KV` allocates the block pools (capacity-sized; `paged_cap = min(MAX_SEQS,
+  max_seqs+1)` bounds concurrency to what the pool backs).
+- `FUCINA_BATCH` builds a `batch.Scheduler` (single owner goroutine) over a cgo `BatchAdapter`
+  implementing `BatchEngine` (AddSeq/StepBatch/RemoveSeq/Capacity → `gemma4_engine_seq_*`).
+  `serveCompletions` routes to `serveBatch` (Submit) instead of the per-request `s.kv.Lock()`.
+- C `gemma4_engine_step_batch` runs ONE `decode_multiseq_forward` over B independent slots
+  (per-row positions + per-row paged block tables; `paged_attn_decode_batched` for attention),
+  samples one greedy token per row. Per-row admission: a slot that can't grow its KV is marked
+  `-1` and excluded; the scheduler stops just that sequence (never the whole batch).
+
+Known limitations: greedy sampling only in the batch path (SeqParams forwarded, not yet honored
+by the kernels); no spec decode / TTFT metrics in the batch path; attention is correctness-first
+(not split-K) so it agrees with the contiguous path to ~1e-5, not bit-identically.
+
+---
+Original plan (branch `perf/continuous-batching-paged-kv`).
 
 ## Motivation
 
