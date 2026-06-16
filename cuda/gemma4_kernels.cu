@@ -2776,6 +2776,20 @@ struct gemma4_engine {
     float        *d_ms_minp;           // [MAX_SEQS] per-row min-p
     float        *d_ms_rnd;            // [MAX_SEQS] per-row uniform draw (host-hashed)
 
+    // CUDA-graph MULTI-SEQ continuous-batching decode: the B-row forward
+    // (decode_multiseq_forward body) captured once PER batch size B (grids depend
+    // on B) and replayed each step. Device-resident-pos trick as the spec-verify
+    // graph: per-row positions (d_ms_pos), per-row block-table device pointers
+    // (in d_ms_views_slid/glob) and per-row tokens (d_sb[0]) are refreshed OUTSIDE
+    // the capture each step, so one captured graph replays across steps. The
+    // attention launches at FIXED max split grids (each row tail-returns past its
+    // own n_splits — bit-identical to the per-kernel path). Indexed by B
+    // (1..GEMMA4_MAX_SEQS); [0] unused. NULL/failed at a B → that B uses per-kernel
+    // launches. FUCINA_NO_BATCH_GRAPH disables capture globally.
+    cudaGraphExec_t multiseq_graph[GEMMA4_MAX_SEQS + 1];
+    int      multiseq_graph_failed;    // global disable (env or capture failure)
+    unsigned multiseq_graph_logged;    // per-B "captured" log guard (bit b set once logged)
+
     // ── Paged KV pools (Phase 2; allocated only when paged mode is enabled) ──
     // The continuous-batching KV store: one physical block pool per cache class,
     // shared by all in-flight sequences (each holds a per-seq block table into
@@ -4013,6 +4027,8 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     for (int k = 0; k <= GEMMA4_SPEC_MAX; k++)
         if (eng->batched_graph[k]) cudaGraphExecDestroy(eng->batched_graph[k]);
     if (eng->d_specpos) cudaFree(eng->d_specpos);
+    for (int b = 0; b <= GEMMA4_MAX_SEQS; b++)
+        if (eng->multiseq_graph[b]) cudaGraphExecDestroy(eng->multiseq_graph[b]);
     cudaFree(eng->d_pf_x); cudaFree(eng->d_pf_norm);
     cudaFree(eng->d_pf_q); cudaFree(eng->d_pf_k); cudaFree(eng->d_pf_v);
     cudaFree(eng->d_pf_attn); cudaFree(eng->d_pf_gate); cudaFree(eng->d_pf_up);
@@ -6723,18 +6739,17 @@ static int ensure_ms_scratch(gemma4_engine_t *eng) {
     return 0;
 }
 
-// Run ONE batched forward over the B slots given by `slv[]` (each slot's KV tables
-// already synced to its CURRENT position; in_tok[] are the B input tokens to feed,
-// positions[] the B absolute positions of those tokens). Leaves the B logit rows in
-// d_sb[11]; if want_sample, also writes per-row argmax ids into eng->d_ms_outtok.
-// All B rows reuse the SPEC_MAX-sized batched scratch (B <= GEMMA4_MAX_SEQS).
-static int decode_multiseq_forward(
-    gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *in_tok,
-    const int *positions, int B, int want_sample)
+// Kernel-launch-only body of the multi-seq forward over B rows. Reads ALL per-step
+// varying inputs from DEVICE buffers (d_sb[0] tokens, d_ms_pos positions, d_ms_views_*
+// per-row block tables/lengths) so it is CUDA-graph-capturable: the caller refreshes
+// those device buffers each step OUTSIDE the capture and replays this body. `max_splits`
+// fixes the attention split grids; pass the largest the batch can need (per-row tail-
+// return makes any value >= a row's n_splits bit-identical). When greedy (want_argmax)
+// it appends the argmax_rows_kernel so the whole step is one graph. Issues launches only
+// on `stream`; advances no engine state. Always launches the full output head.
+static void decode_multiseq_body(
+    gemma4_engine_t *eng, int B, int max_splits, int want_argmax, cudaStream_t stream)
 {
-    if (!eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
-    if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
-    cudaStream_t stream = eng->stream;
     const int H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE, HEADS = GEMMA4_HEADS;
     const int HD2 = 32 * sizeof(float);
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
@@ -6745,22 +6760,7 @@ static int decode_multiseq_forward(
     float *d_attn = eng->d_sb[7], *d_o   = eng->d_sb[8], *d_gate= eng->d_sb[9];
     float *d_up = eng->d_sb[10], *d_logitsK = eng->d_sb[11];
 
-    // Upload per-row tokens + positions, and build the per-class views on host.
-    cudaMemcpyAsync(d_tok, in_tok, (size_t)B*sizeof(int32_t), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(eng->d_ms_pos, positions, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, stream);
-    PagedSeqView hvs[GEMMA4_MAX_SEQS], hvg[GEMMA4_MAX_SEQS];
-    for (int r = 0; r < B; r++) {
-        gemma4_seq *s = slv[r];
-        int np = positions[r] + 1;                 // tokens visible after this write (incl. new)
-        hvs[r].block_table = s->d_slid_blocks; hvs[r].n_blocks = s->slid_bt.n;
-        hvs[r].base = s->slid_bt.base; hvs[r].n_tokens = np;
-        hvg[r].block_table = s->d_glob_blocks; hvg[r].n_blocks = s->glob_bt.n;
-        hvg[r].base = s->glob_bt.base; hvg[r].n_tokens = np;
-    }
-    cudaMemcpyAsync(eng->d_ms_views_slid, hvs, (size_t)B*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(eng->d_ms_views_glob, hvg, (size_t)B*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
-
-    // Embed (per-row token) + Gemma √H scale.
+    // Embed (per-row token, device d_tok) + Gemma √H scale.
     embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, B, H, stream);
     scale_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, B*H, sqrtf((float)H));
 
@@ -6819,19 +6819,15 @@ static int decode_multiseq_forward(
         // is resolved through the block table). Per-(split,seq) partials into the
         // shared d_fa_acc/m/l scratch (slot seq*MAX_SPLITS+split), merged by the
         // paged combine. Replaces the sequential per-(head,seq) online-softmax.
-        // Launch only as many split blocks as the LONGEST row in the batch needs
-        // (grid.x = max_splits over rows). Each row still tail-returns past its own
-        // n_splits, so the per-row partition/scan/combine order is unchanged and the
-        // result stays bit-identical — this only avoids launching the full 128-block
-        // grid when the batch's contexts are short. max_len comes from positions[].
-        int max_len = 0;
-        for (int r = 0; r < B; r++) { int np = positions[r] + 1; if (np > max_len) max_len = np; }
-        int g_splits;
+        // Launch grid.x = max_splits split blocks (caller passes the largest the
+        // batch can need). Each row still tail-returns past its own n_splits, so the
+        // per-row partition/scan/combine order is unchanged and the result stays
+        // bit-identical for ANY max_splits >= a row's n_splits — that fixed grid is
+        // what lets one captured graph replay across steps at any position.
+        int g_splits = max_splits;
+        if (g_splits < 1) g_splits = 1;
+        if (g_splits > GEMMA4_GLOBAL_MAX_SPLITS) g_splits = GEMMA4_GLOBAL_MAX_SPLITS;
         if (lt == LAYER_SLIDING) {
-            int wl = (max_len < GEMMA4_SLIDING_WINDOW) ? max_len : GEMMA4_SLIDING_WINDOW;
-            g_splits = (wl + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
-            if (g_splits < 1) g_splits = 1;
-            if (g_splits > GEMMA4_GLOBAL_MAX_SPLITS) g_splits = GEMMA4_GLOBAL_MAX_SPLITS;
             paged_sliding_attn_splitk_batched<GEMMA4_HEADS, GEMMA4_KV_HEADS,
                                               GEMMA4_HEAD_DIM, GEMMA4_GLOBAL_MAX_SPLITS>
                 <<<dim3(g_splits, B), GEMMA4_KV_HEADS*32, 0, stream>>>(
@@ -6842,9 +6838,6 @@ static int decode_multiseq_forward(
                     d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, views,
                     hd, window, GEMMA4_SLIDING_SPLIT_CHUNK);
         } else {
-            g_splits = (max_len + GEMMA4_GLOBAL_SPLIT_CHUNK - 1) / GEMMA4_GLOBAL_SPLIT_CHUNK;
-            if (g_splits < 1) g_splits = 1;
-            if (g_splits > GEMMA4_GLOBAL_MAX_SPLITS) g_splits = GEMMA4_GLOBAL_MAX_SPLITS;
             paged_global_attn_splitk_batched<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM,
                                              GEMMA4_GLOBAL_MAX_SPLITS>
                 <<<dim3(g_splits, B), GEMMA4_HEADS*32, 0, stream>>>(
@@ -6883,44 +6876,160 @@ static int decode_multiseq_forward(
             suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
                 d_logitsK + (size_t)i*vocab, eng->d_suppress, eng->n_suppress, vocab);
 
-    if (want_sample) {
-        // Per-row sampling. If EVERY row is greedy (temp<=0), keep the exact
-        // argmax_rows_kernel path so the greedy batch self-test stays byte-
-        // identical. Otherwise dispatch the per-row sampler with each slot's own
-        // params + a reproducible draw hash(seed, n_sampled).
-        int any_sample = 0;
-        for (int r = 0; r < B; r++) if (slv[r]->samp_temp > 0.0f) { any_sample = 1; break; }
-        if (!any_sample) {
-            argmax_rows_kernel<<<B,32,0,stream>>>(d_logitsK, eng->d_ms_outtok, B, vocab);
-        } else {
-            float h_temp[GEMMA4_MAX_SEQS], h_topp[GEMMA4_MAX_SEQS], h_minp[GEMMA4_MAX_SEQS], h_rnd[GEMMA4_MAX_SEQS];
-            int   h_topk[GEMMA4_MAX_SEQS];
-            for (int r = 0; r < B; r++) {
-                gemma4_seq *s = slv[r];
-                h_temp[r] = s->samp_temp;
-                h_topk[r] = s->samp_top_k;
-                h_topp[r] = s->samp_top_p;
-                h_minp[r] = s->samp_min_p;
-                // splitmix64(seed ^ index): reproducible per (seed, token index),
-                // independent of batch position so two runs match regardless of
-                // how rows are grouped into steps.
-                uint64_t z = (s->samp_seed ? s->samp_seed : 0x9e3779b97f4a7c15ULL) + 0x9e3779b97f4a7c15ULL * (s->n_sampled + 1);
-                z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-                z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-                z =  z ^ (z >> 31);
-                h_rnd[r] = (float)((z >> 11) * (1.0 / 9007199254740992.0));
-            }
-            cudaMemcpyAsync(eng->d_ms_temp, h_temp, (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(eng->d_ms_topk, h_topk, (size_t)B*sizeof(int),   cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(eng->d_ms_topp, h_topp, (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(eng->d_ms_minp, h_minp, (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(eng->d_ms_rnd,  h_rnd,  (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
-            sample_logits_ms_kernel<<<B,1024,0,stream>>>(
-                d_logitsK, vocab, eng->d_ms_temp, eng->d_ms_topk, eng->d_ms_topp,
-                eng->d_ms_minp, eng->d_ms_rnd, eng->d_ms_outtok);
-        }
+    // Greedy argmax (graph-capturable: reads only d_logitsK). The per-row
+    // temperature sampler stays in the host wrapper (off the graph path).
+    if (want_argmax)
+        argmax_rows_kernel<<<B,32,0,stream>>>(d_logitsK, eng->d_ms_outtok, B, vocab);
+}
+
+// Lazy one-time capture of the multi-seq forward at batch size B (one graph PER B,
+// grids depend on B). Replays via cudaGraphLaunch with device-resident per-row
+// positions (d_ms_pos), per-row views (d_ms_views_*) and tokens (d_sb[0]) refreshed
+// each step OUTSIDE the capture — collapsing the ~B-row, 48-layer launch storm to one
+// replay. Attention launches at the FULL split grid (every position fits). Greedy only
+// (argmax appended); temperature rows fall back to the per-kernel host path. Same escape
+// hatch as batched_graph_ensure. FUCINA_NO_BATCH_GRAPH disables.
+static int multiseq_graph_ensure(gemma4_engine_t *eng, int B)
+{
+    if (B < 1 || B > GEMMA4_MAX_SEQS) return -1;
+    if (eng->multiseq_graph[B]) return 0;
+    if (eng->multiseq_graph_failed) return -1;
+    static const int disabled = (getenv("FUCINA_NO_BATCH_GRAPH") != NULL);
+    if (disabled) { eng->multiseq_graph_failed = 1; return -1; }
+    if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) {
+        eng->multiseq_graph_failed = 1; return -1;
+    }
+    cudaStream_t cs = NULL;
+    cudaGraph_t  g  = NULL;
+    int ok = cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) == cudaSuccess;
+    if (ok && cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+        decode_multiseq_body(eng, B, GEMMA4_GLOBAL_MAX_SPLITS, /*want_argmax=*/1, cs);
+        ok = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != NULL;
+    } else {
+        ok = 0;
+    }
+    if (ok) ok = cudaGraphInstantiate(&eng->multiseq_graph[B], g, 0) == cudaSuccess;
+    if (g)  cudaGraphDestroy(g);
+    if (cs) cudaStreamDestroy(cs);
+    if (!ok || !eng->multiseq_graph[B]) {
+        eng->multiseq_graph[B] = NULL;
+        eng->multiseq_graph_failed = 1;
+        cudaGetLastError();
+        fprintf(stderr, "fucina: multiseq batch graph capture failed (B=%d) — per-kernel launches\n", B);
+        return -1;
+    }
+    if (!(eng->multiseq_graph_logged & (1u << B))) {
+        fprintf(stderr, "fucina: multiseq batch graph captured (B=%d)\n", B);
+        eng->multiseq_graph_logged |= (1u << B);
+    }
+    return 0;
+}
+
+// Refresh the per-step varying DEVICE inputs (tokens, positions, per-row paged views)
+// for a multi-seq forward over B rows on `stream`. Shared by the graph-replay and
+// per-kernel paths so both feed bit-identical device state. Returns the longest row's
+// position+1 (for the per-kernel split-grid sizing). slv/in_tok/positions are host.
+static int multiseq_upload_inputs(
+    gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *in_tok,
+    const int *positions, int B, cudaStream_t stream)
+{
+    int32_t *d_tok = (int32_t*)eng->d_sb[0];
+    cudaMemcpyAsync(d_tok, in_tok, (size_t)B*sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(eng->d_ms_pos, positions, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, stream);
+    PagedSeqView hvs[GEMMA4_MAX_SEQS], hvg[GEMMA4_MAX_SEQS];
+    int max_len = 0;
+    for (int r = 0; r < B; r++) {
+        gemma4_seq *s = slv[r];
+        int np = positions[r] + 1;                 // tokens visible after this write (incl. new)
+        if (np > max_len) max_len = np;
+        hvs[r].block_table = s->d_slid_blocks; hvs[r].n_blocks = s->slid_bt.n;
+        hvs[r].base = s->slid_bt.base; hvs[r].n_tokens = np;
+        hvg[r].block_table = s->d_glob_blocks; hvg[r].n_blocks = s->glob_bt.n;
+        hvg[r].base = s->glob_bt.base; hvg[r].n_tokens = np;
+    }
+    cudaMemcpyAsync(eng->d_ms_views_slid, hvs, (size_t)B*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(eng->d_ms_views_glob, hvg, (size_t)B*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
+    return max_len;
+}
+
+// Run ONE batched forward over the B slots given by `slv[]` (each slot's KV tables
+// already synced to its CURRENT position; in_tok[] are the B input tokens to feed,
+// positions[] the B absolute positions of those tokens). Leaves the B logit rows in
+// d_sb[11]; if want_sample, also writes per-row sampled ids into eng->d_ms_outtok.
+// All B rows reuse the SPEC_MAX-sized batched scratch (B <= GEMMA4_MAX_SEQS).
+//
+// Fast path: if every row is greedy (temp<=0) the captured per-B CUDA graph replays
+// the whole forward + argmax in one launch (device-resident positions/views/tokens
+// refreshed just above). Any temperature row, capture failure, or FUCINA_NO_BATCH_GRAPH
+// falls back to the per-kernel body (which also runs the per-row temperature sampler).
+static int decode_multiseq_forward(
+    gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *in_tok,
+    const int *positions, int B, int want_sample)
+{
+    if (!eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
+    cudaStream_t stream = eng->stream;
+    const int vocab = GEMMA4_VOCAB_SIZE;
+
+    int any_sample = 0;
+    for (int r = 0; r < B; r++) if (slv[r]->samp_temp > 0.0f) { any_sample = 1; break; }
+
+    // Always refresh the device-resident per-step inputs first (shared by both paths).
+    int max_len = multiseq_upload_inputs(eng, slv, in_tok, positions, B, stream);
+
+    // ── Graph fast path (greedy batches only) ────────────────────────────────────
+    if (want_sample && !any_sample && multiseq_graph_ensure(eng, B) == 0) {
+        if (cudaGraphLaunch(eng->multiseq_graph[B], stream) == cudaSuccess)
+            return 0;
+        // Replay failed: retire the graph and fall through to per-kernel launches.
+        cudaGetLastError();
+        cudaGraphExecDestroy(eng->multiseq_graph[B]);
+        eng->multiseq_graph[B] = NULL;
+        eng->multiseq_graph_failed = 1;
+        fprintf(stderr, "fucina: multiseq batch graph replay failed — using per-kernel launches\n");
     }
 
+    // ── Per-kernel path ──────────────────────────────────────────────────────────
+    // Size the split grid to the LONGEST row (saves split blocks at short contexts);
+    // greedy argmax folded into the body, temperature sampler dispatched after.
+    int max_splits;
+    {   // worst case over both classes: global chunk over the full max_len.
+        int gs = (max_len + GEMMA4_GLOBAL_SPLIT_CHUNK - 1) / GEMMA4_GLOBAL_SPLIT_CHUNK;
+        if (gs < 1) gs = 1;
+        if (gs > GEMMA4_GLOBAL_MAX_SPLITS) gs = GEMMA4_GLOBAL_MAX_SPLITS;
+        max_splits = gs;
+    }
+    int want_argmax = (want_sample && !any_sample);
+    decode_multiseq_body(eng, B, max_splits, want_argmax, stream);
+
+    if (want_sample && any_sample) {
+        float *d_logitsK = eng->d_sb[11];
+        float h_temp[GEMMA4_MAX_SEQS], h_topp[GEMMA4_MAX_SEQS], h_minp[GEMMA4_MAX_SEQS], h_rnd[GEMMA4_MAX_SEQS];
+        int   h_topk[GEMMA4_MAX_SEQS];
+        for (int r = 0; r < B; r++) {
+            gemma4_seq *s = slv[r];
+            h_temp[r] = s->samp_temp;
+            h_topk[r] = s->samp_top_k;
+            h_topp[r] = s->samp_top_p;
+            h_minp[r] = s->samp_min_p;
+            // splitmix64(seed, index): reproducible per (seed, token index),
+            // independent of batch position so two runs match regardless of
+            // how rows are grouped into steps.
+            uint64_t z = (s->samp_seed ? s->samp_seed : 0x9e3779b97f4a7c15ULL) + 0x9e3779b97f4a7c15ULL * (s->n_sampled + 1);
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            z =  z ^ (z >> 31);
+            h_rnd[r] = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+        }
+        cudaMemcpyAsync(eng->d_ms_temp, h_temp, (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_ms_topk, h_topk, (size_t)B*sizeof(int),   cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_ms_topp, h_topp, (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_ms_minp, h_minp, (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_ms_rnd,  h_rnd,  (size_t)B*sizeof(float), cudaMemcpyHostToDevice, stream);
+        sample_logits_ms_kernel<<<B,1024,0,stream>>>(
+            d_logitsK, vocab, eng->d_ms_temp, eng->d_ms_topk, eng->d_ms_topp,
+            eng->d_ms_minp, eng->d_ms_rnd, eng->d_ms_outtok);
+    }
     return 0;
 }
 

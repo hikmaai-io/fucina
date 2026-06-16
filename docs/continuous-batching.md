@@ -29,6 +29,18 @@ combine launch costs ~10% aggregate tok/s vs the old sequential kernel at short/
 (measured 4×512 long-gen: 57.0 → ~51 tok/s on the GB10). Kept because bit-identity to the
 contiguous path is structurally impossible with a single-scan kernel (different summation order).
 
+The greedy multi-seq decode step is now a CUDA graph captured PER batch size B (1..MAX_SEQS),
+`multiseq_graph_ensure` / `decode_multiseq_body` in cuda/gemma4_kernels.cu. Per-row positions
+(`d_ms_pos`), per-row paged views (`d_ms_views_slid/glob`, which carry each row's block-table
+device pointer + length) and per-row tokens (`d_sb[0]`) are device-resident and refreshed each
+step OUTSIDE the capture (same trick as `d_specpos`), so one captured graph replays across steps
+at any position; attention launches at the full split grid (`GEMMA4_GLOBAL_MAX_SPLITS`, each row
+tail-returns past its own n_splits → bit-identical to the per-kernel split-K path). Logs
+"multiseq batch graph captured (B=%d)" once per distinct B. Temperature rows (any `temp>0`),
+capture failure, or `FUCINA_NO_BATCH_GRAPH` fall back to the per-kernel body (which also runs the
+per-row sampler). Verified: batch self-test 32/32 unchanged with B=1 and B=3 graphs exercised;
+4 concurrent greedy requests replay B=1/3/4 with correct deterministic output.
+
 Known limitations: no spec decode / TTFT metrics in the batch path. (Per-sequence sampling
 params are now honored; see the sampling-params phase note.)
 
