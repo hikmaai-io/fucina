@@ -5123,7 +5123,7 @@ static int ensure_fp4_act(gemma4_engine_t *eng, int N) {
     if (eng->d_fp4_actsc)  cudaFree(eng->d_fp4_actsc);
     if (eng->d_fp4_actlin) cudaFree(eng->d_fp4_actlin);
     eng->d_fp4_act=nullptr; eng->d_fp4_actsc=nullptr; eng->d_fp4_actlin=nullptr;
-    size_t I = GEMMA4_INTERMEDIATE;
+    size_t I = eng->ffn;   // widest activation in_dim (FFN down) — 21504 on the 31B, not the 12B const
     size_t packed=(size_t)N*(I/2);
     size_t swsz=(size_t)nvfp4_pad(N,128)*nvfp4_pad(I/NVFP4_BLK,4);
     size_t linsz=(size_t)N*(I/NVFP4_BLK);
@@ -5316,11 +5316,12 @@ int gemma4_engine_prefill_batched(
         const char *e = getenv("FUCINA_FP4"); fp4_opt = (e && e[0]=='0') ? 0 : 1;  // on unless =0
         const char *mn = getenv("FUCINA_FP4_MIN"); if (mn) fp4_min = atoi(mn);
     }
-    // Gate FP4 to the 12B geometry: the 31B FP4 prefill GEMM throws an illegal memory
-    // access (the activation-quant / block-scale layout was only validated for the 12B
-    // global wide-GEMM path; the 31B's 4-KV-head global + 32 q-heads break it). The BF16
-    // fallback is correct on the 31B, so default it there until the FP4 path is fixed.
-    // Mirrors the spec/MTP geom gates. See [[fucina-31b-fp4-prefill-bug]].
+    // Gate FP4 to the 12B geometry: the 31B FP4 prefill produces GARBAGE logits (the
+    // global wide-GEMM / block-scale layout was validated only for the 12B's single
+    // global KV head; the 31B's 4-KV-head global path is not yet handled). It no longer
+    // crashes (the activation-quant scratch overflow that caused the illegal access is
+    // fixed via eng->ffn sizing), but the output is still wrong, so keep BF16 on the 31B
+    // until the FP4 GEMM itself is geometry-correct. Mirrors the spec/MTP geom gates.
     const bool use_fp4 = fp4_opt && eng->geom == GEOM_12B && !use_mmq && N >= fp4_min
                          && build_fp4_weights(eng) == 0 && ensure_fp4_act(eng, N) == 0;
     if (!use_mmq && !use_fp4 && build_bf16_weights(eng) != 0) return -1;
