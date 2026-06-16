@@ -2768,6 +2768,11 @@ struct gemma4_engine {
     // / d_global_* path above stays the default until the paged read/write paths
     // are wired and validated against it.
     int            paged_enabled;       // 1 once the pools are allocated
+    int            paged_cap;           // max concurrent sequences the POOL can back at full
+                                        // per-seq reservation (= min(MAX_SEQS, max_seqs+1)).
+                                        // Admission is gated on this, NOT the slot count, so a
+                                        // batch can never over-subscribe the block pool and
+                                        // exhaust it mid-generation (would fail the whole batch).
     int            paged_read;          // 1 → decode reads attention from the paged pool
                                         // (the contiguous mirror still runs); used to flip
                                         // the read path and validate it drives generation.
@@ -3800,6 +3805,11 @@ gemma4_engine_t* gemma4_engine_create(
                  cudaMalloc(&eng->d_glob_pool_v, glob_pool_bytes) == cudaSuccess;
             if (ok) {
                 eng->paged_enabled = 1;
+                // The pools back (max_seqs+1) sequences at full per-seq reservation;
+                // the slot array holds GEMMA4_MAX_SEQS. Concurrency is the min — this
+                // is what seq_capacity() admits against, so the block pool is never
+                // over-subscribed (each admitted seq is guaranteed its maxctx blocks).
+                eng->paged_cap = (max_seqs + 1 < GEMMA4_MAX_SEQS) ? (max_seqs + 1) : GEMMA4_MAX_SEQS;
                 fprintf(stderr,
                     "fucina: paged KV ENABLED — ~%d concurrent seqs @ maxctx %d "
                     "(block=%d tok): sliding %d blk %.1f GB, global %d blk %.1f GB\n",
@@ -6829,24 +6839,38 @@ extern "C" int gemma4_engine_step_batch(
     if (!eng || !eng->loaded || !eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
     if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
 
+    // Per-row admission: a row whose paged block table cannot grow (pool out of
+    // blocks / sequence past its reserved context) is marked with the -1 sentinel
+    // and EXCLUDED from this forward, so one sequence hitting its KV limit cannot
+    // fail (and evict) the whole batch. The scheduler treats out == -1 as a
+    // graceful per-sequence stop. Hard errors (bad slot id) still fail the call.
     gemma4_seq *slv[GEMMA4_MAX_SEQS];
     int positions[GEMMA4_MAX_SEQS];
+    int32_t in2[GEMMA4_MAX_SEQS];
+    int rowmap[GEMMA4_MAX_SEQS];
+    int Bv = 0;
     for (int r = 0; r < B; r++) {
         int id = slots[r];
         if (id < 0 || id >= GEMMA4_MAX_SEQS || !eng->slots[id].used) return -1;
         gemma4_seq *s = &eng->slots[id];
-        slv[r] = s;
-        positions[r] = s->n_tokens;
-        if (paged_slot_sync(eng, s, s->n_tokens) != 0) return -1;
+        if (paged_slot_sync(eng, s, s->n_tokens) != 0) {   // out of KV blocks → stop this row
+            if (out_tokens) out_tokens[r] = -1;
+            continue;
+        }
+        slv[Bv] = s; positions[Bv] = s->n_tokens; in2[Bv] = in_tokens[r]; rowmap[Bv] = r; Bv++;
     }
-    if (decode_multiseq_forward(eng, slv, in_tokens, positions, B, /*want_sample=*/1) != 0)
+    if (Bv == 0) return 0;   // every row hit its limit; caller evicts the -1 rows
+    if (decode_multiseq_forward(eng, slv, in2, positions, Bv, /*want_sample=*/1) != 0)
         return -1;
     int32_t outs[GEMMA4_MAX_SEQS];
-    cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)B*sizeof(int32_t),
+    cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)Bv*sizeof(int32_t),
                     cudaMemcpyDeviceToHost, eng->stream);
     cudaStreamSynchronize(eng->stream);
     if (cudaGetLastError() != cudaSuccess) return -1;
-    for (int r = 0; r < B; r++) { slv[r]->n_tokens = positions[r] + 1; if (out_tokens) out_tokens[r] = outs[r]; }
+    for (int v = 0; v < Bv; v++) {
+        slv[v]->n_tokens = positions[v] + 1;
+        if (out_tokens) out_tokens[rowmap[v]] = outs[v];
+    }
     return 0;
 }
 
@@ -6863,9 +6887,13 @@ extern "C" void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot) {
 // Number of free slots available for new sequences.
 extern "C" int gemma4_engine_seq_capacity(gemma4_engine_t *eng) {
     if (!eng || !eng->paged_enabled) return 0;
-    int n = 0;
-    for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (!eng->slots[i].used) n++;
-    return n;
+    // Free capacity is bounded by what the BLOCK POOL can back (paged_cap), not
+    // the raw slot count: admitting more would over-subscribe the pool and let one
+    // sequence's mid-generation block growth fail (and evict) the entire batch.
+    int used = 0;
+    for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (eng->slots[i].used) used++;
+    int free_eff = eng->paged_cap - used;
+    return free_eff > 0 ? free_eff : 0;
 }
 
 // Self-test (FUCINA_BATCH_SELFTEST): 3 distinct short token sequences, each run
