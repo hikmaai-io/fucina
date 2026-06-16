@@ -377,13 +377,64 @@ static void run_class(const char *name, int nkv, int head_dim,
         }
     }
 
+    // ── Batched multi-seq primitive: paged_attn_decode_batched attends ALL
+    // sequences in ONE launch (block (h,s) → seq s's KV via its block table).
+    // Validate it row-by-row against the single-seq gather: must be bit-identical
+    // (same math, same per-seq indirection). This is the continuous-batching
+    // attention the scheduler's StepBatch will call.
+    float worst_batched = 0.0f;
+    {
+        int nh = nkv;   // one query head per kv head (group 1) for this check
+        PagedSeqView *dViews;
+        CK(cudaMalloc(&dViews, (size_t)n_seq * sizeof(PagedSeqView)));
+        CK(cudaMemcpy(dViews, hViews.data(), (size_t)n_seq * sizeof(PagedSeqView), cudaMemcpyHostToDevice));
+
+        size_t qsz = (size_t)n_seq * nh * head_dim;
+        std::vector<float> hQb(qsz);
+        for (int s = 0; s < n_seq; s++)
+            for (int h = 0; h < nh; h++)
+                for (int d = 0; d < head_dim; d++)
+                    hQb[((size_t)s * nh + h) * head_dim + d] = gen_q(s * 31 + h, d);
+        float *dQb, *dOb;
+        CK(cudaMalloc(&dQb, qsz * sizeof(float)));
+        CK(cudaMalloc(&dOb, qsz * sizeof(float)));
+        CK(cudaMemcpy(dQb, hQb.data(), qsz * sizeof(float), cudaMemcpyHostToDevice));
+
+        dim3 bgrid(nh, n_seq);
+        paged_attn_decode_batched<<<bgrid, head_dim, 32 * sizeof(float)>>>(
+            dOb, dQb, dKpool, dVpool, dViews, nh, nkv, head_dim, /*window=*/0, BT, ept);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        std::vector<float> hOb(qsz);
+        CK(cudaMemcpy(hOb.data(), dOb, qsz * sizeof(float), cudaMemcpyDeviceToHost));
+
+        // reference: single-seq gather per (s, h)
+        for (int s = 0; s < n_seq; s++) {
+            int lo = tabs[s].base;
+            for (int h = 0; h < nh; h++) {
+                std::vector<float> hQ(head_dim);
+                for (int d = 0; d < head_dim; d++) hQ[d] = gen_q(s * 31 + h, d);
+                CK(cudaMemcpy(dQ, hQ.data(), head_dim * sizeof(float), cudaMemcpyHostToDevice));
+                paged_attn_gather<<<1, head_dim, 32 * sizeof(float)>>>(
+                    dOut, dQ, dKpool, dVpool, hViews[s], head_dim, BT, ept, h * head_dim, lo);
+                CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+                std::vector<float> g(head_dim);
+                CK(cudaMemcpy(g.data(), dOut, head_dim * sizeof(float), cudaMemcpyDeviceToHost));
+                for (int d = 0; d < head_dim; d++)
+                    worst_batched = fmaxf(worst_batched,
+                        fabsf(g[d] - hOb[((size_t)s * nh + h) * head_dim + d]));
+            }
+        }
+        cudaFree(dViews); cudaFree(dQb); cudaFree(dOb);
+    }
+
     // readback_diff: MUST be exactly 0 (bit-exact indirection).
     // worst_pc / worst_host: float-arithmetic tolerance only.
-    bool ok = (readback_diff == 0.0f) && (worst_pc < 1e-2f) && (worst_host < 1e-2f);
+    bool ok = (readback_diff == 0.0f) && (worst_pc < 1e-2f) && (worst_host < 1e-2f)
+              && (worst_batched == 0.0f);
     printf("  [%-7s] nkv=%d hd=%d seqs=%d%s  readback=%.3g (EXACT)  "
-           "attn paged-vs-contig=%.3g  paged-vs-host=%.3g  %s\n",
+           "attn paged-vs-contig=%.3g  paged-vs-host=%.3g  batched-vs-single=%.3g  %s\n",
            name, nkv, head_dim, n_seq, recycle_last ? " (recycled base>0)" : "",
-           readback_diff, worst_pc, worst_host, ok ? "OK" : "FAIL");
+           readback_diff, worst_pc, worst_host, worst_batched, ok ? "OK" : "FAIL");
     if (!ok) g_fail++;
 
     cudaFree(dOutC);
