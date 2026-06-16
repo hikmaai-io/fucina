@@ -99,7 +99,10 @@ To put numbers on the decision, NVFP4-precision KV is now wired into the engine 
 every KV store site (`copy_f32_to_fp8[_at]_kernel`, `kv_write_{sliding,global}_kernel`, and both
 paged writers) routes the float K/V through `kv_codec_value` (`cuda/paged_kv_device.cuh`), which
 when `FUCINA_KV_NVFP4=1` round-trips each value through NVFP4 (E2M1 + per-16 E4M3 block scale,
-block amax read directly — no warp shuffles) before the existing FP8 store. So the engine *generates
+block amax read directly — no warp shuffles) before the existing FP8 store. The E2M1 conversion uses
+the **native Blackwell FP4 instruction** (`__nv_cvt_float_to_fp4`/`__nv_cvt_fp4_to_halfraw`,
+`cuda_fp4.h`) — the same hardware path the weight codec uses (`__nv_cvt_float2_to_fp4x2`) — so the
+fake-quant is bit-for-bit what a real packed NVFP4 store would read back. So the engine *generates
 exactly what a real ~4.5-bit packed KV store would read back* (plus a negligible FP8-restore error),
 **without touching any read kernel**. The cache still physically stores 1 byte/elem, so this measures
 the quality/speed cost; the ~1.78× memory saving is analytic and realized only by the (gated) packed-

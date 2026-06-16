@@ -36,6 +36,7 @@
 #define FUCINA_PAGED_KV_DEVICE_CUH
 
 #include <cuda_fp8.h>      // __nv_fp8_storage_t + public CUDA 13 conversion APIs
+#include <cuda_fp4.h>      // __nv_fp4_storage_t + native E2M1 conversion (NVFP4 KV)
 #include <math.h>
 #include "paged_kv.h"      // PAGED_KV_BLOCK_TOKENS, host pool/table types (no CUDA dep)
 
@@ -69,13 +70,13 @@ static inline __device__ pkv_t pkv_float_to_fp8(float v) {
 // ─────────────────────────────────────────────────────────────────────────────
 __device__ __constant__ int c_kv_nvfp4 = 0;            // set once at engine create
 
-__device__ inline float pkv_e2m1(float v) {            // nearest E2M1 level (signed)
-    const float lv[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    float s = v < 0 ? -1.0f : 1.0f; v = fabsf(v);
-    float best = 0.0f, bd = v;
-    #pragma unroll
-    for (int k = 0; k < 8; k++) { float d = fabsf(v - lv[k]); if (d < bd) { bd = d; best = lv[k]; } }
-    return s * best;
+// Native Blackwell FP4 (E2M1) round-trip via the cuda_fp4.h hardware conversion —
+// the SAME instruction the weight codec uses (__nv_cvt_float2_to_fp4x2,
+// gemma4_kernels.cu) — so the fake-quant matches a real packed NVFP4 store bit-for-
+// bit (round-to-nearest into the 8 E2M1 levels), not a software approximation.
+__device__ inline float pkv_e2m1(float v) {
+    __nv_fp4_storage_t q = __nv_cvt_float_to_fp4(v, __NV_E2M1, cudaRoundNearest);
+    return __half2float(__half(__nv_cvt_fp4_to_halfraw(q, __NV_E2M1)));
 }
 
 // NVFP4 round-trip of row[j] using its 16-wide block [j&~15 .. +15]. The block
