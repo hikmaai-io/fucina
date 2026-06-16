@@ -42,6 +42,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/hikmaai-io/fucina/internal/server/batch"
 )
 
 // vocabSize is the gemma-4 logits width (the device writes exactly this many
@@ -536,6 +538,143 @@ func (e *Engine) GraphStats() (hits, misses, captures, launches int) {
 	C._fucina_graph_stats(e.ptr, &h, &m, &c, &l)
 	return int(h), int(m), int(c), int(l)
 }
+
+// ─── Continuous-batching ABI (FUCINA_BATCH) ────────────────────────
+//
+// These wrap the paged multi-sequence C ABI (gemma4_engine_seq_add /
+// _step_batch / _seq_remove / _seq_capacity). They require the engine to have
+// been created with FUCINA_PAGED_KV=1; otherwise every call returns an error
+// (the C side checks eng->paged_enabled). Sampling is greedy on-device per the
+// ABI — SeqParams sampling knobs are NOT yet honored by the C kernels (tracked
+// for a later phase); the adapter accepts them so the interface is stable.
+//
+// maxBatchSeqs mirrors GEMMA4_MAX_SEQS (== GEMMA4_SPEC_MAX) in the kernels: the
+// fixed number of concurrent paged slots. seq_capacity() reports only the FREE
+// slots, so the adapter reconstructs the *total* (free+used) for the scheduler's
+// Capacity() contract by tracking how many slots it currently holds.
+const maxBatchSeqs = 16
+
+// SeqAdd prefills prompt into a fresh paged slot and returns the slot id and the
+// first greedily-sampled token. err is non-nil when no slot is free, the engine
+// is not in paged mode, or prefill failed.
+func (e *Engine) SeqAdd(prompt []int32) (slot int, first int32, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(prompt) == 0 {
+		return 0, 0, fmt.Errorf("fucina: seq_add: empty prompt")
+	}
+	var firstTok C.int32_t
+	id := C.gemma4_engine_seq_add(
+		e.ptr,
+		(*C.int32_t)(unsafe.Pointer(&prompt[0])), C.int(len(prompt)),
+		&firstTok,
+	)
+	if id < 0 {
+		return 0, 0, fmt.Errorf("fucina: seq_add failed (no slot / not paged / prefill error)")
+	}
+	return int(id), int32(firstTok), nil
+}
+
+// StepBatch advances each slot in slots by one token (feeding inputs[i] to
+// slots[i]) in a single batched forward, returning one freshly sampled token per
+// slot. len(inputs) must equal len(slots).
+func (e *Engine) StepBatch(slots []int32, inputs []int32) ([]int32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(slots) != len(inputs) {
+		return nil, fmt.Errorf("fucina: step_batch: %d slots vs %d inputs", len(slots), len(inputs))
+	}
+	b := len(slots)
+	if b == 0 {
+		return nil, nil
+	}
+	if b > maxBatchSeqs {
+		return nil, fmt.Errorf("fucina: step_batch: batch %d exceeds max %d", b, maxBatchSeqs)
+	}
+	// The C ABI takes `const int *slots`; Go int32 is not C int, so marshal into
+	// a C-int slot array.
+	cslots := make([]C.int, b)
+	for i, s := range slots {
+		cslots[i] = C.int(s)
+	}
+	out := make([]int32, b)
+	ret := C.gemma4_engine_step_batch(
+		e.ptr,
+		&cslots[0],
+		(*C.int32_t)(unsafe.Pointer(&inputs[0])),
+		C.int(b),
+		(*C.int32_t)(unsafe.Pointer(&out[0])),
+	)
+	if ret != 0 {
+		return nil, fmt.Errorf("fucina: step_batch failed")
+	}
+	return out, nil
+}
+
+// SeqRemove frees a slot's paged KV back to the pool and marks it reusable.
+func (e *Engine) SeqRemove(slot int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	C.gemma4_engine_seq_remove(e.ptr, C.int(slot))
+}
+
+// SeqFreeCapacity reports the number of currently FREE paged slots.
+func (e *Engine) SeqFreeCapacity() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return int(C.gemma4_engine_seq_capacity(e.ptr))
+}
+
+// BatchAdapter adapts *Engine to batch.BatchEngine so the continuous-batching
+// scheduler can drive the paged multi-sequence engine. It is the only consumer
+// of the SeqAdd/StepBatch/SeqRemove/SeqFreeCapacity wrappers.
+//
+// The scheduler calls every method from its single owner goroutine, so the
+// adapter needs no locking of its own beyond the engine mutex the wrappers take.
+// It tracks the live slot count so Capacity() can report the engine's TOTAL slot
+// budget (free + used) — the C seq_capacity() returns only free slots, but the
+// scheduler's admission test (len(active) < Capacity()) needs the total.
+type BatchAdapter struct {
+	eng    *Engine
+	active int // slots currently held by the scheduler (incremented in AddSeq, decremented in RemoveSeq)
+}
+
+// NewBatchAdapter wraps eng for the batch scheduler. The engine must have been
+// created with FUCINA_PAGED_KV=1; Supported() reports whether batching is usable.
+func NewBatchAdapter(eng *Engine) *BatchAdapter { return &BatchAdapter{eng: eng} }
+
+// Supported reports whether the engine can serve batched requests: a free-slot
+// count > 0 means paged mode is enabled (seq_capacity returns 0 when it is not).
+func (a *BatchAdapter) Supported() bool { return a.eng.SeqFreeCapacity() > 0 }
+
+// AddSeq admits a new sequence (prefill + first greedy token). On success it
+// records the slot so Capacity() stays accurate.
+func (a *BatchAdapter) AddSeq(prompt []int32, _ batch.SeqParams) (int, int32, error) {
+	slot, first, err := a.eng.SeqAdd(prompt)
+	if err != nil {
+		return 0, 0, err
+	}
+	a.active++
+	return slot, first, nil
+}
+
+// StepBatch runs one batched decode step over active slots.
+func (a *BatchAdapter) StepBatch(active []int32, inputs []int32) ([]int32, error) {
+	return a.eng.StepBatch(active, inputs)
+}
+
+// RemoveSeq frees a slot and updates the live-slot count.
+func (a *BatchAdapter) RemoveSeq(slot int) error {
+	a.eng.SeqRemove(slot)
+	if a.active > 0 {
+		a.active--
+	}
+	return nil
+}
+
+// Capacity reports the engine's total concurrent-slot budget (free + currently
+// held), so the scheduler's admission test len(active) < Capacity() is correct.
+func (a *BatchAdapter) Capacity() int { return a.eng.SeqFreeCapacity() + a.active }
 
 // ensure CGO runs on the main thread for CUDA compatibility
 func init() {

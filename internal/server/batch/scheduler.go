@@ -438,6 +438,14 @@ func (s *Scheduler) admit(active map[int]*seq, waiting *[]Request) bool {
 // false if it was evicted here (stop token, budget exhausted, emit backpressure,
 // or context cancellation). On false it has already freed the slot and replied.
 func (s *Scheduler) deliver(active map[int]*seq, sq *seq, token int32) bool {
+	// A negative token is the engine signalling this sequence can no longer grow
+	// its KV (block pool exhausted / context limit). Stop it GRACEFULLY — evict
+	// only this sequence, never the whole batch — and do not emit the sentinel.
+	if token < 0 {
+		s.evict(active, sq, Result{Reason: FinishLength, Generated: sq.generated})
+		return false
+	}
+
 	// Context cancelled after admission but before we emit: evict now.
 	if sq.req.Ctx != nil && sq.req.Ctx.Err() != nil {
 		s.evict(active, sq, Result{Reason: FinishCancelled, Generated: sq.generated})

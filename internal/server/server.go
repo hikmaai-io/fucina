@@ -20,6 +20,7 @@ import (
 
 	"github.com/hikmaai-io/fucina/internal/chat"
 	"github.com/hikmaai-io/fucina/internal/sampler"
+	"github.com/hikmaai-io/fucina/internal/server/batch"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
@@ -86,6 +87,13 @@ type Server struct {
 	// means the server is saturated and new requests get 503 instead of piling
 	// up unbounded goroutines (each holding a buffered body) behind the kv lock.
 	inflight chan struct{}
+
+	// scheduler is the continuous-batching scheduler. It is nil unless batching
+	// was enabled at startup (SetBatchEngine, gated on FUCINA_BATCH). When non-nil
+	// serveCompletions routes through it (per-step serialization, no per-request
+	// kv lock) instead of the single-flight kv path. Its presence is a pure
+	// additive opt-in: with it nil the behaviour is exactly as before.
+	scheduler *batch.Scheduler
 }
 
 // prefillAborter is satisfied by engines that support cooperative prefill
@@ -494,6 +502,46 @@ func New(eng serverEngine, tok *tokenizer.Tokenizer) *Server {
 	}
 	s.logLevel.Store(int32(logLevelInfo))
 	return s
+}
+
+// BatchEngine is the engine the continuous-batching scheduler drives. It is the
+// scheduler's contract (batch.BatchEngine) plus Supported(), so the server can
+// refuse to enable batching when the engine was not built for it (e.g. paged KV
+// off). *cuda.BatchAdapter satisfies it; the server stays GPU-free for tests.
+type BatchEngine interface {
+	batch.BatchEngine
+	// Supported reports whether the engine can actually serve batched requests
+	// (paged mode enabled). When false the scheduler must not be started.
+	Supported() bool
+}
+
+// SetBatchEngine enables continuous batching: it constructs and starts a
+// batch.Scheduler over eng so serveCompletions routes through per-step batching
+// instead of the per-request kv lock. It is a no-op (returns false) when eng is
+// nil or reports !Supported(), leaving the single-flight path untouched. Call it
+// once at startup, after the engine is warmed, gated on FUCINA_BATCH.
+func (s *Server) SetBatchEngine(eng BatchEngine) bool {
+	if eng == nil || !eng.Supported() {
+		return false
+	}
+	// Queue depth mirrors the single-flight admission channel: waiting requests
+	// not yet admitted to a slot. The scheduler admits up to engine Capacity()
+	// concurrently and queues the rest (surfacing ErrQueueFull as a 503).
+	slots := eng.Capacity()
+	if slots < 1 {
+		slots = 1
+	}
+	// Queue depth: room for a backlog of waiting requests beyond the live slots.
+	depth := slots
+	s.scheduler = batch.New(eng, depth)
+	s.scheduler.Start()
+	// The single-flight inflight bound (default 4) would cap concurrency below
+	// the engine's slot budget, since each batched handler holds an inflight slot
+	// for its whole request. Grow it so up to Capacity() sequences can run
+	// concurrently plus a queue depth of waiters; the scheduler's own ErrQueueFull
+	// backpressure still sheds load past that.
+	s.inflight = make(chan struct{}, slots+depth)
+	return true
 }
 
 // SetAPIKey enables bearer-token auth on /v1/* routes. Empty disables auth
@@ -936,6 +984,16 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		tokens = kept
 	}
 
+	// Continuous-batching path (FUCINA_BATCH): route the request through the
+	// scheduler so it shares a per-step batched forward with other in-flight
+	// sequences, instead of holding the whole-request kv lock. Everything below
+	// (the single-flight kv path) is left exactly as before for when batching is
+	// off (s.scheduler == nil).
+	if s.scheduler != nil {
+		s.serveBatch(w, r, params, tokens, wantTools, legacy)
+		return
+	}
+
 	// Streaming requests get their first bytes BEFORE the prefill: SSE headers +
 	// role delta now (~1ms TTFB instead of the full prefill latency), then a
 	// ": ping" heartbeat while the prefill runs, so the client (and any proxy)
@@ -1087,6 +1145,232 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	s.specDrafted.Store(dr)
 	s.specAccepted.Store(ac)
 	s.specEmitted.Store(em)
+}
+
+// serveBatch handles a completion via the continuous-batching scheduler. It
+// submits one batch.Request (prefill prompt, greedy/temperature sampling on the
+// device, stop at EOS/end-of-turn) and drives the per-token Emit/Done lifecycle
+// onto the wire: streaming deltas for SSE requests, a single collected response
+// otherwise. It is the per-request analogue of streamResponse/generateResponse
+// for the batched path, but it never touches the kv lock — the scheduler owns
+// the engine and serializes per step, not per request.
+//
+// Sampling note: the current batched C ABI samples greedily on-device regardless
+// of SeqParams. The params are still forwarded so the contract is stable for when
+// the kernels grow temperature/top-k support.
+func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params GenerationParams, tokens []int32, wantTools, legacy bool) {
+	stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
+
+	seed := uint64(params.Seed)
+	if params.Seed < 0 {
+		seed = uint64(time.Now().UnixNano())
+	}
+	sp := batch.SeqParams{
+		Temperature:   float32(params.Temperature),
+		TopK:          params.TopK,
+		TopP:          float32(params.TopP),
+		MinP:          float32(params.MinP),
+		RepeatPenalty: float32(params.RepeatPenalty),
+		Seed:          seed,
+	}
+
+	// tokCh carries sampled token ids from the scheduler goroutine to THIS
+	// handler goroutine. Emit must not block the shared step loop, so it does a
+	// non-blocking send and asks the scheduler to evict (returns false) if the
+	// buffer is full — i.e. this client is too slow to keep up. The buffer is
+	// generous so a transient write hiccup does not drop the sequence.
+	tokCh := make(chan int32, 1024)
+	done := make(chan batch.Result, 1)
+
+	req := batch.Request{
+		Tokens: tokens,
+		Params: sp,
+		Stops:  stops,
+		MaxNew: params.MaxTokens,
+		Ctx:    r.Context(),
+		Emit: func(t int32) bool {
+			select {
+			case tokCh <- t:
+				return true
+			default:
+				return false // client backpressure: drop the sequence
+			}
+		},
+		Done: done,
+	}
+
+	if err := s.scheduler.Submit(req); err != nil {
+		// Queue full / shutting down: shed load the same way the single-flight
+		// path does (503), or report shutdown.
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error": map[string]string{"message": "server busy: too many concurrent requests", "type": "overloaded"},
+		})
+		return
+	}
+
+	if params.Stream {
+		s.streamBatch(w, r, tokCh, done, legacy)
+	} else {
+		s.collectBatch(w, r, tokCh, done, wantTools, legacy, len(tokens), params.Tools)
+	}
+}
+
+// drainTokens reads token ids from tokCh until done fires AND tokCh is empty,
+// invoking onTok for each id in order. It returns the terminal Result. Because
+// the scheduler delivers the terminal Done only AFTER its last Emit, draining
+// tokCh to empty after Done guarantees no in-flight token is lost.
+func drainTokens(tokCh <-chan int32, done <-chan batch.Result, onTok func(int32)) batch.Result {
+	for {
+		select {
+		case t := <-tokCh:
+			onTok(t)
+		case res := <-done:
+			// Flush any tokens already queued before the terminal result.
+			for {
+				select {
+				case t := <-tokCh:
+					onTok(t)
+				default:
+					return res
+				}
+			}
+		}
+	}
+}
+
+// streamBatch streams a batched sequence's tokens to an SSE client. It decodes
+// incrementally (decode the whole id slice each step and emit only the new text)
+// so multi-byte UTF-8 / SentencePiece pieces are never split mid-character.
+func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, tokCh <-chan int32, done <-chan batch.Result, legacy bool) {
+	sse, ok := newSSEWriter(w, legacy, s.modelName)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	sse.begin()
+
+	var ids []int32
+	var emitted string
+	generated := 0
+	genStart := time.Now()
+
+	res := drainTokens(tokCh, done, func(t int32) {
+		generated++
+		if s.tokenizer.IsStop(t) {
+			return // never render stop markers
+		}
+		ids = append(ids, t)
+		full := stripMarkers(s.tokenizer.DecodeRaw(ids))
+		if len(full) > len(emitted) {
+			delta := full[len(emitted):]
+			emitted = full
+			if legacy {
+				sse.event(CompletionStreamResponse{
+					ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
+					Choices: []CompletionStreamChoice{{Index: 0, Text: delta}},
+				})
+			} else {
+				sse.event(StreamResponse{
+					ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
+					Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: delta}}},
+				})
+			}
+		}
+	})
+
+	s.logGenSpeed(genStart, generated)
+	finish := batchFinish(res, r.Context())
+	s.finishStream(sse, finish, 0, generated)
+}
+
+// collectBatch accumulates a non-streaming batched sequence and writes the full
+// response (with reasoning split + tool-call parsing, mirroring generateResponse).
+func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, tokCh <-chan int32, done <-chan batch.Result, wantTools, legacy bool, promptTokens int, tools []Tool) {
+	var ids []int32
+	genStart := time.Now()
+	res := drainTokens(tokCh, done, func(t int32) {
+		if s.tokenizer.IsStop(t) {
+			return
+		}
+		ids = append(ids, t)
+	})
+	generated := len(ids)
+	s.logGenSpeed(genStart, generated)
+	finish := batchFinish(res, r.Context())
+
+	msg := ChatMessage{Role: "assistant"}
+	reasoning, rest := splitReasoning(s.tokenizer.DecodeRaw(ids))
+	msg.ReasoningContent = reasoning
+	if wantTools {
+		if finish == "length" || finish == "cancelled" {
+			if o := strings.LastIndex(rest, "<|tool_call>"); o > strings.LastIndex(rest, "<tool_call|>") {
+				rest = rest[:o]
+			}
+		}
+		content, calls := parseToolCalls(rest)
+		if len(calls) > 0 {
+			calls, _ = validateToolCalls(calls, tools)
+		}
+		msg.Content = strings.TrimSpace(stripMarkers(content))
+		if len(calls) > 0 {
+			msg.ToolCalls = calls
+			if finish != "cancelled" {
+				finish = "tool_calls"
+			}
+		}
+	} else {
+		msg.Content = strings.TrimSpace(stripMarkers(rest))
+	}
+
+	if legacy {
+		text := msg.Content
+		if msg.ReasoningContent != "" {
+			text = msg.ReasoningContent + text
+		}
+		writeJSON(w, http.StatusOK, CompletionResponse{
+			ID:      fmt.Sprintf("cmpl-%d", time.Now().UnixNano()),
+			Object:  "text_completion",
+			Created: time.Now().Unix(),
+			Model:   s.modelName,
+			Choices: []CompletionChoice{{Index: 0, Text: text, FinishReason: finish}},
+			Usage: Usage{
+				PromptTokens: promptTokens, CompletionTokens: generated,
+				TotalTokens: promptTokens + generated,
+			},
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ChatResponse{
+		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   s.modelName,
+		Choices: []Choice{{Index: 0, Message: msg, FinishReason: finish}},
+		Usage: Usage{
+			PromptTokens: promptTokens, CompletionTokens: generated,
+			TotalTokens: promptTokens + generated,
+		},
+	})
+}
+
+// batchFinish maps a scheduler Result (and the request context) to the OpenAI
+// finish_reason string.
+func batchFinish(res batch.Result, _ context.Context) string {
+	switch res.Reason {
+	case batch.FinishStop:
+		return "stop"
+	case batch.FinishLength:
+		return "length"
+	case batch.FinishCancelled:
+		return "cancelled"
+	case batch.FinishError, batch.FinishShutdown:
+		// A truncated turn: make it visible rather than looking like a clean stop.
+		return "length"
+	default:
+		return "stop"
+	}
 }
 
 // finishStream emits the terminal finish_reason + usage chunk and [DONE] on an
@@ -1953,5 +2237,11 @@ func (s *Server) Stop() {
 		if cerr := s.httpServer.Close(); cerr != nil {
 			log.Printf("fucina: forced close failed: %v", cerr)
 		}
+	}
+	// Drain the batch scheduler AFTER the HTTP server stops accepting requests,
+	// so no in-flight handler is still trying to Submit. Shutdown blocks until
+	// the owner goroutine has evicted every sequence (freeing its KV slots).
+	if s.scheduler != nil {
+		s.scheduler.Shutdown()
 	}
 }
