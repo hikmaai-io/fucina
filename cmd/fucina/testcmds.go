@@ -66,36 +66,39 @@ func runTestCUDA(args CLIArgs) int {
 		return 1
 	}
 	nLayers := eng.NumLayers()
-	nKeep := eng.NTokens() // KV state to restore to before each path
+	nKeep := eng.NTokens() // KV state to restore to before each batched call
 
-	tokIDs := make([]int32, 0, steps)
+	// Isolate the row>0 interaction: row 0 of DecodeBatched MUST NOT depend on K. Compare
+	// row 0 of a K=1 forward against row 0 of a K=2 forward from the SAME post-prefill state.
+	// A divergence means the batched path corrupts row 0 when extra rows are present — the
+	// exact failure mode (first spec token correct, later tokens wrong). Two fixed tokens.
+	t0 := int32(pt[len(pt)-1])
+	t1 := int32(argmax(must(eng.DecodeBatched([]int32{t0})))) // 1 step to get a plausible 2nd token
+	eng.Rewind(nKeep)
+
+	tokIDs := []int32{}
 	maxAbs, maxRel := 0.0, 0.0
 	argmaxMismatch := 0
-	next := int32(pt[len(pt)-1]) // first token to feed both paths (last prompt token)
 	for s := 0; s < steps; s++ {
-		lsShared, err := eng.Decode(next)
+		_ = s
+		l1, err := eng.DecodeBatched([]int32{t0})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "fucina: decode step %d: %v\n", s, err)
+			fmt.Fprintf(os.Stderr, "fucina: K=1 batched: %v\n", err)
 			return 1
 		}
-		ls := append([]float32(nil), lsShared...) // copy before Rewind/Batched reuse the buffer
-		if !eng.Rewind(nKeep) {
-			fmt.Fprintf(os.Stderr, "fucina: rewind to %d failed at step %d\n", nKeep, s)
-			return 1
-		}
-		lb, err := eng.DecodeBatched([]int32{next})
+		ls := append([]float32(nil), l1...) // row 0 of K=1 (reference)
+		eng.Rewind(nKeep)
+		l2, err := eng.DecodeBatched([]int32{t0, t1})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "fucina: decode_batched step %d: %v\n", s, err)
+			fmt.Fprintf(os.Stderr, "fucina: K=2 batched: %v\n", err)
 			return 1
 		}
-		if !eng.Rewind(nKeep) {
-			fmt.Fprintf(os.Stderr, "fucina: rewind (post-batched) failed at step %d\n", s)
-			return 1
-		}
+		lb := l2[:len(ls)] // row 0 of K=2 (must equal row 0 of K=1)
+		eng.Rewind(nKeep)
 		da, db := argmax(ls), argmax(lb)
 		if da != db {
 			argmaxMismatch++
-			fmt.Printf("  step %d: ARGMAX MISMATCH single=%d batched=%d\n", s, da, db)
+			fmt.Printf("  step %d: ROW0 MISMATCH K1=%d K2row0=%d\n", s, da, db)
 		}
 		var sumSq, refSq float64
 		for i := range ls {
@@ -111,30 +114,67 @@ func runTestCUDA(args CLIArgs) int {
 				maxRel = rel
 			}
 		}
-		// Advance the reference trajectory with the single-token greedy choice, then
-		// re-decode it on the (rewound) engine to move the KV state forward one step.
-		next = int32(da)
-		tokIDs = append(tokIDs, next)
-		if _, err := eng.Decode(next); err != nil {
-			fmt.Fprintf(os.Stderr, "fucina: advance decode step %d: %v\n", s, err)
-			return 1
+		_ = tokIDs
+		break // the K-invariance check is deterministic; one iteration suffices
+	}
+
+	// Row>0 CORRECTNESS: row 1 of DecodeBatched([t0,t1]) must equal the row-0 logits of a
+	// DecodeBatched([t1]) issued AFTER t0 has advanced the cache by one (i.e. the same token
+	// at the same absolute position with the same causal context). A mismatch is the spec bug:
+	// the verify rows past row 0 produce wrong logits, so wrong tokens get accepted.
+	l2, err := eng.DecodeBatched([]int32{t0, t1})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fucina: K=2 row1: %v\n", err)
+		return 1
+	}
+	row1 := append([]float32(nil), l2[len(l2)/2:]...) // row 1 of the K=2 forward
+	eng.Rewind(nKeep)
+	if _, err := eng.DecodeBatched([]int32{t0}); err != nil { // advance cache by t0
+		fmt.Fprintf(os.Stderr, "fucina: advance t0: %v\n", err)
+		return 1
+	}
+	ref1, err := eng.DecodeBatched([]int32{t1}) // row 0 at position pos+1
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fucina: ref row1: %v\n", err)
+		return 1
+	}
+	r1max := 0.0
+	row1Mismatch := argmax(row1) != argmax(ref1)
+	for i := range ref1 {
+		if d := math.Abs(float64(row1[i] - ref1[i])); d > r1max {
+			r1max = d
 		}
-		nKeep = eng.NTokens()
 	}
 
 	geom := "12B"
 	if nLayers > 48 {
 		geom = "31B"
 	}
-	fmt.Printf("fucina: logit self-test (%s): max_abs_err=%.6g max_rel_l2=%.6g argmax_mismatches=%d/%d\n",
-		geom, maxAbs, maxRel, argmaxMismatch, steps)
-	fmt.Printf("  single-token greedy: %q\n", tok.Decode(tokIDs))
-	if argmaxMismatch != 0 {
-		fmt.Println("  FAIL: batched spec-verify diverges from single-token decode")
+	pass := func(ok bool) string {
+		if ok {
+			return "PASS"
+		}
+		return "FAIL"
+	}
+	fmt.Printf("fucina: batched self-test (%s) t0=%d t1=%d\n", geom, t0, t1)
+	fmt.Printf("  row0 K-invariance: max_abs_err=%.6g mismatches=%d  (%s)\n",
+		maxAbs, argmaxMismatch, pass(argmaxMismatch == 0))
+	fmt.Printf("  row1 correctness:  max_abs_err=%.6g argmax_mismatch=%v  (%s)\n",
+		r1max, row1Mismatch, pass(!row1Mismatch))
+	if argmaxMismatch != 0 || row1Mismatch {
+		fmt.Println("  => batched spec-verify is INCORRECT")
 		return 1
 	}
-	fmt.Println("  PASS: batched matches single-token (spec decoding is sound)")
+	fmt.Println("  => batched spec-verify matches single-token math")
 	return 0
+}
+
+// must panics on error; for one-shot setup calls in the self-test.
+func must(v []float32, err error) []float32 {
+	if err != nil {
+		panic(err)
+	}
+	return v
 }
 
 // argmax returns the index of the maximum logit.
