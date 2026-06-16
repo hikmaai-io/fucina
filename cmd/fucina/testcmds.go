@@ -61,9 +61,29 @@ func runTestCUDA(args CLIArgs) int {
 		return 1
 	}
 	defer eng.Close()
-	if _, err := eng.Prefill(pt); err != nil {
+	pl, err := eng.Prefill(pt)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "fucina: prefill: %v\n", err)
 		return 1
+	}
+	fmt.Printf("  [diag] prefill argmax=%d (the first generated token); prompt=%v\n", argmax(pl), pt)
+	// Replicate the generate loop: greedy-decode 5 tokens via Decode (host argmax) and print
+	// the ids. If these go degenerate while the prefill argmax was sane, the decode-after-
+	// prefill continuation (KV state) is the bug, not the kernels.
+	{
+		gtoks := []int32{}
+		nt := int32(argmax(pl))
+		for i := 0; i < 5; i++ {
+			gtoks = append(gtoks, nt)
+			dl, e := eng.Decode(nt)
+			if e != nil {
+				break
+			}
+			nt = int32(argmax(dl))
+		}
+		fmt.Printf("  [diag] greedy decode chain (Decode+argmax): %v\n", gtoks)
+		eng.Reset()
+		eng.Prefill(pt) // re-establish state for the batched checks below
 	}
 	nLayers := eng.NumLayers()
 	nKeep := eng.NTokens() // KV state to restore to before each batched call
