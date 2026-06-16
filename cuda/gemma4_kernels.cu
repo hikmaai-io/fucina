@@ -3832,16 +3832,20 @@ gemma4_engine_t* gemma4_engine_create(
 
     cudaMalloc(&eng->d_head_norm_w, GEMMA4_GLOBAL_HEAD_DIM * sizeof(float));
 
-    // dp4a MMVQ activation-quant scratch (widest in_dim = intermediate).
+    // dp4a MMVQ activation-quant scratch. The widest in_dim any GEMV quantizes is the
+    // FFN down projection's eng->ffn (21504 on the 31B, 15360 on the 12B) — NOT the
+    // compile-time GEMMA4_INTERMEDIATE, which is the 12B default and undersizes the 31B
+    // (the down-proj quantize then overran the buffer → garbage/NaN in the FFN output).
+    const size_t qx_in = (size_t)eng->ffn;
     eng->d_qx = NULL; eng->d_dx = NULL; eng->d_sx = NULL;
-    cudaMalloc(&eng->d_qx, (size_t)GEMMA4_INTERMEDIATE * sizeof(int8_t));
-    cudaMalloc(&eng->d_dx, (size_t)(GEMMA4_INTERMEDIATE/32) * sizeof(float));
-    cudaMalloc(&eng->d_sx, (size_t)(GEMMA4_INTERMEDIATE/32) * sizeof(int));   // Q4_0 −8 fold
+    cudaMalloc(&eng->d_qx, qx_in * sizeof(int8_t));
+    cudaMalloc(&eng->d_dx, (qx_in/32) * sizeof(float));
+    cudaMalloc(&eng->d_sx, (qx_in/32) * sizeof(int));   // Q4_0 −8 fold
     // Batched (speculative-decode) variant: NK ≤ SPEC_MAX activation vectors at once.
     eng->d_qx_b = NULL; eng->d_dx_b = NULL; eng->d_sx_b = NULL;
-    cudaMalloc(&eng->d_qx_b, (size_t)GEMMA4_SPEC_MAX * GEMMA4_INTERMEDIATE * sizeof(int8_t));
-    cudaMalloc(&eng->d_dx_b, (size_t)GEMMA4_SPEC_MAX * (GEMMA4_INTERMEDIATE/32) * sizeof(float));
-    cudaMalloc(&eng->d_sx_b, (size_t)GEMMA4_SPEC_MAX * (GEMMA4_INTERMEDIATE/32) * sizeof(int));
+    cudaMalloc(&eng->d_qx_b, (size_t)GEMMA4_SPEC_MAX * qx_in * sizeof(int8_t));
+    cudaMalloc(&eng->d_dx_b, (size_t)GEMMA4_SPEC_MAX * (qx_in/32) * sizeof(float));
+    cudaMalloc(&eng->d_sx_b, (size_t)GEMMA4_SPEC_MAX * (qx_in/32) * sizeof(int));
     if (!eng->d_qx || !eng->d_dx || !eng->d_sx || !eng->d_qx_b || !eng->d_dx_b || !eng->d_sx_b) {
         fprintf(stderr, "fucina: dp4a activation scratch alloc failed\n");
         gemma4_engine_destroy(eng);
