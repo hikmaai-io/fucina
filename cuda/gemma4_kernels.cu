@@ -7203,6 +7203,13 @@ static int run_spec_loop(
     uint64_t seed, int *n_accepted_out, gemma4_token_cb cb, void *cb_ud)
 {
     int V = GEMMA4_VOCAB_SIZE;
+    // The batched spec-verify on-device sampling path is not yet correct for the 31B
+    // geometry (the keep_dev=1 verify diverges; the keep_dev=0 forward is proven correct).
+    // Force draft_k=0 so every step takes the single-token decode + on-device sample path
+    // (gemma4_engine_decode, validated correct on the 31B) — i.e. plain greedy/sampling at
+    // the same output distribution, just without the speculation speedup. The 12B keeps
+    // full speculation. Remove this gate once the 31B verify-sample path is fixed.
+    if (eng->geom != GEOM_12B) draft_k = 0;
     // (a) Verify logits stay on device (d_sb[11]); only K ids cross to host — no Lbuf.
     int32_t batch[GEMMA4_SPEC_MAX];
     if (ensure_spec_scratch(eng) != 0) return -1;  // d_spec_ids/d_spec_rnd, d_sb
