@@ -662,9 +662,24 @@ func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int3
 	return slot, first, nil
 }
 
-// StepBatch runs one batched decode step over active slots.
-func (a *BatchAdapter) StepBatch(active []int32, inputs []int32) ([]int32, error) {
-	return a.eng.StepBatch(active, inputs)
+// StepBatch runs one batched decode step over active slots and returns a token
+// RUN per slot (batch.BatchEngine contract). The current C ABI
+// (gemma4_engine_step_batch) is the non-speculative path: it samples exactly one
+// token per slot, so each row's run has length 1 — including the -1 KV-exhausted
+// sentinel, which is delivered as []int32{-1} so the scheduler stops just that
+// row. When the C engine grows a per-sequence speculative step that emits a
+// variable number of accepted tokens per slot, this is the boundary that widens
+// each row's run; the scheduler already walks runs token-by-token.
+func (a *BatchAdapter) StepBatch(active []int32, inputs []int32) ([][]int32, error) {
+	toks, err := a.eng.StepBatch(active, inputs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]int32, len(toks))
+	for i, t := range toks {
+		out[i] = []int32{t}
+	}
+	return out, nil
 }
 
 // RemoveSeq frees a slot and updates the live-slot count.

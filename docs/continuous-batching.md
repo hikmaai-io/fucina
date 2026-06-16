@@ -124,13 +124,26 @@ type BatchEngine interface {
 ```
 On-device sampling both for prefill (returns first token) and each step (one token/slot).
 
-### KNOWN GAP — spec decode in the batch (decision #3)
+### Spec decode in the batch (decision #3) — interface landed, C kernel pending
 
-`StepBatch` returns ONE token per slot. But per-sequence spec decode (MTP draft+verify) emits a
-VARIABLE number of accepted tokens per slot per step. Before Phase 5 the interface must grow to
-e.g. `StepBatch(...) (out [][]int32, err error)` (a token run per slot), and the scheduler's
-`deliver` loop must emit each run with stop/budget checks mid-run. Tracked on task #5. Phase 4's
-1-token base case is correct as-is for B>1 non-spec batching.
+The scheduler interface now carries a token RUN per slot: `StepBatch(active, inputs) (out
+[][]int32, err error)`. The scheduler's `step` walks each row's run in order, calling `deliver`
+per token, and stops emitting the instant a token evicts the row (stop token / budget / cancel /
+the -1 KV-exhausted sentinel) — so drafted tokens past the boundary are dropped. The non-spec C
+path still samples exactly one token per slot; `BatchAdapter.StepBatch` wraps each into a length-1
+run, so behavior is unchanged (batch self-test 32/32, regression byte-identical). Two unit tests
+cover multi-token runs (`TestSpeculativeRunsDeliverEveryToken`) and a stop landing mid-run
+(`TestSpeculativeRunStopsMidRun`).
+
+STILL PENDING (the hard CUDA half): the MTP drafter (`mtp_forward`) is structurally single-
+sequence — it reads K/V from the CONTIGUOUS single-seq cache at fixed layer offsets
+(`d_sliding_k + (MAX_LAYERS-2)*lstride`, `d_global_k + global_slot[MAX_LAYERS-1]`), its recurrent
+state `d_mtp_h` is one `[3840]` buffer, and its attention launches at a single-row grid. Per-slot
+spec-in-batch needs (1) per-slot `d_mtp_h[MAX_SEQS][3840]`, (2) a PAGED + BATCHED drafter attention
+reading each slot's block table (the contiguous cache is not where batch KV lives), and (3) a
+variable-K, per-slot, 2D-batched verify (slot × draft-position) over each slot's paged KV — a new
+kernel geometry that does not yet exist. The Go interface above is the prerequisite that unblocks
+that work; until the C side lands, runs stay length-1 in the batch path.
 
 ## Verification harness
 

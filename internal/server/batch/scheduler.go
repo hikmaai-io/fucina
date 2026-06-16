@@ -51,9 +51,15 @@ type BatchEngine interface {
 
 	// StepBatch runs ONE batched decode step. active is the list of slot ids to
 	// advance and inputs is the matching input token per slot (len(inputs) ==
-	// len(active), inputs[i] advances slot active[i]). It returns one freshly
-	// sampled token per slot: out[i] is the next token for slot active[i].
-	StepBatch(active []int32, inputs []int32) (out []int32, err error)
+	// len(active), inputs[i] advances slot active[i]). It returns a RUN of freshly
+	// sampled tokens per slot: out[i] is the ordered list of tokens produced for
+	// slot active[i] this step. A plain (non-speculative) step returns a run of
+	// length 1 per slot; a per-sequence speculative-decode step may return a
+	// VARIABLE number of accepted tokens per slot (>=1 normally). A run beginning
+	// with the -1 sentinel (out[i] == []int32{-1}) signals that slot can no longer
+	// grow its KV and must be stopped gracefully. An empty run (len(out[i]) == 0)
+	// is treated as "no progress this step" and the slot is left active.
+	StepBatch(active []int32, inputs []int32) (out [][]int32, err error)
 
 	// RemoveSeq frees a slot's KV blocks when its sequence finishes or is
 	// cancelled. After it returns the slot id may be reused by a later AddSeq.
@@ -521,7 +527,7 @@ func (s *Scheduler) step(active map[int]*seq) bool {
 		return false
 	}
 	if len(out) != len(slots) {
-		err := fmt.Errorf("StepBatch returned %d tokens for %d slots", len(out), len(slots))
+		err := fmt.Errorf("StepBatch returned %d token-runs for %d slots", len(out), len(slots))
 		log.Printf("batch: %v", err)
 		for _, slot := range slots {
 			sq := active[int(slot)]
@@ -533,15 +539,23 @@ func (s *Scheduler) step(active map[int]*seq) bool {
 		return false
 	}
 
-	// Scatter: deliver out[i] to the sequence in slots[i]. deliver handles
-	// stop/budget/cancel eviction, so a finished sequence frees its slot now,
-	// making room for a queued request on the next admission pass.
+	// Scatter: deliver out[i] (a RUN of tokens) to the sequence in slots[i].
+	// deliver handles stop/budget/cancel eviction per token, so we walk the run
+	// in order and STOP emitting the moment a token in the run evicts the
+	// sequence (deliver returns false) — the remaining drafted tokens of that
+	// run are past the stop/budget boundary and must not be emitted. A finished
+	// sequence frees its slot now, making room for a queued request on the next
+	// admission pass.
 	for i, slot := range slots {
 		sq := active[int(slot)]
 		if sq == nil {
 			continue // already evicted this pass (defensive)
 		}
-		s.deliver(active, sq, out[i])
+		for _, tok := range out[i] {
+			if !s.deliver(active, sq, tok) {
+				break // evicted mid-run: drop the rest of this row's run
+			}
+		}
 	}
 	return true
 }

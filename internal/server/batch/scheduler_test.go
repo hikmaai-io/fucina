@@ -42,6 +42,11 @@ type mockEngine struct {
 	addErr  error
 	stepErr error
 
+	// runLen, when > 1, makes StepBatch return a RUN of that many tokens per slot
+	// per step (a per-sequence speculative-decode step), so the scheduler's
+	// run-walking deliver loop is exercised. Default 0/1 keeps the one-token path.
+	runLen int
+
 	// addCalls / removeCalls count admissions and evictions for leak checks.
 	addCalls    int
 	removeCalls int
@@ -93,7 +98,7 @@ func (m *mockEngine) tokenFor(slot int, tok int32) int32 {
 	return tok
 }
 
-func (m *mockEngine) StepBatch(active []int32, inputs []int32) ([]int32, error) {
+func (m *mockEngine) StepBatch(active []int32, inputs []int32) ([][]int32, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.stepErr != nil {
@@ -105,15 +110,29 @@ func (m *mockEngine) StepBatch(active []int32, inputs []int32) ([]int32, error) 
 	copy(logged, active)
 	m.stepLog = append(m.stepLog, logged)
 
-	out := make([]int32, len(active))
+	out := make([][]int32, len(active))
 	for i, slot := range active {
 		if !m.live[int(slot)] {
 			// The scheduler should never feed a freed slot; treat as a test bug
 			// signal by echoing input (the assertion lives in the test).
-			out[i] = inputs[i]
+			out[i] = []int32{inputs[i]}
 			continue
 		}
-		out[i] = m.tokenFor(int(slot), inputs[i]+1)
+		n := m.runLen
+		if n < 1 {
+			n = 1
+		}
+		// A run of n sequential tokens for this slot. Each call to tokenFor
+		// advances the slot's produced counter and applies the stop-token policy,
+		// so a stop landing MID-RUN truncates the emitted run (the scheduler must
+		// not emit tokens past the stop — that is what this models).
+		run := make([]int32, n)
+		tok := inputs[i]
+		for k := 0; k < n; k++ {
+			tok = m.tokenFor(int(slot), tok+1)
+			run[k] = tok
+		}
+		out[i] = run
 	}
 	return out, nil
 }
@@ -536,5 +555,87 @@ func TestAddSeqErrorRejects(t *testing.T) {
 	}
 	if res.Err == nil {
 		t.Error("expected a non-nil Err on FinishError")
+	}
+}
+
+// (e) Speculative runs: StepBatch returns a RUN of tokens per slot per step. The
+// scheduler must emit every token in a row's run, in order, and count each one
+// against the sequence's budget — i.e. a row generates runLen tokens per step,
+// so MaxNew is reached in MaxNew/runLen steps with every token delivered.
+func TestSpeculativeRunsDeliverEveryToken(t *testing.T) {
+	const runLen = 3
+	const maxNew = 9 // exact multiple of runLen so the budget lands on a run boundary
+	eng := newMockEngine(1)
+	eng.runLen = runLen
+	sched := New(eng, 4)
+	sched.Start()
+	defer sched.Shutdown()
+
+	col := &collector{}
+	done := make(chan Result, 1)
+	if err := sched.Submit(Request{
+		Tokens: []int32{1}, MaxNew: maxNew, Ctx: context.Background(),
+		Emit: col.emit, Done: done,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res := waitResult(t, done)
+	if res.Reason != FinishLength || res.Generated != maxNew {
+		t.Fatalf("result = %+v want length/%d", res, maxNew)
+	}
+	if got := len(col.got()); got != maxNew {
+		t.Errorf("emitted %d tokens want %d (every run token must be delivered)", got, maxNew)
+	}
+	// maxNew tokens at runLen per step => the first token comes from AddSeq, then
+	// the remaining maxNew-1 are produced by ceil((maxNew-1)/runLen) steps.
+	steps := len(eng.steps())
+	wantSteps := (maxNew - 1 + runLen - 1) / runLen
+	if steps != wantSteps {
+		t.Errorf("ran %d steps want %d (runLen=%d amortizes the budget)", steps, wantSteps, runLen)
+	}
+}
+
+// (f) Stop mid-run truncates: when a stop token lands in the MIDDLE of a row's
+// speculative run, the scheduler must emit the stop token and then STOP — the
+// drafted tokens after the stop are past the boundary and must not be delivered.
+func TestSpeculativeRunStopsMidRun(t *testing.T) {
+	const runLen = 4
+	eng := newMockEngine(1)
+	eng.runLen = runLen
+	eng.stopToken = 99
+	// The first token is produced by AddSeq (produced=1). With stopAfter=3 the
+	// stop lands on the 3rd produced token, which is the 2nd token of the FIRST
+	// StepBatch run (run produces tokens #2,#3,#4,#5) — i.e. strictly mid-run.
+	eng.stopAfter = 3
+	sched := New(eng, 4)
+	sched.Start()
+	defer sched.Shutdown()
+
+	col := &collector{}
+	done := make(chan Result, 1)
+	if err := sched.Submit(Request{
+		Tokens: []int32{1}, MaxNew: 100, Ctx: context.Background(),
+		Emit: col.emit, Done: done, Stops: []int32{99},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res := waitResult(t, done)
+	if res.Reason != FinishStop {
+		t.Fatalf("reason = %q want %q", res.Reason, FinishStop)
+	}
+	got := col.got()
+	// Emitted: AddSeq first token, then run token #2, then the stop (#3). The run
+	// also drafted #4 and #5 AFTER the stop; those must be dropped.
+	if len(got) != 3 {
+		t.Fatalf("emitted %v (%d tokens) want 3 — tokens past the stop must be dropped", got, len(got))
+	}
+	if got[len(got)-1] != 99 {
+		t.Errorf("last emitted = %d want stop token 99", got[len(got)-1])
+	}
+	if res.Generated != 3 {
+		t.Errorf("Generated = %d want 3", res.Generated)
+	}
+	if live := eng.liveCount(); live != 0 {
+		t.Errorf("live slots after stop = %d want 0 (slot freed mid-run)", live)
 	}
 }
