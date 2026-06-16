@@ -2458,7 +2458,13 @@ typedef struct gemma4_seq {
     int            *d_glob_blocks;   // device copy of glob_bt.blocks (or NULL)
     int             d_slid_cap;      // capacity of d_slid_blocks (elems)
     int             d_glob_cap;      // capacity of d_glob_blocks (elems)
+    int             used;            // 1 if this slot is allocated to a live sequence
 } gemma4_seq;
+
+// Max concurrent sequences in one multi-seq batched decode. Bounded by the
+// batched-decode scratch (d_sb / d_qx_b / d_fa_acc), which is sized for
+// GEMMA4_SPEC_MAX rows — so B independent rows reuse that scratch directly.
+#define GEMMA4_MAX_SEQS GEMMA4_SPEC_MAX
 
 struct gemma4_engine {
     // GGUF data (mmap'd)
@@ -2736,6 +2742,20 @@ struct gemma4_engine {
     gemma4_seq cur;      // the active sequence (Phase 1: the only one). cur.n_tokens
                          // is the absolute KV position, formerly `global_n_tokens`.
     int     global_kv_capacity;
+
+    // ── Multi-sequence continuous-batching slots (Phase 3) ────────────────
+    // Independent in-flight sequences, each owning its own paged block tables
+    // into the shared pools. slots[0] is NOT eng->cur (the single-seq path keeps
+    // using eng->cur untouched); these are a separate pool for the batched API.
+    // Device scratch for one multi-seq batched forward over up to GEMMA4_MAX_SEQS
+    // rows: per-row absolute positions (RoPE / write), per-class PagedSeqView
+    // arrays, and per-row sampled token ids. Lazily allocated on first seq_add.
+    gemma4_seq    slots[GEMMA4_MAX_SEQS];
+    int           ms_ready;            // 1 once the ms_* device scratch is allocated
+    int          *d_ms_pos;            // [MAX_SEQS] per-row absolute position
+    int          *d_ms_outtok;         // [MAX_SEQS] per-row sampled token id
+    PagedSeqView *d_ms_views_slid;     // [MAX_SEQS] sliding-class per-seq views
+    PagedSeqView *d_ms_views_glob;     // [MAX_SEQS] global-class per-seq views
 
     // ── Paged KV pools (Phase 2; allocated only when paged mode is enabled) ──
     // The continuous-batching KV store: one physical block pool per cache class,
@@ -3117,6 +3137,7 @@ static int build_packed_q4(gemma4_engine_t *eng);  // FUCINA_PACKED: lazy/eager 
 static void gemma4_engine_paged_selftest(gemma4_engine_t *eng);       // Phase 2 inc 3 (body below)
 static void gemma4_engine_paged_read_selftest(gemma4_engine_t *eng);  // Phase 2 inc 4 (body below)
 static void gemma4_engine_paged_e2e_selftest(gemma4_engine_t *eng);   // Phase 2 inc 4b (body below)
+static void gemma4_engine_batch_selftest(gemma4_engine_t *eng);       // Phase 3 (body below)
 
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
@@ -3816,6 +3837,8 @@ gemma4_engine_t* gemma4_engine_create(
     if (getenv("FUCINA_PAGED_READ_SELFTEST")) gemma4_engine_paged_read_selftest(eng);
     // Paged E2E validation (opt-in): assert paged-read generation == contiguous.
     if (getenv("FUCINA_PAGED_E2E_SELFTEST"))  gemma4_engine_paged_e2e_selftest(eng);
+    // Multi-seq batched-decode validation (opt-in): batched(B) == B single decodes.
+    if (getenv("FUCINA_BATCH_SELFTEST"))      gemma4_engine_batch_selftest(eng);
 
     return eng;
 }
@@ -3866,6 +3889,17 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->cur.d_glob_blocks);
     paged_table_free_struct(&eng->cur.slid_bt);
     paged_table_free_struct(&eng->cur.glob_bt);
+    // Multi-seq slots + their device block-id arrays + the ms_* batched scratch.
+    for (int i = 0; i < GEMMA4_MAX_SEQS; i++) {
+        CUDA_FREE(eng->slots[i].d_slid_blocks);
+        CUDA_FREE(eng->slots[i].d_glob_blocks);
+        paged_table_free_struct(&eng->slots[i].slid_bt);
+        paged_table_free_struct(&eng->slots[i].glob_bt);
+    }
+    CUDA_FREE(eng->d_ms_pos);
+    CUDA_FREE(eng->d_ms_outtok);
+    CUDA_FREE(eng->d_ms_views_slid);
+    CUDA_FREE(eng->d_ms_views_glob);
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -4243,6 +4277,53 @@ __global__ void paged_attn_decode_kernel(
         m   = m_new;
     }
     if (tid < head_dim) out[h * head_dim + tid] = (l > 0.0f) ? acc / l : 0.0f;
+}
+
+// RoPE for B INDEPENDENT rows, each at its OWN absolute position d_row_pos[row]
+// (the multi-seq batched-decode counterpart of rope_rows_kernel, which uses the
+// consecutive base_pos+row of a single sequence). grid=(n_heads,rows), block=hd/2.
+__global__ void rope_rows_pos_kernel(
+    float *q, float *k, const int *d_row_pos, int n_heads, int n_kv_heads,
+    int head_dim, int rows, float theta_base, const float *freq_factors)
+{
+    int d = threadIdx.x, half = head_dim / 2;
+    if (d >= half) return;
+    int head = blockIdx.x, row = blockIdx.y;
+    if (row >= rows) return;
+    int pos = d_row_pos[row];
+    float ff    = freq_factors ? freq_factors[d] : 1.0f;
+    float theta = powf(theta_base, -2.0f * d / head_dim) / ff;
+    float c = cosf(pos * theta), s = sinf(pos * theta);
+    float *qh = q + ((size_t)row * n_heads + head) * head_dim;
+    float q0 = qh[d], q1 = qh[d + half];
+    qh[d] = q0 * c - q1 * s;  qh[d + half] = q0 * s + q1 * c;
+    if (head < n_kv_heads) {
+        float *kh = k + ((size_t)row * n_kv_heads + head) * head_dim;
+        float k0 = kh[d], k1 = kh[d + half];
+        kh[d] = k0 * c - k1 * s;  kh[d + half] = k0 * s + k1 * c;
+    }
+}
+
+// Per-row argmax over a [rows][vocab] logits matrix: one block per row, writes the
+// argmax token id to out_idx[row]. Same warp-shuffle reduction as argmax_kernel,
+// generalised to B rows (block.y indexes the row); blockDim.x lanes stride vocab.
+__global__ void argmax_rows_kernel(
+    const float *logits, int *out_idx, int rows, int vocab_size)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    const float *lr = logits + (size_t)row * vocab_size;
+    float best_val = -1e30f; int best_idx = 0;
+    for (int i = tid; i < vocab_size; i += blockDim.x) {
+        if (lr[i] > best_val) { best_val = lr[i]; best_idx = i; }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float ov = __shfl_xor_sync(0xFFFFFFFF, best_val, offset);
+        int   oi = __shfl_xor_sync(0xFFFFFFFF, best_idx, offset);
+        if (ov > best_val || (ov == best_val && oi < best_idx)) { best_val = ov; best_idx = oi; }
+    }
+    if (tid == 0) out_idx[row] = best_idx;
 }
 
 // (Re)upload a host block table's id array to device, growing the device buffer
@@ -6520,6 +6601,354 @@ int gemma4_engine_decode_batched(
 // d_sb[11] device logits accessor for the GPU-side verify (a).
 static inline float *decode_batched_dev_logits(gemma4_engine_t *eng) {
     return eng->d_sb[11];
+}
+
+// =========================================================================
+// ─── Multi-sequence batched decode (Phase 3: B INDEPENDENT sequences) ────
+// =========================================================================
+// One batched forward over B independent sequences, each with its own absolute
+// position and its own paged KV (per-seq block tables into the shared pools).
+// Reuses decode_batched_forward's GEMV/norm/FFN machinery (the K rows are now
+// independent sequences instead of consecutive positions of one sequence), but:
+//   - RoPE uses each row's own absolute position (rope_rows_pos_kernel),
+//   - KV mirror-writes scatter each row into ITS OWN block table (paged_kv_write),
+//   - attention reads each row through ITS OWN block table (paged_attn_decode_batched).
+// Requires paged mode. The contiguous d_sliding_*/d_global_* caches are NOT touched
+// (they belong to the single-seq eng->cur path); the batch lives entirely in the pool.
+
+extern "C" void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot);  // fwd decl
+
+// Grow/recycle one slot's paged block tables to cover logical position `pos`, then
+// refresh its device block-id arrays. Mirror of paged_seq_sync for an explicit slot.
+static int paged_slot_sync(gemma4_engine_t *eng, gemma4_seq *s, int pos) {
+    if (!eng->paged_enabled) return -1;
+    if (paged_table_ensure(&eng->slid_pool, &s->slid_bt, pos + 1) != 0) return -1;
+    paged_table_advance_sliding(&eng->slid_pool, &s->slid_bt, pos + 1, GEMMA4_SLIDING_WINDOW);
+    if (paged_table_ensure(&eng->glob_pool, &s->glob_bt, pos + 1) != 0) return -1;
+    if (paged_upload_blocks(&s->slid_bt, &s->d_slid_blocks, &s->d_slid_cap, eng->stream) != 0) return -1;
+    if (paged_upload_blocks(&s->glob_bt, &s->d_glob_blocks, &s->d_glob_cap, eng->stream) != 0) return -1;
+    return 0;
+}
+
+// Lazily allocate the multi-seq device scratch (positions, views, sampled ids).
+static int ensure_ms_scratch(gemma4_engine_t *eng) {
+    if (eng->ms_ready) return 0;
+    const int N = GEMMA4_MAX_SEQS;
+    int ok = cudaMalloc(&eng->d_ms_pos,    (size_t)N*sizeof(int)) == cudaSuccess
+          && cudaMalloc(&eng->d_ms_outtok, (size_t)N*sizeof(int)) == cudaSuccess
+          && cudaMalloc(&eng->d_ms_views_slid, (size_t)N*sizeof(PagedSeqView)) == cudaSuccess
+          && cudaMalloc(&eng->d_ms_views_glob, (size_t)N*sizeof(PagedSeqView)) == cudaSuccess;
+    if (!ok) {
+        if (eng->d_ms_pos)    { cudaFree(eng->d_ms_pos);    eng->d_ms_pos = NULL; }
+        if (eng->d_ms_outtok) { cudaFree(eng->d_ms_outtok); eng->d_ms_outtok = NULL; }
+        if (eng->d_ms_views_slid) { cudaFree(eng->d_ms_views_slid); eng->d_ms_views_slid = NULL; }
+        if (eng->d_ms_views_glob) { cudaFree(eng->d_ms_views_glob); eng->d_ms_views_glob = NULL; }
+        cudaGetLastError();
+        return -1;
+    }
+    eng->ms_ready = 1;
+    return 0;
+}
+
+// Run ONE batched forward over the B slots given by `slv[]` (each slot's KV tables
+// already synced to its CURRENT position; in_tok[] are the B input tokens to feed,
+// positions[] the B absolute positions of those tokens). Leaves the B logit rows in
+// d_sb[11]; if want_sample, also writes per-row argmax ids into eng->d_ms_outtok.
+// All B rows reuse the SPEC_MAX-sized batched scratch (B <= GEMMA4_MAX_SEQS).
+static int decode_multiseq_forward(
+    gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *in_tok,
+    const int *positions, int B, int want_sample)
+{
+    if (!eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
+    cudaStream_t stream = eng->stream;
+    const int H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE, HEADS = GEMMA4_HEADS;
+    const int HD2 = 32 * sizeof(float);
+    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+
+    int32_t *d_tok = (int32_t*)eng->d_sb[0];
+    float *d_x  = eng->d_sb[1],  *d_norm = eng->d_sb[2], *d_inf = eng->d_sb[3];
+    float *d_q  = eng->d_sb[4],  *d_k    = eng->d_sb[5], *d_v   = eng->d_sb[6];
+    float *d_attn = eng->d_sb[7], *d_o   = eng->d_sb[8], *d_gate= eng->d_sb[9];
+    float *d_up = eng->d_sb[10], *d_logitsK = eng->d_sb[11];
+
+    // Upload per-row tokens + positions, and build the per-class views on host.
+    cudaMemcpyAsync(d_tok, in_tok, (size_t)B*sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(eng->d_ms_pos, positions, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, stream);
+    PagedSeqView hvs[GEMMA4_MAX_SEQS], hvg[GEMMA4_MAX_SEQS];
+    for (int r = 0; r < B; r++) {
+        gemma4_seq *s = slv[r];
+        int np = positions[r] + 1;                 // tokens visible after this write (incl. new)
+        hvs[r].block_table = s->d_slid_blocks; hvs[r].n_blocks = s->slid_bt.n;
+        hvs[r].base = s->slid_bt.base; hvs[r].n_tokens = np;
+        hvg[r].block_table = s->d_glob_blocks; hvg[r].n_blocks = s->glob_bt.n;
+        hvg[r].base = s->glob_bt.base; hvg[r].n_tokens = np;
+    }
+    cudaMemcpyAsync(eng->d_ms_views_slid, hvs, (size_t)B*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(eng->d_ms_views_glob, hvg, (size_t)B*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
+
+    // Embed (per-row token) + Gemma √H scale.
+    embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, B, H, stream);
+    scale_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, B*H, sqrtf((float)H));
+
+    const int shmem_attn = 32 * sizeof(float);
+    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        layer_type_t lt = eng->layer_types[l];
+        int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+        int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+        int oq  = HEADS*hd, okv = nkv*hd;
+        const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
+        const float *w_post_a = eng->d_w_post_attn_norm + (size_t)l*H;
+        const float *w_ffn    = eng->d_w_ffn_norm       + (size_t)l*H;
+        const float *w_post_f = eng->d_w_post_ffn_norm  + (size_t)l*H;
+        const float *w_qn     = eng->d_w_q_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+        const float *w_kn     = eng->d_w_k_norm + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+        const __typeof__(eng->tensors.layers[0]) *L = &eng->tensors.layers[l];
+
+        rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_inf, d_x, w_attn, H, B, GEMMA4_RMS_EPS);
+        gemv_batched_w(eng, d_q, weight_fp8(eng, L->attn_q), d_inf, H, oq, B, stream);
+        per_head_rms_norm_rows_kernel<<<dim3(HEADS,B),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, B, GEMMA4_RMS_EPS);
+        gemv_batched_w(eng, d_k, weight_fp8(eng, L->attn_k), d_inf, H, okv, B, stream);
+        if (lt == LAYER_SLIDING) {
+            gemv_batched_w(eng, d_v, weight_fp8(eng, L->attn_v), d_inf, H, okv, B, stream);
+            per_head_rms_norm_rows_kernel<<<dim3(nkv,B),hd,HD2,stream>>>(d_v, NULL, nkv, hd, B, GEMMA4_RMS_EPS);
+        } else {
+            cudaMemcpyAsync(d_v, d_k, (size_t)B*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            per_head_rms_norm_rows_kernel<<<dim3(nkv,B),hd,HD2,stream>>>(d_v, NULL, nkv, hd, B, GEMMA4_RMS_EPS);
+        }
+        per_head_rms_norm_rows_kernel<<<dim3(nkv,B),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, B, GEMMA4_RMS_EPS);
+
+        // RoPE with each row's OWN absolute position.
+        if (lt == LAYER_SLIDING)
+            rope_rows_pos_kernel<<<dim3(HEADS,B),hd/2,0,stream>>>(d_q, d_k, eng->d_ms_pos, HEADS, nkv, hd, B, 10000.0f, NULL);
+        else
+            rope_rows_pos_kernel<<<dim3(HEADS,B),hd/2,0,stream>>>(d_q, d_k, eng->d_ms_pos, HEADS, nkv, hd, B, 1000000.0f, eng->d_rope_freqs);
+
+        // Mirror K/V write + paged attention, both through per-row block tables.
+        PagedSeqView *views = (lt==LAYER_SLIDING)? eng->d_ms_views_slid : eng->d_ms_views_glob;
+        PagedWriteBatch wb; wb.seqs = views; wb.write_pos = eng->d_ms_pos; wb.n_rows = B;
+        size_t pls; pkv_t *pk, *pv;
+        if (lt == LAYER_SLIDING) {
+            pls = (size_t)eng->slid_pool.n_blocks * PAGED_KV_BLOCK_TOKENS * okv;
+            pk = eng->d_slid_pool_k + (size_t)l * pls;
+            pv = eng->d_slid_pool_v + (size_t)l * pls;
+        } else {
+            int slot = eng->global_slot[l];
+            pls = (size_t)eng->glob_pool.n_blocks * PAGED_KV_BLOCK_TOKENS * okv;
+            pk = eng->d_glob_pool_k + (size_t)slot * pls;
+            pv = eng->d_glob_pool_v + (size_t)slot * pls;
+        }
+        paged_kv_write<<<dim3(grid1d(okv),B),256,0,stream>>>(
+            pk, pv, d_k, d_v, wb, PAGED_KV_BLOCK_TOKENS, okv);
+        int window = (lt==LAYER_SLIDING) ? GEMMA4_SLIDING_WINDOW : 0;
+        paged_attn_decode_batched<<<dim3(HEADS,B),hd,shmem_attn,stream>>>(
+            d_attn, d_q, pk, pv, views, HEADS, nkv, hd, window,
+            PAGED_KV_BLOCK_TOKENS, okv);
+
+        // O proj → post-attn norm → residual; FFN; post-FFN norm → residual; out scale.
+        gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, B, stream);
+        rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_norm, d_o, w_post_a, H, B, GEMMA4_RMS_EPS);
+        residual_add_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, d_norm, B*H);
+
+        rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_inf, d_x, w_ffn, H, B, GEMMA4_RMS_EPS);
+        gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, B, stream);
+        gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, B, stream);
+        geglu_kernel<<<grid1d((size_t)B*I),256,0,stream>>>(d_inf, d_gate, d_up, B*I);
+        gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, B, stream);
+        rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_norm, d_o, w_post_f, H, B, GEMMA4_RMS_EPS);
+        residual_add_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, d_norm, B*H);
+        if (eng->h_out_scale[l] != 1.0f)
+            scale_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, B*H, eng->h_out_scale[l]);
+    }
+
+    // Output norm + LM head (batched) + softcap (+suppress) → d_logitsK [B][VOCAB].
+    int vocab = GEMMA4_VOCAB_SIZE;
+    rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, B, GEMMA4_RMS_EPS);
+    gemv_batched_w(eng, d_logitsK, lmhead_w(eng), d_norm, H, vocab, B, stream, embd_fmt(eng));
+    logit_softcap_kernel<<<grid1d((size_t)B*vocab),256,0,stream>>>(d_logitsK, GEMMA4_SOFTCAP, B*vocab);
+    if (eng->n_suppress > 0)
+        for (int i = 0; i < B; i++)
+            suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
+                d_logitsK + (size_t)i*vocab, eng->d_suppress, eng->n_suppress, vocab);
+
+    if (want_sample)
+        argmax_rows_kernel<<<B,32,0,stream>>>(d_logitsK, eng->d_ms_outtok, B, vocab);
+
+    return 0;
+}
+
+// ── Multi-sequence continuous-batching C ABI ────────────────────────────────
+// All require paged mode (FUCINA_PAGED_KV). slots[] are opaque ids 0..MAX_SEQS-1.
+
+// Allocate a free slot, prefill `prompt` into THAT slot's paged KV (correctness
+// first: loop single-token multi-seq forwards over the slot alone), sample the
+// first token greedily, write it to *first_token_out. Returns slot id (>=0) or -1.
+extern "C" int gemma4_engine_seq_add(
+    gemma4_engine_t *eng, const int32_t *prompt, int n_prompt, int32_t *first_token_out)
+{
+    if (!eng || !eng->loaded || !eng->paged_enabled || !prompt || n_prompt <= 0) return -1;
+    int slot = -1;
+    for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (!eng->slots[i].used) { slot = i; break; }
+    if (slot < 0) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
+
+    gemma4_seq *s = &eng->slots[slot];
+    // Fresh tables (struct was zeroed at create / released on remove).
+    s->n_tokens = 0; s->slid_bt.base = 0; s->slid_bt.n = 0; s->glob_bt.base = 0; s->glob_bt.n = 0;
+    s->used = 1;
+
+    gemma4_seq *one[1] = { s };
+    int32_t last_tok = 0;
+    for (int i = 0; i < n_prompt; i++) {
+        int pos = s->n_tokens;
+        if (paged_slot_sync(eng, s, pos) != 0) { gemma4_engine_seq_remove(eng, slot); return -1; }
+        int32_t tok = prompt[i];
+        int positions[1] = { pos };
+        int want_sample = (i == n_prompt - 1);
+        if (decode_multiseq_forward(eng, one, &tok, positions, 1, want_sample) != 0) {
+            gemma4_engine_seq_remove(eng, slot); return -1;
+        }
+        s->n_tokens = pos + 1;
+        if (want_sample) {
+            cudaMemcpyAsync(&last_tok, eng->d_ms_outtok, sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, eng->stream);
+        }
+    }
+    cudaStreamSynchronize(eng->stream);
+    if (cudaGetLastError() != cudaSuccess) { gemma4_engine_seq_remove(eng, slot); return -1; }
+    if (first_token_out) *first_token_out = last_tok;
+    return slot;
+}
+
+// One batched forward over the B given slots: feed in_tokens[i] at each slot's
+// current position, advance positions, sample one greedy token per slot into
+// out_tokens. Returns 0 on success, -1 on error.
+extern "C" int gemma4_engine_step_batch(
+    gemma4_engine_t *eng, const int *slots, const int32_t *in_tokens, int B, int32_t *out_tokens)
+{
+    if (!eng || !eng->loaded || !eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
+
+    gemma4_seq *slv[GEMMA4_MAX_SEQS];
+    int positions[GEMMA4_MAX_SEQS];
+    for (int r = 0; r < B; r++) {
+        int id = slots[r];
+        if (id < 0 || id >= GEMMA4_MAX_SEQS || !eng->slots[id].used) return -1;
+        gemma4_seq *s = &eng->slots[id];
+        slv[r] = s;
+        positions[r] = s->n_tokens;
+        if (paged_slot_sync(eng, s, s->n_tokens) != 0) return -1;
+    }
+    if (decode_multiseq_forward(eng, slv, in_tokens, positions, B, /*want_sample=*/1) != 0)
+        return -1;
+    int32_t outs[GEMMA4_MAX_SEQS];
+    cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)B*sizeof(int32_t),
+                    cudaMemcpyDeviceToHost, eng->stream);
+    cudaStreamSynchronize(eng->stream);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    for (int r = 0; r < B; r++) { slv[r]->n_tokens = positions[r] + 1; if (out_tokens) out_tokens[r] = outs[r]; }
+    return 0;
+}
+
+// Free a slot's block tables back to the pools and mark it free.
+extern "C" void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot) {
+    if (!eng || slot < 0 || slot >= GEMMA4_MAX_SEQS) return;
+    gemma4_seq *s = &eng->slots[slot];
+    paged_table_release(&eng->slid_pool, &s->slid_bt);
+    paged_table_release(&eng->glob_pool, &s->glob_bt);
+    s->n_tokens = 0; s->used = 0;
+    // d_slid_blocks/d_glob_blocks device buffers are retained for slot reuse.
+}
+
+// Number of free slots available for new sequences.
+extern "C" int gemma4_engine_seq_capacity(gemma4_engine_t *eng) {
+    if (!eng || !eng->paged_enabled) return 0;
+    int n = 0;
+    for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (!eng->slots[i].used) n++;
+    return n;
+}
+
+// Self-test (FUCINA_BATCH_SELFTEST): 3 distinct short token sequences, each run
+// through single-seq decode (greedy argmax, K steps) and then together as a batch
+// of 3 via seq_add + step_batch; assert the batched per-step argmax matches the
+// single-seq argmax for each sequence (a few fp near-tie flips tolerated — PASS if
+// each sequence agrees >= 90%). Mirrors the FUCINA_PAGED_*_SELFTEST create hooks.
+static void gemma4_engine_batch_selftest(gemma4_engine_t *eng) {
+    if (!eng->paged_enabled) return;
+    const int NSEQ = 3;
+    const int KSTEP = 32;
+    // Three distinct short prompts (token ids in-vocab; avoid specials).
+    int32_t prompt[NSEQ][4] = {
+        { 100, 200, 300, 400 },
+        { 500, 600, 700, 800 },
+        { 111, 222, 333, 444 },
+    };
+    const int NP = 4;
+
+    // ── Reference: each sequence alone through the single-seq slot path ──
+    // Use a private slot (seq_add prefills then we step_batch with B=1), which is
+    // the SAME math the batch uses but one row at a time — the regression bar is
+    // batched(B=3) == B separate single-row runs.
+    int32_t ref[NSEQ][KSTEP];
+    for (int q = 0; q < NSEQ; q++) {
+        int32_t first = 0;
+        int slot = gemma4_engine_seq_add(eng, prompt[q], NP, &first);
+        if (slot < 0) { fprintf(stderr, "fucina: batch self-test: seq_add(ref) failed\n"); return; }
+        int32_t tok = first;
+        for (int k = 0; k < KSTEP; k++) {
+            ref[q][k] = tok;
+            int32_t nxt = 0; int sl = slot;
+            if (gemma4_engine_step_batch(eng, &sl, &tok, 1, &nxt) != 0) {
+                fprintf(stderr, "fucina: batch self-test: step(ref) failed\n");
+                gemma4_engine_seq_remove(eng, slot); return;
+            }
+            tok = nxt;
+        }
+        gemma4_engine_seq_remove(eng, slot);
+    }
+
+    // ── Batched: all NSEQ together, B=NSEQ each step ──
+    int slots[NSEQ]; int32_t cur[NSEQ]; int32_t bat[NSEQ][KSTEP];
+    for (int q = 0; q < NSEQ; q++) {
+        int32_t first = 0;
+        slots[q] = gemma4_engine_seq_add(eng, prompt[q], NP, &first);
+        if (slots[q] < 0) { fprintf(stderr, "fucina: batch self-test: seq_add(batch) failed\n"); return; }
+        cur[q] = first;
+    }
+    for (int k = 0; k < KSTEP; k++) {
+        int32_t nxt[NSEQ];
+        for (int q = 0; q < NSEQ; q++) bat[q][k] = cur[q];
+        if (gemma4_engine_step_batch(eng, slots, cur, NSEQ, nxt) != 0) {
+            fprintf(stderr, "fucina: batch self-test: step(batch) failed\n");
+            for (int q = 0; q < NSEQ; q++) gemma4_engine_seq_remove(eng, slots[q]);
+            return;
+        }
+        for (int q = 0; q < NSEQ; q++) cur[q] = nxt[q];
+    }
+    for (int q = 0; q < NSEQ; q++) gemma4_engine_seq_remove(eng, slots[q]);
+
+    // ── Compare ──
+    int all_pass = 1;
+    for (int q = 0; q < NSEQ; q++) {
+        int agree = 0, first_mism = -1;
+        for (int k = 0; k < KSTEP; k++) {
+            if (ref[q][k] == bat[q][k]) agree++;
+            else if (first_mism < 0) first_mism = k;
+        }
+        double pct = 100.0 * agree / KSTEP;
+        int pass = (agree >= (KSTEP * 9 + 9) / 10);   // >= 90%
+        all_pass &= pass;
+        fprintf(stderr,
+            "fucina: batch self-test seq %d: %d/%d argmax agree (%.0f%%)%s%s\n",
+            q, agree, KSTEP, pct,
+            (first_mism >= 0) ? " first-mismatch step " : "",
+            "");
+        if (first_mism >= 0)
+            fprintf(stderr, "fucina:   seq %d first mismatch at step %d (ref %d vs batch %d)\n",
+                    q, first_mism, ref[q][first_mism], bat[q][first_mism]);
+    }
+    fprintf(stderr, "fucina: batch self-test %s — batched(B=%d) decode vs %d single-seq decodes\n",
+            all_pass ? "PASSED" : "FAILED", NSEQ, NSEQ);
 }
 
 // =========================================================================
