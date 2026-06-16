@@ -157,6 +157,18 @@ func main() {
 		}
 		srv.SetMaxConcurrent(args.MaxConcurrent) // 0 ignored (keeps default)
 		srv.SetMaxOutputTokens(args.MaxOutputToks)
+		// Continuous batching (experimental): FUCINA_BATCH routes requests through
+		// the per-step scheduler over the paged multi-sequence engine instead of the
+		// per-request kv lock. Requires the engine to be in paged mode
+		// (FUCINA_PAGED_KV=1); SetBatchEngine is a no-op otherwise, so the
+		// single-flight path stays intact.
+		if os.Getenv("FUCINA_BATCH") != "" {
+			if srv.SetBatchEngine(cuda.NewBatchAdapter(eng)) {
+				log.Printf("fucina: continuous batching ENABLED (paged KV multi-sequence)")
+			} else {
+				log.Printf("fucina: WARNING — FUCINA_BATCH set but engine not in paged mode (FUCINA_PAGED_KV); batching disabled")
+			}
+		}
 		// Debug request dumping: --debug or --log-level debug.
 		if args.Debug || strings.EqualFold(args.LogLevel, "debug") {
 			srv.SetDebug(true)
