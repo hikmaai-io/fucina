@@ -55,8 +55,12 @@ curl http://localhost:8080/v1/chat/completions \
   gemma-4 chat template. `make smoke` uses a raw prompt on purpose (it only checks the engine runs).
 - Watch speculation live at `/metrics` → `speculation` (`accept_rate`, `tokens_per_forward`). Decode
   on GB10 is bandwidth-bound on weight bytes; the levers are CUDA-graph launch-bubble removal + τ.
-- Key flags: `--ctx` (default 262144; lower to save VRAM), `--temp`/`--top-k`/`--top-p`,
+- Key flags: `--ctx` (default 262144; raises only the global-layer KV), `--temp`/`--top-k`/`--top-p`,
   `--thinking off|on|low|mid|high|xhigh`, `--spec` (on), `--draft-k`, `--assistant`. `fucina --help`.
+- Memory levers (memory-constrained hosts): `FUCINA_NO_PACKED=1` drops the repacked-Q4_0 decode-GEMV
+  weight copy — **frees ~7 GiB VRAM**, ~2–3% slower decode, output bit-identical. `FUCINA_SLIDING_RING=N`
+  sets the sliding ring capacity (default 8192); also the max-exact prefix-reuse rewind depth (deeper
+  → full re-prefill). ring + `FUCINA_NO_PACKED=1` ≈ **23 GiB total at 131072** (vs ~53 GiB before).
 
 ## DiffusionGemma (optional, experimental)
 
@@ -89,8 +93,10 @@ NVFP4 MoE experts. See README "DiffusionGemma".
 
 Gemma 4 12B: 48 layers (40 sliding-window + 8 global), GeGLU FFN (`gelu_pytorch_tanh`, intermediate
 15360), RoPE/p-RoPE, logit softcap 30.0, vocab 262144, hidden 3840, Q6_K tied LM head. KV cache is
-FP8 E4M3 (~54 GiB at full 262144 ctx — fits GB10's 128 GB unified memory). The MTP draft head is a
-4-layer `gemma4-assistant` GGUF (~444 MB Q8_0), a build of `google/gemma-4-12B-it-assistant`.
+FP8 E4M3. The 40 sliding layers use a capped **ring buffer** (`FUCINA_SLIDING_RING`, default 8192
+slots ≈ 1.5 GiB, ctx-independent); only the 8 global layers scale with `--ctx` (~2.0 GiB at 262144).
+Total KV ≈ **3.5 GiB at 262144 / 2.5 GiB at 131072** (was ~54 GiB before the ring). The MTP draft head
+is a 4-layer `gemma4-assistant` GGUF (~444 MB Q8_0), a build of `google/gemma-4-12B-it-assistant`.
 
 ## Build / test / dev
 

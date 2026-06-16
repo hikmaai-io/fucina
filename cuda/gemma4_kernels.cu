@@ -326,10 +326,10 @@ __global__ void copy_f32_to_fp8_kernel(
 // scalar site's copy_f32_to_fp8_kernel(base + pos*stride, src, n).
 __global__ void copy_f32_to_fp8_at_kernel(
     unsigned char *base, const int *pos_ptr, int stride,
-    const float *src, int n)
+    const float *src, int n, int cap)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) base[(size_t)(*pos_ptr) * stride + i] = float_to_fp8(src[i]);
+    if (i < n) base[(size_t)((*pos_ptr) % cap) * stride + i] = float_to_fp8(src[i]);
 }
 
 // Dequantize a weight matrix (Q8_0 or FP8) to BF16, preserving the source's
@@ -1568,8 +1568,8 @@ __global__ void sliding_attn_splitk_kernel(
     float *part_acc,                          // [n_splits][NH][HD] (unnormalized)
     float *part_m, float *part_l,             // [n_splits][NH]
     const float *q,                           // [NH][HD]
-    const kv_t *k_cache, const kv_t *v_cache, // FLAT [capacity][NKV][HD] FP8
-    int window, int n_tokens, int n_splits)
+    const kv_t *k_cache, const kv_t *v_cache, // RING [cap][NKV][HD] FP8
+    int window, int n_tokens, int n_splits, int cap)
 {
     constexpr int GQ = NH / NKV;              // query heads per KV head (GQA group) = 2
     constexpr int slice = HD / 32;            // 8 floats/lane at HD 256
@@ -1594,7 +1594,7 @@ __global__ void sliding_attn_splitk_kernel(
     }
 
     for (int i = i0; i < i1; i++) {
-        size_t pos = (size_t)(lo + i);        // absolute position (flat, no wrap)
+        size_t pos = (size_t)(lo + i) % (size_t)cap;   // ring slot for absolute pos lo+i
         const kv_t *kp = k_cache + (pos*NKV + kv_head)*HD;
         const kv_t *vp = v_cache + (pos*NKV + kv_head)*HD;
         float kd[slice], vd[slice];
@@ -1737,8 +1737,8 @@ template<int NH, int NKV, int HD>
 __global__ void sliding_attn_splitk_rows_kernel(
     float *part_acc, float *part_m, float *part_l,   // slot r*MAX_SPLITS+split
     const float *q,                                  // [K][NH*HD]
-    const kv_t *k_cache, const kv_t *v_cache,        // FLAT [capacity][NKV][HD]
-    int window, int n_tokens0,
+    const kv_t *k_cache, const kv_t *v_cache,        // RING [cap][NKV][HD]
+    int window, int n_tokens0, int cap,
     const int *n_tokens0_ptr)                        // non-NULL: device override (graph path)
 {
     constexpr int GQ = NH / NKV;
@@ -1768,7 +1768,7 @@ __global__ void sliding_attn_splitk_rows_kernel(
     }
 
     for (int i = i0; i < i1; i++) {
-        size_t pos = (size_t)(lo + i);
+        size_t pos = (size_t)(lo + i) % (size_t)cap;   // ring slot for absolute pos lo+i
         const kv_t *kp = k_cache + (pos*NKV + kv_head)*HD;
         const kv_t *vp = v_cache + (pos*NKV + kv_head)*HD;
         float kd[slice], vd[slice];
@@ -1881,13 +1881,13 @@ __global__ void kv_broadcast_f32_bf16_kernel(
 __global__ void fp_hist_tile_bf16_kernel(
     __nv_bfloat16 *kt, __nv_bfloat16 *vt,
     const kv_t *kc, const kv_t *vc,
-    int t0, int tn, int n_heads, int n_kv_heads, int head_dim)
+    int t0, int tn, int n_heads, int n_kv_heads, int head_dim, int cap)
 {
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     int h = blockIdx.y, t = blockIdx.z;
     if (d >= head_dim || t >= tn) return;
     int kvh = h / (n_heads / n_kv_heads);
-    size_t src = ((size_t)(t0 + t) * n_kv_heads + kvh) * head_dim + d;
+    size_t src = (((size_t)(t0 + t) % (size_t)cap) * n_kv_heads + kvh) * head_dim + d;
     size_t dst = ((size_t)t * n_heads + h) * head_dim + d;
     kt[dst] = __float2bfloat16(fp8_to_float(kc[src]));
     vt[dst] = __float2bfloat16(fp8_to_float(vc[src]));
@@ -2148,11 +2148,13 @@ __global__ void attn_softmax_colmajor_kernel(
 // and hold their true most-recent occupant. kvhd = n_kv_heads*head_dim.
 // k/vcache point at the layer's ring base [window][kvhd]. grid=(ceil(kvhd/256),
 // count), block=256.
-// FLAT per-position write (Step 3): token at batch index t goes to ABSOLUTE position base+t
-// (no ring wrap), so the cache holds every position for exact rewind. `window` is unused now.
+// RING per-position write: token at batch index t goes to absolute position base+t,
+// stored at ring slot (base+t) % cap. cap == sliding_kv_capacity; for a context that
+// never exceeds cap this is identity (flat). `window` is unused (kept for ABI parity
+// with the global writer's call shape).
 __global__ void kv_write_sliding_kernel(
     kv_t *kcache, kv_t *vcache, const float *kb, const float *vb,
-    int base, int first, int count, int kvhd, int window,
+    int base, int first, int count, int kvhd, int window, int cap,
     const int *base_ptr = nullptr)                     // non-NULL: device override (graph path)
 {
     int i = blockIdx.y;                                // 0..count-1
@@ -2160,7 +2162,7 @@ __global__ void kv_write_sliding_kernel(
     if (i >= count || j >= kvhd) return;
     if (base_ptr) base = *base_ptr;
     int t    = first + i;                              // token index within batch
-    size_t slot = (size_t)base + t;                    // absolute position (flat)
+    size_t slot = ((size_t)base + t) % (size_t)cap;    // ring position
     kcache[slot * kvhd + j] = float_to_fp8(kb[(size_t)t * kvhd + j]);
     vcache[slot * kvhd + j] = float_to_fp8(vb[(size_t)t * kvhd + j]);
 }
@@ -2686,10 +2688,11 @@ struct gemma4_engine {
     float  h_out_scale[GEMMA4_MAX_LAYERS]; // layer_output_scale scalars (host)
 
     // KV cache (device) — FP8 E4M3 (1 byte/elem), see kv_t.
-    // Sliding: 40 layers × 1024 window × 8 heads × 256 head_dim.
-    // FLAT per-position sliding KV (Step 3): [MAX_LAYERS][sliding_kv_capacity][8×256] indexed
-    // by ABSOLUTE token position (no ring wrap), so rewind/prefix-reuse is exact. Token count
-    // per sliding layer == global_n_tokens (every token writes all layers).
+    // Sliding: [MAX_LAYERS][sliding_kv_capacity][8×256] per-position RING; absolute position p
+    // lives at slot p % sliding_kv_capacity. Sliding-window attention reads only the last
+    // GEMMA4_SLIDING_WINDOW positions, so the ring is capped well below context_size (see the
+    // allocation): exact rewind/prefix-reuse within the last (cap-window) tokens, full
+    // re-prefill fallback beyond it. Token count per sliding layer == global_n_tokens.
     kv_t   *d_sliding_k;       // [MAX_LAYERS × sliding_kv_capacity × 8 × 256]
     kv_t   *d_sliding_v;
     int     sliding_kv_capacity;
@@ -3600,12 +3603,28 @@ gemma4_engine_t* gemma4_engine_create(
     }
 
     // KV cache allocation
-    // Sliding cache is now FLAT per-position (Step 3): [MAX_LAYERS][capacity][8×256], indexed
-    // by absolute position so rewind is exact (was a 1024-window ring). capacity = context_size
-    // (floored at the window so attention always has room). Scales with ctx — ~805 MB @4k,
-    // ~21 GB @131k (fine on the 128 GB unified box; the design accepts this for exact rewind).
-    eng->sliding_kv_capacity = (int)(context_size > GEMMA4_SLIDING_WINDOW
-                                     ? context_size : GEMMA4_SLIDING_WINDOW);
+    // Sliding cache is a per-position RING: [MAX_LAYERS][cap][8×256], position p stored at
+    // slot p % cap. Sliding-window attention only ever reads the last GEMMA4_SLIDING_WINDOW
+    // positions, so cap need not equal context_size — capping it makes the sliding cache
+    // (the dominant, ctx-scaling allocation) nearly context-independent: ~768 MB at cap=8192
+    // vs ~21 GB flat @131k. cap = min(context_size, FUCINA_SLIDING_RING) (default 8192,
+    // floored at the window). The margin cap-window bounds how far a prefix-reuse rewind can
+    // look back exactly; deeper rewinds report failure (gemma4_engine_rewind) and the server
+    // falls back to a full re-prefill. Speculation rewinds ≤ GEMMA4_SPEC_MAX, always inside it.
+    {
+        int ring_w = 8192;                          // default ring capacity (window + margin)
+        const char *e = getenv("FUCINA_SLIDING_RING");
+        if (e && *e) { int v = atoi(e); if (v >= GEMMA4_SLIDING_WINDOW) ring_w = v; }
+        // Floor at window + spec_max: a spec-verify batch writes K≤SPEC_MAX draft
+        // positions while each row reads its window, so window+SPEC_MAX consecutive
+        // ring slots must be collision-free. (Only binds for a tiny FUCINA_SLIDING_RING;
+        // the default 8192 clears it by ~7×.)
+        const int ring_floor = GEMMA4_SLIDING_WINDOW + GEMMA4_SPEC_MAX;
+        int cap = (int)context_size;
+        if (cap > ring_w)      cap = ring_w;
+        if (cap < ring_floor)  cap = ring_floor;
+        eng->sliding_kv_capacity = cap;
+    }
     size_t sliding_kv_size = (size_t)GEMMA4_MAX_LAYERS *
         GEMMA4_KV_HEADS * (size_t)eng->sliding_kv_capacity * GEMMA4_HEAD_DIM * sizeof(kv_t);
     if (cudaMalloc(&eng->d_sliding_k, sliding_kv_size) != cudaSuccess ||
@@ -3976,7 +3995,7 @@ static inline void sliding_attn_decode_broadcast(
     sliding_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
         <<<splits, GEMMA4_KV_HEADS * 32, 0, stream>>>(
             eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc,
-            window, n_tokens, splits);
+            window, n_tokens, splits, eng->sliding_kv_capacity);
     flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
         out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
 }
@@ -4094,11 +4113,12 @@ static int decode_layer(
         kv_t *base_k = eng->d_sliding_k + (size_t)layer * layer_stride;
         kv_t *base_v = eng->d_sliding_v + (size_t)layer * layer_stride;
         if (d_pos) {
-            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, kv_size, eng->d_attn_k, kv_size);
-            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, kv_size, eng->d_attn_v, kv_size);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, kv_size, eng->d_attn_k, kv_size, eng->sliding_kv_capacity);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, kv_size, eng->d_attn_v, kv_size, eng->sliding_kv_capacity);
         } else {
-            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)pos*kv_size, eng->d_attn_k, kv_size);
-            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)pos*kv_size, eng->d_attn_v, kv_size);
+            size_t rslot = (size_t)(pos % eng->sliding_kv_capacity) * kv_size;  // ring slot
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + rslot, eng->d_attn_k, kv_size);
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + rslot, eng->d_attn_v, kv_size);
         }
     } else {
         int n = pos;   // == eng->global_n_tokens at every call site
@@ -4107,8 +4127,8 @@ static int decode_layer(
         kv_t *base_k = eng->d_global_k + (size_t)slot * layer_stride;
         kv_t *base_v = eng->d_global_v + (size_t)slot * layer_stride;
         if (d_pos) {
-            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size);
-            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size, eng->global_kv_capacity);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size, eng->global_kv_capacity);
         } else {
             copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size);
             copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size);
@@ -4128,7 +4148,7 @@ static int decode_layer(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
                     eng->d_sliding_k + (size_t)layer * lstride,
                     eng->d_sliding_v + (size_t)layer * lstride,
-                    GEMMA4_SLIDING_WINDOW, 0, d_pos + 1);
+                    GEMMA4_SLIDING_WINDOW, 0, eng->sliding_kv_capacity, d_pos + 1);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS>
                 <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
                     eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
@@ -4925,7 +4945,8 @@ int gemma4_engine_prefill_batched(
             kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
             kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
             kv_write_sliding_kernel<<<dim3(grid1d(kvhd),N),256,0,stream>>>(
-                kc, vc, d_k, d_v, base, 0, N, kvhd, GEMMA4_SLIDING_WINDOW);
+                kc, vc, d_k, d_v, base, 0, N, kvhd, GEMMA4_SLIDING_WINDOW,
+                eng->sliding_kv_capacity);
         } else {
             int slot = eng->global_slot[l];
             size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
@@ -5232,17 +5253,22 @@ int gemma4_engine_prefill_flash(
                         HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
                 };
 
-                // History tiles (frozen FP8 cache, flat absolute positions).
+                // History tiles (frozen FP8 cache). Sliding uses the ring (cap =
+                // sliding_kv_capacity); global is flat full-ctx (cap = its capacity,
+                // positions < ctx so the modulo is identity).
                 const kv_t *hk, *hv;
+                int hcap;
                 if (lt == LAYER_SLIDING) {
                     size_t lstride = (size_t)eng->sliding_kv_capacity * kvhd;
                     hk = eng->d_sliding_k + (size_t)l*lstride;
                     hv = eng->d_sliding_v + (size_t)l*lstride;
+                    hcap = eng->sliding_kv_capacity;
                 } else {
                     int slot = eng->global_slot[l];
                     size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
                     hk = eng->d_global_k + (size_t)slot*stride;
                     hv = eng->d_global_v + (size_t)slot*stride;
+                    hcap = eng->global_kv_capacity;
                 }
                 int hstart = 0;                           // sliding: only the window reach
                 if (window > 0) { hstart = abs0 - (window - 1); if (hstart < 0) hstart = 0; }
@@ -5252,7 +5278,7 @@ int gemma4_engine_prefill_flash(
                 for (int t0 = hstart; t0 < abs0; t0 += T) {
                     int tn = (abs0 - t0 < T) ? (abs0 - t0) : T;
                     fp_hist_tile_bf16_kernel<<<dim3(grid1d(hd),global?1:HEADS,tn),256,0,stream>>>(
-                        eng->d_fp_kt, eng->d_fp_vt, hk, hv, t0, tn, global?1:HEADS, nkv, hd);
+                        eng->d_fp_kt, eng->d_fp_vt, hk, hv, t0, tn, global?1:HEADS, nkv, hd, hcap);
                     long long qe = cn;                    // queries that can see this tile
                     if (window > 0) {
                         qe = (long long)t0 + tn - 1 + window - abs0;
@@ -5280,7 +5306,8 @@ int gemma4_engine_prefill_flash(
                 size_t lstride = (size_t)eng->sliding_kv_capacity * kvhd;
                 kv_write_sliding_kernel<<<dim3(grid1d(kvhd),cn),256,0,stream>>>(
                     eng->d_sliding_k + (size_t)l*lstride, eng->d_sliding_v + (size_t)l*lstride,
-                    d_k, d_v, abs0, 0, cn, kvhd, GEMMA4_SLIDING_WINDOW);
+                    d_k, d_v, abs0, 0, cn, kvhd, GEMMA4_SLIDING_WINDOW,
+                    eng->sliding_kv_capacity);
             } else {
                 int slot = eng->global_slot[l];
                 size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
@@ -5769,7 +5796,8 @@ static void decode_batched_forward(
             kv_t *kc = eng->d_sliding_k + (size_t)l*lstride;
             kv_t *vc = eng->d_sliding_v + (size_t)l*lstride;
             kv_write_sliding_kernel<<<dim3(grid1d(okv),K),256,0,stream>>>(
-                kc, vc, d_k, d_v, pos, 0, K, okv, GEMMA4_SLIDING_WINDOW, d_pos);
+                kc, vc, d_k, d_v, pos, 0, K, okv, GEMMA4_SLIDING_WINDOW,
+                eng->sliding_kv_capacity, d_pos);
             int max_splits;
             if (d_pos) {
                 max_splits = (GEMMA4_SLIDING_WINDOW + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
@@ -5782,7 +5810,7 @@ static void decode_batched_forward(
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(max_splits, K), GEMMA4_KV_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc,
-                    GEMMA4_SLIDING_WINDOW, pos + 1, d_ntok);
+                    GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
                 d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                 hd, GEMMA4_SLIDING_WINDOW, pos + 1, d_ntok, oq);
@@ -6188,7 +6216,7 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
                     eng->d_sliding_k + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
                     eng->d_sliding_v + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
-                    GEMMA4_SLIDING_WINDOW - 1, 0, pos_ptr);
+                    GEMMA4_SLIDING_WINDOW - 1, 0, eng->sliding_kv_capacity, pos_ptr);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS>
                 <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
                     eng->d_mtp_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
@@ -7229,6 +7257,17 @@ int gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep) {
     if (!eng) return -1;
     if (n_keep < 0 || n_keep > eng->global_n_tokens) return -1;
     if (n_keep == eng->global_n_tokens) return 0; // nothing to discard
+
+    // Ring sliding cache: once the sequence has exceeded the ring capacity, only the
+    // last `cap` positions survive, so the sliding window for n_keep is intact only if
+    // n_keep >= H - (cap - window). A deeper rewind cannot be served exactly — report
+    // failure so KVCache.Prefill falls back to a full re-prefill (Rewind()==false). When
+    // H <= cap nothing has been overwritten and every rewind is exact, as before.
+    if (eng->global_n_tokens > eng->sliding_kv_capacity &&
+        n_keep < eng->global_n_tokens -
+                 (eng->sliding_kv_capacity - GEMMA4_SLIDING_WINDOW)) {
+        return -1;
+    }
 
     eng->global_n_tokens = n_keep;
     return 0;

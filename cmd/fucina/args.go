@@ -103,11 +103,13 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	// injects large file contents via Read tool responses; a small window forces
 	// constant compaction, which trims the oldest tokens and collapses the prefix
 	// cache (longestCommonPrefix → ~1), re-prefilling the whole window every turn.
-	// MEMORY COST at full context (FP8 KV, 1 B/elem, K+V): global 8 layers ×
-	// 512 head-dim × ctx ≈ 2.1 GiB, and the FLAT per-position sliding cache
-	// (DECODE-30-35 Step 3) SCALES WITH CTX: 48 layers × 8 heads × 256 head-dim
-	// × ctx ≈ 51.5 GiB — ~54 GiB total, sized for the 128 GB GB10 box; use
-	// --ctx 131072 (~27 GiB) or lower elsewhere. Engine clamps to 262144.
+	// MEMORY COST at full context (FP8 KV, 1 B/elem, K+V): the global cache still
+	// scales with ctx (8 layers × 512 head-dim × ctx ≈ 2.1 GiB @131k), but the
+	// sliding cache is now a capped RING (default 8192 slots, FUCINA_SLIDING_RING):
+	// 48 × 8 × 256 × 8192 × 2 ≈ 1.5 GiB, ctx-independent — was ~21 GiB flat @131k.
+	// Sliding-window attention only reads the last 1024 positions, so the ring loses
+	// nothing for same-conversation turns and speculation; only a prefix-reuse rewind
+	// deeper than (ring-1024) tokens degrades to a full re-prefill. Engine clamps to 262144.
 	fs.IntVar(&a.ContextSize, "ctx", 262144, "Context size in tokens")
 	fs.IntVar(&a.ContextSize, "c", 262144, "Context size (short)")
 	fs.IntVar(&a.BatchSize, "batch-size", 2048, "Logical maximum batch size")
