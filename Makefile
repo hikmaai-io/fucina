@@ -28,7 +28,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test \
-        paged-kv-device-test \
+        paged-kv-device-test kv-quant-explore \
         dg dg-dequant-test dg-forward-test dg-generate
 
 # `make` with no arguments builds everything (CUDA archive + Go binary).
@@ -105,6 +105,15 @@ paged-kv-device-test:
 	$(NVCC) -arch=$(CUDA_ARCH) -o /tmp/fucina_paged_kv_device_test \
 		cuda/paged_kv_device_test.cu -diag-suppress 550
 	/tmp/fucina_paged_kv_device_test
+
+# ─── KV-quant exploration (host, Phase 6) ───────────────────────────────
+# Offline comparison of KV-cache quant codecs (FP8 / per-token FP8 / NVFP4 /
+# TurboQuant-MSE). Decides whether to move KV off flat FP8. Host-only, no engine
+# link. Optional args: `make kv-quant-explore ARGS="<n_outlier> <outlier_std>"`.
+# See docs/kv-quant-exploration.md.
+kv-quant-explore:
+	g++ -std=c++17 -O2 -Wall -Wextra cuda/kv_quant_explore.cc -o /tmp/fucina_kv_quant_explore -lm
+	/tmp/fucina_kv_quant_explore $(ARGS)
 
 test-vectors: fucina
 	./fucina --test-vectors tests/vectors/official.vec
