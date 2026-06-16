@@ -396,10 +396,17 @@ __global__ void embed_lookup_bf16_kernel(
 }
 
 // BF16 LM-head GEMV (FORMAT_NVFP4): logits[v] = Σ_h lmhead_bf16[v,h] · x[h], full-precision
-// accumulate. Warp-per-row (mirrors nvfp4_gemv) over a plain BF16 weight — no block/global
-// scale. Capture-safe (no alloc / host sync). One warp per output row, WARPS warps/block.
+// accumulate over a plain BF16 weight (no block/global scale). This reads the WHOLE 2 GB untied
+// BF16 head per token (vocab 262144 × hidden 3840 × 2 B) — a big share of the decode — so like
+// nvfp4_gemv it register-blocks the OUTPUT rows: each warp reduces BF16_HEAD_ROWS rows, keeping
+// that many accumulators and issuing that many independent weight loads per k-stride while x is
+// loaded once and reused (L1-hot). A naive warp-per-row version is latency-bound at ~66 GB/s.
+// Capture-safe (no alloc / host sync). gridDim.x = ceil(out_dim / (WARPS*ROWS)).
 #ifndef BF16_HEAD_WARPS
 #define BF16_HEAD_WARPS 8
+#endif
+#ifndef BF16_HEAD_ROWS
+#define BF16_HEAD_ROWS 4
 #endif
 __global__ void bf16_head_gemv_kernel(
     float               *__restrict__ y,   // [out_dim]
@@ -409,21 +416,34 @@ __global__ void bf16_head_gemv_kernel(
 {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row  = blockIdx.x * BF16_HEAD_WARPS + warp;
-    if (row >= out_dim) return;
-    const __nv_bfloat16 *wrow = w + (size_t)row * in_dim;
-    float acc = 0.f;
-    for (int k = lane; k < in_dim; k += 32)
-        acc += __bfloat162float(wrow[k]) * x[k];
+    const int row0 = (blockIdx.x * BF16_HEAD_WARPS + warp) * BF16_HEAD_ROWS;
+    if (row0 >= out_dim) return;
+    const int nrow = min(BF16_HEAD_ROWS, out_dim - row0);
+    float acc[BF16_HEAD_ROWS];
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-    if (lane == 0) y[row] = acc;
+    for (int r = 0; r < BF16_HEAD_ROWS; r++) acc[r] = 0.f;
+    for (int k = lane; k < in_dim; k += 32) {
+        float xk = x[k];
+        #pragma unroll
+        for (int r = 0; r < BF16_HEAD_ROWS; r++) {
+            if (r >= nrow) break;
+            acc[r] += __bfloat162float(w[(size_t)(row0 + r) * in_dim + k]) * xk;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < BF16_HEAD_ROWS; r++) {
+        float a = acc[r];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane == 0 && r < nrow) y[row0 + r] = a;
+    }
 }
 static inline void bf16_head_gemv_launch(
     float *y, const __nv_bfloat16 *w, const float *x,
     int in_dim, int out_dim, cudaStream_t stream)
 {
-    unsigned blocks = (unsigned)((out_dim + BF16_HEAD_WARPS - 1) / BF16_HEAD_WARPS);
+    const int per_blk = BF16_HEAD_WARPS * BF16_HEAD_ROWS;
+    unsigned blocks = (unsigned)((out_dim + per_blk - 1) / per_blk);
     bf16_head_gemv_kernel<<<blocks, 32*BF16_HEAD_WARPS, 0, stream>>>(y, w, x, in_dim, out_dim);
 }
 
@@ -7947,8 +7967,10 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
     const int smem32 = 32 * (int)sizeof(float);
 
     // x = target_embd(tok)·√3840  ‖  h   → pre_projection → cur [1024]
-    embed_lookup_q8_0_kernel<<<1, 256, 0, stream>>>(
-        eng->d_mtp_xh, weight_fp8(eng, eng->tensors.token_embd), tok_ptr, 1, H);
+    // The MTP head shares the TARGET model's token embedding — so embed via embed_w, which reads
+    // the BF16 table (d_embed_bf16) for NVFP4 and the Q8_0 table otherwise. The previous hard
+    // Q8_0 lookup deref'd a NULL d_weights under NVFP4, garbaging h → the drafter always declined.
+    embed_w(eng, eng->d_mtp_xh, weight_fp8(eng, eng->tensors.token_embd), tok_ptr, 1, H, stream);
     scale_kernel<<<(H+255)/256, 256, 0, stream>>>(eng->d_mtp_xh, H, sqrtf((float)H));
     cudaMemcpyAsync(eng->d_mtp_xh + H, eng->d_mtp_h, H * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
