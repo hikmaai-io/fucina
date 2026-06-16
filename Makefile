@@ -26,7 +26,7 @@ NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo --use_fast_math \
 CGO_CFLAGS   := -I$(CUDA_HOME)/include
 CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 
-.PHONY: all clean test cuda lib libdg fucina smoke profile \
+.PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench \
         dg dg-dequant-test dg-forward-test dg-generate
@@ -257,6 +257,13 @@ dg-fp4-parity: cuda/diffusion_gemma_kernels.o cuda/dg_fp4_moe.o   # FP4 grouped 
 	$(NVCC) -arch=$(CUDA_ARCH) /tmp/parity.o cuda/diffusion_gemma_kernels.o cuda/dg_fp4_moe.o /tmp/parity_link.o -lcublas -lcublasLt -o /tmp/dg_fp4_parity
 	@echo "run: /tmp/dg_fp4_parity $(DG_GGUF)"
 fp4: fp4-probe fp4-gemm-test
+
+# NVFP4 safetensors loader unit tests (host + decode-kernel parity). Self-contained, no model.
+nvfp4-test:
+	g++ -std=c++17 -O2 -Wall -Wextra cuda/safetensors_test.cc   -o /tmp/st_test     && /tmp/st_test
+	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_test.cc          -o /tmp/nvfp4_test  && /tmp/nvfp4_test
+	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_loader_test.cc   -o /tmp/nvfp4_ld    && /tmp/nvfp4_ld
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 cuda/test_nvfp4_gemv.cu -o /tmp/nvfp4_gemv && /tmp/nvfp4_gemv
 
 # ─── Clean ──────────────────────────────────────────────────────────────
 clean:

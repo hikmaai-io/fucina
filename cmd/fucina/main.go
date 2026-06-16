@@ -37,6 +37,19 @@ func newRNG(seed int64) *rand.Rand {
 	return rand.New(rand.NewSource(seed))
 }
 
+// deriveModelID maps a model path to a client-facing model id. For a GGUF or single
+// .safetensors file it strips the extension; for an NVFP4 directory it uses the dir
+// name verbatim (so a checkpoint dir yields its base name, not a mangled string).
+func deriveModelID(modelPath string) string {
+	base := filepath.Base(modelPath)
+	if fi, err := os.Stat(modelPath); err == nil && fi.IsDir() {
+		return base
+	}
+	base = strings.TrimSuffix(base, ".gguf")
+	base = strings.TrimSuffix(base, ".safetensors")
+	return base
+}
+
 // samplerParams maps the CLI flags onto the shared sampler.Params.
 func samplerParams(args CLIArgs) sampler.Params {
 	return sampler.Params{
@@ -103,10 +116,16 @@ func main() {
 		eng.PrintInfo()
 	}
 
-	// Load GGUF for tokenizer
-	ggufData, err := os.ReadFile(args.ModelPath)
+	// Load the tokenizer vocab. It lives in a GGUF; an NVFP4 safetensors checkpoint carries
+	// no GGUF vocab, so --tokenizer must point at a Gemma-4 GGUF (same vocab) in that case.
+	tokSrc := args.ModelPath
+	if args.TokenizerPath != "" {
+		tokSrc = args.TokenizerPath
+	}
+	ggufData, err := os.ReadFile(tokSrc)
 	if err != nil {
-		log.Fatalf("fucina: cannot read GGUF for tokenizer: %v", err)
+		log.Fatalf("fucina: cannot read GGUF for tokenizer (%s): %v "+
+			"(for an NVFP4 checkpoint pass --tokenizer <gemma-4.gguf>)", tokSrc, err)
 	}
 
 	tok, err := tokenizer.New(ggufData, int64(len(ggufData)))
@@ -138,7 +157,7 @@ func main() {
 		srv := gemserver.New(eng, tok)
 		// Report a quantization-aware model id (GGUF basename minus extension), e.g.
 		// gemma-4-12b-it-qat-q4_0, so clients can see which build/quant they hit.
-		srv.SetModelName(strings.TrimSuffix(filepath.Base(args.ModelPath), ".gguf"))
+		srv.SetModelName(deriveModelID(args.ModelPath))
 		// Startup default for the reasoning channel; per-request reasoning_effort wins.
 		srv.SetThinkingDefault(gemserver.ParseThinkingLevel(args.Thinking))
 		srv.SetDraftK(args.DraftK)

@@ -74,10 +74,12 @@ type Engine struct {
 	logitsBuf []float32
 }
 
-// Config holds engine configuration. The weight format (Q4_0-QAT or Q8_0) is
-// auto-detected from the GGUF tensor table; other formats are rejected at load.
+// Config holds engine configuration. The weight format (Q4_0/Q8_0/NVFP4) is
+// auto-detected from the file header: a "GGUF" magic takes the GGUF path; anything
+// else is treated as an NVFP4 safetensors checkpoint (a directory, an .index.json,
+// or a single .safetensors file). Other formats are rejected at load.
 type Config struct {
-	ModelPath   string // -m, --model
+	ModelPath   string // -m, --model (GGUF file, or NVFP4 safetensors dir/.safetensors)
 	ContextSize uint32 // --ctx
 	DeviceID    int    // --cuda-device
 }

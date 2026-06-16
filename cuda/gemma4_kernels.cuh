@@ -68,6 +68,9 @@ typedef enum {
     FORMAT_Q4_0  = 2,  // GGML Q4_0 blocks (QAT 4-bit; layers Q4_0, token_embd→Q8_0)
     FORMAT_Q6_K  = 3,  // GGML Q6_K super-blocks (used only as a wfmt override for the native
                        // QAT tied LM head — DECODE-30-35 Step 8; not a whole-model format)
+    FORMAT_NVFP4 = 4,  // NVFP4 from safetensors (ModelOpt/compressed-tensors): E2M1 + per-16
+                       // E4M3 block scales + per-tensor FP32 global. Single weight store feeds
+                       // both the cuBLASLt block-scaled prefill and the fused decode GEMV.
 } tensor_format_t;
 
 // ─── GGML Q8_0 block ──────────────────────────────────────────────────

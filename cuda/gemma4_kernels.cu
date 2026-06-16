@@ -25,6 +25,13 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+
+// NVFP4 safetensors loading (FORMAT_NVFP4): container parser, dequant math, name mapping, and
+// the fused decode GEMV. All header-only; the decode kernel lives in nvfp4_gemv.cuh.
+#include "safetensors.h"
+#include "nvfp4.h"
+#include "nvfp4_loader.h"
+#include "nvfp4_gemv.cuh"
 // =========================================================================
 // GGUF File Layout
 // =========================================================================
@@ -350,6 +357,66 @@ __global__ void dequant_to_bf16_kernel(
 __global__ void f32_to_bf16_kernel(__nv_bfloat16 *dst, const float *src, uint64_t n) {
     uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __float2bfloat16(src[i]);
+}
+
+// Convert bf16 -> f32 (FORMAT_NVFP4: safetensors norm tensors ship BF16; the engine's norm
+// stores (d_w_*_norm) are float, exactly like the GGUF path's UPLOAD_NORM destinations).
+__global__ void bf16_to_f32_kernel(float *dst, const __nv_bfloat16 *src, uint64_t n) {
+    uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __bfloat162float(src[i]);
+}
+
+// BF16 embedding lookup (FORMAT_NVFP4). Mirror of embed_lookup_q8_0_kernel but the table is a
+// dense BF16 [vocab × hidden] matrix (Gemma's UNSCALED embed_tokens — the √hidden scale is
+// applied by the caller, identical to the Q8_0 path). One block per row; clamp the token id.
+__global__ void embed_lookup_bf16_kernel(
+    float               *out,    // [batch × hidden_size]
+    const __nv_bfloat16 *table,  // [vocab_size × hidden_size] BF16
+    const int32_t       *tokens, // [batch]
+    int                  batch,
+    int                  hidden_size)
+{
+    int row = blockIdx.x;
+    if (row >= batch) return;
+    int token = tokens[row];
+    if (token < 0) token = 0;
+    if (token >= GEMMA4_VOCAB_SIZE) token = 0;
+    const __nv_bfloat16 *emb = table + (size_t)token * hidden_size;
+    float *out_row = out + (size_t)row * hidden_size;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x)
+        out_row[i] = __bfloat162float(emb[i]);
+}
+
+// BF16 LM-head GEMV (FORMAT_NVFP4): logits[v] = Σ_h lmhead_bf16[v,h] · x[h], full-precision
+// accumulate. Warp-per-row (mirrors nvfp4_gemv) over a plain BF16 weight — no block/global
+// scale. Capture-safe (no alloc / host sync). One warp per output row, WARPS warps/block.
+#ifndef BF16_HEAD_WARPS
+#define BF16_HEAD_WARPS 8
+#endif
+__global__ void bf16_head_gemv_kernel(
+    float               *__restrict__ y,   // [out_dim]
+    const __nv_bfloat16 *__restrict__ w,   // [out_dim × in_dim]
+    const float         *__restrict__ x,   // [in_dim]
+    int in_dim, int out_dim)
+{
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row  = blockIdx.x * BF16_HEAD_WARPS + warp;
+    if (row >= out_dim) return;
+    const __nv_bfloat16 *wrow = w + (size_t)row * in_dim;
+    float acc = 0.f;
+    for (int k = lane; k < in_dim; k += 32)
+        acc += __bfloat162float(wrow[k]) * x[k];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[row] = acc;
+}
+static inline void bf16_head_gemv_launch(
+    float *y, const __nv_bfloat16 *w, const float *x,
+    int in_dim, int out_dim, cudaStream_t stream)
+{
+    unsigned blocks = (unsigned)((out_dim + BF16_HEAD_WARPS - 1) / BF16_HEAD_WARPS);
+    bf16_head_gemv_kernel<<<blocks, 32*BF16_HEAD_WARPS, 0, stream>>>(y, w, x, in_dim, out_dim);
 }
 
 // ─── Argmax over vocab_size ───────────────────────────────────────────
@@ -2710,8 +2777,19 @@ struct gemma4_engine {
     cublasLtHandle_t cublaslt;
     uint8_t *d_fp4_w[GEMMA4_MAX_LAYERS][PJ_COUNT];   // packed [out_dim × in_dim/2]
     uint8_t *d_fp4_wsc[GEMMA4_MAX_LAYERS][PJ_COUNT]; // swizzled E4M3 [pad(out,128)×pad(in/16,4)]
+    // NVFP4 SINGLE-STORE decode (FORMAT_NVFP4): the decode GEMV (nvfp4_gemv.cuh) reads LINEAR
+    // E4M3 block scales [out,in/16], but d_fp4_wsc holds the SWIZZLED scales (for cuBLASLt) which
+    // the GEMV cannot consume. So retain a per-projection LINEAR-scale copy uploaded straight off
+    // disk (~0.75 GB extra; still a net win vs a duplicate Q4_0 store). NULL on non-NVFP4 models.
+    uint8_t *d_fp4_wsc_lin[GEMMA4_MAX_LAYERS][PJ_COUNT]; // linear E4M3 [out_dim × in_dim/16]
     float   *d_fp4_gsw;        // device [MAX_LAYERS*PJ_COUNT] weight per-tensor global scales
     int      fp4_ready;        // 1 once persistent NVFP4 weights are built
+    int      nvfp4_decode_ready; // 1 once NVFP4 store + linear scales + embed + norms are resident
+    // BF16 non-quant tensors loaded from the safetensors checkpoint (FORMAT_NVFP4 only): the
+    // embedding table doubles as the (tied) LM head. d_lmhead_bf16 ALIASES d_embed_bf16 when tied
+    // — destroy frees it only if the pointers differ (double-free guard). NULL on GGUF models.
+    __nv_bfloat16 *d_embed_bf16;   // [vocab × hidden] BF16 embeddings
+    __nv_bfloat16 *d_lmhead_bf16;  // [vocab × hidden] BF16 LM head (== d_embed_bf16 when tied)
     uint8_t *d_fp4_act;        // activation packed E2M1 scratch (lazily sized to N×in/2)
     uint8_t *d_fp4_actsc;      // activation swizzled E4M3 block scales scratch
     uint8_t *d_fp4_actlin;     // activation LINEAR E4M3 block scales (pre-swizzle) scratch
@@ -3179,6 +3257,10 @@ static void gemma4_engine_paged_selftest(gemma4_engine_t *eng);       // Phase 2
 static void gemma4_engine_paged_read_selftest(gemma4_engine_t *eng);  // Phase 2 inc 4 (body below)
 static void gemma4_engine_paged_e2e_selftest(gemma4_engine_t *eng);   // Phase 2 inc 4b (body below)
 static void gemma4_engine_batch_selftest(gemma4_engine_t *eng);       // Phase 3 (body below)
+// NVFP4 single-store residency (body far below, near the prefill GEMM). Forward-declared so the
+// create-fork can call it.
+static int nvfp4_load_from_safetensors(gemma4_engine_t *eng, const char *path,
+                                       const nvfp4ld::Layout *layout, st::Model *model);
 
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
@@ -3266,34 +3348,96 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_pf_inb = eng->d_pf_qb = eng->d_pf_kb = eng->d_pf_vb = NULL;
     eng->d_pf_kbx = eng->d_pf_vbx = eng->d_pf_pb = NULL;
 
-    // Open and mmap the GGUF file
-    eng->gguf_fd = open(model_path, O_RDONLY);
-    if (eng->gguf_fd < 0) {
-        perror("fucina: open model");
-        gemma4_engine_destroy(eng);
-        return NULL;
+    // Format autodetect. The NVFP4 checkpoint is commonly passed as a DIRECTORY (or an
+    // .index.json / single .safetensors), which cannot be mmap'd here — st::Model::open handles
+    // sharded layouts itself. So: stat first. A directory → NVFP4 (no engine mmap). A regular
+    // file → mmap and read the 4-byte magic: 'GGUF' (0x46554747 LE) takes the GGUF flow; anything
+    // else is a single-file NVFP4 safetensors checkpoint (its header is a u64 LE length, so byte 0
+    // is never 'G'). For NVFP4 the engine's own mmap is redundant (st::Model::open re-maps it) and
+    // is released below to avoid a transient ~10 GB double-map on RAM-constrained boxes.
+    bool is_nvfp4 = false;
+    eng->gguf_fd = -1;
+    eng->gguf_data = NULL;
+    eng->gguf_size = 0;
+    {
+        struct stat pst;
+        if (stat(model_path, &pst) != 0) {
+            perror("fucina: stat model");
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+        if (S_ISDIR(pst.st_mode)) {
+            is_nvfp4 = true;   // a sharded/dir checkpoint — st::Model::open resolves it
+            fprintf(stderr, "fucina: loaded %s (directory)\n", model_path);
+        } else {
+            eng->gguf_fd = open(model_path, O_RDONLY);
+            if (eng->gguf_fd < 0) {
+                perror("fucina: open model");
+                gemma4_engine_destroy(eng);
+                return NULL;
+            }
+            struct stat st;
+            fstat(eng->gguf_fd, &st);
+            eng->gguf_size = st.st_size;
+            eng->gguf_data = (const uint8_t *)mmap(
+                NULL, eng->gguf_size, PROT_READ, MAP_PRIVATE, eng->gguf_fd, 0);
+            if (eng->gguf_data == MAP_FAILED) {
+                perror("fucina: mmap model");
+                eng->gguf_data = NULL;
+                gemma4_engine_destroy(eng);
+                return NULL;
+            }
+            fprintf(stderr, "fucina: loaded %s (%.2f GB)\n",
+                    model_path, eng->gguf_size / (1024.0 * 1024.0 * 1024.0));
+            uint32_t magic = 0;
+            if (eng->gguf_size >= 4) memcpy(&magic, eng->gguf_data, 4);
+            is_nvfp4 = (magic != 0x46554747u);
+        }
     }
 
-    struct stat st;
-    fstat(eng->gguf_fd, &st);
-    eng->gguf_size = st.st_size;
+    // NVFP4 layout (opened in the NVFP4 branch below; declared here so the redundant-mmap release
+    // and the residency/BF16 load can all see it).
+    st::Model nvfp4_model;
+    nvfp4ld::Layout nvfp4_layout;
 
-    eng->gguf_data = (const uint8_t *)mmap(
-        NULL, eng->gguf_size, PROT_READ, MAP_PRIVATE, eng->gguf_fd, 0);
-    if (eng->gguf_data == MAP_FAILED) {
-        perror("fucina: mmap model");
-        gemma4_engine_destroy(eng);
-        return NULL;
+    int embd_is_q6k = 0;   // GGUF QAT-only (Q6_K token_embd → Q8_0)
+    if (is_nvfp4) {
+        std::string err;
+        if (!nvfp4_model.open(model_path, err)) {
+            fprintf(stderr, "fucina: NVFP4 open '%s' failed: %s\n", model_path, err.c_str());
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+        if (!nvfp4ld::detect(nvfp4_model, nvfp4_layout, err)) {
+            fprintf(stderr, "fucina: NVFP4 detect failed: %s\n", err.c_str());
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+        // Cross-check the architecture against the hardcoded Gemma-4-12B constants so a wrong
+        // checkpoint fails loudly instead of producing garbage. (Dims are validated per-tensor
+        // during residency; here we only assert the layer count, which sizes every loop.)
+        if (nvfp4_layout.n_layers != GEMMA4_MAX_LAYERS) {
+            fprintf(stderr, "fucina: NVFP4 model has %d layers, expected %d (Gemma-4-12B)\n",
+                    nvfp4_layout.n_layers, GEMMA4_MAX_LAYERS);
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+        eng->format = FORMAT_NVFP4;   // override the placeholder hint passed from Go
+        // safetensors carries no GGUF attention-pattern array — keep the DEFAULT 5-sliding/
+        // 1-global cadence computed at create top (verified against the real checkpoint's
+        // config.json layer_types). Release the redundant create-time mmap of the checkpoint.
+        if (eng->gguf_data && eng->gguf_data != MAP_FAILED)
+            munmap((void *)eng->gguf_data, eng->gguf_size);
+        eng->gguf_data = NULL;
+        fprintf(stderr, "fucina: NVFP4 safetensors checkpoint detected (%d layers, %s)\n",
+                nvfp4_layout.n_layers,
+                nvfp4_layout.naming == nvfp4ld::Naming::COMPRESSED ? "compressed-tensors" : "modelopt");
     }
-
-    fprintf(stderr, "fucina: loaded %s (%.2f GB)\n",
-            model_path, eng->gguf_size / (1024.0 * 1024.0 * 1024.0));
 
     // Auto-detect the weight format from the GGUF tensor table. Trusting the CLI flag
     // is dangerous (decoding Q8_0 blocks as FP8 bytes yields NaNs). Detect from a LAYER
     // tensor (ffn_down) — token_embd may be a different type (Q6_K in the QAT Q4_0 model).
-    int embd_is_q6k = 0;
-    {
+    if (!is_nvfp4) {
         uint64_t _off = 0, _n = 0; uint32_t gtype = 0;
         const char *names[] = {"blk.0.ffn_down.weight", "blk.0.attn_q.weight"};
         for (int t = 0; t < 2; t++) {
@@ -3317,6 +3461,11 @@ gemma4_engine_t* gemma4_engine_create(
         }
     }
 
+    // ─── GGUF-only middle (tensor-offset table, attention pattern, rope_freqs, suppress
+    // tokens, norm preload, bulk weight upload, token_embd convert). The NVFP4 path sources
+    // all of this from the safetensors checkpoint in its own block below; everything past the
+    // device-scratch alloc (KV cache, global-slot map, smem opt-in) is format-independent. ───
+    if (!is_nvfp4) {
     // Parse the per-layer attention pattern from GGUF metadata, overriding the
     // defaults computed above. The real Gemma-4 GGUF exposes this as:
     //
@@ -3493,6 +3642,7 @@ gemma4_engine_t* gemma4_engine_create(
         free(eng);
         return NULL;
     }
+    } // if (!is_nvfp4) — end GGUF-only middle
 
     // Allocate device memory
     // Scratch (1M floats = 4 MB)
@@ -3550,15 +3700,27 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_fp4_gsw = NULL; eng->d_fp4_act = NULL; eng->d_fp4_actsc = NULL;
     eng->d_fp4_actlin = NULL; eng->d_fp4_gsact = NULL; eng->d_fp4_alpha = NULL;
     eng->d_fp4_amax = NULL; eng->fp4_act_cap = 0; eng->d_fp4_ws = NULL;
+    eng->nvfp4_decode_ready = 0; eng->d_embed_bf16 = NULL; eng->d_lmhead_bf16 = NULL;
     for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
-        eng->d_fp4_w[l][p]=NULL; eng->d_fp4_wsc[l][p]=NULL; }
+        eng->d_fp4_w[l][p]=NULL; eng->d_fp4_wsc[l][p]=NULL; eng->d_fp4_wsc_lin[l][p]=NULL; }
 
     // Load rope_freqs.weight into device buffer for global-layer RoPE.
     {
         uint64_t rf_off = 0, rf_n = 0;
         cudaMalloc(&eng->d_rope_freqs,
             GEMMA4_GLOBAL_HEAD_DIM / 2 * sizeof(float));
-        if (gguf_find_tensor_offset(eng->gguf_data, eng->gguf_size,
+        if (is_nvfp4) {
+            // safetensors has no rope_freqs.weight. Gemma-4's GLOBAL (full-attention) layers use
+            // partial_rotary_factor=0.25 → only the first rotary_dim/2 = 64 of the 256 freq pairs
+            // rotate; the rest pass through. The GGUF encodes this as freq_factors = 1.0 for the
+            // first 64 entries and 1e30 (→ theta≈0 → identity) for the remaining 192. Replicate it
+            // EXACTLY (verified against /home/mauromedda/hack/gem4d/model.gguf rope_freqs.weight).
+            const int half = GEMMA4_GLOBAL_HEAD_DIM / 2;        // 256
+            const int rot_half = half / 4;                      // 64 (partial_rotary_factor 0.25)
+            float ff[GEMMA4_GLOBAL_HEAD_DIM / 2];
+            for (int i = 0; i < half; i++) ff[i] = (i < rot_half) ? 1.0f : 1e30f;
+            cudaMemcpy(eng->d_rope_freqs, ff, half * sizeof(float), cudaMemcpyHostToDevice);
+        } else if (gguf_find_tensor_offset(eng->gguf_data, eng->gguf_size,
                 "rope_freqs.weight", &rf_off, &rf_n) == 0) {
             // rope_freqs.weight shape=[256] F32; values are freq divisors.
             cudaMemcpy(eng->d_rope_freqs,
@@ -3575,10 +3737,11 @@ gemma4_engine_t* gemma4_engine_create(
         }
     }
 
-    // Suppressed token ids → device list for the -inf logits mask
+    // Suppressed token ids → device list for the -inf logits mask (GGUF metadata only;
+    // the NVFP4 safetensors checkpoint carries no suppress list → n_suppress stays 0).
     eng->d_suppress = NULL;
     eng->n_suppress = 0;
-    {
+    if (!is_nvfp4) {
         gguf_array_t sarr;
         if (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
                 "tokenizer.ggml.suppress_tokens", &sarr, GGUF_TYPE_ARRAY) == 0
@@ -3608,6 +3771,7 @@ gemma4_engine_t* gemma4_engine_create(
         float *ones = (float *)malloc(hs * sizeof(float));
         for (size_t i = 0; i < hs; i++) ones[i] = 1.0f;
 
+      if (!is_nvfp4) {
         #define UPLOAD_NORM(dst, off, n) do { \
             const void *src = (off) ? (const void *)(eng->gguf_data + (off)) : (const void *)ones; \
             cudaMemcpy((dst), src, (n) * sizeof(float), cudaMemcpyHostToDevice); \
@@ -3632,14 +3796,124 @@ gemma4_engine_t* gemma4_engine_create(
         }
         UPLOAD_NORM(eng->d_w_out_norm, eng->tensors.output_norm, hs);
         #undef UPLOAD_NORM
+      } else {
+        // NVFP4: norms ship BF16 in the safetensors checkpoint. Upload each to a temp BF16
+        // device buffer and convert to the FLOAT norm store via bf16_to_f32_kernel. A missing
+        // tensor falls back to identity (1.0) — but a SILENT identity fallback on a real norm
+        // produces fluent garbage, so every per-layer key is verified present below (and the
+        // exact HF suffixes were dumped from the real checkpoint before wiring). q/k norm use
+        // the head-dim stride (256) within the head-dim-wide (512) store slot. No per-layer
+        // output scale exists in HF Gemma-4 NVFP4 → h_out_scale stays 1.0.
+        const nvfp4ld::Layout &L = nvfp4_layout;
+        st::Model &m = nvfp4_model;
+        __nv_bfloat16 *d_tmp = nullptr;
+        cudaMalloc(&d_tmp, hs * sizeof(__nv_bfloat16));   // widest norm = hidden
+        auto upload_norm_bf16 = [&](float *dst, const std::string &key, int n) -> bool {
+            const st::Tensor *t = m.find(key);
+            if (!t || (int)(t->nbytes / sizeof(__nv_bfloat16)) < n) {
+                // identity fallback (also covers a genuinely absent norm)
+                cudaMemcpy(dst, ones, n * sizeof(float), cudaMemcpyHostToDevice);
+                return false;
+            }
+            cudaMemcpy(d_tmp, t->data, (size_t)n * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+            bf16_to_f32_kernel<<<(unsigned)((n + 255) / 256), 256>>>(dst, d_tmp, n);
+            return true;
+        };
+        bool norm_ok = true;
+        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+            int head_dim = (eng->layer_types[l] == LAYER_SLIDING)
+                               ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+            std::string pre = L.layer_prefix + std::to_string(l) + ".";
+            norm_ok &= upload_norm_bf16(eng->d_w_attn_norm      + l * hs, pre + "input_layernorm.weight",          (int)hs);
+            norm_ok &= upload_norm_bf16(eng->d_w_post_attn_norm + l * hs, pre + "post_attention_layernorm.weight", (int)hs);
+            norm_ok &= upload_norm_bf16(eng->d_w_ffn_norm       + l * hs, pre + "pre_feedforward_layernorm.weight",(int)hs);
+            norm_ok &= upload_norm_bf16(eng->d_w_post_ffn_norm  + l * hs, pre + "post_feedforward_layernorm.weight",(int)hs);
+            norm_ok &= upload_norm_bf16(eng->d_w_q_norm + l * hd, pre + "self_attn.q_norm.weight", head_dim);
+            norm_ok &= upload_norm_bf16(eng->d_w_k_norm + l * hd, pre + "self_attn.k_norm.weight", head_dim);
+            // Per-layer output scalar (Gemma-4 "layer_scalar" — the GGUF's layer_output_scale).
+            // It MULTIPLIES each layer's output (scale_kernel at the end of every layer); without
+            // it the residual stream grows ~18× and the logits saturate the softcap → garbage.
+            // BF16 [1] in the safetensors; default 1.0 only if genuinely absent.
+            eng->h_out_scale[l] = 1.0f;
+            {
+                const st::Tensor *tls = m.find(pre + "layer_scalar");
+                if (tls && tls->nbytes >= sizeof(__nv_bfloat16)) {
+                    __nv_bfloat16 hb; memcpy(&hb, tls->data, sizeof(hb));
+                    eng->h_out_scale[l] = __bfloat162float(hb);
+                }
+            }
+        }
+        norm_ok &= upload_norm_bf16(eng->d_w_out_norm, L.final_norm_key, (int)hs);
+        cudaDeviceSynchronize();
+        cudaFree(d_tmp);
+        if (!norm_ok) {
+            fprintf(stderr, "fucina: NVFP4 one or more norm tensors missing — "
+                            "identity fallback would produce garbage; aborting\n");
+            free(ones);
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+      }
         free(ones);
     }
 
+    eng->d_weights = NULL;
+    eng->d_token_embd = NULL;
+    eng->d_lmhead_q6k = NULL; eng->lmhead_q6k = 0;
+  if (is_nvfp4) {
+    // ── NVFP4 SINGLE-STORE residency + BF16 embed / LM head ──────────────
+    // nvfp4_model's mmap MUST stay alive through nvfp4_load_from_safetensors (it copies the
+    // tensor bytes H2D synchronously and ends with cudaDeviceSynchronize) and through the embed
+    // /head uploads below. (A) Residency populates d_fp4_w / d_fp4_wsc / d_fp4_wsc_lin / d_fp4_gsw,
+    // sets fp4_ready=1 and builds fp4_desc — prefill works immediately.
+    if (nvfp4_load_from_safetensors(eng, model_path, &nvfp4_layout, &nvfp4_model) != 0) {
+        fprintf(stderr, "fucina: NVFP4 residency failed\n");
+        gemma4_engine_destroy(eng);
+        return NULL;
+    }
+    // (B) BF16 embeddings [vocab × hidden], uploaded verbatim (Gemma stores the UNSCALED table;
+    // the √hidden scale is applied post-lookup, identical to the GGUF path).
+    {
+        const st::Tensor *te = nvfp4_model.find(nvfp4_layout.embed_key);
+        size_t want = (size_t)GEMMA4_VOCAB_SIZE * GEMMA4_HIDDEN_SIZE * sizeof(__nv_bfloat16);
+        if (!te || te->nbytes != want) {
+            fprintf(stderr, "fucina: NVFP4 embed '%s' missing or wrong size (%zu vs %zu)\n",
+                    nvfp4_layout.embed_key.c_str(), te ? te->nbytes : 0, want);
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+        if (cudaMalloc(&eng->d_embed_bf16, want) != cudaSuccess) {
+            fprintf(stderr, "fucina: NVFP4 embed alloc failed\n");
+            gemma4_engine_destroy(eng); return NULL;
+        }
+        cudaMemcpy(eng->d_embed_bf16, te->data, want, cudaMemcpyHostToDevice);
+    }
+    // (C) LM head: explicit lm_head.weight (untied) → its own buffer; else alias d_embed_bf16.
+    if (!nvfp4_layout.lmhead_key.empty()) {
+        const st::Tensor *th = nvfp4_model.find(nvfp4_layout.lmhead_key);
+        size_t want = (size_t)GEMMA4_VOCAB_SIZE * GEMMA4_HIDDEN_SIZE * sizeof(__nv_bfloat16);
+        if (!th || th->nbytes != want) {
+            fprintf(stderr, "fucina: NVFP4 lm_head '%s' missing or wrong size\n", nvfp4_layout.lmhead_key.c_str());
+            gemma4_engine_destroy(eng); return NULL;
+        }
+        if (cudaMalloc(&eng->d_lmhead_bf16, want) != cudaSuccess) {
+            fprintf(stderr, "fucina: NVFP4 lm_head alloc failed\n");
+            gemma4_engine_destroy(eng); return NULL;
+        }
+        cudaMemcpy(eng->d_lmhead_bf16, th->data, want, cudaMemcpyHostToDevice);
+    } else {
+        eng->d_lmhead_bf16 = eng->d_embed_bf16;   // tied (destroy frees once via the alias guard)
+    }
+    cudaDeviceSynchronize();   // all H2D from nvfp4_model's mmap complete before it falls out of scope
+    eng->output_tied = nvfp4_layout.lmhead_key.empty() ? 1 : 0;
+    eng->nvfp4_decode_ready = 1;
+    fprintf(stderr, "fucina: NVFP4 BF16 embed + %s LM head resident\n",
+            nvfp4_layout.lmhead_key.empty() ? "tied" : "untied");
+  } else {
     // ── Copy tensor data into device memory (llama.cpp-style residency) ──
     // GEMV kernels previously dereferenced the mmap'd file from the GPU.
     // That works on GB10 unified memory but pays page-fault + host-path
     // costs on every weight read. One bulk upload at load time instead.
-    eng->d_weights = NULL;
     eng->tdata_start = gguf_tensor_data_start(eng->gguf_data, eng->gguf_size);
     if (eng->tdata_start != 0) {
         size_t tbytes = eng->gguf_size - eng->tdata_start;
@@ -3665,7 +3939,6 @@ gemma4_engine_t* gemma4_engine_create(
 
     // QAT Q4_0 model: convert the Q6_K token_embd (= tied LM head) to a Q8_0 device
     // buffer so the existing Q8_0 embed/LM-head kernels handle it (layers stay Q4_0).
-    eng->d_token_embd = NULL;
     if (eng->format == FORMAT_Q4_0 && embd_is_q6k) {
         int64_t n_elem = (int64_t)GEMMA4_VOCAB_SIZE * GEMMA4_HIDDEN_SIZE;
         const unsigned char *q6 = (const unsigned char*)(eng->gguf_data + eng->tensors.token_embd);
@@ -3689,7 +3962,6 @@ gemma4_engine_t* gemma4_engine_create(
     // saves the 0.24 GB/token the Q8_0 upconvert added (1.07 → 0.83 GB). d_lmhead_q6k
     // points INTO d_weights (the raw Q6_K bytes of the tied token_embd) — never freed.
     // d_token_embd (Q8_0 convert) is still used for the one-row embedding lookup.
-    eng->d_lmhead_q6k = NULL; eng->lmhead_q6k = 0;
     if (eng->format == FORMAT_Q4_0 && embd_is_q6k && eng->output_tied &&
         eng->d_weights && eng->d_token_embd) {
         eng->d_lmhead_q6k = (unsigned char *)(eng->d_weights
@@ -3697,6 +3969,7 @@ gemma4_engine_t* gemma4_engine_create(
         eng->lmhead_q6k = 1;
         fprintf(stderr, "fucina: LM head native Q6_K dp4a (0.83 GB/token vs 1.07 Q8_0)\n");
     }
+  } // else (!is_nvfp4) — GGUF weight residency
 
     // Build the absolute-id -> global-slot inverse map from global_layer_indices
     // (set by the layer-type detection above). Sliding layers map to -1.
@@ -3776,7 +4049,7 @@ gemma4_engine_t* gemma4_engine_create(
     fprintf(stderr, "fucina: engine initialized (%.2f GB model, %u ctx, %s)\n",
             eng->gguf_size / (1024.0*1024.0*1024.0),
             context_size,
-            eng->format == FORMAT_Q4_0 ? "Q4_0" : "Q8_0");
+            eng->format == FORMAT_NVFP4 ? "NVFP4" : (eng->format == FORMAT_Q4_0 ? "Q4_0" : "Q8_0"));
     fprintf(stderr, "fucina: %d sliding + %d global layers\n",
             eng->n_layers_sliding, eng->n_layers_global);
     fprintf(stderr, "fucina: KV cache: sliding=%.1f MB, global=%.1f MB\n",
@@ -3885,7 +4158,8 @@ gemma4_engine_t* gemma4_engine_create(
     // via coalesced uint4 weight loads; costs +6.96 GB weight VRAM — fine on GB10's 128 GB
     // unified memory). Built eagerly now — before any request or CUDA-graph capture — so
     // the decode GEMV's packed branch is a pure read. Opt out with FUCINA_NO_PACKED=1.
-    {
+    // NVFP4 has NO Q4_0 store (single-store invariant) — skip the repack entirely.
+    if (!is_nvfp4) {
         const char *off = getenv("FUCINA_NO_PACKED");
         if (!(off && off[0] == '1')) build_packed_q4(eng);   // non-fatal: falls back if it fails
     }
@@ -4012,7 +4286,8 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     if (eng->fp4_ready) {
         for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
             if (eng->d_fp4_w[l][p]) cudaFree(eng->d_fp4_w[l][p]);
-            if (eng->d_fp4_wsc[l][p]) cudaFree(eng->d_fp4_wsc[l][p]); }
+            if (eng->d_fp4_wsc[l][p]) cudaFree(eng->d_fp4_wsc[l][p]);
+            if (eng->d_fp4_wsc_lin[l][p]) cudaFree(eng->d_fp4_wsc_lin[l][p]); }
         if (eng->d_fp4_gsw)    cudaFree(eng->d_fp4_gsw);
         if (eng->d_fp4_act)    cudaFree(eng->d_fp4_act);
         if (eng->d_fp4_actsc)  cudaFree(eng->d_fp4_actsc);
@@ -4024,6 +4299,11 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
         if (eng->fp4_desc)     cublasLtMatmulDescDestroy(eng->fp4_desc);
         if (eng->cublaslt)     cublasLtDestroy(eng->cublaslt);
     }
+    // BF16 embed / LM head (FORMAT_NVFP4). Free the head ONLY if it is a distinct allocation —
+    // when the head is tied it aliases d_embed_bf16, so freeing both would double-free.
+    if (eng->d_lmhead_bf16 && eng->d_lmhead_bf16 != eng->d_embed_bf16)
+        cudaFree(eng->d_lmhead_bf16);
+    if (eng->d_embed_bf16) cudaFree(eng->d_embed_bf16);
     if (eng->ev_start) cudaEventDestroy(eng->ev_start);
     if (eng->ev_stop)  cudaEventDestroy(eng->ev_stop);
     if (eng->mtp.d_w)   cudaFree(eng->mtp.d_w);
@@ -4172,14 +4452,38 @@ static inline void gemv_batched_w(
                         in_dim, out_dim, K, fmt, stream);
 }
 
+// Forward declarations: logits_head uses lmhead_w/embd_fmt (defined just below); the decode
+// NVFP4 routing uses nvfp4_decode_proj (defined with the NVFP4 residency, far below).
+static inline const unsigned char* lmhead_w(const gemma4_engine_t *eng);
+static inline int embd_fmt(const gemma4_engine_t *eng);
+static inline void nvfp4_decode_proj(gemma4_engine_t *eng, int l, int p,
+        const float *x, float *y, int in_dim, int out_dim, cudaStream_t st);
+
 static inline void embed_w(
     const gemma4_engine_t *eng,
     float *out, const uint8_t *table, const int32_t *tokens,
     int batch, int hidden_size, cudaStream_t stream, int efmt = -1)
 {
     (void)efmt;   // the token_embd table is always Q8_0 (native, or converted from Q6_K)
+    if (eng->format == FORMAT_NVFP4) {   // BF16 embedding table (the passed `table` is unused)
+        embed_lookup_bf16_kernel<<<batch, 256, 0, stream>>>(
+            out, eng->d_embed_bf16, tokens, batch, hidden_size);
+        return;
+    }
     embed_lookup_q8_0_kernel<<<batch, 256, 0, stream>>>(
         out, table, tokens, batch, hidden_size);
+}
+
+// LM-head logits for FORMAT_NVFP4 (BF16 head GEMV), else the standard Q4_0/Q8_0/Q6_K MMVQ via
+// gemv_w. One call shape for every single-token / last-token logits site (prefill + decode).
+static inline void logits_head(
+    const gemma4_engine_t *eng, float *logits, const float *x,
+    int in_dim, int out_dim, cudaStream_t stream)
+{
+    if (eng->format == FORMAT_NVFP4)
+        bf16_head_gemv_launch(logits, eng->d_lmhead_bf16, x, in_dim, out_dim, stream);
+    else
+        gemv_w(eng, logits, lmhead_w(eng), x, in_dim, out_dim, stream, embd_fmt(eng));
 }
 
 // LM-head weight pointer + format. Step 8: when the tied head is kept NATIVE Q6_K
@@ -4468,6 +4772,24 @@ static int decode_layer(
     // (audit #30 lever 2): the three projections share one int8 quant of d_norm instead of
     // re-quantizing it per gemv_w call. q/k/v are always the layer's Q4_0/Q8_0 format (never
     // the Q6_K head), so mmvq_launch is called directly. Bit-identical (same quant input).
+    const bool nvfp4 = (eng->format == FORMAT_NVFP4 && eng->nvfp4_decode_ready);
+    if (nvfp4) {
+        // NVFP4 store: the fused decode GEMV reads the float activation directly — no int8
+        // quant (d_qx/d_dx/d_sx are neither produced nor consumed on this path). V on global
+        // layers is the K-memcpy, NOT a PJ_V GEMV (proj_desc returns 0 there) — mirror that.
+        nvfp4_decode_proj(eng, layer, PJ_Q, eng->d_norm, eng->d_attn_q, GEMMA4_HIDDEN_SIZE, out_dim_q, stream);
+        nvfp4_decode_proj(eng, layer, PJ_K, eng->d_norm, eng->d_attn_k, GEMMA4_HIDDEN_SIZE, out_dim_kv, stream);
+        PER_HEAD_NORM(eng->d_attn_q, HEAD_NORM_W(d_w_q_norm), n_heads, head_dim);
+        if (ltype == LAYER_SLIDING) {
+            nvfp4_decode_proj(eng, layer, PJ_V, eng->d_norm, eng->d_attn_v, GEMMA4_HIDDEN_SIZE, out_dim_kv, stream);
+            PER_HEAD_NORM(eng->d_attn_v, NULL, n_kv_heads, head_dim);
+        } else {
+            cudaMemcpyAsync(eng->d_attn_v, eng->d_attn_k,
+                out_dim_kv * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+            PER_HEAD_NORM(eng->d_attn_v, NULL, n_kv_heads, head_dim);
+        }
+        PER_HEAD_NORM(eng->d_attn_k, HEAD_NORM_W(d_w_k_norm), n_kv_heads, head_dim);
+    } else {
     quantize_q8_1_kernel<<<GEMMA4_HIDDEN_SIZE/32, 32, 0, stream>>>(
         eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE);
     mmvq_q4aware(eng, eng->d_attn_q, weight_fp8(eng, eng->tensors.layers[layer].attn_q),
@@ -4494,6 +4816,7 @@ static int decode_layer(
 
     // Now apply K-norm (after V copy for global layers)
     PER_HEAD_NORM(eng->d_attn_k, HEAD_NORM_W(d_w_k_norm), n_kv_heads, head_dim);
+    } // else (non-NVFP4 q/k/v)
 
     // ── 5. RoPE ──────────────────────────────────────────────────────────
     if (ltype == LAYER_SLIDING) {
@@ -4662,6 +4985,9 @@ static int decode_layer(
     }
 
     // ── 8. Output projection → post-attn norm → residual add ─────────────
+    if (nvfp4) {
+        nvfp4_decode_proj(eng, layer, PJ_O, eng->d_attn_out, eng->d_x, out_dim_q, GEMMA4_HIDDEN_SIZE, stream);
+    } else
     gemv_w(eng, eng->d_x,
         weight_fp8(eng, eng->tensors.layers[layer].attn_output),
         eng->d_attn_out, out_dim_q, GEMMA4_HIDDEN_SIZE, stream);
@@ -4688,6 +5014,14 @@ static int decode_layer(
     // then ONE fused kernel computes gate·up·GeGLU per row — the gate/up intermediates never
     // touch DRAM, and interleaving both weight reads in-warp lifts FFN bandwidth. Bit-identical
     // to the old gate-mmvq + up-mmvq + geglu (see mmvq_q*_glu_kernel).
+    if (nvfp4) {
+        // No fused FP4 GLU: two GEMVs into engine-resident gate/up scratch (graph-safe), then
+        // the existing float geglu (gelu_tanh(gate)·up — matches the fused path) into d_ffn_out.
+        nvfp4_decode_proj(eng, layer, PJ_GATE, eng->d_norm, eng->d_ffn_gate, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE, stream);
+        nvfp4_decode_proj(eng, layer, PJ_UP,   eng->d_norm, eng->d_ffn_up,   GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE, stream);
+        geglu_kernel<<<(GEMMA4_INTERMEDIATE+255)/256, 256, 0, stream>>>(
+            eng->d_ffn_out, eng->d_ffn_gate, eng->d_ffn_up, GEMMA4_INTERMEDIATE);
+    } else {
     quantize_q8_1_kernel<<<GEMMA4_HIDDEN_SIZE/32, 32, 0, stream>>>(
         eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE);
     mmvq_glu_launch(eng->d_ffn_out,
@@ -4695,8 +5029,12 @@ static int decode_layer(
         weight_fp8(eng, eng->tensors.layers[layer].ffn_up),
         eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE,
         (int)eng->format, stream);
+    }
 
     // ── 12. FFN down projection ───────────────────────────────────────────
+    if (nvfp4) {
+        nvfp4_decode_proj(eng, layer, PJ_DOWN, eng->d_ffn_out, eng->d_x, GEMMA4_INTERMEDIATE, GEMMA4_HIDDEN_SIZE, stream);
+    } else
     gemv_w(eng, eng->d_x,
         weight_fp8(eng, eng->tensors.layers[layer].ffn_down),
         eng->d_ffn_out, GEMMA4_INTERMEDIATE, GEMMA4_HIDDEN_SIZE, stream);
@@ -5085,6 +5423,119 @@ static bool gemm_nvfp4(gemma4_engine_t *eng, int l, int p, const __nv_bfloat16 *
     return okrun;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// NVFP4 SINGLE-STORE RESIDENCY (FORMAT_NVFP4) — load native NVFP4 weights from a safetensors
+// checkpoint directly into the persistent prefill fields (d_fp4_w / d_fp4_wsc / d_fp4_gsw), so
+// gemm_nvfp4 above drives prefill UNCHANGED and the decode GEMV reads the same store. Unlike
+// build_fp4_weights (which dequants Q4_0→bf16→requantizes), here the E2M1 weights and E4M3 block
+// scales come straight off disk — no Q4_0 copy is kept, saving ~6 GB on the 12B (the memory win).
+//
+// On disk each projection is: packed E2M1 [out, in/2] (low nibble=even k), LINEAR E4M3 block
+// scales [out, in/16], and an FP32 global = amax/(6*448). cuBLASLt wants the block scales in its
+// 32×4×4 swizzled layout (same as the activation path) and the global folded into alpha — so we
+// upload the packed weights as-is, swizzle the linear scales with nvfp4_swizzle_kernel, and store
+// the global into d_fp4_gsw. Returns 0 on success, <0 on failure (caller errors out — there is no
+// Q4_0 fallback for an NVFP4 model). Norm/embed/lm_head (BF16) are loaded by the create path.
+static int nvfp4_load_from_safetensors(gemma4_engine_t *eng, const char *path,
+                                       const nvfp4ld::Layout *layout, st::Model *model)
+{
+    if (eng->fp4_ready) return 0;
+    const nvfp4ld::Layout &L = *layout;
+    st::Model &m = *model;
+
+    if (cublasLtCreate(&eng->cublaslt) != CUBLAS_STATUS_SUCCESS) return -1;
+    if (cudaMalloc(&eng->d_fp4_gsw, (size_t)GEMMA4_MAX_LAYERS*PJ_COUNT*sizeof(float)) != cudaSuccess) return -2;
+    if (cudaMalloc(&eng->d_fp4_amax, sizeof(float)) != cudaSuccess) return -2;
+
+    // map our PJ_* projection ids onto the loader's HF-suffix ids
+    static const int PJ2HF[PJ_COUNT] = {
+        nvfp4ld::P_Q, nvfp4ld::P_K, nvfp4ld::P_V, nvfp4ld::P_O,
+        nvfp4ld::P_GATE, nvfp4ld::P_UP, nvfp4ld::P_DOWN };
+
+    size_t wbytes = 0;
+    int ok = 1;
+    for (int l = 0; ok && l < GEMMA4_MAX_LAYERS; l++) {
+        for (int p = 0; ok && p < PJ_COUNT; p++) {
+            uint64_t off; int in_dim, out_dim;
+            if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;  // e.g. global V (=K)
+            nvfp4ld::ProjKeys k = nvfp4ld::proj_keys(L, l, PJ2HF[p]);
+            const st::Tensor *tw = m.find(k.packed);
+            const st::Tensor *ts = m.find(k.scale);
+            const st::Tensor *tg = m.find(k.gscale);
+            if (!tw || !ts || !tg) {
+                fprintf(stderr, "fucina: NVFP4 missing tensor for L%d P%d (%s)\n", l, p, k.packed.c_str());
+                ok = 0; break;
+            }
+            const size_t packed_bytes = (size_t)out_dim * (in_dim / 2);
+            const size_t lin_bytes    = (size_t)out_dim * (in_dim / NVFP4_BLK);
+            if (tw->nbytes != packed_bytes || ts->nbytes != lin_bytes || tg->nbytes < sizeof(float)) {
+                fprintf(stderr, "fucina: NVFP4 shape mismatch L%d P%d (packed %zu vs %zu, scale %zu vs %zu)\n",
+                        l, p, tw->nbytes, packed_bytes, ts->nbytes, lin_bytes);
+                ok = 0; break;
+            }
+            // packed E2M1 weights → persistent device store (verbatim, layout matches d_fp4_w)
+            if (cudaMalloc(&eng->d_fp4_w[l][p], packed_bytes) != cudaSuccess) { ok = 0; break; }
+            cudaMemcpy(eng->d_fp4_w[l][p], tw->data, packed_bytes, cudaMemcpyHostToDevice);
+            // linear E4M3 scales → temp device buffer → swizzle into d_fp4_wsc
+            const int nblk = in_dim / NVFP4_BLK;
+            const size_t swsz = (size_t)nvfp4_pad(out_dim,128) * nvfp4_pad(nblk,4);
+            uint8_t *d_lin = nullptr;
+            if (cudaMalloc(&d_lin, lin_bytes) != cudaSuccess) { ok = 0; break; }
+            cudaMemcpy(d_lin, ts->data, lin_bytes, cudaMemcpyHostToDevice);
+            // Retain a LINEAR-scale copy for the decode GEMV (it cannot read the swizzled
+            // cuBLASLt scales). Copied straight from host ts->data — identical bytes to d_lin,
+            // independent of d_lin's lifetime (which the swizzle below frees). Freed in destroy.
+            if (cudaMalloc(&eng->d_fp4_wsc_lin[l][p], lin_bytes) != cudaSuccess) { cudaFree(d_lin); ok = 0; break; }
+            cudaMemcpy(eng->d_fp4_wsc_lin[l][p], ts->data, lin_bytes, cudaMemcpyHostToDevice);
+            if (cudaMalloc(&eng->d_fp4_wsc[l][p], swsz) != cudaSuccess) { cudaFree(d_lin); ok = 0; break; }
+            cudaMemset(eng->d_fp4_wsc[l][p], 0, swsz);
+            dim3 b2(32,8), g2((nblk+31)/32,(out_dim+7)/8);
+            nvfp4_swizzle_kernel<<<g2,b2>>>(d_lin, eng->d_fp4_wsc[l][p], out_dim, nblk, nvfp4_pad(nblk,4));
+            cudaFree(d_lin);
+            // per-tensor global → normalized decode MULTIPLIER (compressed-tensors stores the
+            // reciprocal; see nvfp4ld::global_mul) → d_fp4_gsw[l*PJ+p]
+            float gmul = nvfp4ld::global_mul(L.naming, *reinterpret_cast<const float*>(tg->data));
+            cudaMemcpy(eng->d_fp4_gsw + (l*PJ_COUNT + p), &gmul, sizeof(float), cudaMemcpyHostToDevice);
+            wbytes += packed_bytes + swsz + lin_bytes;
+        }
+    }
+    cudaDeviceSynchronize();
+    if (!ok || cudaGetLastError() != cudaSuccess) {
+        fprintf(stderr, "fucina: NVFP4 safetensors residency failed\n");
+        return -3;
+    }
+
+    // prefill activation scalars + workspace + cached cuBLASLt desc (identical to build_fp4_weights)
+    cudaMalloc(&eng->d_fp4_gsact, sizeof(float));
+    cudaMalloc(&eng->d_fp4_alpha, 2*sizeof(float));
+    eng->d_fp4_ws = nullptr; cudaMalloc(&eng->d_fp4_ws, 64ull<<20);
+    cublasLtMatmulDescCreate(&eng->fp4_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasOperation_t opT=CUBLAS_OP_T, opN=CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+    int32_t smode=CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &smode, sizeof(smode));
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &smode, sizeof(smode));
+    int32_t pmode=CUBLASLT_POINTER_MODE_DEVICE;
+    cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pmode, sizeof(pmode));
+    eng->fp4_ready = 1;
+    (void)path;
+    fprintf(stderr, "fucina: NVFP4 safetensors store resident (%.2f GB, single-store — no Q4_0 copy)\n",
+            wbytes/1e9);
+    return 0;
+}
+
+// Decode/GEMV projection over the NVFP4 single store: y[out] = (W_nvfp4 · x) for B=1, using the
+// fused decode kernel (nvfp4_gemv.cuh). Sources the LINEAR E4M3 block scales from the engine's
+// retained per-projection copy (d_fp4_wsc_lin — d_fp4_wsc holds the SWIZZLED cuBLASLt scales the
+// GEMV cannot read) and the normalized per-tensor global from d_fp4_gsw[l*PJ_COUNT+p]. Capture-
+// safe (no alloc / host sync; device-resident gs scalar). x and y are the float decode scratch.
+static inline void nvfp4_decode_proj(gemma4_engine_t *eng, int l, int p,
+        const float *x, float *y, int in_dim, int out_dim, cudaStream_t st) {
+    nvfp4_gemv_launch(y, eng->d_fp4_w[l][p], eng->d_fp4_wsc_lin[l][p],
+                      eng->d_fp4_gsw + (l*PJ_COUNT + p), x, in_dim, out_dim, st);
+}
+
 // Lazily allocate the tiled-MMQ prefill activation scratch (Q4_0 models only): the
 // quantized [N × in_dim] activation for N ≤ MMQ_MAX_N over the widest projection
 // (in_dim = INTERMEDIATE). Idempotent. Returns 0 on success, -1 on failure (caller
@@ -5202,7 +5653,7 @@ int gemma4_engine_prefill_batched(
     // dequant pass) — eliminating the ~125 ms fixed full-model dequant that dominated
     // suffix prefills. Above MMQ_MAX_N the BF16 tensor-core GEMM (with pipelined dequant)
     // wins, so we fall through to it. mmq needs no BF16 scratch; only build it otherwise.
-    const bool use_mmq = mmq_enabled(eng, N);
+    bool use_mmq = mmq_enabled(eng, N);   // forced false for FORMAT_NVFP4 (no Q4_0 store)
     // NVFP4 tensor-core prefill (FUCINA_FP4=1): persistent NVFP4 weights + per-GEMM
     // activation quant + cuBLASLt block-scaled FP4 GEMM (~2.4× BF16). Needs no per-layer
     // dequant pipeline. Falls back to BF16 if weight/scratch build fails.
@@ -5218,8 +5669,19 @@ int gemma4_engine_prefill_batched(
         const char *e = getenv("FUCINA_FP4"); fp4_opt = (e && e[0]=='0') ? 0 : 1;  // on unless =0
         const char *mn = getenv("FUCINA_FP4_MIN"); if (mn) fp4_min = atoi(mn);
     }
-    const bool use_fp4 = fp4_opt && !use_mmq && N >= fp4_min
+    bool use_fp4 = fp4_opt && !use_mmq && N >= fp4_min
                          && build_fp4_weights(eng) == 0 && ensure_fp4_act(eng, N) == 0;
+    // FORMAT_NVFP4 has NO Q4_0/BF16 fallback store (eng->d_weights is NULL): the prefill MUST
+    // always use gemm_nvfp4, for EVERY N. Bypass the 1024-token floor and the MMQ/BF16 paths.
+    // build_fp4_weights is a no-op here (fp4_ready=1 from residency); ensure_fp4_act sets up the
+    // cuBLASLt activation-quant scratch and must succeed.
+    if (eng->format == FORMAT_NVFP4) {
+        if (ensure_fp4_act(eng, N) != 0) {
+            fprintf(stderr, "fucina: NVFP4 activation scratch alloc failed (N=%d)\n", N);
+            return -1;
+        }
+        use_mmq = false; use_fp4 = true;
+    }
     if (!use_mmq && !use_fp4 && build_bf16_weights(eng) != 0) return -1;
 
     cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
@@ -5441,8 +5903,7 @@ int gemma4_engine_prefill_batched(
     // ── Output norm + LM head + softcap on the LAST token only ──
     float *x_last = d_x + (size_t)(N-1)*H;
     rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
-    gemv_w(eng, eng->d_logits, lmhead_w(eng),
-           eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream, embd_fmt(eng));
+    logits_head(eng, eng->d_logits, eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream);
     logit_softcap_kernel<<<grid1d(GEMMA4_VOCAB_SIZE),256,0,stream>>>(
         eng->d_logits, GEMMA4_SOFTCAP, GEMMA4_VOCAB_SIZE);
     if (eng->n_suppress > 0)
@@ -5511,6 +5972,10 @@ int gemma4_engine_prefill_flash(
     eng->mtp_h_valid = 0;   // prefill invalidates the MTP drafter's recurrent h
 
     if (!eng->loaded || n_tokens <= 0) return -1;
+    // FORMAT_NVFP4: this path is BF16/MMQ-only (no FP4 GEMM) and would deref the NULL Q4_0
+    // store. prefill_batched forces use_fp4=true for all N (so it never returns -2 here), but
+    // guard anyway so a future change can't silently route NVFP4 through the Q4_0/BF16 path.
+    if (eng->format == FORMAT_NVFP4) return -2;
     const int base0 = eng->cur.n_tokens;               // 0 = fresh, >0 = suffix
     if (base0 + n_tokens > eng->global_kv_capacity) return -2;  // would overflow cache
     // Tiny suffixes stay on the chunked dp4a fallback: this path pays a fixed
@@ -5795,8 +6260,7 @@ int gemma4_engine_prefill_flash(
         if (c0 + cn >= N) {                               // last chunk: logits of last token
             float *x_last = d_x + (size_t)(cn-1)*H;
             rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
-            gemv_w(eng, eng->d_logits, lmhead_w(eng),
-                   eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream, embd_fmt(eng));
+            logits_head(eng, eng->d_logits, eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream);
             logit_softcap_kernel<<<grid1d(GEMMA4_VOCAB_SIZE),256,0,stream>>>(
                 eng->d_logits, GEMMA4_SOFTCAP, GEMMA4_VOCAB_SIZE);
             if (eng->n_suppress > 0)
@@ -5977,8 +6441,7 @@ static void decode_forward_device(gemma4_engine_t *eng, cudaStream_t stream)
     if (eng->mtp.loaded)
         cudaMemcpyAsync(eng->d_mtp_h, eng->d_norm,
                         GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-    gemv_w(eng, eng->d_logits, lmhead_w(eng), eng->d_norm,
-           GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE, stream, embd_fmt(eng));
+    logits_head(eng, eng->d_logits, eng->d_norm, GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE, stream);
     logit_softcap_kernel<<<(GEMMA4_VOCAB_SIZE + 255) / 256, 256, 0, stream>>>(
         eng->d_logits, GEMMA4_SOFTCAP, GEMMA4_VOCAB_SIZE);
     if (eng->n_suppress > 0)
@@ -6093,10 +6556,7 @@ int gemma4_engine_decode(
         }
 
         int vocab = GEMMA4_VOCAB_SIZE;
-        gemv_w(eng, eng->d_logits,
-            lmhead_w(eng),
-            eng->d_norm,
-            GEMMA4_HIDDEN_SIZE, vocab, stream, embd_fmt(eng));
+        logits_head(eng, eng->d_logits, eng->d_norm, GEMMA4_HIDDEN_SIZE, vocab, stream);
 
         logit_softcap_kernel<<<(vocab + 255) / 256, 256, 0, stream>>>(
             eng->d_logits, GEMMA4_SOFTCAP, vocab);
@@ -6448,7 +6908,25 @@ static void decode_batched_forward(
         const __typeof__(eng->tensors.layers[0]) *L = &eng->tensors.layers[l];
 
         // Pre-attn norm (fp32) → Q,K,V batched GEMV (Q8_0 read once, reused over K).
+        // For NVFP4 there is no batched FP4 GEMV: the fused decode kernel is B=1, so loop the K
+        // rows (the row-major d_inf/d_q/d_k/d_v scratch is [K][dim], one GEMV per row). Attention,
+        // RoPE and norms below are weight-free and stay batched. (Reached only via the chunked
+        // suffix-prefill / spec-verify paths; the public single-token decode uses decode_layer.)
+        const bool nvfp4 = (eng->format == FORMAT_NVFP4 && eng->nvfp4_decode_ready);
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_inf, d_x, w_attn, H, K, GEMMA4_RMS_EPS);
+        if (nvfp4) {
+            for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_Q, d_inf+(size_t)r*H, d_q+(size_t)r*oq,  H, oq,  stream);
+            per_head_rms_norm_rows_kernel<<<dim3(HEADS,K),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, K, GEMMA4_RMS_EPS);
+            for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_K, d_inf+(size_t)r*H, d_k+(size_t)r*okv, H, okv, stream);
+            if (lt == LAYER_SLIDING) {
+                for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_V, d_inf+(size_t)r*H, d_v+(size_t)r*okv, H, okv, stream);
+                per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_v, NULL, nkv, hd, K, GEMMA4_RMS_EPS);
+            } else {
+                cudaMemcpyAsync(d_v, d_k, (size_t)K*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+                per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_v, NULL, nkv, hd, K, GEMMA4_RMS_EPS);
+            }
+            per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, K, GEMMA4_RMS_EPS);
+        } else {
         gemv_batched_w(eng, d_q, weight_fp8(eng, L->attn_q), d_inf, H, oq, K, stream);
         per_head_rms_norm_rows_kernel<<<dim3(HEADS,K),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, K, GEMMA4_RMS_EPS);
         gemv_batched_w(eng, d_k, weight_fp8(eng, L->attn_k), d_inf, H, okv, K, stream);
@@ -6460,6 +6938,7 @@ static void decode_batched_forward(
             per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_v, NULL, nkv, hd, K, GEMMA4_RMS_EPS);
         }
         per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, K, GEMMA4_RMS_EPS);
+        } // else (non-NVFP4 q/k/v batched)
 
         if (lt == LAYER_SLIDING)
             rope_rows_kernel<<<dim3(HEADS,K),hd/2,0,stream>>>(d_q, d_k, pos, HEADS, nkv, hd, K, 10000.0f, NULL, d_pos);
@@ -6523,16 +7002,23 @@ static void decode_batched_forward(
         }
 
         // O projection (input d_attn is already fp32) → d_o; post-attn norm; residual.
-        gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, K, stream);
+        if (nvfp4) for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_O, d_attn+(size_t)r*oq, d_o+(size_t)r*H, oq, H, stream);
+        else gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, K, stream);
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_a, H, K, GEMMA4_RMS_EPS);
         residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
 
         // FFN (fp32 batched GEMV throughout).
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_inf, d_x, w_ffn, H, K, GEMMA4_RMS_EPS);
-        gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, K, stream);
-        gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, K, stream);
+        if (nvfp4) {
+            for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_GATE, d_inf+(size_t)r*H, d_gate+(size_t)r*I, H, I, stream);
+            for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_UP,   d_inf+(size_t)r*H, d_up+(size_t)r*I,   H, I, stream);
+        } else {
+            gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, K, stream);
+            gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, K, stream);
+        }
         geglu_kernel<<<grid1d((size_t)K*I),256,0,stream>>>(d_inf, d_gate, d_up, K*I);
-        gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, K, stream);
+        if (nvfp4) for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_DOWN, d_inf+(size_t)r*I, d_o+(size_t)r*H, I, H, stream);
+        else gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, K, stream);
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_f, H, K, GEMMA4_RMS_EPS);
         residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
         if (eng->h_out_scale[l] != 1.0f)
@@ -6545,6 +7031,10 @@ static void decode_batched_forward(
     if (want_head) {
         int vocab = GEMMA4_VOCAB_SIZE;
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, K, GEMMA4_RMS_EPS);
+        if (eng->format == FORMAT_NVFP4)
+            for (int r=0;r<K;r++)
+                bf16_head_gemv_launch(d_logitsK+(size_t)r*vocab, eng->d_lmhead_bf16, d_norm+(size_t)r*H, H, vocab, stream);
+        else
         gemv_batched_w(eng, d_logitsK, lmhead_w(eng),
                        d_norm, H, vocab, K, stream, embd_fmt(eng));
         logit_softcap_kernel<<<grid1d((size_t)K*vocab),256,0,stream>>>(d_logitsK, GEMMA4_SOFTCAP, K*vocab);

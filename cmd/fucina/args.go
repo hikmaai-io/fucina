@@ -11,6 +11,8 @@ import (
 type CLIArgs struct {
 	// Model
 	ModelPath     string
+	TokenizerPath string // --tokenizer: GGUF to source the tokenizer vocab from (required when
+	//                       -m is an NVFP4 safetensors checkpoint, which carries no GGUF vocab)
 	AssistantPath string // Gemma-4 MTP assistant GGUF (official draft head)
 	DiffModelPath string // -dm: diffusion model path; also enables the NVFP4 MoE experts
 	FP4MoE        bool   // --fp4-moe / implied by -dm: enable DiffusionGemma NVFP4 MoE experts
@@ -90,6 +92,8 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	// Defaults matching llama.cpp
 	fs.StringVar(&a.ModelPath, "m", "", "Path to GGUF model file")
 	fs.StringVar(&a.ModelPath, "model", "", "Path to GGUF model file")
+	fs.StringVar(&a.TokenizerPath, "tokenizer", "",
+		"GGUF to load the tokenizer vocab from (required for an NVFP4 safetensors checkpoint)")
 	fs.StringVar(&a.AssistantPath, "assistant", "",
 		"Path to the Gemma-4 MTP assistant GGUF (official draft head; enables draft-mtp speculation)")
 	// -dm: like -m but for DiffusionGemma — sets the model path AND enables the NVFP4 MoE
@@ -205,15 +209,21 @@ func parseFlags() CLIArgs {
 
 	// Model is required unless running tests
 	if a.ModelPath == "" && !t.parser && !t.cuda && t.vectors == "" {
-		// Check default locations
-		for _, p := range []string{"./gemma-4-12b-it.gguf", "./model.gguf", "./gguf/model.gguf"} {
+		// Check default locations: a GGUF file, or an NVFP4 safetensors checkpoint
+		// (a single .safetensors file or a directory the C loader resolves via its
+		// .index.json / single-shard handling).
+		for _, p := range []string{
+			"./gemma-4-12b-it.gguf", "./model.gguf", "./gguf/model.gguf",
+			"./model.safetensors", "./gemma-4-12B-it-NVFP4",
+		} {
 			if _, err := os.Stat(p); err == nil {
 				a.ModelPath = p
 				break
 			}
 		}
 		if a.ModelPath == "" {
-			fmt.Fprintf(os.Stderr, "error: no model specified. Use -m <model.gguf>\n\n")
+			fmt.Fprintf(os.Stderr, "error: no model specified. "+
+				"Use -m <model.gguf | nvfp4-dir | model.safetensors>\n\n")
 			printUsage()
 			os.Exit(1)
 		}

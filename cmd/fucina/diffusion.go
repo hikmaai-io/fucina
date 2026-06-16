@@ -12,7 +12,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -347,7 +346,7 @@ func runDiffusionServer(args CLIArgs, tok *tokenizer.Tokenizer, eng *diffusion.E
 	addr := fmt.Sprintf("%s:%d", args.Host, args.Port)
 	// Canonical id reported by /v1/models — derived from the GGUF filename (not hardcoded).
 	// Requests echo back whatever `model` the client sends, so any pi/OpenAI provider id works.
-	modelID := strings.TrimSuffix(filepath.Base(args.ModelPath), ".gguf")
+	modelID := deriveModelID(args.ModelPath)
 
 	// Auth, matching the dense server: flag wins, else FUCINA_API_KEY. /v1/* routes
 	// are wrapped with the same bearer check so a configured key is NOT silently
