@@ -320,7 +320,7 @@ __global__ void copy_f32_to_fp8_kernel(
     uint64_t n)
 {
     uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = float_to_fp8(src[i]);
+    if (i < n) dst[i] = float_to_fp8(kv_codec_value(src, (int)i));
 }
 
 // Device-pos KV write for the CUDA-graph decode: the destination slot is computed
@@ -332,7 +332,7 @@ __global__ void copy_f32_to_fp8_at_kernel(
     const float *src, int n, int cap)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) base[(size_t)((*pos_ptr) % cap) * stride + i] = float_to_fp8(src[i]);
+    if (i < n) base[(size_t)((*pos_ptr) % cap) * stride + i] = float_to_fp8(kv_codec_value(src, i));
 }
 
 // Dequantize a weight matrix (Q8_0 or FP8) to BF16, preserving the source's
@@ -2166,8 +2166,8 @@ __global__ void kv_write_sliding_kernel(
     if (base_ptr) base = *base_ptr;
     int t    = first + i;                              // token index within batch
     size_t slot = ((size_t)base + t) % (size_t)cap;    // ring position
-    kcache[slot * kvhd + j] = float_to_fp8(kb[(size_t)t * kvhd + j]);
-    vcache[slot * kvhd + j] = float_to_fp8(vb[(size_t)t * kvhd + j]);
+    kcache[slot * kvhd + j] = float_to_fp8(kv_codec_value(kb + (size_t)t * kvhd, j));
+    vcache[slot * kvhd + j] = float_to_fp8(kv_codec_value(vb + (size_t)t * kvhd, j));
 }
 
 // Scatter the batch's K/V into the linear global cache at positions base..base+rows-1.
@@ -2182,8 +2182,8 @@ __global__ void kv_write_global_kernel(
     if (t >= rows || j >= hd) return;
     if (base_ptr) base = *base_ptr;
     int pos = base + t;
-    kcache[(size_t)pos * hd + j] = float_to_fp8(kb[(size_t)t * hd + j]);
-    vcache[(size_t)pos * hd + j] = float_to_fp8(vb[(size_t)t * hd + j]);
+    kcache[(size_t)pos * hd + j] = float_to_fp8(kv_codec_value(kb + (size_t)t * hd, j));
+    vcache[(size_t)pos * hd + j] = float_to_fp8(kv_codec_value(vb + (size_t)t * hd, j));
 }
 
 // =========================================================================
@@ -3790,6 +3790,18 @@ gemma4_engine_t* gemma4_engine_create(
     // them unused for the global layers) so the KV-write mirror can index it with
     // the same `layer` the contiguous cache uses — no sliding-slot map. The global
     // pool is indexed by the compact global_slot[layer] (n_layers_global slots).
+    // KV codec select (Phase 6). FUCINA_KV_NVFP4 fake-quants KV through NVFP4
+    // precision (E2M1 + per-16 E4M3 block scale) at every store site; default OFF
+    // keeps flat FP8 byte-identical. Set the device constant once. See
+    // docs/kv-quant-exploration.md.
+    {
+        int kv_nvfp4 = getenv("FUCINA_KV_NVFP4") ? 1 : 0;
+        cudaMemcpyToSymbol(c_kv_nvfp4, &kv_nvfp4, sizeof(int));
+        if (kv_nvfp4)
+            printf("fucina: KV codec = NVFP4 fake-quant (E2M1 + per-16 E4M3 block scale) "
+                   "[Phase 6 bench; ~4.5-bit precision, storage still FP8]\n");
+    }
+
     if (getenv("FUCINA_PAGED_KV")) {
         const int BT = PAGED_KV_BLOCK_TOKENS;
         const int slid_elems = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;          // 8×256 = 2048
@@ -4286,8 +4298,8 @@ __global__ void paged_mirror_write_kernel(
     v.base = base; v.n_tokens = pos + 1;
     size_t idx = paged_elem_index(v, pos, e, block_tokens, elems);
     if (idx == (size_t)-1) return;
-    pool_k[idx] = pkv_float_to_fp8(kb[e]);
-    pool_v[idx] = pkv_float_to_fp8(vb[e]);
+    pool_k[idx] = pkv_float_to_fp8(kv_codec_value(kb, e));
+    pool_v[idx] = pkv_float_to_fp8(kv_codec_value(vb, e));
 }
 
 // Paged single-token decode attention (GQA), scale 1.0 (gemma4), online softmax.

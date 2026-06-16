@@ -57,6 +57,48 @@ static inline __device__ pkv_t pkv_float_to_fp8(float v) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// NVFP4 KV codec (Phase 6, behind FUCINA_KV_NVFP4) — fake-quant: the cache still
+// stores 1 byte/elem (FP8), but each KV value is first round-tripped through NVFP4
+// (E2M1 4-bit element + per-16 E4M3 block scale, the weight codec) so the engine
+// generates EXACTLY what a real ~4.5-bit packed KV store would read back (plus a
+// negligible final FP8-restore error). This measures the generation-quality cost
+// of NVFP4-precision KV — the gate that decides the packed-storage rewrite — while
+// leaving every read kernel untouched. The ~1.78x memory saving is analytic.
+// Default OFF: kv_codec_value returns the raw float → float_to_fp8 byte-identical.
+// See docs/kv-quant-exploration.md.
+// ─────────────────────────────────────────────────────────────────────────────
+__device__ __constant__ int c_kv_nvfp4 = 0;            // set once at engine create
+
+__device__ inline float pkv_e2m1(float v) {            // nearest E2M1 level (signed)
+    const float lv[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float s = v < 0 ? -1.0f : 1.0f; v = fabsf(v);
+    float best = 0.0f, bd = v;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) { float d = fabsf(v - lv[k]); if (d < bd) { bd = d; best = lv[k]; } }
+    return s * best;
+}
+
+// NVFP4 round-trip of row[j] using its 16-wide block [j&~15 .. +15]. The block
+// never crosses a head boundary (head_dim is a multiple of 16), and row points at
+// the element's own token row so b0+15 stays in range at every call site.
+__device__ inline float pkv_nvfp4_roundtrip(const float* row, int j) {
+    int b0 = j & ~15;
+    float amax = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 16; k++) amax = fmaxf(amax, fabsf(row[b0 + k]));
+    if (amax == 0.0f) return 0.0f;
+    float bs = pkv_fp8_to_float(pkv_float_to_fp8(amax * (1.0f / 6.0f)));  // E4M3 block scale
+    if (bs == 0.0f) bs = amax * (1.0f / 6.0f);
+    return pkv_e2m1(row[j] * (1.0f / bs)) * bs;
+}
+
+// The value to feed to {float,pkv}_to_fp8 at a KV store site: NVFP4-precision when
+// enabled, otherwise the raw float (so the FP8 store is bit-for-bit unchanged).
+__device__ inline float kv_codec_value(const float* row, int j) {
+    return c_kv_nvfp4 ? pkv_nvfp4_roundtrip(row, j) : row[j];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POD descriptors the engine fills per batched step. All pointers are DEVICE
 // pointers. There is no CUDA-runtime type in here so the engine can build these
 // on the host and memcpy them as plain bytes.
@@ -134,8 +176,8 @@ __global__ void paged_kv_write(
     if (idx == (size_t)-1) return;                     // unmapped → skip (engine bug if hit)
 
     size_t src = (size_t)row * elems_per_token + e;
-    k_pool[idx] = pkv_float_to_fp8(kb[src]);
-    v_pool[idx] = pkv_float_to_fp8(vb[src]);
+    k_pool[idx] = pkv_float_to_fp8(kv_codec_value(kb + (size_t)row * elems_per_token, e));
+    v_pool[idx] = pkv_float_to_fp8(kv_codec_value(vb + (size_t)row * elems_per_token, e));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

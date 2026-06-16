@@ -92,3 +92,40 @@ heavy outliers (16 channels @ std 12, pathological / activation-like):
 
 The harness is the deliverable here: it lets that decision be re-run against real dumped K/V (feed
 real vectors instead of the synthetic generator) the moment the memory pressure is real.
+
+## NVFP4-KV implemented & benched (behind `FUCINA_KV_NVFP4`)
+
+To put numbers on the decision, NVFP4-precision KV is now wired into the engine as a **fake-quant**:
+every KV store site (`copy_f32_to_fp8[_at]_kernel`, `kv_write_{sliding,global}_kernel`, and both
+paged writers) routes the float K/V through `kv_codec_value` (`cuda/paged_kv_device.cuh`), which
+when `FUCINA_KV_NVFP4=1` round-trips each value through NVFP4 (E2M1 + per-16 E4M3 block scale,
+block amax read directly — no warp shuffles) before the existing FP8 store. So the engine *generates
+exactly what a real ~4.5-bit packed KV store would read back* (plus a negligible FP8-restore error),
+**without touching any read kernel**. The cache still physically stores 1 byte/elem, so this measures
+the quality/speed cost; the ~1.78× memory saving is analytic and realized only by the (gated) packed-
+storage rewrite. Default OFF is byte-identical (a `__constant__` flag; `kv_codec_value` returns the
+raw float) — verified: greedy `011111111111` unchanged, batch self-test 32/32.
+
+**Speed (GB10, non-spec to isolate raw throughput, 802-token prompt):**
+
+| | prefill (wall / GPU) | decode @ 802 ctx |
+|---|---|---|
+| FP8 (default) | 1050 / 1268 tok/s | 26.0 tok/s |
+| NVFP4-KV | 1071 / 1280 tok/s | 25.7 tok/s |
+
+Prefill and raw decode are **identical within noise** — confirming `nvfp4-decode-bandwidth.md`:
+NVFP4 KV gives no decode-bandwidth edge, and the fake-quant write overhead is negligible (KV write
+is not on the critical path). At short context decode is ~47 tok/s (both); with prompt-lookup spec
+decode on, NVFP4-KV lowers acceptance ~7% (84→78 drafts/160 tok, 2.11→1.95 tok/step), so spec
+throughput drops ~5% (45.8→43.4 tok/s) — the only measurable speed effect, and itself a *quality*
+signal (perturbed KV makes the drafter verify slightly less often).
+
+**Quality:** the offline ~9e-3 rel-MSE / 4.5e-3 cos-error shows up as real distribution shift —
+greedy outputs diverge and spec acceptance drops. A clean instruct/tool-bench verdict needs the
+chat-template server path (factual probe `17×23` returned **391 on both** FP8 and NVFP4); a full
+tool-eval-bench run is the remaining gate before NVFP4-KV could be considered for default. The
+implementation is the lever to run that gate.
+
+**Bottom line unchanged:** NVFP4-KV is memory-only (no speed win), costs a small but real quality
+perturbation, and stays **opt-in behind the flag, default FP8**, pending a tool-bench quality gate
+and the packed-storage rewrite to actually bank the memory.
