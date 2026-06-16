@@ -6788,10 +6788,12 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
             rope_global_kernel<<<GEMMA4_HEADS, head_dim/2, 0, stream>>>(
                 eng->d_mtp_q, eng->d_mtp_q, 0, pos_ptr, 0, GEMMA4_HEADS, /*n_kv_heads=*/0,
                 head_dim, 1000000.0f, mtp_f32(eng, eng->mtp.rope_freqs));
-            // target layer 47 = the LAST global layer (llama.cpp share(il)=n_layer-1).
+            // The LAST global layer (llama.cpp share(il)=n_layer-1). Use the runtime
+            // layer count, not the array cap — GEMMA4_MAX_LAYERS-1 would index a phantom
+            // layer once the cap (60) exceeds the model's n_layers (48 on the 12B).
             // Fixed-grid split-K with device n_tokens (= *pos_ptr): same split formula
             // as global_attn_decode_broadcast, so the math is bit-identical to it.
-            int slot = eng->global_slot[GEMMA4_MAX_LAYERS - 1];
+            int slot = eng->global_slot[eng->n_layers - 1];
             size_t lstride = global_layer_stride(eng);
             global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
@@ -6807,14 +6809,14 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
             rope_sliding_kernel<<<GEMMA4_HEADS, head_dim/2, 0, stream>>>(
                 eng->d_mtp_q, eng->d_mtp_q, 0, pos_ptr, GEMMA4_HEADS, /*n_kv_heads=*/0,
                 head_dim, 10000.0f);
-            // target layer 46 = the LAST sliding layer (share(il)=n_layer-2); the
-            // drafter attends window-1 keys of the frozen cache at n_tokens = *pos_ptr.
+            // The LAST sliding layer (share(il)=n_layer-2); the drafter attends window-1
+            // keys of the frozen cache at n_tokens = *pos_ptr. Runtime n_layers, not the cap.
             size_t lstride = sliding_layer_stride(eng);
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
-                    eng->d_sliding_k + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
-                    eng->d_sliding_v + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
+                    eng->d_sliding_k + (size_t)(eng->n_layers - 2) * lstride,
+                    eng->d_sliding_v + (size_t)(eng->n_layers - 2) * lstride,
                     GEMMA4_SLIDING_WINDOW - 1, 0, pos_ptr);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS>
                 <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
