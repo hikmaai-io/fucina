@@ -4177,8 +4177,6 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
             CUDA_FREE(eng->d_bf16_layer[b][p]);
     for (int p = 0; p < 12; p++)
         CUDA_FREE(eng->d_sb[p]);
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
-    }
     CUDA_FREE(eng->d_sample_id);
     CUDA_FREE(eng->d_sample_p);
     CUDA_FREE(eng->d_spec_ids);
@@ -5059,9 +5057,12 @@ static void nvfp4_quantize(const __nv_bfloat16 *X, int rows, int k,
 static int build_fp4_weights(gemma4_engine_t *eng) {
     if (eng->fp4_ready) return 0;
     if (cublasLtCreate(&eng->cublaslt) != CUBLAS_STATUS_SUCCESS) return -1;
-    // find max projection element count for the temp bf16 + linear-scale scratch
+    // find max projection element count for the temp bf16 + linear-scale scratch.
+    // Iterate the model's real layer count, NOT the array cap: layers n_layers..cap-1
+    // are phantom (offset-0 garbage), and quantizing them faults — proj_desc returns
+    // valid-looking dims for the calloc'd-0 offsets, so the loop must stop at n_layers.
     uint64_t maxn = 0; int max_in = 0, max_out = 0;
-    for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
+    for (int l=0;l<eng->n_layers;l++) for (int p=0;p<PJ_COUNT;p++){
         uint64_t off; int in_dim,out_dim; if(!proj_desc(eng,l,p,&off,&in_dim,&out_dim)) continue;
         uint64_t nn=(uint64_t)in_dim*out_dim; if(nn>maxn)maxn=nn;
         if(in_dim>max_in)max_in=in_dim; if(out_dim>max_out)max_out=out_dim;
@@ -5073,7 +5074,7 @@ static int build_fp4_weights(gemma4_engine_t *eng) {
     if (ok && cudaMalloc(&eng->d_fp4_gsw, (size_t)GEMMA4_MAX_LAYERS*PJ_COUNT*sizeof(float))!=cudaSuccess) ok=0;
     if (ok && cudaMalloc(&eng->d_fp4_amax, sizeof(float))!=cudaSuccess) ok=0;
     size_t wbytes=0;
-    for (int l=0; ok && l<GEMMA4_MAX_LAYERS; l++) for (int p=0; ok && p<PJ_COUNT; p++){
+    for (int l=0; ok && l<eng->n_layers; l++) for (int p=0; ok && p<PJ_COUNT; p++){
         uint64_t off; int in_dim,out_dim; if(!proj_desc(eng,l,p,&off,&in_dim,&out_dim)) continue;
         size_t packed=(size_t)out_dim*(in_dim/2);
         size_t swsz=(size_t)nvfp4_pad(out_dim,128)*nvfp4_pad(in_dim/NVFP4_BLK,4);
