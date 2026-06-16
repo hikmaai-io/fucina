@@ -85,8 +85,53 @@ func runTestCUDA(args CLIArgs) int {
 		eng.Reset()
 		eng.Prefill(pt) // re-establish state for the batched checks below
 	}
+	// Same chain via DecodeBatched([t]) one token at a time: if THIS is coherent while
+	// the single-token Decode chain degenerated, the bug is in decode_layer (single-token);
+	// if both degenerate identically, it's the shared forward/KV-read.
+	{
+		btoks := []int32{}
+		nt := int32(sampler.Argmax(pl))
+		for i := 0; i < 5; i++ {
+			btoks = append(btoks, nt)
+			bl, e := eng.DecodeBatched([]int32{nt})
+			if e != nil {
+				break
+			}
+			nt = int32(sampler.Argmax(bl))
+		}
+		fmt.Printf("  [diag] greedy decode chain (DecodeBatched+argmax): %v\n", btoks)
+		eng.Reset()
+		eng.Prefill(pt) // re-establish state for the batched checks below
+	}
 	nLayers := eng.NumLayers()
 	nKeep := eng.NTokens() // KV state to restore to before each batched call
+
+	// Direct single-token Decode vs DecodeBatched on the SAME token from the SAME
+	// post-prefill state. Both compute one token's logits; a divergence means the
+	// single-token decode_layer disagrees with the batched decode_batched_forward
+	// (the 31B pad-degeneration: Decode→pad while DecodeBatched→real token).
+	{
+		tt := int32(sampler.Argmax(pl)) // the first generated token
+		ldRaw, _ := eng.Decode(tt)
+		ld := append([]float32(nil), ldRaw...) // COPY: Decode/DecodeBatched share logitsBuf
+		eng.Rewind(nKeep)
+		lbRaw, _ := eng.DecodeBatched([]int32{tt})
+		lb := append([]float32(nil), lbRaw...)
+		eng.Rewind(nKeep)
+		var md float64
+		for i := range ld {
+			if d := math.Abs(float64(ld[i] - lb[i])); d > md {
+				md = d
+			}
+		}
+		top3 := func(v []float32) string {
+			a := sampler.Argmax(v)
+			return fmt.Sprintf("argmax=%d (%.3f); val[0]=%.3f", a, v[a], v[0])
+		}
+		fmt.Printf("  [diag] Decode      : %s\n", top3(ld))
+		fmt.Printf("  [diag] DecodeBatched: %s\n", top3(lb))
+		fmt.Printf("  [diag] max_abs_err(Decode,Batched)=%.6g\n", md)
+	}
 
 	// Isolate the row>0 interaction: row 0 of DecodeBatched MUST NOT depend on K. Compare
 	// row 0 of a K=1 forward against row 0 of a K=2 forward from the SAME post-prefill state.
