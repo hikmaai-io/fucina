@@ -54,9 +54,28 @@ except Exception:  # no scipy; use a rational approximation of probit
     _probit = sqrt(2.0) * _erfinv(2 * _q - 1)
 LEVELS_NF2 = (_probit / _probit[-1]).astype(np.float32)  # normalize outer to 1
 
+# NF3: 8 symmetric non-zero normal-float levels (3-bit), same construction as NF2
+# with half-quantile offsets {1/16,3/16,...,15/16}; normalized so |outer|=1. Used by
+# the LEAN recipe to protect embed + attn_k/v. (scale magnitude cancels in normalize.)
+def _probit_fn(q):
+    q = np.asarray(q, dtype=np.float64)
+    try:
+        from scipy.special import erfinv as _ef
+        return sqrt(2.0) * _ef(2 * q - 1)
+    except Exception:
+        a = 0.147
+        y = 2 * q - 1
+        ln = np.log(1 - y * y)
+        t = 2 / (np.pi * a) + ln / 2
+        return np.sign(y) * np.sqrt(np.sqrt(t * t - ln / a) - t) * sqrt(2.0)
+_q3 = (2 * np.arange(8, dtype=np.float64) + 1) / 16.0
+_probit3 = _probit_fn(_q3)
+LEVELS_NF3 = (_probit3 / _probit3[-1]).astype(np.float32)
+
 VARIANTS = {
     "e1m0": LEVELS_E1M0,
     "nf2": LEVELS_NF2,
+    "nf3": LEVELS_NF3,
 }
 
 
