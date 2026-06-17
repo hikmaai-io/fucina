@@ -10,9 +10,12 @@ func printUsage() {
 Usage:
   fucina -m model.gguf [options]                  # Server mode (default)
   fucina -m model.gguf -p "Hello" -n 100          # One-shot prompt
+  fucina -m ./gemma-4-12B-it-NVFP4 -p "Hi" -n 64  # NVFP4 safetensors checkpoint (dir)
 
 Model options:
-  -m, --model FILE           Path to GGUF model file (Q4_0-QAT or Q8_0; auto-detected)
+  -m, --model PATH           GGUF file, or an NVFP4 safetensors checkpoint (a directory,
+                             an .index.json, or a single .safetensors). Auto-detected
+                             from the file header (Q4_0/Q8_0/NVFP4).
   -dm, --diffusion-model FILE  DiffusionGemma GGUF; like -m but also enables the NVFP4 MoE
                              experts (CUTLASS grouped FP4 tensor cores, ~1.9x denoise)
   --fp4-moe                  Enable DiffusionGemma NVFP4 MoE experts (use with -m)

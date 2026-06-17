@@ -313,6 +313,29 @@ hf download unsloth/diffusiongemma-26B-A4B-it-GGUF \
 > fucina finds it automatically when `-m` is omitted. The reported model id is derived from the
 > GGUF filename.
 
+### Native NVFP4 (safetensors)
+
+fucina also runs a **natively NVFP4-quantized** Gemma 4 loaded straight from a HuggingFace
+safetensors checkpoint (e.g. `RedHatAI/gemma-4-12B-it-NVFP4`) — a single FP4 weight store feeding
+both the cuBLASLt block-scaled prefill and a fused FP4 decode GEMV, with the checkpoint's own
+`tokenizer.json` read natively (no `--tokenizer`). Point `-m` at the checkpoint directory:
+
+```bash
+./fucina -m /path/to/gemma-4-12B-it-NVFP4 -p "Explain photosynthesis." -n 128
+```
+
+Both compressed-tensors (`RedHatAI/*`) and ModelOpt (`nvidia/*-FP4`) naming are auto-detected. See
+[docs/nvfp4-safetensors.md](docs/nvfp4-safetensors.md) for the schema, architecture, performance,
+and limits.
+
+> [!TIP]
+> **Speculative decoding with NVFP4.** The MTP draft head (`--assistant`) accepts NVFP4's tokens at
+> a lower rate (~42%) than the original model (~89%): the assistant is matched to the original
+> weights, not the NVFP4 checkpoint. For NVFP4, **prompt-lookup speculation** (model-agnostic,
+> enabled by default) is the recommended speculative path. MTP still works, but the throughput gain
+> is smaller (~28 tok/s vs ~57 with Q4_0+MTP). See
+> [docs/nvfp4-safetensors.md](docs/nvfp4-safetensors.md) for details.
+
 ---
 
 ## 🎯 Speculative decoding (MTP)
