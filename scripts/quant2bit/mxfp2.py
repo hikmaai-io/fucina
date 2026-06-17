@@ -158,22 +158,31 @@ def quantize_mse(w, variant, n_scales=24):
     # candidate multipliers on the base scale (covers shrinking the scale, which
     # lowers MSE for non-uniform/gaussian-ish weights)
     mults = np.linspace(0.45, 1.10, n_scales).astype(np.float32)
-    best_mse = np.full(nb, np.inf, dtype=np.float32)
-    best_scale = np.empty(nb, dtype=np.float32)
     best_idx = np.zeros((nb, BLOCK), dtype=np.uint8)
-    for m in mults:
-        scale = quantize_e4m3(base * m)
-        scale = np.where(scale <= 0, E4M3_MIN_POS, scale).astype(np.float32)
-        lvl_real = levels[None, :] * scale[:, None]
-        diff = wb[:, :, None] - lvl_real[:, None, :]
-        ad = np.abs(diff)
-        idx = np.argmin(ad, axis=2).astype(np.uint8)
-        rec = levels[idx] * scale[:, None]
-        mse = np.mean((rec - wb) ** 2, axis=1)
-        upd = mse < best_mse
-        best_mse = np.where(upd, mse, best_mse)
-        best_scale = np.where(upd, scale, best_scale)
-        best_idx[upd] = idx[upd]
+    best_scale = np.empty(nb, dtype=np.float32)
+    # chunk over blocks to bound peak memory (the [chunk,16,4] broadcast)
+    CH = 1 << 20  # blocks per chunk -> ~256 MB peak per candidate
+    for s in range(0, nb, CH):
+        e = min(s + CH, nb)
+        wc = wb[s:e]                       # [c,BLOCK]
+        bc = base[s:e]
+        best_mse = np.full(e - s, np.inf, dtype=np.float32)
+        bidx = np.zeros((e - s, BLOCK), dtype=np.uint8)
+        bscl = np.empty(e - s, dtype=np.float32)
+        for m in mults:
+            scale = quantize_e4m3(bc * m)
+            scale = np.where(scale <= 0, E4M3_MIN_POS, scale).astype(np.float32)
+            lvl_real = levels[None, :] * scale[:, None]      # [c,4]
+            diff = wc[:, :, None] - lvl_real[:, None, :]     # [c,BLOCK,4]
+            idx = np.argmin(np.abs(diff), axis=2).astype(np.uint8)
+            rec = levels[idx] * scale[:, None]
+            mse = np.mean((rec - wc) ** 2, axis=1)
+            upd = mse < best_mse
+            best_mse = np.where(upd, mse, best_mse)
+            bscl = np.where(upd, scale, bscl)
+            bidx[upd] = idx[upd]
+        best_idx[s:e] = bidx
+        best_scale[s:e] = bscl
     return best_idx, best_scale.astype(np.float32), n
 
 
