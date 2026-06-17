@@ -3485,7 +3485,7 @@ __global__ void fp8gate_proxy_hidden_kernel(
 // proxy hidden states, and return the top-1 argmax match count. Caller keeps FP8 only on a full match.
 static int fp8_head_accuracy_gate(gemma4_engine_t *eng, int nsamp, double *out_worst_l2)
 {
-    const int H = GEMMA4_HIDDEN_SIZE, V = GEMMA4_VOCAB_SIZE;
+    const int H = eng->cfg.hidden_size, V = GEMMA4_VOCAB_SIZE;
     float   *dX = NULL, *dYbf = NULL, *dYfp = NULL; int32_t *dTok = NULL;
     int     *dArgBf = NULL, *dArgFp = NULL;
     int match = -1; if (out_worst_l2) *out_worst_l2 = 0;
@@ -4190,7 +4190,7 @@ gemma4_engine_t* gemma4_engine_create(
     // the √hidden scale is applied post-lookup, identical to the GGUF path).
     {
         const st::Tensor *te = nvfp4_model.find(nvfp4_layout.embed_key);
-        size_t want = (size_t)GEMMA4_VOCAB_SIZE * GEMMA4_HIDDEN_SIZE * sizeof(__nv_bfloat16);
+        size_t want = (size_t)GEMMA4_VOCAB_SIZE * eng->cfg.hidden_size * sizeof(__nv_bfloat16);
         if (!te || te->nbytes != want) {
             fprintf(stderr, "fucina: NVFP4 embed '%s' missing or wrong size (%zu vs %zu)\n",
                     nvfp4_layout.embed_key.c_str(), te ? te->nbytes : 0, want);
@@ -4206,7 +4206,7 @@ gemma4_engine_t* gemma4_engine_create(
     // (C) LM head: explicit lm_head.weight (untied) → its own buffer; else alias d_embed_bf16.
     if (!nvfp4_layout.lmhead_key.empty()) {
         const st::Tensor *th = nvfp4_model.find(nvfp4_layout.lmhead_key);
-        size_t want = (size_t)GEMMA4_VOCAB_SIZE * GEMMA4_HIDDEN_SIZE * sizeof(__nv_bfloat16);
+        size_t want = (size_t)GEMMA4_VOCAB_SIZE * eng->cfg.hidden_size * sizeof(__nv_bfloat16);
         if (!th || th->nbytes != want) {
             fprintf(stderr, "fucina: NVFP4 lm_head '%s' missing or wrong size\n", nvfp4_layout.lmhead_key.c_str());
             gemma4_engine_destroy(eng); return NULL;
@@ -4225,7 +4225,7 @@ gemma4_engine_t* gemma4_engine_create(
         // OFF by default; the BF16 head is correctness-critical and stays resident. The gate below is
         // kept for experimentation but never auto-enables.
         if (getenv("FUCINA_FP8_HEAD")) {
-            const int H = GEMMA4_HIDDEN_SIZE, V = GEMMA4_VOCAB_SIZE;
+            const int H = eng->cfg.hidden_size, V = GEMMA4_VOCAB_SIZE;
             uint8_t *dq = NULL; float *dsc = NULL;
             if (cudaMalloc(&dq,(size_t)V*H) == cudaSuccess &&
                 cudaMalloc(&dsc,(size_t)V*sizeof(float)) == cudaSuccess) {
@@ -4484,8 +4484,8 @@ gemma4_engine_t* gemma4_engine_create(
 
     if (getenv("FUCINA_PAGED_KV")) {
         const int BT = PAGED_KV_BLOCK_TOKENS;
-        const int slid_elems = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;          // 8×256 = 2048
-        const int glob_elems = GEMMA4_GLOBAL_KV_HEADS * GEMMA4_GLOBAL_HEAD_DIM; // 1×512 = 512
+        const int slid_elems = eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM;          // 8×256 (12B) / 16×256 (31B)
+        const int glob_elems = eng->cfg.n_kv_global  * GEMMA4_GLOBAL_HEAD_DIM;   // 1×512 (12B) / 4×512 (31B)
         // Per-block bytes for K (== V) across all layers of the class.
         size_t slid_block_k = (size_t)eng->cfg.n_layers    * BT * slid_elems * sizeof(kv_t);
         size_t glob_block_k = (size_t)eng->n_layers_global * BT * glob_elems * sizeof(kv_t);
@@ -5550,20 +5550,22 @@ static int proj_desc(const gemma4_engine_t *eng, int layer, int p,
                      uint64_t *offset, int *in_dim, int *out_dim)
 {
     layer_type_t lt = eng->layer_types[layer];
+    int H   = eng->cfg.hidden_size;
+    int I   = eng->cfg.intermediate;
     int hd  = (lt == LAYER_SLIDING) ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
-    int nkv = (lt == LAYER_SLIDING) ? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
-    int oq  = GEMMA4_HEADS * hd;
+    int nkv = (lt == LAYER_SLIDING) ? eng->cfg.n_kv_sliding : eng->cfg.n_kv_global;
+    int oq  = eng->cfg.n_heads * hd;
     int okv = nkv * hd;
     const __typeof__(eng->tensors.layers[0]) *L = &eng->tensors.layers[layer];
     switch (p) {
-        case PJ_Q:    *offset = L->attn_q;      *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = oq;  return 1;
-        case PJ_K:    *offset = L->attn_k;      *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = okv; return 1;
+        case PJ_Q:    *offset = L->attn_q;      *in_dim = H; *out_dim = oq;  return 1;
+        case PJ_K:    *offset = L->attn_k;      *in_dim = H; *out_dim = okv; return 1;
         case PJ_V:    if (lt != LAYER_SLIDING) return 0;  // global: V = K, no weight
-                      *offset = L->attn_v;      *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = okv; return 1;
-        case PJ_O:    *offset = L->attn_output; *in_dim = oq;  *out_dim = GEMMA4_HIDDEN_SIZE; return 1;
-        case PJ_GATE: *offset = L->ffn_gate;    *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = GEMMA4_INTERMEDIATE; return 1;
-        case PJ_UP:   *offset = L->ffn_up;      *in_dim = GEMMA4_HIDDEN_SIZE; *out_dim = GEMMA4_INTERMEDIATE; return 1;
-        case PJ_DOWN: *offset = L->ffn_down;    *in_dim = GEMMA4_INTERMEDIATE; *out_dim = GEMMA4_HIDDEN_SIZE; return 1;
+                      *offset = L->attn_v;      *in_dim = H; *out_dim = okv; return 1;
+        case PJ_O:    *offset = L->attn_output; *in_dim = oq;  *out_dim = H; return 1;
+        case PJ_GATE: *offset = L->ffn_gate;    *in_dim = H; *out_dim = I; return 1;
+        case PJ_UP:   *offset = L->ffn_up;      *in_dim = H; *out_dim = I; return 1;
+        case PJ_DOWN: *offset = L->ffn_down;    *in_dim = I; *out_dim = H; return 1;
     }
     return 0;
 }
@@ -5847,7 +5849,7 @@ static int ensure_fp4_act(gemma4_engine_t *eng, int N) {
     if (eng->d_fp4_actsc)  cudaFree(eng->d_fp4_actsc);
     if (eng->d_fp4_actlin) cudaFree(eng->d_fp4_actlin);
     eng->d_fp4_act=nullptr; eng->d_fp4_actsc=nullptr; eng->d_fp4_actlin=nullptr;
-    size_t I = GEMMA4_INTERMEDIATE;
+    size_t I = eng->cfg.intermediate;
     size_t packed=(size_t)N*(I/2);
     size_t swsz=(size_t)nvfp4_pad(N,128)*nvfp4_pad(I/NVFP4_BLK,4);
     size_t linsz=(size_t)N*(I/NVFP4_BLK);
@@ -6038,7 +6040,7 @@ static int ensure_mmq_scratch(gemma4_engine_t *eng)
 {
     if (eng->mmq_ready) return 0;
     const size_t Nmax = GEMMA4_MMQ_MAX_N;
-    const size_t I    = GEMMA4_INTERMEDIATE;
+    const size_t I    = eng->cfg.intermediate;
     int ok = 1;
     if (cudaMalloc(&eng->d_pf_qx, Nmax * I * sizeof(int8_t))     != cudaSuccess) ok = 0;
     if (cudaMalloc(&eng->d_pf_dx, Nmax * (I/32) * sizeof(float)) != cudaSuccess) ok = 0;
@@ -6137,8 +6139,8 @@ int gemma4_engine_prefill_batched(
 
     cudaStream_t stream = eng->stream;
     const int N   = n_tokens;
-    const int H   = GEMMA4_HIDDEN_SIZE;
-    const int I   = GEMMA4_INTERMEDIATE;
+    const int H   = eng->cfg.hidden_size;
+    const int I   = eng->cfg.intermediate;
     const int HD2 = 32 * sizeof(float);
     const int base = 0;
 
@@ -6196,9 +6198,9 @@ int gemma4_engine_prefill_batched(
     }
 
     // ── Scratch (token-major). Sized to the widest dim each can take. ──
-    const int OQ_MAX = GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM; // 8192
-    const int OKV_MAX = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;    // 2048
-    const int HEADS = GEMMA4_HEADS;
+    const int OQ_MAX = eng->cfg.n_heads * GEMMA4_GLOBAL_HEAD_DIM; // 8192 (12B) / 16384 (31B)
+    const int OKV_MAX = eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM;  // 2048 (12B) / 4096 (31B)
+    const int HEADS = eng->cfg.n_heads;
     float *d_x=0,*d_norm=0,*d_q=0,*d_k=0,*d_v=0,*d_attn=0,*d_gate=0,*d_up=0,*d_scores=0;
     __nv_bfloat16 *d_inb=0,*d_qb=0,*d_kb=0,*d_vb=0,*d_kbx=0,*d_vbx=0,*d_pb=0;
     bool own_bufs = false;
@@ -6280,8 +6282,8 @@ int gemma4_engine_prefill_batched(
     for (int l = 0; l < eng->cfg.n_layers; l++) {
         layer_type_t lt = eng->layer_types[l];
         int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
-        int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
-        int oq  = GEMMA4_HEADS*hd, okv = nkv*hd, kvhd = okv;
+        int nkv = (lt==LAYER_SLIDING)? eng->cfg.n_kv_sliding : eng->cfg.n_kv_global;
+        int oq  = HEADS*hd, okv = nkv*hd, kvhd = okv;
         const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
         const float *w_post_a = eng->d_w_post_attn_norm + (size_t)l*H;
         const float *w_ffn    = eng->d_w_ffn_norm       + (size_t)l*H;
@@ -6306,7 +6308,7 @@ int gemma4_engine_prefill_batched(
 
         // Q,K (and V) projections (one normed input feeds all three)
         gemm_proj(l, PJ_Q, H, oq, d_q);
-        per_head_rms_norm_rows_kernel<<<dim3(GEMMA4_HEADS,N),hd,HD2,stream>>>(d_q, w_qn, GEMMA4_HEADS, hd, N, GEMMA4_RMS_EPS);
+        per_head_rms_norm_rows_kernel<<<dim3(HEADS,N),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, N, GEMMA4_RMS_EPS);
         gemm_proj(l, PJ_K, H, okv, d_k);
         if (lt == LAYER_SLIDING) {
             gemm_proj(l, PJ_V, H, okv, d_v);
@@ -6320,9 +6322,9 @@ int gemma4_engine_prefill_batched(
 
         // RoPE Q,K
         if (lt == LAYER_SLIDING)
-            rope_rows_kernel<<<dim3(GEMMA4_HEADS,N),hd/2,0,stream>>>(d_q, d_k, base, GEMMA4_HEADS, nkv, hd, N, 10000.0f, NULL);
+            rope_rows_kernel<<<dim3(HEADS,N),hd/2,0,stream>>>(d_q, d_k, base, HEADS, nkv, hd, N, 10000.0f, NULL);
         else
-            rope_rows_kernel<<<dim3(GEMMA4_HEADS,N),hd/2,0,stream>>>(d_q, d_k, base, GEMMA4_HEADS, nkv, hd, N, 1000000.0f, eng->d_rope_freqs);
+            rope_rows_kernel<<<dim3(HEADS,N),hd/2,0,stream>>>(d_q, d_k, base, HEADS, nkv, hd, N, 1000000.0f, eng->d_rope_freqs);
 
         // Attention → d_attn [N][oq], batched over all heads via tensor-core GEMMs:
         // expand K/V to all query heads (GQA), S=Q·Kᵀ (col-major [HEADS][N×N]) →
@@ -6332,8 +6334,8 @@ int gemma4_engine_prefill_batched(
         f32_to_bf16_kernel<<<grid1d((size_t)N*okv),256,0,stream>>>(d_kb, d_k, (size_t)N*okv);
         f32_to_bf16_kernel<<<grid1d((size_t)N*okv),256,0,stream>>>(d_vb, d_v, (size_t)N*okv);
         {
-            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),GEMMA4_HEADS,N),256,0,stream>>>(d_kbx, d_kb, N, GEMMA4_HEADS, nkv, hd);
-            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),GEMMA4_HEADS,N),256,0,stream>>>(d_vbx, d_vb, N, GEMMA4_HEADS, nkv, hd);
+            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),HEADS,N),256,0,stream>>>(d_kbx, d_kb, N, HEADS, nkv, hd);
+            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),HEADS,N),256,0,stream>>>(d_vbx, d_vb, N, HEADS, nkv, hd);
             const float a1=1.0f, b0=0.0f;
             long long sNN = (long long)N * N;
             // S[h] = Q[h]ᵀ·K[h]  (m=N,n=N,k=hd; A,B col-major [hd×N] ld=oq stride=hd)
@@ -6341,14 +6343,14 @@ int gemma4_engine_prefill_batched(
                 &a1, d_qb,  CUDA_R_16BF, oq, (long long)hd,
                      d_kbx, CUDA_R_16BF, oq, (long long)hd,
                 &b0, d_scores, CUDA_R_32F, N, sNN,
-                GEMMA4_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            attn_softmax_batched_kernel<<<dim3(N,GEMMA4_HEADS),256,HD2,stream>>>(d_scores, d_pb, N, window);
+                HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            attn_softmax_batched_kernel<<<dim3(N,HEADS),256,HD2,stream>>>(d_scores, d_pb, N, window);
             // O[h] = V[h]·P[h]ᵀ  (m=hd,n=N,k=N → C col-major [hd×N] ld=oq stride=hd)
             cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_N, CUBLAS_OP_T, hd, N, N,
                 &a1, d_vbx, CUDA_R_16BF, oq, (long long)hd,
                      d_pb,  CUDA_R_16BF, N,  sNN,
                 &b0, d_attn, CUDA_R_32F, oq, (long long)hd,
-                GEMMA4_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         }
 
         // Write final K/V into the persistent cache for decode continuation.
@@ -6479,10 +6481,10 @@ int gemma4_engine_prefill_flash(
     if (ensure_fp_scratch(eng) != 0) return -2;           // attention tile scratch
 
     cudaStream_t stream = eng->stream;
-    const int H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE, HD2 = 32*sizeof(float);
-    const int HEADS = GEMMA4_HEADS, N = n_tokens;
+    const int H = eng->cfg.hidden_size, I = eng->cfg.intermediate, HD2 = 32*sizeof(float);
+    const int HEADS = eng->cfg.n_heads, N = n_tokens;
     const int C = (N < GEMMA4_FP_CHUNK) ? N : GEMMA4_FP_CHUNK;  // chunk (amortizes weight re-reads)
-    const int OQ_MAX = HEADS*GEMMA4_GLOBAL_HEAD_DIM, OKV_MAX = GEMMA4_KV_HEADS*GEMMA4_HEAD_DIM;
+    const int OQ_MAX = HEADS*GEMMA4_GLOBAL_HEAD_DIM, OKV_MAX = eng->cfg.n_kv_sliding*GEMMA4_HEAD_DIM;
 
     // Tiled-MMQ fast path: a Q4_0 suffix whose chunk fits MMQ_MAX_N (the agentic case —
     // re-rendered turn + tool result, ~hundreds of tokens) reads native Q4_0 weights once
@@ -6555,7 +6557,7 @@ int gemma4_engine_prefill_flash(
             if (eng->abort_req) { aborted = 1; break; }
             layer_type_t lt = eng->layer_types[l];
             int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
-            int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+            int nkv = (lt==LAYER_SLIDING)? eng->cfg.n_kv_sliding : eng->cfg.n_kv_global;
             int oq  = HEADS*hd, okv = nkv*hd, kvhd = okv;
             const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
             const float *w_post_a = eng->d_w_post_attn_norm + (size_t)l*H;
@@ -6683,6 +6685,9 @@ int gemma4_engine_prefill_flash(
                     hcap = eng->sliding_kv_capacity;
                 } else {
                     int slot = eng->global_slot[l];
+                    // NOTE: 31B global GQA (n_kv_global=4) not yet wired in the FLASH prefill
+                    // global-tile path; this stride is the 12B (n_kv_global=1) layout. Fresh
+                    // prompts ≤4096 tok use prefill_batched; flash is the >4096/suffix path.
                     size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
                     hk = eng->d_global_k + (size_t)slot*stride;
                     hv = eng->d_global_v + (size_t)slot*stride;
@@ -6774,7 +6779,7 @@ int gemma4_engine_prefill_flash(
         // drafting starts immediately after a suffix prefill.
         if (eng->mtp.loaded) {
             cudaMemcpyAsync(eng->d_mtp_h, eng->d_norm,
-                            GEMMA4_HIDDEN_SIZE * sizeof(float),
+                            H * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);
             eng->mtp_h_valid = 1;
         }
@@ -6864,8 +6869,8 @@ int gemma4_engine_prefill(
     // prompt token — exactly the recurrent h the MTP drafter pairs with the first
     // sampled token, so drafting works from the very first generated token.
     if (eng->mtp.loaded && lastK > 0) {
-        cudaMemcpyAsync(eng->d_mtp_h, eng->d_sb[2] + (size_t)(lastK - 1) * GEMMA4_HIDDEN_SIZE,
-                        GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, eng->stream);
+        cudaMemcpyAsync(eng->d_mtp_h, eng->d_sb[2] + (size_t)(lastK - 1) * eng->cfg.hidden_size,
+                        eng->cfg.hidden_size * sizeof(float), cudaMemcpyDeviceToDevice, eng->stream);
         eng->mtp_h_valid = 1;
     }
 
@@ -6923,19 +6928,20 @@ static void decode_timing_lap(gemma4_engine_t *eng)
 // exactly (decode_layer dispatches the device-pos kernel variants when d_pos != NULL).
 static void decode_forward_device(gemma4_engine_t *eng, cudaStream_t stream)
 {
+    const int H = eng->cfg.hidden_size;
     embed_w(eng, eng->d_x, weight_fp8(eng, eng->tensors.token_embd),
-            eng->d_dectok, 1, GEMMA4_HIDDEN_SIZE, stream);
-    float sc = sqrtf((float)GEMMA4_HIDDEN_SIZE);
-    scale_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
-        eng->d_x, GEMMA4_HIDDEN_SIZE, sc);
+            eng->d_dectok, 1, H, stream);
+    float sc = sqrtf((float)H);
+    scale_kernel<<<(H+255)/256, 256, 0, stream>>>(
+        eng->d_x, H, sc);
     for (int l = 0; l < eng->cfg.n_layers; l++)
         decode_layer(eng, l, /*pos=*/0, /*context_len=*/0, stream, eng->d_decpos);
     rms_norm_kernel<<<1, 256, 32*sizeof(float), stream>>>(
-        eng->d_norm, eng->d_x, eng->d_w_out_norm, GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+        eng->d_norm, eng->d_x, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
     if (eng->mtp.loaded)
         cudaMemcpyAsync(eng->d_mtp_h, eng->d_norm,
-                        GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-    logits_head(eng, eng->d_logits, eng->d_norm, GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE, stream);
+                        H * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    logits_head(eng, eng->d_logits, eng->d_norm, H, GEMMA4_VOCAB_SIZE, stream);
     logit_softcap_kernel<<<(GEMMA4_VOCAB_SIZE + 255) / 256, 256, 0, stream>>>(
         eng->d_logits, GEMMA4_SOFTCAP, GEMMA4_VOCAB_SIZE);
     if (eng->n_suppress > 0)
@@ -7017,22 +7023,23 @@ int gemma4_engine_decode(
     }
 
     if (!used_graph) {
+        const int H = eng->cfg.hidden_size;
         // Embedding (format-aware: FP8 or Q8_0 table)
         embed_w(eng,
             eng->d_x,
             weight_fp8(eng, eng->tensors.token_embd),
-            &token, 1, GEMMA4_HIDDEN_SIZE, stream);
+            &token, 1, H, stream);
 
         // Gemma scales embeddings by √hidden_size
-        { float sc = sqrtf((float)GEMMA4_HIDDEN_SIZE);
-          scale_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
-                eng->d_x, GEMMA4_HIDDEN_SIZE, sc); }
+        { float sc = sqrtf((float)H);
+          scale_kernel<<<(H+255)/256, 256, 0, stream>>>(
+                eng->d_x, H, sc); }
 
         // Paged KV: ensure the active sequence's block tables cover `pos` and
         // the device block ids are fresh BEFORE any layer mirrors its KV write.
         if (eng->paged_enabled) paged_seq_sync(eng, pos);
 
-        // Run all 48 layers
+        // Run all layers
         for (int l = 0; l < eng->cfg.n_layers; l++) {
             decode_layer(eng, l, pos, eng->cur.n_tokens + 1, stream);
         }
@@ -7040,17 +7047,17 @@ int gemma4_engine_decode(
         // Output norm + projection + softcap
         rms_norm_kernel<<<1, 256, 32*sizeof(float), stream>>>(
             eng->d_norm, eng->d_x, eng->d_w_out_norm,
-            GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+            H, GEMMA4_RMS_EPS);
 
         // MTP recurrent h: the LM-head input (post-output-norm hidden) is exactly the
         // h the assistant drafter pairs with the token sampled from these logits.
         if (eng->mtp.loaded) {
             cudaMemcpyAsync(eng->d_mtp_h, eng->d_norm,
-                            GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+                            H * sizeof(float), cudaMemcpyDeviceToDevice, stream);
         }
 
         int vocab = GEMMA4_VOCAB_SIZE;
-        logits_head(eng, eng->d_logits, eng->d_norm, GEMMA4_HIDDEN_SIZE, vocab, stream);
+        logits_head(eng, eng->d_logits, eng->d_norm, H, vocab, stream);
 
         logit_softcap_kernel<<<(vocab + 255) / 256, 256, 0, stream>>>(
             eng->d_logits, GEMMA4_SOFTCAP, vocab);
@@ -7323,9 +7330,9 @@ static int ensure_spec_scratch(gemma4_engine_t *eng)
 {
     if (eng->sb_ready) return 0;
     const size_t M = GEMMA4_SPEC_MAX;
-    const size_t H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE, V = GEMMA4_VOCAB_SIZE;
-    const size_t OQ = (size_t)GEMMA4_HEADS*GEMMA4_GLOBAL_HEAD_DIM;
-    const size_t OKV = (size_t)GEMMA4_KV_HEADS*GEMMA4_HEAD_DIM;
+    const size_t H = eng->cfg.hidden_size, I = eng->cfg.intermediate, V = GEMMA4_VOCAB_SIZE;
+    const size_t OQ = (size_t)eng->cfg.n_heads*GEMMA4_GLOBAL_HEAD_DIM;
+    const size_t OKV = (size_t)eng->cfg.n_kv_sliding*GEMMA4_HEAD_DIM;
     size_t elems[12] = { M, M*H, M*H, M*I, M*OQ, M*OKV, M*OKV, M*OQ, M*H, M*I, M*I, M*V };
     for (int i = 0; i < 12; i++) {
         if (cudaMalloc(&eng->d_sb[i], elems[i]*sizeof(float)) != cudaSuccess) {
@@ -7799,7 +7806,7 @@ static int ensure_ms_scratch(gemma4_engine_t *eng) {
 static void decode_multiseq_body(
     gemma4_engine_t *eng, int B, int max_splits, int want_argmax, cudaStream_t stream)
 {
-    const int H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE, HEADS = GEMMA4_HEADS;
+    const int H = eng->cfg.hidden_size, I = eng->cfg.intermediate, HEADS = eng->cfg.n_heads;
     const int HD2 = 32 * sizeof(float);
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
 
@@ -9673,9 +9680,9 @@ int gemma4_engine_rewind(gemma4_engine_t *eng, int n_keep) {
 static void kv_seq_pitches(const gemma4_engine_t *eng,
                            size_t *srow, size_t *spitch,
                            size_t *grow, size_t *gpitch) {
-    *srow   = (size_t)GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM * sizeof(kv_t);
+    *srow   = (size_t)eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM * sizeof(kv_t);
     *spitch = (size_t)eng->sliding_kv_capacity * (*srow);
-    *grow   = (size_t)GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
+    *grow   = (size_t)eng->cfg.n_kv_global * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
     *gpitch = (size_t)eng->global_kv_capacity * (*grow);
 }
 
@@ -9829,10 +9836,10 @@ int gemma4_engine_kv_restore(gemma4_engine_t *eng, const void *buf, int n_tokens
 // ─── Persistent prefill scratch allocator ───────────────────────────
 static int alloc_prefill_scratch(gemma4_engine_t *eng) {
     if (eng->pf_scratch_ready) return 0;
-    const int NC = 4096, H = GEMMA4_HIDDEN_SIZE, I = GEMMA4_INTERMEDIATE;
-    const int OQ = GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM;
-    const int OK = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
-    const int HE = GEMMA4_HEADS;
+    const int NC = 4096, H = eng->cfg.hidden_size, I = eng->cfg.intermediate;
+    const int OQ = eng->cfg.n_heads * GEMMA4_GLOBAL_HEAD_DIM;
+    const int OK = eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM;
+    const int HE = eng->cfg.n_heads;
     cudaError_t ok = cudaSuccess;
     #define A(p,sz) if(ok==cudaSuccess) ok=cudaMalloc(&(p),(size_t)(sz))
     A(eng->d_pf_x, (size_t)NC*H*sizeof(float));
@@ -9866,8 +9873,8 @@ static int alloc_prefill_scratch(gemma4_engine_t *eng) {
 static int ensure_fp_scratch(gemma4_engine_t *eng) {
     if (eng->fp_scratch_ready) return 0;
     const size_t C  = GEMMA4_FP_CHUNK, T = GEMMA4_FP_TILE_K;
-    const size_t OQ = (size_t)GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM;
-    const size_t HC = (size_t)GEMMA4_HEADS * C;
+    const size_t OQ = (size_t)eng->cfg.n_heads * GEMMA4_GLOBAL_HEAD_DIM;
+    const size_t HC = (size_t)eng->cfg.n_heads * C;
     cudaError_t ok = cudaSuccess;
     #define A(p,sz) if(ok==cudaSuccess) ok=cudaMalloc(&(p),(size_t)(sz))
     A(eng->d_fp_qb,  C*OQ*sizeof(__nv_bfloat16));
