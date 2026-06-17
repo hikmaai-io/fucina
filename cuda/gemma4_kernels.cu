@@ -9,6 +9,7 @@
 //   Output: logit softcapping at 30.0
 
 #include "gemma4_kernels.cuh"
+#include "gemma4_detect.h"   // M0: runtime arch auto-detection (gemma4_detect_from_gguf/_config_json)
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>         // __nv_fp8_storage_t, conversion functions
@@ -2679,7 +2680,7 @@ struct gemma4_engine {
             uint64_t ffn_norm;          // [hidden_size] pre-FFN RMSNorm
             uint64_t post_ffn_norm;     // [hidden_size] post-FFN sandwich norm
             uint64_t layer_out_scale;   // [1]  scalar output multiplier
-        } layers[GEMMA4_MAX_LAYERS];
+        } layers[GEMMA4_CAP_LAYERS];
 
         uint64_t output_norm;        // [hidden_size] (FP32)
         uint64_t output_weight;      // [hidden_size × vocab_size]
@@ -2692,18 +2693,18 @@ struct gemma4_engine {
     // Model parameters
     tensor_format_t format;
     uint32_t        context_size;
-    layer_type_t    layer_types[GEMMA4_MAX_LAYERS]; // 0=sliding, 1=global
+    layer_type_t    layer_types[GEMMA4_CAP_LAYERS]; // 0=sliding, 1=global
     int             n_layers_sliding;
     int             n_layers_global;
 
     // Layer index helpers: which layers are global
-    int             global_layer_indices[GEMMA4_MAX_LAYERS];
+    int             global_layer_indices[GEMMA4_CAP_LAYERS];
     int             n_global;
     // Inverse map: absolute layer id -> contiguous global cache slot
     // (0..n_layers_global-1), or -1 for sliding layers. The global KV cache is
     // allocated for n_layers_global slots only (not all GEMMA4_MAX_LAYERS), so
     // every read/write into d_global_k/v must index by global_slot[layer].
-    int             global_slot[GEMMA4_MAX_LAYERS];
+    int             global_slot[GEMMA4_CAP_LAYERS];
 
     // Device memory
     float  *d_scratch;         // scratch buffer [1M elements]
@@ -2807,13 +2808,13 @@ struct gemma4_engine {
     // swizzled layout) + a per-tensor fp32 global scale. cuBLASLt computes the GEMM ~2.4×
     // faster than the BF16 tensor-core path. Activation quantized per-GEMM into d_fp4_act*.
     cublasLtHandle_t cublaslt;
-    uint8_t *d_fp4_w[GEMMA4_MAX_LAYERS][PJ_COUNT];   // packed [out_dim × in_dim/2]
-    uint8_t *d_fp4_wsc[GEMMA4_MAX_LAYERS][PJ_COUNT]; // swizzled E4M3 [pad(out,128)×pad(in/16,4)]
+    uint8_t *d_fp4_w[GEMMA4_CAP_LAYERS][PJ_COUNT];   // packed [out_dim × in_dim/2]
+    uint8_t *d_fp4_wsc[GEMMA4_CAP_LAYERS][PJ_COUNT]; // swizzled E4M3 [pad(out,128)×pad(in/16,4)]
     // NVFP4 SINGLE-STORE decode (FORMAT_NVFP4): the decode GEMV (nvfp4_gemv.cuh) reads LINEAR
     // E4M3 block scales [out,in/16], but d_fp4_wsc holds the SWIZZLED scales (for cuBLASLt) which
     // the GEMV cannot consume. So retain a per-projection LINEAR-scale copy uploaded straight off
     // disk (~0.75 GB extra; still a net win vs a duplicate Q4_0 store). NULL on non-NVFP4 models.
-    uint8_t *d_fp4_wsc_lin[GEMMA4_MAX_LAYERS][PJ_COUNT]; // linear E4M3 [out_dim × in_dim/16]
+    uint8_t *d_fp4_wsc_lin[GEMMA4_CAP_LAYERS][PJ_COUNT]; // linear E4M3 [out_dim × in_dim/16]
     float   *d_fp4_gsw;        // device [MAX_LAYERS*PJ_COUNT] weight per-tensor global scales
     int      fp4_ready;        // 1 once persistent NVFP4 weights are built
     int      nvfp4_decode_ready; // 1 once NVFP4 store + linear scales + embed + norms are resident
@@ -2852,7 +2853,7 @@ struct gemma4_engine {
     float *d_w_q_norm;          // stride GEMMA4_GLOBAL_HEAD_DIM
     float *d_w_k_norm;          // stride GEMMA4_GLOBAL_HEAD_DIM
     float *d_w_out_norm;        // [GEMMA4_HIDDEN_SIZE]
-    float  h_out_scale[GEMMA4_MAX_LAYERS]; // layer_output_scale scalars (host)
+    float  h_out_scale[GEMMA4_CAP_LAYERS]; // layer_output_scale scalars (host)
 
     // KV cache (device) — FP8 E4M3 (1 byte/elem), see kv_t.
     // Sliding: [MAX_LAYERS][sliding_kv_capacity][8×256] per-position RING; absolute position p
@@ -3002,6 +3003,14 @@ struct gemma4_engine {
     // prefill chunks. Cleared at every prefill entry. Plain int is fine for a
     // sticky advisory flag (worst case the abort lands one chunk late).
     volatile int abort_req;
+
+    // ─── M0: runtime model configuration ────────────────────────────────
+    // Auto-detected from the checkpoint's own metadata (GGUF kv / safetensors
+    // config.json) at create time. The host alloc / loop / KV-sizing paths read
+    // these fields instead of the GEMMA4_* #defines (which remain the 12B values
+    // and the constant head dims). Static arrays size to GEMMA4_CAP_*; cfg.n_*
+    // give the live counts. See docs/dense-31b-89tok-plan.md (M0).
+    gemma4_model_config_t cfg;
 
     // ─── LoRA adapter support ───────────────────────────────────────────
 };
@@ -3377,6 +3386,27 @@ done:
     return match;
 }
 
+// M0: derive the engine's per-layer attention bookkeeping from the auto-detected
+// gemma4_model_config_t (eng->cfg). Called after cfg is populated (defaults at create top,
+// then overwritten by gemma4_detect_from_gguf / _config_json). Fills layer_types[],
+// global_layer_indices[], global_slot[] and the n_layers_* counts from cfg.is_global[].
+// Keeping this in one place means every cfg source produces an identical engine state.
+static void gemma4_apply_cfg(gemma4_engine_t *eng) {
+    gemma4_model_config_t *c = &eng->cfg;
+    eng->n_global         = 0;
+    eng->n_layers_sliding = 0;
+    for (int i = 0; i < c->n_layers && i < GEMMA4_CAP_LAYERS; i++) {
+        if (c->is_global[i]) {
+            eng->layer_types[i] = LAYER_GLOBAL;
+            eng->global_layer_indices[eng->n_global++] = i;
+        } else {
+            eng->layer_types[i] = LAYER_SLIDING;
+            eng->n_layers_sliding++;
+        }
+    }
+    eng->n_layers_global = eng->n_global;
+}
+
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
     tensor_format_t format,
@@ -3401,18 +3431,33 @@ gemma4_engine_t* gemma4_engine_create(
         return NULL;
     }
 
-    // Default layer types: 5 sliding + 1 global, repeated 8 times
-    for (int i = 0; i < 48; i++) {
-        int pos_in_block = i % 6;
-        if (pos_in_block == 5) {
-            eng->layer_types[i] = LAYER_GLOBAL;
-            eng->global_layer_indices[eng->n_global++] = i;
-        } else {
-            eng->layer_types[i] = LAYER_SLIDING;
-            eng->n_layers_sliding++;
+    // M0: the model architecture is auto-detected from the checkpoint's own metadata
+    // (GGUF kv / safetensors config.json) into eng->cfg below, right after the file is
+    // opened. Seed cfg with the Gemma-4-12B defaults so any read before detection is sane
+    // and the 12B path is behavior-identical even if a checkpoint omits a kv. The derived
+    // per-layer attention arrays (layer_types / global_layer_indices / n_*) are filled from
+    // eng->cfg by gemma4_apply_cfg() once detection runs.
+    {
+        gemma4_model_config_t *c = &eng->cfg;
+        memset(c, 0, sizeof(*c));
+        c->n_layers          = GEMMA4_MAX_LAYERS;     // 48
+        c->hidden_size       = GEMMA4_HIDDEN_SIZE;    // 3840
+        c->intermediate      = GEMMA4_INTERMEDIATE;   // 15360
+        c->n_heads           = GEMMA4_HEADS;          // 16
+        c->n_kv_sliding      = GEMMA4_KV_HEADS;       // 8
+        c->n_kv_global       = GEMMA4_GLOBAL_KV_HEADS;// 1
+        c->vocab_size        = GEMMA4_VOCAB_SIZE;     // 262144
+        c->softcap           = GEMMA4_SOFTCAP;        // 30
+        c->rope_theta_global = 1000000.0f;
+        c->rope_theta_sliding= 10000.0f;
+        c->n_global = 0;
+        for (int i = 0; i < GEMMA4_MAX_LAYERS; i++) {
+            int is_global = ((i % 6) == 5);           // 5 sliding + 1 global
+            c->is_global[i] = (uint8_t)is_global;
+            if (is_global) c->n_global++;
         }
     }
-    eng->n_layers_global = eng->n_global;
+    gemma4_apply_cfg(eng);   // derive layer_types / global_layer_indices / n_* from eng->cfg
 
     // CUDA setup
     cudaSetDevice(device_id);
@@ -3529,19 +3574,40 @@ gemma4_engine_t* gemma4_engine_create(
             gemma4_engine_destroy(eng);
             return NULL;
         }
-        // Cross-check the architecture against the hardcoded Gemma-4-12B constants so a wrong
-        // checkpoint fails loudly instead of producing garbage. (Dims are validated per-tensor
-        // during residency; here we only assert the layer count, which sizes every loop.)
-        if (nvfp4_layout.n_layers != GEMMA4_MAX_LAYERS) {
-            fprintf(stderr, "fucina: NVFP4 model has %d layers, expected %d (Gemma-4-12B)\n",
-                    nvfp4_layout.n_layers, GEMMA4_MAX_LAYERS);
-            gemma4_engine_destroy(eng);
-            return NULL;
+        // M0: auto-detect the architecture from the safetensors config.json (the checkpoint's
+        // own metadata) into eng->cfg, then derive the per-layer pattern from it. Replaces the
+        // old hard assertion that the model be exactly 48 layers (12B). config.json carries
+        // num_hidden_layers / hidden_size / intermediate_size / num_attention_heads /
+        // num_key_value_heads / sliding_window_pattern / final_logit_softcapping / rope_theta.
+        {
+            char derr[256] = {0};
+            const std::string &cj = nvfp4_model.config_json();
+            if (cj.empty() ||
+                gemma4_detect_from_config_json(cj.c_str(), &eng->cfg, derr, sizeof(derr)) != 0) {
+                fprintf(stderr, "fucina: NVFP4 config.json arch auto-detect failed: %s "
+                        "(falling back to 12B defaults; %d-layer layout)\n",
+                        cj.empty() ? "config.json missing" : derr, nvfp4_layout.n_layers);
+                // eng->cfg holds the 12B defaults; ensure n_layers tracks the safetensors layout.
+                eng->cfg.n_layers = nvfp4_layout.n_layers;
+            }
+            // The safetensors residency loop is sized by nvfp4_layout.n_layers; keep cfg in sync
+            // so the two agree (config.json num_hidden_layers should equal the tensor layout).
+            if (eng->cfg.n_layers != nvfp4_layout.n_layers) {
+                fprintf(stderr, "fucina: NVFP4 config.json n_layers %d != tensor layout %d; "
+                        "using tensor layout\n", eng->cfg.n_layers, nvfp4_layout.n_layers);
+                eng->cfg.n_layers = nvfp4_layout.n_layers;
+            }
+            if (eng->cfg.n_layers > GEMMA4_CAP_LAYERS) {
+                fprintf(stderr, "fucina: NVFP4 model has %d layers, exceeds capacity %d\n",
+                        eng->cfg.n_layers, GEMMA4_CAP_LAYERS);
+                gemma4_engine_destroy(eng);
+                return NULL;
+            }
+            gemma4_apply_cfg(eng);   // layer_types / global_layer_indices / n_* from cfg
         }
         eng->format = FORMAT_NVFP4;   // override the placeholder hint passed from Go
-        // safetensors carries no GGUF attention-pattern array — keep the DEFAULT 5-sliding/
-        // 1-global cadence computed at create top (verified against the real checkpoint's
-        // config.json layer_types). Release the redundant create-time mmap of the checkpoint.
+        // Release the redundant create-time mmap of the checkpoint (NVFP4 sources weights from
+        // the st::Model below, not the raw mmap).
         if (eng->gguf_data && eng->gguf_data != MAP_FAILED)
             munmap((void *)eng->gguf_data, eng->gguf_size);
         eng->gguf_data = NULL;
@@ -3582,64 +3648,27 @@ gemma4_engine_t* gemma4_engine_create(
     // all of this from the safetensors checkpoint in its own block below; everything past the
     // device-scratch alloc (KV cache, global-slot map, smem opt-in) is format-independent. ───
     if (!is_nvfp4) {
-    // Parse the per-layer attention pattern from GGUF metadata, overriding the
-    // defaults computed above. The real Gemma-4 GGUF exposes this as:
-    //
-    //   gemma4.attention.sliding_window_pattern : bool[block_count]
-    //       true  => sliding-window attention layer
-    //       false => global attention layer
-    //
-    // Older/alternate exports instead carry an i32 array of KV-head counts:
-    //
-    //   gemma4.attention.head_count_kv : i32[block_count]
-    //       value == GEMMA4_GLOBAL_KV_HEADS (1) => global layer
-    //       otherwise                            => sliding layer
-    //
-    // We try the bool pattern first, then fall back to the head-count array.
-    bool pattern_parsed = false;
-    gguf_array_t arr;
-    if (gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
-            "gemma4.attention.sliding_window_pattern", &arr, GGUF_TYPE_ARRAY) == 0
-        && arr.elem_type == GGUF_TYPE_BOOL)
+    // M0: auto-detect the full architecture (layer count, hidden/FFN sizes, head counts,
+    // per-layer sliding/global pattern, softcap, rope thetas) from the GGUF's own kv metadata
+    // into eng->cfg, then derive the engine's per-layer bookkeeping from it. This replaces the
+    // old fixed 5-sliding/1-global default + standalone pattern parse: the same metadata
+    // (gemma4.attention.sliding_window_pattern / head_count_kv) now flows through cfg.is_global[].
+    // On the 12B GGUF this reproduces the previous 48/8-global/16-head geometry exactly.
     {
-        eng->n_layers_sliding = 0;
-        eng->n_global = 0;
-        for (uint64_t i = 0; i < arr.count && i < GEMMA4_MAX_LAYERS; i++) {
-            bool is_sliding = arr.data[i] != 0;
-            if (is_sliding) {
-                eng->layer_types[i] = LAYER_SLIDING;
-                eng->n_layers_sliding++;
-            } else {
-                eng->layer_types[i] = LAYER_GLOBAL;
-                eng->global_layer_indices[eng->n_global++] = (int)i;
-            }
+        char derr[256] = {0};
+        if (gemma4_detect_from_gguf(eng->gguf_data, eng->gguf_size, &eng->cfg,
+                                    derr, sizeof(derr)) != 0) {
+            fprintf(stderr, "fucina: GGUF arch auto-detect failed: %s "
+                            "(falling back to 12B defaults)\n", derr);
+            // eng->cfg already holds the 12B defaults seeded at create top.
+        } else {
+            fprintf(stderr, "fucina: detected Gemma-4 arch: %d layers, hidden %d, FFN %d, "
+                    "%d heads, KV %d sliding/%d global, %d global layers, softcap %.1f\n",
+                    eng->cfg.n_layers, eng->cfg.hidden_size, eng->cfg.intermediate,
+                    eng->cfg.n_heads, eng->cfg.n_kv_sliding, eng->cfg.n_kv_global,
+                    eng->cfg.n_global, eng->cfg.softcap);
         }
-        eng->n_layers_global = eng->n_global;
-        pattern_parsed = true;
-    }
-    if (!pattern_parsed &&
-        gguf_parse_metadata(eng->gguf_data, eng->gguf_size,
-            "gemma4.attention.head_count_kv", &arr, GGUF_TYPE_ARRAY) == 0
-        && (arr.elem_type == GGUF_TYPE_INT32 || arr.elem_type == GGUF_TYPE_UINT32))
-    {
-        eng->n_layers_sliding = 0;
-        eng->n_global = 0;
-        for (uint64_t i = 0; i < arr.count && i < GEMMA4_MAX_LAYERS; i++) {
-            int32_t kv; memcpy(&kv, arr.data + i * 4, 4);
-            if (kv == GEMMA4_GLOBAL_KV_HEADS) {
-                eng->layer_types[i] = LAYER_GLOBAL;
-                eng->global_layer_indices[eng->n_global++] = (int)i;
-            } else {
-                eng->layer_types[i] = LAYER_SLIDING;
-                eng->n_layers_sliding++;
-            }
-        }
-        eng->n_layers_global = eng->n_global;
-        pattern_parsed = true;
-    }
-    if (!pattern_parsed) {
-        fprintf(stderr, "fucina: warning: no attention pattern in GGUF, "
-                        "using default 5-sliding/1-global cadence\n");
+        gemma4_apply_cfg(eng);   // layer_types / global_layer_indices / n_* from cfg.is_global[]
     }
 
     // Parse tensor offsets via gguf_find_tensor_offset.
@@ -3675,9 +3704,9 @@ gemma4_engine_t* gemma4_engine_create(
     // Load embedding (required — also the tied LM head)
     LOAD_TENSOR_REQUIRED("token_embd.weight", token_embd);
 
-    // Load per-layer tensors
+    // Load per-layer tensors (M0: loop over the detected layer count, not the 12B max).
     char tname[128];
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->cfg.n_layers; l++) {
         snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].attn_q);
 
@@ -3764,12 +3793,15 @@ gemma4_engine_t* gemma4_engine_create(
     // Scratch (1M floats = 4 MB)
     cudaMalloc(&eng->d_scratch,    4 * 1024 * 1024);
     cudaMalloc(&eng->d_logits,     GEMMA4_VOCAB_SIZE * sizeof(float));
-    cudaMalloc(&eng->d_x,          GEMMA4_HIDDEN_SIZE * sizeof(float));
-    // d_attn_q/k/v/out must be large enough for BOTH layer types.
-    //   sliding: Q=16×256=4096  KV=8×256=2048
-    //   global:  Q=16×512=8192  KV=1×512=512
-    int max_q    = GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM;          // 8192
-    int max_kv   = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;              // 2048
+    cudaMalloc(&eng->d_x,          eng->cfg.hidden_size * sizeof(float));
+    // d_attn_q/k/v/out must be large enough for BOTH layer types (M0: runtime head counts).
+    //   12B sliding: Q=16×256=4096  KV=8×256=2048 ; global Q=16×512=8192 KV=1×512=512
+    //   31B sliding: Q=32×256=8192  KV=16×256=4096; global Q=32×512=16384 KV=4×512=2048
+    int max_q    = eng->cfg.n_heads * GEMMA4_GLOBAL_HEAD_DIM;
+    int max_kv   = eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM;
+    // global KV (n_kv_global × global_head_dim) can exceed the sliding KV size on some configs;
+    // take the larger so the K/V scratch holds both classes.
+    { int g_kv = eng->cfg.n_kv_global * GEMMA4_GLOBAL_HEAD_DIM; if (g_kv > max_kv) max_kv = g_kv; }
     cudaMalloc(&eng->d_attn_q,     max_q  * sizeof(float));
     cudaMalloc(&eng->d_attn_k,     max_kv * sizeof(float));
     cudaMalloc(&eng->d_attn_v,     max_kv * sizeof(float));
@@ -3781,30 +3813,32 @@ gemma4_engine_t* gemma4_engine_create(
     // (decode_layer, MTP) keep using row-0's slot range unchanged.
     eng->d_fa_acc = NULL; eng->d_fa_m = NULL; eng->d_fa_l = NULL;
     cudaMalloc(&eng->d_fa_acc, (size_t)GEMMA4_SPEC_MAX * GEMMA4_GLOBAL_MAX_SPLITS
-                                * GEMMA4_HEADS * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float));
+                                * eng->cfg.n_heads * GEMMA4_GLOBAL_HEAD_DIM * sizeof(float));
     cudaMalloc(&eng->d_fa_m,   (size_t)GEMMA4_SPEC_MAX * GEMMA4_GLOBAL_MAX_SPLITS
-                                * GEMMA4_HEADS * sizeof(float));
+                                * eng->cfg.n_heads * sizeof(float));
     cudaMalloc(&eng->d_fa_l,   (size_t)GEMMA4_SPEC_MAX * GEMMA4_GLOBAL_MAX_SPLITS
-                                * GEMMA4_HEADS * sizeof(float));
-    cudaMalloc(&eng->d_ffn_out,    GEMMA4_INTERMEDIATE * sizeof(float));
-    cudaMalloc(&eng->d_ffn_gate,   GEMMA4_INTERMEDIATE * sizeof(float));
-    cudaMalloc(&eng->d_ffn_up,     GEMMA4_INTERMEDIATE * sizeof(float));
-    cudaMalloc(&eng->d_norm,       GEMMA4_HIDDEN_SIZE * sizeof(float));
-    cudaMalloc(&eng->d_norm_w,     GEMMA4_HIDDEN_SIZE * sizeof(float));
-    cudaMalloc(&eng->d_residual,   GEMMA4_HIDDEN_SIZE * sizeof(float));
+                                * eng->cfg.n_heads * sizeof(float));
+    cudaMalloc(&eng->d_ffn_out,    eng->cfg.intermediate * sizeof(float));
+    cudaMalloc(&eng->d_ffn_gate,   eng->cfg.intermediate * sizeof(float));
+    cudaMalloc(&eng->d_ffn_up,     eng->cfg.intermediate * sizeof(float));
+    cudaMalloc(&eng->d_norm,       eng->cfg.hidden_size * sizeof(float));
+    cudaMalloc(&eng->d_norm_w,     eng->cfg.hidden_size * sizeof(float));
+    cudaMalloc(&eng->d_residual,   eng->cfg.hidden_size * sizeof(float));
 
     cudaMalloc(&eng->d_head_norm_w, GEMMA4_GLOBAL_HEAD_DIM * sizeof(float));
 
     // dp4a MMVQ activation-quant scratch (widest in_dim = intermediate).
+    // M0: widest projection in_dim is the runtime FFN intermediate.
+    const int q_in = eng->cfg.intermediate;
     eng->d_qx = NULL; eng->d_dx = NULL; eng->d_sx = NULL;
-    cudaMalloc(&eng->d_qx, (size_t)GEMMA4_INTERMEDIATE * sizeof(int8_t));
-    cudaMalloc(&eng->d_dx, (size_t)(GEMMA4_INTERMEDIATE/32) * sizeof(float));
-    cudaMalloc(&eng->d_sx, (size_t)(GEMMA4_INTERMEDIATE/32) * sizeof(int));   // Q4_0 −8 fold
+    cudaMalloc(&eng->d_qx, (size_t)q_in * sizeof(int8_t));
+    cudaMalloc(&eng->d_dx, (size_t)(q_in/32) * sizeof(float));
+    cudaMalloc(&eng->d_sx, (size_t)(q_in/32) * sizeof(int));   // Q4_0 −8 fold
     // Batched (speculative-decode) variant: NK ≤ SPEC_MAX activation vectors at once.
     eng->d_qx_b = NULL; eng->d_dx_b = NULL; eng->d_sx_b = NULL;
-    cudaMalloc(&eng->d_qx_b, (size_t)GEMMA4_SPEC_MAX * GEMMA4_INTERMEDIATE * sizeof(int8_t));
-    cudaMalloc(&eng->d_dx_b, (size_t)GEMMA4_SPEC_MAX * (GEMMA4_INTERMEDIATE/32) * sizeof(float));
-    cudaMalloc(&eng->d_sx_b, (size_t)GEMMA4_SPEC_MAX * (GEMMA4_INTERMEDIATE/32) * sizeof(int));
+    cudaMalloc(&eng->d_qx_b, (size_t)GEMMA4_SPEC_MAX * q_in * sizeof(int8_t));
+    cudaMalloc(&eng->d_dx_b, (size_t)GEMMA4_SPEC_MAX * (q_in/32) * sizeof(float));
+    cudaMalloc(&eng->d_sx_b, (size_t)GEMMA4_SPEC_MAX * (q_in/32) * sizeof(int));
     if (!eng->d_qx || !eng->d_dx || !eng->d_sx || !eng->d_qx_b || !eng->d_dx_b || !eng->d_sx_b) {
         fprintf(stderr, "fucina: dp4a activation scratch alloc failed\n");
         gemma4_engine_destroy(eng);
@@ -3818,7 +3852,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_fp4_amax = NULL; eng->fp4_act_cap = 0; eng->d_fp4_ws = NULL;
     eng->nvfp4_decode_ready = 0; eng->d_embed_bf16 = NULL; eng->d_lmhead_bf16 = NULL;
     eng->d_lmhead_fp8 = NULL; eng->d_lmhead_fp8_scale = NULL;
-    for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
+    for (int l=0;l<GEMMA4_CAP_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
         eng->d_fp4_w[l][p]=NULL; eng->d_fp4_wsc[l][p]=NULL; eng->d_fp4_wsc_lin[l][p]=NULL; }
 
     // Load rope_freqs.weight into device buffer for global-layer RoPE.
@@ -3875,13 +3909,17 @@ gemma4_engine_t* gemma4_engine_create(
 
     // ── Preload all F32 norm weights to device (once) ────────────────────
     {
-        const size_t hs = GEMMA4_HIDDEN_SIZE, hd = GEMMA4_GLOBAL_HEAD_DIM;
-        cudaMalloc(&eng->d_w_attn_norm,      GEMMA4_MAX_LAYERS * hs * sizeof(float));
-        cudaMalloc(&eng->d_w_post_attn_norm, GEMMA4_MAX_LAYERS * hs * sizeof(float));
-        cudaMalloc(&eng->d_w_ffn_norm,       GEMMA4_MAX_LAYERS * hs * sizeof(float));
-        cudaMalloc(&eng->d_w_post_ffn_norm,  GEMMA4_MAX_LAYERS * hs * sizeof(float));
-        cudaMalloc(&eng->d_w_q_norm,         GEMMA4_MAX_LAYERS * hd * sizeof(float));
-        cudaMalloc(&eng->d_w_k_norm,         GEMMA4_MAX_LAYERS * hd * sizeof(float));
+        // M0: norm-store STRIDE is the runtime hidden size; the per-layer LOOP runs cfg.n_layers.
+        // Allocate CAP_LAYERS slots (compile-time upper bound) so the device store is large enough
+        // for any supported size; only the first cfg.n_layers are filled/read.
+        const size_t hs = (size_t)eng->cfg.hidden_size, hd = GEMMA4_GLOBAL_HEAD_DIM;
+        const int    nL = eng->cfg.n_layers;
+        cudaMalloc(&eng->d_w_attn_norm,      GEMMA4_CAP_LAYERS * hs * sizeof(float));
+        cudaMalloc(&eng->d_w_post_attn_norm, GEMMA4_CAP_LAYERS * hs * sizeof(float));
+        cudaMalloc(&eng->d_w_ffn_norm,       GEMMA4_CAP_LAYERS * hs * sizeof(float));
+        cudaMalloc(&eng->d_w_post_ffn_norm,  GEMMA4_CAP_LAYERS * hs * sizeof(float));
+        cudaMalloc(&eng->d_w_q_norm,         GEMMA4_CAP_LAYERS * hd * sizeof(float));
+        cudaMalloc(&eng->d_w_k_norm,         GEMMA4_CAP_LAYERS * hd * sizeof(float));
         cudaMalloc(&eng->d_w_out_norm,       hs * sizeof(float));
 
         // missing tensor (offset 0) → identity weight 1.0
@@ -3894,7 +3932,7 @@ gemma4_engine_t* gemma4_engine_create(
             cudaMemcpy((dst), src, (n) * sizeof(float), cudaMemcpyHostToDevice); \
         } while (0)
 
-        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        for (int l = 0; l < nL; l++) {
             int head_dim = (eng->layer_types[l] == LAYER_SLIDING)
                                ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
             UPLOAD_NORM(eng->d_w_attn_norm      + l * hs, eng->tensors.layers[l].attn_norm,      hs);
@@ -3937,7 +3975,7 @@ gemma4_engine_t* gemma4_engine_create(
             return true;
         };
         bool norm_ok = true;
-        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        for (int l = 0; l < nL; l++) {
             int head_dim = (eng->layer_types[l] == LAYER_SLIDING)
                                ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
             std::string pre = L.layer_prefix + std::to_string(l) + ".";
@@ -4125,7 +4163,7 @@ gemma4_engine_t* gemma4_engine_create(
 
     // Build the absolute-id -> global-slot inverse map from global_layer_indices
     // (set by the layer-type detection above). Sliding layers map to -1.
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) eng->global_slot[l] = -1;
+    for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) eng->global_slot[l] = -1;
     for (int g = 0; g < eng->n_layers_global; g++)
         eng->global_slot[eng->global_layer_indices[g]] = g;
 
@@ -4171,7 +4209,11 @@ gemma4_engine_t* gemma4_engine_create(
         if (cap < ring_floor)  cap = ring_floor;
         eng->sliding_kv_capacity = cap;
     }
-    size_t sliding_kv_size = (size_t)GEMMA4_MAX_LAYERS *
+    // M0: the sliding cache is indexed by ABSOLUTE layer id, so it needs cfg.n_layers slots.
+    // KV-head count / head dim stay 12B geometry until the attention kernels are dispatched on
+    // the runtime head counts (Stage A3); on 12B cfg.n_layers == GEMMA4_MAX_LAYERS so this is
+    // byte-identical.
+    size_t sliding_kv_size = (size_t)eng->cfg.n_layers *
         GEMMA4_KV_HEADS * (size_t)eng->sliding_kv_capacity * GEMMA4_HEAD_DIM * sizeof(kv_t);
     if (cudaMalloc(&eng->d_sliding_k, sliding_kv_size) != cudaSuccess ||
         cudaMalloc(&eng->d_sliding_v, sliding_kv_size) != cudaSuccess) {
@@ -4235,7 +4277,7 @@ gemma4_engine_t* gemma4_engine_create(
         const int slid_elems = GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;          // 8×256 = 2048
         const int glob_elems = GEMMA4_GLOBAL_KV_HEADS * GEMMA4_GLOBAL_HEAD_DIM; // 1×512 = 512
         // Per-block bytes for K (== V) across all layers of the class.
-        size_t slid_block_k = (size_t)GEMMA4_MAX_LAYERS    * BT * slid_elems * sizeof(kv_t);
+        size_t slid_block_k = (size_t)eng->cfg.n_layers    * BT * slid_elems * sizeof(kv_t);
         size_t glob_block_k = (size_t)eng->n_layers_global * BT * glob_elems * sizeof(kv_t);
         // K+V together = the cost of one block in each class.
         uint64_t slid_block_kv = 2ull * slid_block_k;
@@ -4408,8 +4450,6 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     for (int p = 0; p < 12; p++)
         CUDA_FREE(eng->d_sb[p]);
     CUDA_FREE(eng->d_specxt);
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
-    }
     CUDA_FREE(eng->d_sample_id);
     CUDA_FREE(eng->d_sample_p);
     CUDA_FREE(eng->d_spec_ids);
@@ -4437,7 +4477,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     if (eng->cublas) cublasDestroy(eng->cublas);
     // NVFP4 prefill resources
     if (eng->fp4_ready) {
-        for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
+        for (int l=0;l<GEMMA4_CAP_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
             if (eng->d_fp4_w[l][p]) cudaFree(eng->d_fp4_w[l][p]);
             if (eng->d_fp4_wsc[l][p]) cudaFree(eng->d_fp4_wsc[l][p]);
             if (eng->d_fp4_wsc_lin[l][p]) cudaFree(eng->d_fp4_wsc_lin[l][p]); }
@@ -5256,7 +5296,7 @@ static int build_bf16_weights(gemma4_engine_t *eng)
     if (eng->bf16_ready) return 0;
 
     uint64_t maxn[PJ_COUNT] = {0};
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->cfg.n_layers; l++) {
         for (int p = 0; p < PJ_COUNT; p++) {
             uint64_t off; int in_dim, out_dim;
             if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;
@@ -5308,7 +5348,7 @@ static int build_packed_q4(gemma4_engine_t *eng)
         eng->d_weights_packed = NULL;
         return -1;
     }
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->cfg.n_layers; l++) {
         for (int p = 0; p < PJ_COUNT; p++) {
             uint64_t off; int in_dim, out_dim;
             if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;
@@ -5469,7 +5509,7 @@ static int build_fp4_weights(gemma4_engine_t *eng) {
     if (cublasLtCreate(&eng->cublaslt) != CUBLAS_STATUS_SUCCESS) return -1;
     // find max projection element count for the temp bf16 + linear-scale scratch
     uint64_t maxn = 0; int max_in = 0, max_out = 0;
-    for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
+    for (int l=0;l<eng->cfg.n_layers;l++) for (int p=0;p<PJ_COUNT;p++){
         uint64_t off; int in_dim,out_dim; if(!proj_desc(eng,l,p,&off,&in_dim,&out_dim)) continue;
         uint64_t nn=(uint64_t)in_dim*out_dim; if(nn>maxn)maxn=nn;
         if(in_dim>max_in)max_in=in_dim; if(out_dim>max_out)max_out=out_dim;
@@ -5478,10 +5518,10 @@ static int build_fp4_weights(gemma4_engine_t *eng) {
     int ok=1;
     if (cudaMalloc(&tmp_bf, maxn*sizeof(__nv_bfloat16))!=cudaSuccess) ok=0;
     if (ok && cudaMalloc(&tmp_lin, (size_t)max_out*(max_in/NVFP4_BLK))!=cudaSuccess) ok=0;
-    if (ok && cudaMalloc(&eng->d_fp4_gsw, (size_t)GEMMA4_MAX_LAYERS*PJ_COUNT*sizeof(float))!=cudaSuccess) ok=0;
+    if (ok && cudaMalloc(&eng->d_fp4_gsw, (size_t)GEMMA4_CAP_LAYERS*PJ_COUNT*sizeof(float))!=cudaSuccess) ok=0;
     if (ok && cudaMalloc(&eng->d_fp4_amax, sizeof(float))!=cudaSuccess) ok=0;
     size_t wbytes=0;
-    for (int l=0; ok && l<GEMMA4_MAX_LAYERS; l++) for (int p=0; ok && p<PJ_COUNT; p++){
+    for (int l=0; ok && l<eng->cfg.n_layers; l++) for (int p=0; ok && p<PJ_COUNT; p++){
         uint64_t off; int in_dim,out_dim; if(!proj_desc(eng,l,p,&off,&in_dim,&out_dim)) continue;
         size_t packed=(size_t)out_dim*(in_dim/2);
         size_t swsz=(size_t)nvfp4_pad(out_dim,128)*nvfp4_pad(in_dim/NVFP4_BLK,4);
@@ -5604,7 +5644,7 @@ static int nvfp4_load_from_safetensors(gemma4_engine_t *eng, const char *path,
     st::Model &m = *model;
 
     if (cublasLtCreate(&eng->cublaslt) != CUBLAS_STATUS_SUCCESS) return -1;
-    if (cudaMalloc(&eng->d_fp4_gsw, (size_t)GEMMA4_MAX_LAYERS*PJ_COUNT*sizeof(float)) != cudaSuccess) return -2;
+    if (cudaMalloc(&eng->d_fp4_gsw, (size_t)GEMMA4_CAP_LAYERS*PJ_COUNT*sizeof(float)) != cudaSuccess) return -2;
     if (cudaMalloc(&eng->d_fp4_amax, sizeof(float)) != cudaSuccess) return -2;
 
     // map our PJ_* projection ids onto the loader's HF-suffix ids
@@ -5614,7 +5654,7 @@ static int nvfp4_load_from_safetensors(gemma4_engine_t *eng, const char *path,
 
     size_t wbytes = 0;
     int ok = 1;
-    for (int l = 0; ok && l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; ok && l < eng->cfg.n_layers; l++) {
         for (int p = 0; ok && p < PJ_COUNT; p++) {
             uint64_t off; int in_dim, out_dim;
             if (!proj_desc(eng, l, p, &off, &in_dim, &out_dim)) continue;  // e.g. global V (=K)
@@ -5956,7 +5996,7 @@ int gemma4_engine_prefill_batched(
     scale_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, N*H, sqrtf((float)H));
 
     if (ovl) issue_dequant(0);   // pipeline fill: layer 0's weights (BF16 path only)
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->cfg.n_layers; l++) {
         layer_type_t lt = eng->layer_types[l];
         int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
         int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
@@ -5973,7 +6013,7 @@ int gemma4_engine_prefill_batched(
         // the native Q4_0 weights directly.
         if (ovl) {
             curbuf = l & 1;
-            if (l + 1 < GEMMA4_MAX_LAYERS) issue_dequant(l + 1);
+            if (l + 1 < eng->cfg.n_layers) issue_dequant(l + 1);
             cudaStreamWaitEvent(stream, eng->ev_dq_done[curbuf], 0);
         }
 
@@ -6226,7 +6266,7 @@ int gemma4_engine_prefill_flash(
         scale_kernel<<<grid1d((size_t)cn*H),256,0,stream>>>(d_x, cn*H, sqrtf((float)H));
 
         if (ovl) issue_dequant(0);   // pipeline fill for this chunk: layer 0's weights
-        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        for (int l = 0; l < eng->cfg.n_layers; l++) {
             // Abort granularity: one 8192-token chunk runs ~30s at long context,
             // so poll per LAYER (~0.7s). Mid-chunk abort is safe for the same
             // reason as mid-prefill: nothing is accounted until global_n_tokens
@@ -6246,7 +6286,7 @@ int gemma4_engine_prefill_flash(
             mmq_l = l;                       // MMQ: weight offset resolved per layer
             if (ovl) {
                 curbuf = l & 1;
-                if (l + 1 < GEMMA4_MAX_LAYERS) issue_dequant(l + 1);
+                if (l + 1 < eng->cfg.n_layers) issue_dequant(l + 1);
                 cudaStreamWaitEvent(stream, eng->ev_dq_done[curbuf], 0);
             }
             rms_norm_rows_bf16_kernel<<<cn,256,HD2,stream>>>(d_inb, d_x, w_attn, H, cn, GEMMA4_RMS_EPS);
@@ -6607,7 +6647,7 @@ static void decode_forward_device(gemma4_engine_t *eng, cudaStream_t stream)
     float sc = sqrtf((float)GEMMA4_HIDDEN_SIZE);
     scale_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
         eng->d_x, GEMMA4_HIDDEN_SIZE, sc);
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++)
+    for (int l = 0; l < eng->cfg.n_layers; l++)
         decode_layer(eng, l, /*pos=*/0, /*context_len=*/0, stream, eng->d_decpos);
     rms_norm_kernel<<<1, 256, 32*sizeof(float), stream>>>(
         eng->d_norm, eng->d_x, eng->d_w_out_norm, GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
@@ -6712,7 +6752,7 @@ int gemma4_engine_decode(
         if (eng->paged_enabled) paged_seq_sync(eng, pos);
 
         // Run all 48 layers
-        for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+        for (int l = 0; l < eng->cfg.n_layers; l++) {
             decode_layer(eng, l, pos, eng->cur.n_tokens + 1, stream);
         }
 
@@ -6821,7 +6861,7 @@ static void gemma4_engine_paged_selftest(gemma4_engine_t *eng) {
     size_t slid_pstride = (size_t)eng->slid_pool.n_blocks  * BT * slid_elems;
     size_t glob_cstride = (size_t)eng->global_kv_capacity  * glob_elems;
     size_t glob_pstride = (size_t)eng->glob_pool.n_blocks  * BT * glob_elems;
-    for (int L = 0; L < GEMMA4_MAX_LAYERS; L++) {
+    for (int L = 0; L < eng->cfg.n_layers; L++) {
         if (eng->layer_types[L] == LAYER_SLIDING) {
             paged_compare_layer_kernel<<<K, 256>>>(
                 eng->d_sliding_k + (size_t)L*slid_cstride, eng->d_sliding_v + (size_t)L*slid_cstride, slid_elems,
@@ -6842,7 +6882,7 @@ static void gemma4_engine_paged_selftest(gemma4_engine_t *eng) {
     cudaFree(d_mm);
     if (mm == 0)
         fprintf(stderr, "fucina: paged self-test PASSED — pool == contiguous over %d tokens × %d layers\n",
-                K, GEMMA4_MAX_LAYERS);
+                K, eng->cfg.n_layers);
     else
         fprintf(stderr, "fucina: paged self-test FAILED — %d mismatching fp8 elements\n", mm);
 
@@ -6884,7 +6924,7 @@ static void gemma4_engine_paged_read_selftest(gemma4_engine_t *eng) {
     float worst = 0.0f;
     size_t shmem = 32 * sizeof(float);
 
-    for (int L = 0; L < GEMMA4_MAX_LAYERS; L++) {   // every layer, both classes
+    for (int L = 0; L < eng->cfg.n_layers; L++) {   // every layer, both classes
         layer_type_t want = eng->layer_types[L];
         int n_heads    = GEMMA4_HEADS;
         int n_kv_heads = (want == LAYER_SLIDING) ? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
@@ -7071,7 +7111,7 @@ static void decode_batched_forward(
     embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, K, H, stream);
     scale_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, K*H, sqrtf((float)H));
 
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->cfg.n_layers; l++) {
         layer_type_t lt = eng->layer_types[l];
         int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
         int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
@@ -7472,7 +7512,7 @@ static void decode_multiseq_body(
     embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, B, H, stream);
     scale_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, B*H, sqrtf((float)H));
 
-    for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
+    for (int l = 0; l < eng->cfg.n_layers; l++) {
         layer_type_t lt = eng->layer_types[l];
         int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
         int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
@@ -8168,7 +8208,7 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
             // target layer 47 = the LAST global layer (llama.cpp share(il)=n_layer-1).
             // Fixed-grid split-K with device n_tokens (= *pos_ptr): same split formula
             // as global_attn_decode_broadcast, so the math is bit-identical to it.
-            int slot = eng->global_slot[GEMMA4_MAX_LAYERS - 1];
+            int slot = eng->global_slot[eng->cfg.n_layers - 1];
             size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
             global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
@@ -8190,8 +8230,8 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
-                    eng->d_sliding_k + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
-                    eng->d_sliding_v + (size_t)(GEMMA4_MAX_LAYERS - 2) * lstride,
+                    eng->d_sliding_k + (size_t)(eng->cfg.n_layers - 2) * lstride,
+                    eng->d_sliding_v + (size_t)(eng->cfg.n_layers - 2) * lstride,
                     GEMMA4_SLIDING_WINDOW - 1, 0, eng->sliding_kv_capacity, pos_ptr);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS>
                 <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
@@ -9168,11 +9208,11 @@ void gemma4_engine_print_info(const gemma4_engine_t *eng) {
     printf("Context:     %u tokens\n", eng->context_size);
     printf("Format:      %s\n", eng->format == FORMAT_Q4_0 ? "Q4_0" : "Q8_0");
     printf("Layers:      %d total (%d sliding, %d global)\n",
-            GEMMA4_MAX_LAYERS, eng->n_layers_sliding, eng->n_layers_global);
+            eng->cfg.n_layers, eng->n_layers_sliding, eng->n_layers_global);
     printf("Hidden:      %d -> %d -> %d\n",
-            GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE, GEMMA4_HIDDEN_SIZE);
+            eng->cfg.hidden_size, eng->cfg.intermediate, eng->cfg.hidden_size);
     printf("Heads:       %d Q, %d KV sliding, %d KV global\n",
-            GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_GLOBAL_KV_HEADS);
+            eng->cfg.n_heads, eng->cfg.n_kv_sliding, eng->cfg.n_kv_global);
     printf("Head dim:    %d sliding, %d global\n",
             GEMMA4_HEAD_DIM, GEMMA4_GLOBAL_HEAD_DIM);
     printf("Sliding win: %d tokens\n", GEMMA4_SLIDING_WINDOW);
@@ -9204,7 +9244,7 @@ void gemma4_engine_print_timing(const gemma4_engine_t *eng) {
 }
 
 int gemma4_engine_get_n_layers(const gemma4_engine_t *eng) {
-    return eng ? GEMMA4_MAX_LAYERS : 0;
+    return eng ? eng->cfg.n_layers : 0;
 }
 
 // ─── Timing accessors (for Go-side speed logging) ─────────────────────
@@ -9316,7 +9356,7 @@ size_t gemma4_engine_kv_state_size(const gemma4_engine_t *eng, int n_tokens) {
         n_tokens > eng->global_kv_capacity) return 0;
     size_t srow, spitch, grow, gpitch;
     kv_seq_pitches(eng, &srow, &spitch, &grow, &gpitch);
-    return 2 * (size_t)GEMMA4_MAX_LAYERS    * (size_t)n_tokens * srow +
+    return 2 * (size_t)eng->cfg.n_layers    * (size_t)n_tokens * srow +
            2 * (size_t)eng->n_layers_global * (size_t)n_tokens * grow;
 }
 
@@ -9365,8 +9405,8 @@ static int kv_seq_copy(gemma4_engine_t *eng, char *buf, int n_tokens,
     const size_t gwidth = (size_t)n_tokens * grow;
 
     struct { char *dev; size_t pitch, width; int layers; } regions[4] = {
-        { (char *)eng->d_sliding_k, spitch, swidth, GEMMA4_MAX_LAYERS },
-        { (char *)eng->d_sliding_v, spitch, swidth, GEMMA4_MAX_LAYERS },
+        { (char *)eng->d_sliding_k, spitch, swidth, eng->cfg.n_layers },
+        { (char *)eng->d_sliding_v, spitch, swidth, eng->cfg.n_layers },
         { (char *)eng->d_global_k,  gpitch, gwidth, eng->n_layers_global },
         { (char *)eng->d_global_v,  gpitch, gwidth, eng->n_layers_global },
     };
