@@ -119,11 +119,8 @@ func runDiffusionREPL(args CLIArgs, tok *tokenizer.Tokenizer, eng *diffusion.Eng
 	ctxTokens := eng.MaxPrompt()
 
 	fmt.Fprintf(os.Stderr,
-		"fucina: interactive mode (DiffusionGemma 26B-A4B) — ctx=%d\n"+
-			"  /reset  clear conversation\n"+
-			"  /stats  show context window\n"+
-			"  /quit   exit (or Ctrl-D)\n\n",
-		ctxTokens)
+		"fucina: interactive mode (DiffusionGemma 26B-A4B) — ctx=%d\n%s\n",
+		ctxTokens, diffusionCommandsHelp)
 
 	for {
 		fmt.Fprint(os.Stderr, "\033[1;32m> \033[0m") // green prompt
@@ -141,6 +138,9 @@ func runDiffusionREPL(args CLIArgs, tok *tokenizer.Tokenizer, eng *diffusion.Eng
 		case "/quit", "/exit", "/q":
 			fmt.Fprintln(os.Stderr, "fucina: bye")
 			return
+		case "/help", "/h", "/?", "/commands":
+			fmt.Fprintf(os.Stderr, "fucina: commands —\n%s", diffusionCommandsHelp)
+			continue
 		case "/reset", "/clear":
 			history = history[:0]
 			fmt.Fprintln(os.Stderr, "fucina: conversation cleared")
@@ -149,6 +149,14 @@ func runDiffusionREPL(args CLIArgs, tok *tokenizer.Tokenizer, eng *diffusion.Eng
 			// Block diffusion re-prefills each turn (no cross-turn KV reuse like the dense
 			// KVCache), so report the prompt window + block size rather than a cache hit rate.
 			fmt.Fprintf(os.Stderr, "fucina: context — max_prompt=%d  canvas=%d tokens\n", eng.MaxPrompt(), eng.CanvasLength())
+			continue
+		}
+
+		// Unknown leading-slash command (the diffusion REPL has no /thinking): report
+		// it rather than sending "/foo" to the model as chat input.
+		if looksLikeCommand(input) {
+			fmt.Fprintf(os.Stderr, "fucina: unknown command %q — type /help for the list\n",
+				strings.Fields(input)[0])
 			continue
 		}
 

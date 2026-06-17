@@ -27,7 +27,8 @@ CGO_CFLAGS   := -I$(CUDA_HOME)/include
 CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile \
-        go-test go-test-race go-test-cgo vet lint check \
+        go-test go-test-race go-test-cgo vet lint check paged-kv-test \
+        paged-kv-device-test packed-kv-test kv-quant-explore bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
 # `make` with no arguments builds everything (CUDA archive + Go binary).
@@ -47,7 +48,8 @@ lib: cuda/libfucina.a
 # sm_121 → sm_121a) MUST force a recompile, otherwise `ar rcs` would bundle
 # a stale cubin built with the old flags into libfucina.a.
 
-cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh Makefile
+cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh \
+                       cuda/paged_kv.h cuda/paged_kv_device.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
 
 cuda/gemma4_kernels_link.o: cuda/gemma4_kernels.o Makefile
@@ -85,9 +87,49 @@ cuda/test_engine: cuda/test_engine.cu cuda/libfucina.a
 # ─── Testing ────────────────────────────────────────────────────────────
 # Full test suite: pure-Go unit tests, cgo-dependent tests (needs the CUDA
 # archive), then the binary's built-in self-tests on the GPU.
-test: fucina go-test go-test-cgo
+test: fucina go-test go-test-cgo paged-kv-test
 	./fucina --test-parser
 	CUDA_VISIBLE_DEVICES=0 ./fucina --test-cuda
+
+# ─── Paged-KV allocator unit test (host-only, no GPU) ───────────────────
+# Pure integer bookkeeping for the continuous-batching paged KV cache; runs on
+# the host so it stays fast and CI-portable. See docs/continuous-batching.md.
+paged-kv-test:
+	g++ -std=c++17 -O2 -Wall -Wextra cuda/paged_kv_test.cc -o /tmp/fucina_paged_kv_test
+	/tmp/fucina_paged_kv_test
+
+# ─── Paged-KV device-kernel test (GPU) ──────────────────────────────────
+# Proves block-table indirection (paged_kv_device.cuh) is bit-identical to the
+# contiguous KV layout on the read path, and numerically correct for attention.
+paged-kv-device-test:
+	$(NVCC) -arch=$(CUDA_ARCH) -o /tmp/fucina_paged_kv_device_test \
+		cuda/paged_kv_device_test.cu -diag-suppress 550
+	/tmp/fucina_paged_kv_device_test
+
+# ─── Packed NVFP4 KV storage test (GPU) ─────────────────────────────────
+# Proves the real ~4.5-bit packed layout (pkv_pack_row/pkv_unpack) is bit-identical
+# to the FP8 NVFP4 fake-quant — so swapping FP8 storage for packed changes only
+# memory, not numerics. See docs/kv-quant-exploration.md.
+packed-kv-test:
+	$(NVCC) -arch=$(CUDA_ARCH) -o /tmp/fucina_packed_kv_test \
+		cuda/packed_kv_test.cu -diag-suppress 550
+	/tmp/fucina_packed_kv_test
+
+# ─── KV-quant exploration (host, Phase 6) ───────────────────────────────
+# Offline comparison of KV-cache quant codecs (FP8 / per-token FP8 / NVFP4 /
+# TurboQuant-MSE). Decides whether to move KV off flat FP8. Host-only, no engine
+# link. Optional args: `make kv-quant-explore ARGS="<n_outlier> <outlier_std>"`.
+# See docs/kv-quant-exploration.md.
+kv-quant-explore:
+	g++ -std=c++17 -O2 -Wall -Wextra cuda/kv_quant_explore.cc -o /tmp/fucina_kv_quant_explore -lm
+	/tmp/fucina_kv_quant_explore $(ARGS)
+
+# ─── Correctness + performance smoke (GB10) ─────────────────────────────
+# Runs the engine self-tests (batch==single, sampling) + greedy byte-identity,
+# then reports prefill/decode throughput. Correctness gates are hard (non-zero
+# exit on failure); perf is reported. Override the model with MODEL=/path.gguf.
+bench: fucina
+	MODEL=$(if $(MODEL),$(MODEL),model.gguf) scripts/bench.sh
 
 test-vectors: fucina
 	./fucina --test-vectors tests/vectors/official.vec
@@ -112,7 +154,7 @@ profile: fucina
 # cuda/libfucina.a, so `go test`/`go vet` there fails to build/link unless the
 # CUDA archive has been compiled with nvcc on a GB10 box. The server,
 # tokenizer, sampler and chat packages are pure Go and run anywhere.
-GO_TEST_PKGS := ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+GO_TEST_PKGS := ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 
 # cgo-dependent Go tests (cmd/fucina: CLI parsing tests). Requires
 # cuda/libfucina.a to link, hence the `lib` prerequisite.

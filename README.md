@@ -60,7 +60,14 @@ LM head — loaded from **Q4_0 (QAT)** or **Q8_0** GGUF weights.
   head** (`--assistant`) that drafts novel text; one batched weight pass verifies many tokens at the
   exact target distribution. **>2× dense decode** at typical acceptance.
 - 🧮 **FP8 Tensor-Core attention** + **FP8 E4M3 KV cache** (1 byte/element) — half the KV bandwidth
-  and a flat decode curve as context grows.
+  and a flat decode curve as context grows. The sliding-window layers use a **capped ring buffer**,
+  so KV memory stays nearly context-independent (~1.5 GiB sliding regardless of `--ctx`). An optional
+  **NVFP4 KV codec** (`FUCINA_KV_NVFP4=1`, native Blackwell FP4) trades a small accuracy cost for a
+  1.78× smaller KV footprint — memory-only, opt-in (see [`docs/kv-quant-exploration.md`](docs/kv-quant-exploration.md)).
+- 🧵 **Continuous batching over a paged KV cache** (`FUCINA_PAGED_KV=1 FUCINA_BATCH=1`) — independent
+  sequences decode in one batched pass (vLLM-style block tables + free-list, split-K paged attention
+  bit-identical to the contiguous path, CUDA graph per batch size). Opt-in; the default single-flight
+  path is unchanged. See [`docs/continuous-batching.md`](docs/continuous-batching.md).
 - 📦 **Native quantized GEMV/GEMM** — Q4_0 / Q6_K / Q8_0 read directly via `dp4a`, with an optional
   repacked-Q4_0 coalesced-load decode path. No BF16 materialize on the decode hot path.
 - 🧠 **On-GPU sampling** — the next token is selected on the device; no 262k-element logit copy back
@@ -70,7 +77,9 @@ LM head — loaded from **Q4_0 (QAT)** or **Q8_0** GGUF weights.
 
 - 🔁 **Prefix-reuse KV cache** — instead of re-prefilling the whole prompt each request, the server
   rewinds the single physical KV cache to the longest common prefix and prefills only the divergent
-  suffix — the difference between sub-second and multi-second agentic turns.
+  suffix — the difference between sub-second and multi-second agentic turns. Rewinds stay exact within
+  the sliding ring's window (covers same-conversation turns and speculation); a deeper divergence
+  falls back to a full re-prefill (see `FUCINA_SLIDING_RING`).
 - 🌐 **OpenAI-compatible API** — `/v1/chat/completions` (streaming + non-streaming), `/v1/models`,
   `/health`, `/metrics`.
 - 🛠️ **Tool calling** (gemma-4 format, OpenAI-shaped) and the **gemma-4 thinking channel**
@@ -172,8 +181,11 @@ See [HTTP API](#-http-api) for every endpoint.
 fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --interactive
 ```
 
-A multi-turn chat with prefix-reuse caching. Commands: `/reset` (clear the conversation),
-`/stats` (KV-cache hit rate), `/quit` (or Ctrl-D).
+A multi-turn chat with prefix-reuse caching. Commands: `/thinking LEVEL` (set the reasoning
+channel — `off`/`on`/`low`/`medium`/`high`/`xhigh`; the thought channel renders dimmed and is
+budget-bounded), `/reset` (clear the conversation), `/stats` (KV-cache hit rate), `/quit` (or
+Ctrl-D). The REPL applies the gemma-4 chat template and honours `--thinking` / `--repeat-penalty`,
+matching the server.
 
 **As a one-shot prompt:**
 
@@ -234,9 +246,13 @@ paths depend on GB10-class tensor-core features:
   engine relies on and are out of scope.
 
 > [!TIP]
-> **Context vs. memory.** The FP8 KV cache (1 B/element) totals **~54 GiB at the full 262144
-> context**, which fits GB10's 128 GB unified memory but not a smaller pool. Lower `--ctx` to save
-> memory (e.g. `--ctx 131072` ≈ 27 GiB). The engine clamps `--ctx` to 262144.
+> **Context vs. memory.** The sliding-window KV cache (40 of 48 layers) is a capped **ring buffer**,
+> so it does **not** grow with `--ctx`: ~**1.5 GiB** at the default ring size (8192 slots), tunable
+> via `FUCINA_SLIDING_RING`. Only the 8 global-attention layers' KV scales with context (~2.0 GiB at
+> the full 262144). Total FP8 KV cache (1 B/element, K+V): **~3.5 GiB at 262144**, **~2.5 GiB at
+> 131072** — down from ~54 GiB before the ring. To shrink the *weights* footprint, set
+> `FUCINA_NO_PACKED=1` to drop the repacked-Q4_0 decode copy (**−~7 GiB**, ~2–3% slower decode). The
+> engine clamps `--ctx` to 262144. See [Environment toggles](#-http-api) for both knobs.
 
 ### Requirements
 
@@ -418,7 +434,11 @@ fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 |----------|--------|
 | `FUCINA_NO_DECODE_GRAPH=1` | Disable CUDA-graph capture for single-token decode |
 | `FUCINA_NO_BATCHED_GRAPH=1` | Disable CUDA-graph capture for the K-row batched verify |
-| `FUCINA_NO_PACKED=1` | Disable the repacked-Q4_0 coalesced-load decode GEMV |
+| `FUCINA_NO_PACKED=1` | Drop the repacked-Q4_0 decode-GEMV weight copy. **Frees ~7 GiB VRAM** at the cost of ~2–3% slower decode; output is bit-identical. The repacked copy is a second, coalesced-load layout of the Q4_0 projection weights kept resident only to speed the bandwidth-bound decode hot path. Recommended on memory-constrained hosts. |
+| `FUCINA_SLIDING_RING=N` | Sliding-window KV ring capacity in tokens (default **8192**, floored at `window+spec_max`). Caps the sliding cache so it stays ctx-independent (~1.5 GiB at 8192). `N` also bounds how far a prefix-reuse rewind stays exact — deeper rewinds (e.g. editing context older than `N-1024` tokens) fall back to a full re-prefill. With `--ctx ≤ N` behavior is identical to the old flat cache. Lower = less VRAM; higher = deeper exact rewind (~+190 MiB per +1024). |
+| `FUCINA_PAGED_KV=1` | Allocate the paged KV pools (block table + free-list), capacity-sized to free VRAM. Prerequisite for continuous batching. |
+| `FUCINA_BATCH=1` | Route the server through the continuous-batching scheduler (needs `FUCINA_PAGED_KV=1`): independent sequences share each batched forward instead of the per-request lock. |
+| `FUCINA_KV_NVFP4=1` | Quantize the KV cache to **NVFP4** precision (native Blackwell FP4 E2M1 + per-16 E4M3 block scale). Memory-only (~1.78× smaller KV), small accuracy cost; default OFF keeps flat FP8 byte-identical. |
 | `FUCINA_NO_WARMUP_PASS=1` | Skip the one-time startup warmup pass |
 | `FUCINA_DEBUG=1` | Dump request bodies + rendered prompts to `/tmp/fucina_debug.log` |
 
@@ -475,6 +495,12 @@ go test ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/
 
 # GPU smoke test (requires the DGX Spark GB10)
 make smoke      # builds, then: fucina --prompt "Hello, world!" --predict 32 --temp 0
+
+# GPU correctness + performance (requires the GB10 + a model; MODEL=… overridable)
+make bench               # batch==single self-test + greedy byte-identity, then prefill/decode tok/s
+make paged-kv-device-test  # paged KV reads bit-identical to the contiguous cache
+make packed-kv-test        # packed 4.5-bit NVFP4 KV storage bit-identical to the fake-quant
+make kv-quant-explore      # offline FP8 / NVFP4 / TurboQuant codec comparison (host-only)
 ```
 
 The CUDA engine is validated for **bit-exactness** against reference paths (greedy byte-identical
@@ -494,8 +520,12 @@ best-effort. The Gemma 4 weights you supply are governed by the
 [Gemma license](https://ai.google.dev/gemma/docs/gemma_4_license).
 
 - **Code:** [Apache-2.0](LICENSE) · **Third-party notices:** [NOTICE](NOTICE)
-- **Roadmap:** harden the experimental DiffusionGemma path; an sm_120 (RTX 50-series) port to
-  loosen the single-hardware constraint.
+- **Roadmap:** continuous batching over paged KV is functional (opt-in; see
+  [`docs/continuous-batching.md`](docs/continuous-batching.md)) — next is per-slot spec decode and
+  routing it on by default. The NVFP4 KV codec is opt-in; the packed 4.5-bit storage that banks the
+  memory is verified and staged to become the default behind a quality gate
+  ([`docs/kv-quant-exploration.md`](docs/kv-quant-exploration.md)). Also: harden the experimental
+  DiffusionGemma path; an sm_120 (RTX 50-series) port to loosen the single-hardware constraint.
 
 ## 🙏 Acknowledgements
 

@@ -101,6 +101,10 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	fmt.Print(prompt)
 	genStart := time.Now()
 	generated := 0
+	// Repeat penalty (host sampler path) edits logits using the token history;
+	// `past` carries prompt + generated tokens so the penalty actually applies
+	// (passing nil here was a silent no-op).
+	past := append([]int32(nil), tokens...)
 	for i := 0; i < nToGenerate; i++ {
 		var token int32
 		var err error
@@ -111,7 +115,7 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			if logits == nil {
 				break
 			}
-			token, err = sampler.Sample(logits, samplerParams(args), rng, nil)
+			token, err = sampler.Sample(logits, samplerParams(args), rng, past)
 		}
 		if err != nil || tok.IsStop(token) {
 			break
@@ -125,6 +129,7 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		if err != nil {
 			break
 		}
+		past = append(past, token)
 		generated++
 	}
 	genElapsed := time.Since(genStart)

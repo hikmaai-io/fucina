@@ -37,6 +37,14 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		nToGenerate = 1 << 20
 	}
 
+	// Thinking level is mutable at runtime via /thinking; it seeds from --thinking.
+	// off|on|low|medium|high|xhigh — see thinkSetting. low<medium<high are reasoning
+	// token budgets that force-close the thought channel, exactly like the server.
+	thinkLevel := args.Thinking
+	if thinkLevel == "" {
+		thinkLevel = "off"
+	}
+
 	// The gemma-4 chat template lives in internal/chat. The REPL always runs with
 	// thinking OFF, so chat.Render opens each model turn with an already-closed
 	// empty thought channel (<|turn>model\n<|channel>thought\n<channel|>) — turns
@@ -51,11 +59,8 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	ctxTokens := int(eng.ContextSize())
 
 	fmt.Fprintf(os.Stderr,
-		"fucina: interactive mode (Gemma 4 12B-IT) — ctx=%d\n"+
-			"  /reset  clear conversation\n"+
-			"  /stats  show KV cache hit rate\n"+
-			"  /quit   exit (or Ctrl-D)\n\n",
-		ctxTokens)
+		"fucina: interactive mode (Gemma 4 12B-IT) — ctx=%d, thinking=%s\n%s\n",
+		ctxTokens, thinkLevel, denseCommandsHelp)
 
 	for {
 		fmt.Fprint(os.Stderr, "\033[1;32m> \033[0m") // green prompt
@@ -74,6 +79,9 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		case "/quit", "/exit", "/q":
 			fmt.Fprintln(os.Stderr, "fucina: bye")
 			return
+		case "/help", "/h", "/?", "/commands":
+			fmt.Fprintf(os.Stderr, "fucina: commands —\n%s", denseCommandsHelp)
+			continue
 		case "/reset", "/clear":
 			history = history[:0]
 			if args.System != "" {
@@ -98,10 +106,43 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 				hits, misses, rate*100, eng.NTokens(), ctxTokens)
 			continue
 		}
+		// /thinking LEVEL — set the reasoning channel level for subsequent turns.
+		if strings.HasPrefix(input, "/thinking") || strings.HasPrefix(input, "/think") {
+			parts := strings.Fields(input)
+			if len(parts) < 2 {
+				on, budget := thinkSetting(thinkLevel, nToGenerate)
+				fmt.Fprintf(os.Stderr, "fucina: thinking=%s (on=%v, budget=%d). "+
+					"Usage: /thinking off|on|low|medium|high|xhigh\n", thinkLevel, on, budget)
+				continue
+			}
+			lvl := strings.ToLower(parts[1])
+			if !validThinkLevel(lvl) {
+				fmt.Fprintf(os.Stderr, "fucina: unknown thinking level %q — "+
+					"use off|on|low|medium|high|xhigh\n", parts[1])
+				continue
+			}
+			thinkLevel = lvl
+			on, budget := thinkSetting(thinkLevel, nToGenerate)
+			fmt.Fprintf(os.Stderr, "fucina: thinking=%s (on=%v, budget=%d tokens)\n",
+				thinkLevel, on, budget)
+			continue
+		}
 
-		// Add user turn and build the full prompt.
+		// A leading-slash token that looks like a command but matched none of the
+		// above is a typo, not chat input — report it instead of silently sending
+		// "/foo" to the model (which is what made unknown commands "not work").
+		if looksLikeCommand(input) {
+			fmt.Fprintf(os.Stderr, "fucina: unknown command %q — type /help for the list\n",
+				strings.Fields(input)[0])
+			continue
+		}
+
+		// Add user turn and build the full prompt. The thinking level decides whether
+		// the model turn is opened with the thought channel OPEN (model reasons) or
+		// pre-closed (answers directly); the budget force-closes runaway reasoning.
+		thinkOn, thinkBudget := thinkSetting(thinkLevel, nToGenerate)
 		history = append(history, chat.Message{Role: "user", Content: input})
-		promptStr := chat.Render(history, false, "", nil)
+		promptStr := chat.Render(history, thinkOn, "", nil)
 		promptToks := tok.Encode(promptStr, true, false)
 
 		// Warn if we are close to the context limit.
@@ -160,23 +201,24 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			}
 			specTurn++
 
-			cacheToks := kv.CurrentTokens() // full cached sequence, under kv lock
 			// Stream each token as the spec loop emits it (between verify steps),
-			// so the reply renders incrementally at full speculative speed.
-			// EOS/<turn|> are control tokens: stop without rendering them.
+			// so the reply renders incrementally at full speculative speed. The
+			// thinking budget force-closes the thought channel when reasoning runs
+			// long (genWithThinking, mirroring the server's runSpec). EOS/<turn|> are
+			// control tokens: stopped without rendering. The thought channel is shown
+			// dimmed; only the post-thought answer is kept in history.
 			var replyBuf strings.Builder
-			toks, nAccepted, err := eng.GenerateSpecStream(cacheToks, pf.Logits,
+			toks, nAccepted, err := genWithThinking(eng, kv, tok, pf.Logits,
 				nToGenerate, stops, args.DraftK, float32(args.Temperature),
 				args.TopK, float32(args.TopP), float32(args.MinP),
-				float32(args.RepeatPenalty), seed,
-				func(t int32) bool {
-					if tok.IsStop(t) {
-						return true
+				float32(args.RepeatPenalty), seed, thinkBudget,
+				func(piece string, inThought bool) {
+					if inThought {
+						fmt.Printf("\033[2m%s\033[0m", piece) // dim reasoning
+					} else {
+						fmt.Print(piece)
 					}
-					piece := tok.Decode([]int32{t})
-					fmt.Print(piece)
 					replyBuf.WriteString(piece)
-					return false
 				})
 			if err != nil {
 				kv.Unlock()
@@ -185,36 +227,45 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 				history = history[:len(history)-1] // undo user turn
 				continue
 			}
-			// Sync the prefix cache with the tokens actually committed to the
-			// engine KV (a trailing stop token may be emitted but not forwarded)
-			// so the NEXT turn's prefill reuses this whole turn.
-			committed := eng.NTokens() - pf.PromptTokens
-			for i := 0; i < committed && i < len(toks); i++ {
-				kv.AppendDecoded(toks[i])
-			}
 			generated = len(toks)
-			reply = replyBuf.String()
+			// Keep only the answer (drop the thought channel) in history so the next
+			// turn's prompt stays clean and the KVCache can reuse the prefix.
+			_, reply = chat.SplitReasoning(replyBuf.String())
 			specStats = fmt.Sprintf(", %d drafts accepted (avg %.2f tokens/step, draft-k=%d)",
 				nAccepted, float64(len(toks))/float64(max(1, len(toks)-nAccepted)), args.DraftK)
 		} else {
 			// Per-token decode loop with the host sampler: required for
 			// repeat-penalty (it edits logits using the token history) or when
-			// --spec=false. Streams tokens to stdout as they are sampled.
+			// --spec=false. Streams tokens to stdout as they are sampled. The
+			// thought channel is shown dimmed; repeat-penalty sees the FULL cached
+			// sequence (kv.CurrentTokens) — passing nil here was a silent no-op.
 			var replyBuf strings.Builder
 			logits := pf.Logits
+			inCh := false
 			for i := 0; i < nToGenerate; i++ {
 				if logits == nil {
 					break
 				}
-				token, err := sampler.Sample(logits, samplerParams(args), rng, nil)
+				token, err := sampler.Sample(logits, samplerParams(args), rng, kv.CurrentTokens())
 				// Stop on EOS or end-of-turn (<turn|>); these are control tokens
 				// and must not be rendered.
 				if err != nil || tok.IsStop(token) {
 					break
 				}
-				piece := tok.Decode([]int32{token})
-				fmt.Print(piece)
-				replyBuf.WriteString(piece)
+				switch {
+				case tok.ChannelOpen >= 0 && token == tok.ChannelOpen:
+					inCh = true
+				case tok.ChannelEnd >= 0 && token == tok.ChannelEnd:
+					inCh = false
+				default:
+					piece := tok.Decode([]int32{token})
+					if inCh {
+						fmt.Printf("\033[2m%s\033[0m", piece)
+					} else {
+						fmt.Print(piece)
+					}
+					replyBuf.WriteString(piece)
+				}
 
 				logits, err = eng.Decode(token)
 				if err != nil {
@@ -227,7 +278,7 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 				kv.AppendDecoded(token)
 				generated++
 			}
-			reply = replyBuf.String()
+			_, reply = chat.SplitReasoning(replyBuf.String())
 		}
 		kv.Unlock()
 
