@@ -28,7 +28,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test \
-        paged-kv-device-test kv-quant-explore \
+        paged-kv-device-test kv-quant-explore bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
 # `make` with no arguments builds everything (CUDA archive + Go binary).
@@ -114,6 +114,13 @@ paged-kv-device-test:
 kv-quant-explore:
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/kv_quant_explore.cc -o /tmp/fucina_kv_quant_explore -lm
 	/tmp/fucina_kv_quant_explore $(ARGS)
+
+# ─── Correctness + performance smoke (GB10) ─────────────────────────────
+# Runs the engine self-tests (batch==single, sampling) + greedy byte-identity,
+# then reports prefill/decode throughput. Correctness gates are hard (non-zero
+# exit on failure); perf is reported. Override the model with MODEL=/path.gguf.
+bench: fucina
+	MODEL=$(if $(MODEL),$(MODEL),model.gguf) scripts/bench.sh
 
 test-vectors: fucina
 	./fucina --test-vectors tests/vectors/official.vec

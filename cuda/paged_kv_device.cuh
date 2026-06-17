@@ -176,9 +176,10 @@ __global__ void paged_kv_write(
     size_t idx = paged_elem_index(v, p, e, block_tokens, elems_per_token);
     if (idx == (size_t)-1) return;                     // unmapped → skip (engine bug if hit)
 
-    size_t src = (size_t)row * elems_per_token + e;
-    k_pool[idx] = pkv_float_to_fp8(kv_codec_value(kb + (size_t)row * elems_per_token, e));
-    v_pool[idx] = pkv_float_to_fp8(kv_codec_value(vb + (size_t)row * elems_per_token, e));
+    const float *krow = kb + (size_t)row * elems_per_token;
+    const float *vrow = vb + (size_t)row * elems_per_token;
+    k_pool[idx] = pkv_float_to_fp8(kv_codec_value(krow, e));
+    v_pool[idx] = pkv_float_to_fp8(kv_codec_value(vrow, e));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
