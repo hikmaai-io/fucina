@@ -59,12 +59,8 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	ctxTokens := int(eng.ContextSize())
 
 	fmt.Fprintf(os.Stderr,
-		"fucina: interactive mode (Gemma 4 12B-IT) — ctx=%d, thinking=%s\n"+
-			"  /thinking LEVEL  set reasoning: off|on|low|medium|high|xhigh\n"+
-			"  /reset  clear conversation\n"+
-			"  /stats  show KV cache hit rate\n"+
-			"  /quit   exit (or Ctrl-D)\n\n",
-		ctxTokens, thinkLevel)
+		"fucina: interactive mode (Gemma 4 12B-IT) — ctx=%d, thinking=%s\n%s\n",
+		ctxTokens, thinkLevel, denseCommandsHelp)
 
 	for {
 		fmt.Fprint(os.Stderr, "\033[1;32m> \033[0m") // green prompt
@@ -83,6 +79,9 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		case "/quit", "/exit", "/q":
 			fmt.Fprintln(os.Stderr, "fucina: bye")
 			return
+		case "/help", "/h", "/?", "/commands":
+			fmt.Fprintf(os.Stderr, "fucina: commands —\n%s", denseCommandsHelp)
+			continue
 		case "/reset", "/clear":
 			history = history[:0]
 			if args.System != "" {
@@ -126,6 +125,15 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			on, budget := thinkSetting(thinkLevel, nToGenerate)
 			fmt.Fprintf(os.Stderr, "fucina: thinking=%s (on=%v, budget=%d tokens)\n",
 				thinkLevel, on, budget)
+			continue
+		}
+
+		// A leading-slash token that looks like a command but matched none of the
+		// above is a typo, not chat input — report it instead of silently sending
+		// "/foo" to the model (which is what made unknown commands "not work").
+		if looksLikeCommand(input) {
+			fmt.Fprintf(os.Stderr, "fucina: unknown command %q — type /help for the list\n",
+				strings.Fields(input)[0])
 			continue
 		}
 

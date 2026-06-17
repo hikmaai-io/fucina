@@ -8,6 +8,40 @@ import (
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
+// denseCommandsHelp is the command list shown in the dense REPL banner and by
+// /help. Kept in one place so the banner and /help can never drift apart.
+const denseCommandsHelp = "  /thinking LEVEL  set reasoning: off|on|low|medium|high|xhigh\n" +
+	"  /reset           clear conversation\n" +
+	"  /stats           show KV cache hit rate\n" +
+	"  /help            show this help\n" +
+	"  /quit            exit (or Ctrl-D)\n"
+
+// diffusionCommandsHelp is the equivalent for the DiffusionGemma REPL, which has
+// no per-turn KV reuse and no runtime /thinking toggle.
+const diffusionCommandsHelp = "  /reset  clear conversation\n" +
+	"  /stats  show context window\n" +
+	"  /help   show this help\n" +
+	"  /quit   exit (or Ctrl-D)\n"
+
+// looksLikeCommand reports whether input is a command-like leading-slash token
+// (e.g. "/help", "/thinking high") rather than chat input. It requires the first
+// whitespace-delimited field to be "/" followed only by letters or '?', so a real
+// message that merely starts with a path ("/etc/hosts is where?") is NOT mistaken
+// for a command. Recognized commands are handled before this is consulted, so a
+// true result here always means an unknown command.
+func looksLikeCommand(input string) bool {
+	f := strings.Fields(input)
+	if len(f) == 0 || len(f[0]) < 2 || f[0][0] != '/' {
+		return false
+	}
+	for _, r := range f[0][1:] {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '?') {
+			return false
+		}
+	}
+	return true
+}
+
 // thinkSetting resolves a thinking level (off|on|low|medium|high|xhigh) to whether
 // the gemma-4 reasoning channel is opened and the per-turn token budget that force-
 // closes it. Mirrors the server's level→enable + think-budget intent so the CLI
