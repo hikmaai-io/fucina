@@ -2735,6 +2735,10 @@ struct gemma4_engine {
     // tok, x, norm, inf, q, k, v, attn, o, gate, up, logitsK.
     float  *d_sb[12];
     int     sb_ready;
+    // NVFP4 batched-verify transposed-activation scratch: Xt[in_dim][K] (input-major) for the
+    // weight-read-once batched GEMV (nvfp4_gemv.cuh). Sized SPEC_MAX × widest in_dim (= INTERMEDIATE,
+    // the DOWN projection). Pre-allocated with d_sb so the captured verify does no alloc/host-sync.
+    float  *d_specxt;
     int    *d_sample_id;       // 4-byte device scratch for GPU-side sampled token id
     float  *d_sample_p;        // 4-byte device scratch: drafter top-1 softmax prob
     // GPU-side spec verify (a): K sampled ids + K host draws stay on device, only the
@@ -2818,6 +2822,12 @@ struct gemma4_engine {
     // — destroy frees it only if the pointers differ (double-free guard). NULL on GGUF models.
     __nv_bfloat16 *d_embed_bf16;   // [vocab × hidden] BF16 embeddings
     __nv_bfloat16 *d_lmhead_bf16;  // [vocab × hidden] BF16 LM head (== d_embed_bf16 when tied)
+    // FP8 E4M3 per-row-quantized UNTIED LM head (FORMAT_NVFP4 only). The untied BF16 head is 2 GB,
+    // read every token; quantizing it to 1 B/elem per-row halves the head bandwidth. Set only when
+    // the head is untied AND passes the load-time argmax accuracy gate; d_lmhead_bf16 is then freed
+    // and set NULL (no tied-alias: untied is always a distinct allocation). NULL ⇒ use BF16 head.
+    uint8_t *d_lmhead_fp8;         // [vocab × hidden] E4M3 weights, per-row scaled
+    float   *d_lmhead_fp8_scale;   // [vocab] per-row dequant scale (amax/448)
     uint8_t *d_fp4_act;        // activation packed E2M1 scratch (lazily sized to N×in/2)
     uint8_t *d_fp4_actsc;      // activation swizzled E4M3 block scales scratch
     uint8_t *d_fp4_actlin;     // activation LINEAR E4M3 block scales (pre-swizzle) scratch
@@ -3290,6 +3300,83 @@ static void gemma4_engine_batch_selftest(gemma4_engine_t *eng);       // Phase 3
 static int nvfp4_load_from_safetensors(gemma4_engine_t *eng, const char *path,
                                        const nvfp4ld::Layout *layout, st::Model *model);
 
+// Build a proxy hidden state from a real embedding row: out[h] = emb[tok][h] · w_out_norm[h] / rms.
+// The trained embedding rows live in the head's input space, and the final RMSNorm is exactly what
+// the decode path applies before the head — so these are realistic head inputs for the accuracy gate.
+__global__ void fp8gate_proxy_hidden_kernel(
+    float *out, const __nv_bfloat16 *emb, const float *wnorm,
+    const int32_t *toks, int hidden, float eps)
+{
+    const int row = blockIdx.x;
+    const __nv_bfloat16 *e = emb + (size_t)toks[row] * hidden;
+    __shared__ float s_ss;
+    float ss = 0.f;
+    for (int h = threadIdx.x; h < hidden; h += blockDim.x) { float v = __bfloat162float(e[h]); ss += v*v; }
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    __shared__ float s_part[32];
+    if ((threadIdx.x & 31) == 0) s_part[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f; for (int i = 0; i < (blockDim.x + 31) / 32; i++) t += s_part[i];
+        s_ss = rsqrtf(t / hidden + eps);
+    }
+    __syncthreads();
+    float inv = s_ss;
+    for (int h = threadIdx.x; h < hidden; h += blockDim.x)
+        out[(size_t)row * hidden + h] = __bfloat162float(e[h]) * inv * wnorm[h];
+}
+
+// Load-time accuracy gate for the FP8 head: quantize the BF16 head, run BOTH heads on `nsamp` real
+// proxy hidden states, and return the top-1 argmax match count. Caller keeps FP8 only on a full match.
+static int fp8_head_accuracy_gate(gemma4_engine_t *eng, int nsamp, double *out_worst_l2)
+{
+    const int H = GEMMA4_HIDDEN_SIZE, V = GEMMA4_VOCAB_SIZE;
+    float   *dX = NULL, *dYbf = NULL, *dYfp = NULL; int32_t *dTok = NULL;
+    int     *dArgBf = NULL, *dArgFp = NULL;
+    int match = -1; if (out_worst_l2) *out_worst_l2 = 0;
+    if (cudaMalloc(&dX,(size_t)nsamp*H*sizeof(float)) != cudaSuccess) goto done;
+    if (cudaMalloc(&dYbf,(size_t)nsamp*V*sizeof(float)) != cudaSuccess) goto done;
+    if (cudaMalloc(&dYfp,(size_t)nsamp*V*sizeof(float)) != cudaSuccess) goto done;
+    if (cudaMalloc(&dTok,(size_t)nsamp*sizeof(int32_t)) != cudaSuccess) goto done;
+    if (cudaMalloc(&dArgBf,(size_t)nsamp*sizeof(int)) != cudaSuccess) goto done;
+    if (cudaMalloc(&dArgFp,(size_t)nsamp*sizeof(int)) != cudaSuccess) goto done;
+    {
+        std::vector<int32_t> toks(nsamp);
+        for (int i = 0; i < nsamp; i++) toks[i] = (int32_t)(((long long)(i+1) * 8675309) % V);
+        cudaMemcpy(dTok, toks.data(), nsamp*sizeof(int32_t), cudaMemcpyHostToDevice);
+        fp8gate_proxy_hidden_kernel<<<nsamp,256>>>(dX, eng->d_embed_bf16, eng->d_w_out_norm, dTok, H, GEMMA4_RMS_EPS);
+
+        for (int r = 0; r < nsamp; r++) {
+            bf16_head_gemv_launch(dYbf+(size_t)r*V, eng->d_lmhead_bf16, dX+(size_t)r*H, H, V, 0);
+            fp8_head_gemv_launch (dYfp+(size_t)r*V, eng->d_lmhead_fp8, eng->d_lmhead_fp8_scale, dX+(size_t)r*H, H, V, 0);
+            argmax_kernel<<<1,32>>>(dYbf+(size_t)r*V, dArgBf+r, V);
+            argmax_kernel<<<1,32>>>(dYfp+(size_t)r*V, dArgFp+r, V);
+        }
+        cudaDeviceSynchronize();
+        std::vector<int> abf(nsamp), afp(nsamp);
+        cudaMemcpy(abf.data(), dArgBf, nsamp*sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(afp.data(), dArgFp, nsamp*sizeof(int), cudaMemcpyDeviceToHost);
+        match = 0; for (int i = 0; i < nsamp; i++) if (abf[i] == afp[i]) match++;
+        if (out_worst_l2) {
+            std::vector<float> ybf((size_t)nsamp*V), yfp((size_t)nsamp*V);
+            cudaMemcpy(ybf.data(), dYbf, ybf.size()*sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(yfp.data(), dYfp, yfp.size()*sizeof(float), cudaMemcpyDeviceToHost);
+            double worst = 0;
+            for (int r = 0; r < nsamp; r++) {
+                double num=0,den=0;
+                for (int v=0; v<V; v++){ double d=(double)yfp[(size_t)r*V+v]-ybf[(size_t)r*V+v]; num+=d*d; den+=(double)ybf[(size_t)r*V+v]*ybf[(size_t)r*V+v]; }
+                double l2 = den>0? sqrt(num/den):0; if (l2>worst) worst=l2;
+            }
+            *out_worst_l2 = worst;
+        }
+    }
+done:
+    if (dX) cudaFree(dX); if (dYbf) cudaFree(dYbf); if (dYfp) cudaFree(dYfp);
+    if (dTok) cudaFree(dTok); if (dArgBf) cudaFree(dArgBf); if (dArgFp) cudaFree(dArgFp);
+    cudaGetLastError();
+    return match;
+}
+
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
     tensor_format_t format,
@@ -3363,6 +3450,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->graph_mode = 0; eng->graph.g = NULL; eng->graph.e = NULL;
     eng->graph.N = 0; eng->graph.hits = eng->graph.misses = 0;
     eng->ev_pending = 0; eng->ev_pending_tokens = 0;
+    eng->d_specxt = NULL;
     eng->decode_graph = NULL; eng->decode_graph_failed = 0;
     eng->d_decpos = NULL; eng->d_dectok = NULL;
     for (int k = 0; k <= GEMMA4_SPEC_MAX; k++) eng->batched_graph[k] = NULL;
@@ -3729,6 +3817,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_fp4_actlin = NULL; eng->d_fp4_gsact = NULL; eng->d_fp4_alpha = NULL;
     eng->d_fp4_amax = NULL; eng->fp4_act_cap = 0; eng->d_fp4_ws = NULL;
     eng->nvfp4_decode_ready = 0; eng->d_embed_bf16 = NULL; eng->d_lmhead_bf16 = NULL;
+    eng->d_lmhead_fp8 = NULL; eng->d_lmhead_fp8_scale = NULL;
     for (int l=0;l<GEMMA4_MAX_LAYERS;l++) for (int p=0;p<PJ_COUNT;p++){
         eng->d_fp4_w[l][p]=NULL; eng->d_fp4_wsc[l][p]=NULL; eng->d_fp4_wsc_lin[l][p]=NULL; }
 
@@ -3929,6 +4018,41 @@ gemma4_engine_t* gemma4_engine_create(
             gemma4_engine_destroy(eng); return NULL;
         }
         cudaMemcpy(eng->d_lmhead_bf16, th->data, want, cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
+        // FP8 E4M3 PER-ROW HEAD: the untied BF16 head is 2 GB read EVERY token. Quantizing it to 1
+        // B/elem per-row would halve the head read, but FP8 (3 mantissa bits) flips the argmax over
+        // a 262144-vocab head and DEGRADES real generation ("capital of France is France") even when
+        // a load-time argmax gate on PROXY hidden states passes — the proxies don't reflect the real
+        // decode distribution and errors compound. So the FP8 head is OPT-IN (FUCINA_FP8_HEAD=1) and
+        // OFF by default; the BF16 head is correctness-critical and stays resident. The gate below is
+        // kept for experimentation but never auto-enables.
+        if (getenv("FUCINA_FP8_HEAD")) {
+            const int H = GEMMA4_HIDDEN_SIZE, V = GEMMA4_VOCAB_SIZE;
+            uint8_t *dq = NULL; float *dsc = NULL;
+            if (cudaMalloc(&dq,(size_t)V*H) == cudaSuccess &&
+                cudaMalloc(&dsc,(size_t)V*sizeof(float)) == cudaSuccess) {
+                fp8_head_quantize_launch(dq, dsc, eng->d_lmhead_bf16, V, H, 0);
+                cudaDeviceSynchronize();
+                eng->d_lmhead_fp8 = dq; eng->d_lmhead_fp8_scale = dsc;
+                double worst_l2 = 0;
+                const int nsamp = 64;
+                int match = fp8_head_accuracy_gate(eng, nsamp, &worst_l2);
+                if (match == nsamp) {
+                    // Gate passed: free the BF16 head (distinct alloc — untied, never aliases embed).
+                    cudaFree(eng->d_lmhead_bf16); eng->d_lmhead_bf16 = NULL;
+                    fprintf(stderr, "fucina: NVFP4 FP8 head ENABLED — argmax %d/%d match, worst logit L2rel=%.4f%%, head read 2.0→1.0 GB/token\n",
+                            match, nsamp, 100*worst_l2);
+                } else {
+                    cudaFree(dq); cudaFree(dsc);
+                    eng->d_lmhead_fp8 = NULL; eng->d_lmhead_fp8_scale = NULL;
+                    fprintf(stderr, "fucina: NVFP4 FP8 head REJECTED by accuracy gate (argmax %d/%d, worst L2rel=%.4f%%) — keeping BF16 head\n",
+                            match, nsamp, 100*worst_l2);
+                }
+            } else {
+                if (dq) cudaFree(dq); if (dsc) cudaFree(dsc); cudaGetLastError();
+                fprintf(stderr, "fucina: NVFP4 FP8 head alloc failed — keeping BF16 head\n");
+            }
+        }
     } else {
         eng->d_lmhead_bf16 = eng->d_embed_bf16;   // tied (destroy frees once via the alias guard)
     }
@@ -4283,6 +4407,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
             CUDA_FREE(eng->d_bf16_layer[b][p]);
     for (int p = 0; p < 12; p++)
         CUDA_FREE(eng->d_sb[p]);
+    CUDA_FREE(eng->d_specxt);
     for (int l = 0; l < GEMMA4_MAX_LAYERS; l++) {
     }
     CUDA_FREE(eng->d_sample_id);
@@ -4331,6 +4456,10 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     // when the head is tied it aliases d_embed_bf16, so freeing both would double-free.
     if (eng->d_lmhead_bf16 && eng->d_lmhead_bf16 != eng->d_embed_bf16)
         cudaFree(eng->d_lmhead_bf16);
+    // FP8-quantized untied head (when the accuracy gate enabled it d_lmhead_bf16 was freed → NULL).
+    // Never aliases d_embed_bf16 (untied), so no double-free guard needed.
+    if (eng->d_lmhead_fp8)       cudaFree(eng->d_lmhead_fp8);
+    if (eng->d_lmhead_fp8_scale) cudaFree(eng->d_lmhead_fp8_scale);
     if (eng->d_embed_bf16) cudaFree(eng->d_embed_bf16);
     if (eng->ev_start) cudaEventDestroy(eng->ev_start);
     if (eng->ev_stop)  cudaEventDestroy(eng->ev_stop);
@@ -4508,9 +4637,12 @@ static inline void logits_head(
     const gemma4_engine_t *eng, float *logits, const float *x,
     int in_dim, int out_dim, cudaStream_t stream)
 {
-    if (eng->format == FORMAT_NVFP4)
-        bf16_head_gemv_launch(logits, eng->d_lmhead_bf16, x, in_dim, out_dim, stream);
-    else
+    if (eng->format == FORMAT_NVFP4) {
+        if (eng->d_lmhead_fp8)   // accuracy-gated FP8 head: 1 B/elem (half the BF16 head read)
+            fp8_head_gemv_launch(logits, eng->d_lmhead_fp8, eng->d_lmhead_fp8_scale, x, in_dim, out_dim, stream);
+        else
+            bf16_head_gemv_launch(logits, eng->d_lmhead_bf16, x, in_dim, out_dim, stream);
+    } else
         gemv_w(eng, logits, lmhead_w(eng), x, in_dim, out_dim, stream, embd_fmt(eng));
 }
 
@@ -5562,6 +5694,19 @@ static inline void nvfp4_decode_proj(gemma4_engine_t *eng, int l, int p,
         const float *x, float *y, int in_dim, int out_dim, cudaStream_t st) {
     nvfp4_gemv_launch(y, eng->d_fp4_w[l][p], eng->d_fp4_wsc_lin[l][p],
                       eng->d_fp4_gsw + (l*PJ_COUNT + p), x, in_dim, out_dim, st);
+}
+
+// Batched (K-row) NVFP4 projection for the spec-verify forward: y[K][out] = X[K][in]·W with the
+// weight read ONCE for all K (vs nvfp4_decode_proj's per-row K× re-read). Transposes the token-major
+// activation X[K][in] → Xt[in][K] into the pre-allocated d_specxt scratch (so the K values for an
+// input index are contiguous/coalesced), then runs the weight-read-once batched GEMV. Output stays
+// token-major [K][out]. Capture-safe: no alloc / host sync (d_specxt pre-allocated in ensure_spec_scratch).
+static inline void nvfp4_decode_proj_batched(gemma4_engine_t *eng, int l, int p,
+        const float *x, float *y, int in_dim, int out_dim, int K, cudaStream_t st) {
+    nvfp4_xT_launch(eng->d_specxt, x, in_dim, K, st);
+    nvfp4_gemv_batched_launch(y, eng->d_fp4_w[l][p], eng->d_fp4_wsc_lin[l][p],
+                              eng->d_fp4_gsw + (l*PJ_COUNT + p), eng->d_specxt,
+                              in_dim, out_dim, K, st);
 }
 
 // Lazily allocate the tiled-MMQ prefill activation scratch (Q4_0 models only): the
@@ -6877,6 +7022,10 @@ static int ensure_spec_scratch(gemma4_engine_t *eng)
         if (cudaMalloc(&eng->d_spec_ids, M*sizeof(int)) != cudaSuccess) { cudaGetLastError(); return -1; }
     if (!eng->d_spec_rnd)
         if (cudaMalloc(&eng->d_spec_rnd, M*sizeof(float)) != cudaSuccess) { cudaGetLastError(); return -1; }
+    // NVFP4 batched-verify transposed-activation scratch Xt[in_dim][K], in_dim ≤ INTERMEDIATE.
+    // Pre-allocated once so the captured verify transposes into it with no alloc/host-sync.
+    if (!eng->d_specxt)
+        if (cudaMalloc(&eng->d_specxt, M*I*sizeof(float)) != cudaSuccess) { cudaGetLastError(); return -1; }
     eng->sb_ready = 1;
     return 0;
 }
@@ -6941,13 +7090,20 @@ static void decode_batched_forward(
         // RoPE and norms below are weight-free and stay batched. (Reached only via the chunked
         // suffix-prefill / spec-verify paths; the public single-token decode uses decode_layer.)
         const bool nvfp4 = (eng->format == FORMAT_NVFP4 && eng->nvfp4_decode_ready);
+        // Batched NVFP4 GEMV (weight read once for all K) when K fits the dispatch (≤ NVFP4_GEMV_KMAX);
+        // larger K (rare; SPEC_MAX=16 > KMAX) falls back to the per-row loop. nvb()/nvb_proj wrap that.
+        const bool nvfp4_b = nvfp4 && (K <= NVFP4_GEMV_KMAX);
+        auto nvb_proj = [&](int pj, const float *xin, float *yout, int idim, int odim){
+            if (nvfp4_b) nvfp4_decode_proj_batched(eng, l, pj, xin, yout, idim, odim, K, stream);
+            else for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, pj, xin+(size_t)r*idim, yout+(size_t)r*odim, idim, odim, stream);
+        };
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_inf, d_x, w_attn, H, K, GEMMA4_RMS_EPS);
         if (nvfp4) {
-            for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_Q, d_inf+(size_t)r*H, d_q+(size_t)r*oq,  H, oq,  stream);
+            nvb_proj(PJ_Q, d_inf, d_q, H, oq);
             per_head_rms_norm_rows_kernel<<<dim3(HEADS,K),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, K, GEMMA4_RMS_EPS);
-            for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_K, d_inf+(size_t)r*H, d_k+(size_t)r*okv, H, okv, stream);
+            nvb_proj(PJ_K, d_inf, d_k, H, okv);
             if (lt == LAYER_SLIDING) {
-                for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_V, d_inf+(size_t)r*H, d_v+(size_t)r*okv, H, okv, stream);
+                nvb_proj(PJ_V, d_inf, d_v, H, okv);
                 per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_v, NULL, nkv, hd, K, GEMMA4_RMS_EPS);
             } else {
                 cudaMemcpyAsync(d_v, d_k, (size_t)K*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
@@ -7030,7 +7186,7 @@ static void decode_batched_forward(
         }
 
         // O projection (input d_attn is already fp32) → d_o; post-attn norm; residual.
-        if (nvfp4) for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_O, d_attn+(size_t)r*oq, d_o+(size_t)r*H, oq, H, stream);
+        if (nvfp4) nvb_proj(PJ_O, d_attn, d_o, oq, H);
         else gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, K, stream);
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_a, H, K, GEMMA4_RMS_EPS);
         residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
@@ -7038,14 +7194,14 @@ static void decode_batched_forward(
         // FFN (fp32 batched GEMV throughout).
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_inf, d_x, w_ffn, H, K, GEMMA4_RMS_EPS);
         if (nvfp4) {
-            for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_GATE, d_inf+(size_t)r*H, d_gate+(size_t)r*I, H, I, stream);
-            for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_UP,   d_inf+(size_t)r*H, d_up+(size_t)r*I,   H, I, stream);
+            nvb_proj(PJ_GATE, d_inf, d_gate, H, I);
+            nvb_proj(PJ_UP,   d_inf, d_up,   H, I);
         } else {
             gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, K, stream);
             gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, K, stream);
         }
         geglu_kernel<<<grid1d((size_t)K*I),256,0,stream>>>(d_inf, d_gate, d_up, K*I);
-        if (nvfp4) for (int r=0;r<K;r++) nvfp4_decode_proj(eng, l, PJ_DOWN, d_inf+(size_t)r*I, d_o+(size_t)r*H, I, H, stream);
+        if (nvfp4) nvb_proj(PJ_DOWN, d_inf, d_o, I, H);
         else gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, K, stream);
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_f, H, K, GEMMA4_RMS_EPS);
         residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
@@ -7059,10 +7215,26 @@ static void decode_batched_forward(
     if (want_head) {
         int vocab = GEMMA4_VOCAB_SIZE;
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, K, GEMMA4_RMS_EPS);
-        if (eng->format == FORMAT_NVFP4)
-            for (int r=0;r<K;r++)
-                bf16_head_gemv_launch(d_logitsK+(size_t)r*vocab, eng->d_lmhead_bf16, d_norm+(size_t)r*H, H, vocab, stream);
-        else
+        if (eng->format == FORMAT_NVFP4) {
+            if (K <= NVFP4_GEMV_KMAX) {
+                // Batched head: the head read ONCE for all K rows (transpose d_norm[K][H] →
+                // d_specxt[H][K], then weight-read-once batched head GEMV). Output token-major.
+                // FP8 head (gated) reads 1 B/elem — halves the per-K-batch head bandwidth vs BF16.
+                nvfp4_xT_launch(eng->d_specxt, d_norm, H, K, stream);
+                if (eng->d_lmhead_fp8)
+                    fp8_head_gemv_batched_launch(d_logitsK, eng->d_lmhead_fp8, eng->d_lmhead_fp8_scale,
+                                                 eng->d_specxt, H, vocab, K, stream);
+                else
+                    bf16_head_gemv_batched_launch(d_logitsK, eng->d_lmhead_bf16, eng->d_specxt,
+                                                  H, vocab, K, stream);
+            } else {
+                for (int r=0;r<K;r++)
+                    if (eng->d_lmhead_fp8)
+                        fp8_head_gemv_launch(d_logitsK+(size_t)r*vocab, eng->d_lmhead_fp8, eng->d_lmhead_fp8_scale, d_norm+(size_t)r*H, H, vocab, stream);
+                    else
+                        bf16_head_gemv_launch(d_logitsK+(size_t)r*vocab, eng->d_lmhead_bf16, d_norm+(size_t)r*H, H, vocab, stream);
+            }
+        } else
         gemv_batched_w(eng, d_logitsK, lmhead_w(eng),
                        d_norm, H, vocab, K, stream, embd_fmt(eng));
         logit_softcap_kernel<<<grid1d((size_t)K*vocab),256,0,stream>>>(d_logitsK, GEMMA4_SOFTCAP, K*vocab);
