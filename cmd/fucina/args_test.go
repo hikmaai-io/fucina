@@ -61,6 +61,14 @@ func TestParseArgsDefaults(t *testing.T) {
 	if a.Seed != -1 {
 		t.Errorf("Seed = %d, want -1", a.Seed)
 	}
+	if a.GPUMemUtil != 0.90 {
+		t.Errorf("GPUMemUtil = %v, want 0.90", a.GPUMemUtil)
+	}
+
+	// --gpu-mem-util overrides the default.
+	if b, _ := mustParse(t, []string{"--gpu-mem-util", "0.20"}); b.GPUMemUtil != 0.20 {
+		t.Errorf("GPUMemUtil = %v, want 0.20", b.GPUMemUtil)
+	}
 
 	// No test-flag dispatch by default.
 	if tf.parser || tf.cuda || tf.vectors != "" {

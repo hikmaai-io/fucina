@@ -2981,6 +2981,7 @@ struct gemma4_engine {
     int    device_id;
     size_t free_mem;
     size_t total_mem;
+    double gpu_mem_util;   // --gpu-mem-util: fraction of total_mem the engine may use (vLLM-style)
 
     // Timing accumulators
     float prefill_time_ms;
@@ -3557,7 +3558,8 @@ gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
     tensor_format_t format,
     uint32_t       context_size,
-    int            device_id)
+    int            device_id,
+    double         gpu_mem_util)
 {
     // Allocate engine
     gemma4_engine_t *eng = (gemma4_engine_t *)
@@ -3567,6 +3569,9 @@ gemma4_engine_t* gemma4_engine_create(
     eng->format = format;
     eng->context_size = context_size;
     eng->device_id = device_id;
+    // GPU-memory budget fraction. Clamp to a sane (0,1]; <=0 or absurd → the 0.90 default.
+    if (gpu_mem_util <= 0.0 || gpu_mem_util > 1.0) gpu_mem_util = 0.90;
+    eng->gpu_mem_util = gpu_mem_util;
     eng->loaded = 0;
 
     // Validate context
@@ -4397,6 +4402,150 @@ gemma4_engine_t* gemma4_engine_create(
         eng->global_attn_max_smem = max_optin;
     }
 
+    // ── GPU-memory budget (--gpu-mem-util) ───────────────────────────────────
+    // Weights + fixed scratch/norms are already RESIDENT at this point. We must fit,
+    // under budget = util * total_mem, the two remaining big allocations:
+    //   - KV cache:  sliding ring (ctx-independent) + global (scales with ctx)
+    //   - packed-Q4_0 decode copy (~= weights size; Q4_0 only, optional)
+    // The budget auto-derives BOTH an effective global-KV ctx (≤ the user's --ctx,
+    // never above) and whether the packed copy fits — unifying the scattered
+    // FUCINA_NO_PACKED / FUCINA_SLIDING_RING env knobs (which still WIN if set).
+    //
+    // OUR footprint is measured as a DELTA: free_at_start - free_now. The GB10 is a
+    // shared unified-memory box — other processes' VRAM (and host RAM) is already
+    // subtracted from `free`, so the raw (total - free) would wrongly bill their bytes
+    // to us. The delta isolates exactly what THIS engine allocated. Two ceilings then
+    // apply: (a) the budget cap util*total on our own footprint, and (b) the bytes
+    // physically still free right now (we cannot allocate what the OS doesn't have).
+    int  budget_packed = 0;        // resolved packed-Q4_0 decision (1 = build it)
+    bool packed_forced_off = false;
+    {
+        size_t free_now = 0, total_now = 0;
+        cudaMemGetInfo(&free_now, &total_now);
+        const double GiB = 1024.0 * 1024.0 * 1024.0;
+        // total_mem was captured at create top; prefer the live total just in case.
+        size_t total_mem = total_now ? total_now : eng->total_mem;
+        uint64_t budget = (uint64_t)(eng->gpu_mem_util * (double)total_mem);
+        // OUR resident bytes = what free dropped by since create-start (weights +
+        // scratch + norms). Clamp to ≥0 (free can wobble up if another proc released).
+        uint64_t free_start = eng->free_mem;
+        uint64_t resident = (free_start > free_now) ? (free_start - free_now) : 0;
+        // Headroom STILL free for our remaining allocs, with a small safety reserve so
+        // CUDA-graph capture / activation scratch (lazy) don't immediately OOM.
+        const uint64_t safety = 512ull << 20;   // 0.5 GiB
+        uint64_t free_room = (free_now > safety) ? (free_now - safety) : 0;
+
+        // Per-element KV byte cost (FP8 KV, K and V each), by class.
+        const uint64_t kv_elem = sizeof(kv_t);
+        // Sliding ring capacity (mirror the existing ring sizing exactly).
+        int ring_w = 8192;
+        if (const char *e = getenv("FUCINA_SLIDING_RING")) { if (*e) { int v = atoi(e); if (v >= GEMMA4_SLIDING_WINDOW) ring_w = v; } }
+        const int ring_floor = GEMMA4_SLIDING_WINDOW + GEMMA4_SPEC_MAX;
+        int ring_cap = (int)context_size;
+        if (ring_cap > ring_w)     ring_cap = ring_w;
+        if (ring_cap < ring_floor) ring_cap = ring_floor;
+        // Sliding KV is K+V, ctx-independent once the ring caps it.
+        uint64_t sliding_bytes = 2ull * (uint64_t)eng->cfg.n_layers *
+            (uint64_t)eng->cfg.n_kv_sliding * (uint64_t)ring_cap *
+            GEMMA4_HEAD_DIM * kv_elem;
+        // Global KV is K+V and scales LINEARLY with ctx: per-token byte cost.
+        uint64_t glob_per_tok = 2ull * (uint64_t)eng->n_layers_global *
+            (uint64_t)eng->cfg.n_kv_global * GEMMA4_GLOBAL_HEAD_DIM * kv_elem;
+        // Packed-Q4_0 copy size (== resident bulk-weight bytes). NVFP4 has no Q4_0
+        // store; non-Q4_0 / mmap'd weights also can't be packed.
+        bool packed_possible = (eng->format == FORMAT_Q4_0) && eng->d_weights;
+        const char *no_packed = getenv("FUCINA_NO_PACKED");
+        bool env_no_packed = (no_packed && no_packed[0] == '1');
+        uint64_t packed_bytes = packed_possible
+            ? (uint64_t)(eng->gguf_size - eng->tdata_start) : 0;
+
+        // REQUIRED floor = resident weights/scratch + sliding ring + a MIN global KV
+        // (the ring_floor's worth of global ctx — enough to decode short prompts).
+        uint64_t min_global = glob_per_tok * (uint64_t)ring_floor;
+        uint64_t required = resident + sliding_bytes + min_global;
+        // The required KV (sliding + min global) must fit BOTH the budget headroom and
+        // the physically-free room; report whichever ceiling is tighter.
+        uint64_t budget_room = (budget > resident) ? (budget - resident) : 0;
+        uint64_t need_kv = sliding_bytes + min_global;
+        if (required > budget || need_kv > free_room) {
+            bool over_budget = (required > budget);
+            fprintf(stderr,
+                "fucina: GPU memory budget exceeded — model needs weights+scratch %.2f GiB "
+                "+ min KV %.2f GiB; %s.\n"
+                "        budget %.2f GiB at util %.2f of %.2f GiB total; %.2f GiB physically free.\n"
+                "        Raise --gpu-mem-util, lower --ctx, free the GPU, or pick another --cuda-device.\n",
+                resident / GiB, need_kv / GiB,
+                over_budget ? "exceeds the util budget" : "exceeds the free GPU memory",
+                budget / GiB, eng->gpu_mem_util, total_mem / GiB, free_now / GiB);
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
+
+        // Spend the remaining room: prefer the packed copy IF it fits while still
+        // leaving room for at least the min global KV; otherwise drop it and give the
+        // freed bytes to ctx. Then cap ctx so the global KV fits what's left. `avail`
+        // is bounded by BOTH the util budget and the physically-free memory.
+        uint64_t avail = budget_room - sliding_bytes;         // budget side
+        uint64_t free_avail = free_room - sliding_bytes;      // physical side
+        if (free_avail < avail) avail = free_avail;           // tighter ceiling wins
+        if (packed_possible && !env_no_packed) {
+            if (packed_bytes + min_global <= avail) {
+                budget_packed = 1;
+                avail -= packed_bytes;
+            } else {
+                packed_forced_off = true;   // would not leave room for a usable KV
+            }
+        } else if (env_no_packed) {
+            // Honor the explicit env opt-out; not a budget decision.
+            budget_packed = 0;
+        }
+
+        // Effective global ctx = min(user ctx, avail / per-token global cost).
+        uint32_t eff_ctx = context_size;
+        if (glob_per_tok > 0) {
+            uint64_t fit_ctx = avail / glob_per_tok;
+            if (fit_ctx < eff_ctx) eff_ctx = (uint32_t)fit_ctx;
+        }
+        if (eff_ctx < (uint32_t)ring_floor) eff_ctx = (uint32_t)ring_floor;  // guaranteed by REQUIRED check
+        bool ctx_capped = (eff_ctx < context_size);
+        context_size = eff_ctx;
+        eng->context_size = eff_ctx;
+        eng->sliding_kv_capacity = ring_cap;
+
+        // Recompute the final global KV at the (possibly capped) ctx for the log.
+        uint64_t global_bytes = glob_per_tok * (uint64_t)eff_ctx;
+        uint64_t total_use = resident + sliding_bytes + global_bytes +
+                             (budget_packed ? packed_bytes : 0);
+
+        // ── Balance sheet ────────────────────────────────────────────────────
+        fprintf(stderr,
+            "fucina: ── GPU memory budget ──────────────────────────────\n"
+            "fucina:   total device mem : %8.2f GiB\n"
+            "fucina:   free at start    : %8.2f GiB  (shared box: %.2f GiB held by others)\n"
+            "fucina:   --gpu-mem-util   : %8.2f\n"
+            "fucina:   budget (our cap) : %8.2f GiB\n"
+            "fucina:   weights+scratch  : %8.2f GiB  (resident, measured)\n"
+            "fucina:   KV sliding ring  : %8.2f GiB  (cap %d, ctx-independent)\n"
+            "fucina:   KV global        : %8.2f GiB  (ctx %u%s)\n"
+            "fucina:   packed Q4_0 copy : %8.2f GiB  (%s)\n"
+            "fucina:   ─────────────────────────────────────────────────\n"
+            "fucina:   our total        : %8.2f GiB  (%s budget by %.2f GiB)\n",
+            total_mem / GiB,
+            free_start / GiB, (total_mem > free_start ? (total_mem - free_start) : 0) / GiB,
+            eng->gpu_mem_util, budget / GiB,
+            resident / GiB,
+            sliding_bytes / GiB, ring_cap,
+            global_bytes / GiB, eff_ctx, ctx_capped ? ", CAPPED from --ctx" : "",
+            (budget_packed ? packed_bytes : 0) / GiB,
+            budget_packed ? "ON" :
+                (packed_forced_off ? "OFF — no budget" :
+                 (env_no_packed ? "OFF — FUCINA_NO_PACKED" :
+                  (packed_possible ? "OFF" : "n/a"))),
+            total_use / GiB,
+            total_use <= budget ? "within" : "OVER",
+            (total_use <= budget ? (budget - total_use) : (total_use - budget)) / GiB);
+    }
+
     // KV cache allocation
     // Sliding cache is a per-position RING: [MAX_LAYERS][cap][8×256], position p stored at
     // slot p % cap. Sliding-window attention only ever reads the last GEMMA4_SLIDING_WINDOW
@@ -4406,20 +4555,7 @@ gemma4_engine_t* gemma4_engine_create(
     // floored at the window). The margin cap-window bounds how far a prefix-reuse rewind can
     // look back exactly; deeper rewinds report failure (gemma4_engine_rewind) and the server
     // falls back to a full re-prefill. Speculation rewinds ≤ GEMMA4_SPEC_MAX, always inside it.
-    {
-        int ring_w = 8192;                          // default ring capacity (window + margin)
-        const char *e = getenv("FUCINA_SLIDING_RING");
-        if (e && *e) { int v = atoi(e); if (v >= GEMMA4_SLIDING_WINDOW) ring_w = v; }
-        // Floor at window + spec_max: a spec-verify batch writes K≤SPEC_MAX draft
-        // positions while each row reads its window, so window+SPEC_MAX consecutive
-        // ring slots must be collision-free. (Only binds for a tiny FUCINA_SLIDING_RING;
-        // the default 8192 clears it by ~7×.)
-        const int ring_floor = GEMMA4_SLIDING_WINDOW + GEMMA4_SPEC_MAX;
-        int cap = (int)context_size;
-        if (cap > ring_w)      cap = ring_w;
-        if (cap < ring_floor)  cap = ring_floor;
-        eng->sliding_kv_capacity = cap;
-    }
+    // (eng->sliding_kv_capacity already set by the GPU-memory-budget block above.)
     // M0 A3: the sliding cache is indexed by ABSOLUTE layer id (cfg.n_layers slots) and now
     // sized by the runtime sliding KV-head count (8 on 12B, 16 on 31B). On 12B cfg.n_kv_sliding
     // == GEMMA4_KV_HEADS and cfg.n_layers == GEMMA4_MAX_LAYERS so this is byte-identical.
@@ -4558,14 +4694,14 @@ gemma4_engine_t* gemma4_engine_create(
         }
     }
 
-    // Repacked-Q4_0 decode GEMV: DEFAULT-ON for dense 12B+MTP (bit-exact, ~+2-3% decode
-    // via coalesced uint4 weight loads; costs +6.96 GB weight VRAM — fine on GB10's 128 GB
-    // unified memory). Built eagerly now — before any request or CUDA-graph capture — so
-    // the decode GEMV's packed branch is a pure read. Opt out with FUCINA_NO_PACKED=1.
+    // Repacked-Q4_0 decode GEMV: bit-exact, ~+2-3% decode via coalesced uint4 weight
+    // loads; costs +weights-size VRAM. The GPU-memory-budget block above already decided
+    // budget_packed (1 only if it fits under --gpu-mem-util AND FUCINA_NO_PACKED is not
+    // set; an explicit FUCINA_NO_PACKED=1 forces it off there). Built eagerly now — before
+    // any request or CUDA-graph capture — so the decode GEMV's packed branch is a pure read.
     // NVFP4 has NO Q4_0 store (single-store invariant) — skip the repack entirely.
-    if (!is_nvfp4) {
-        const char *off = getenv("FUCINA_NO_PACKED");
-        if (!(off && off[0] == '1')) build_packed_q4(eng);   // non-fatal: falls back if it fails
+    if (!is_nvfp4 && budget_packed) {
+        build_packed_q4(eng);   // non-fatal: falls back if it fails
     }
 
     // Paged KV mirror validation (opt-in): decode a fixed run and assert the

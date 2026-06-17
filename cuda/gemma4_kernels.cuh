@@ -113,7 +113,10 @@ gemma4_engine_t* gemma4_engine_create(
     const char *model_path,     // path to GGUF file
     tensor_format_t format,     // hint only — the real format is auto-detected from the GGUF
     uint32_t context_size,      // max context tokens
-    int device_id               // CUDA device (0 for DGX Spark)
+    int device_id,              // CUDA device (0 for DGX Spark)
+    double gpu_mem_util         // --gpu-mem-util: fraction of total device mem the engine may use
+                                // (vLLM-style; e.g. 0.90). Budgets weights+KV+scratch+packed; the
+                                // engine caps ctx / drops the packed-Q4_0 copy to satisfy it. <=0 → 0.90.
 );
 
 void gemma4_engine_destroy(gemma4_engine_t *eng);

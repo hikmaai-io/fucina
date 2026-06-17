@@ -79,9 +79,10 @@ type Engine struct {
 // else is treated as an NVFP4 safetensors checkpoint (a directory, an .index.json,
 // or a single .safetensors file). Other formats are rejected at load.
 type Config struct {
-	ModelPath   string // -m, --model (GGUF file, or NVFP4 safetensors dir/.safetensors)
-	ContextSize uint32 // --ctx
-	DeviceID    int    // --cuda-device
+	ModelPath   string  // -m, --model (GGUF file, or NVFP4 safetensors dir/.safetensors)
+	ContextSize uint32  // --ctx
+	DeviceID    int     // --cuda-device
+	GPUMemUtil  float64 // --gpu-mem-util: fraction of total device mem the engine may use (vLLM-style; <=0 → 0.90)
 }
 
 // NewEngine creates and initializes the CUDA inference engine.
@@ -103,6 +104,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 		C.FORMAT_Q8_0, // placeholder — the engine auto-detects Q4_0/Q8_0 from the GGUF
 		C.uint32_t(ctxSize),
 		C.int(cfg.DeviceID),
+		C.double(cfg.GPUMemUtil), // --gpu-mem-util (<=0 → engine clamps to 0.90)
 	)
 	if ptr == nil {
 		return nil, fmt.Errorf("fucina: engine creation failed for %s", cfg.ModelPath)
