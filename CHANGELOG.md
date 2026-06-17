@@ -50,6 +50,27 @@ First public release as `github.com/hikmaai-io/fucina` (formerly the internal `g
   and prefill/decode throughput smoke.
 - **`make paged-kv-device-test`**: GPU test proving paged KV reads are bit-identical
   to the contiguous cache.
+- **Native NVFP4 safetensors single-store loading** (`FORMAT_NVFP4`): loads a
+  HuggingFace NVFP4 checkpoint (`RedHatAI/*` compressed-tensors or `nvidia/*-FP4`
+  ModelOpt) as one packed weight store (E2M1 + E4M3 block scales + global
+  multiplier, ~6.81 GB): no Q4_0 copy, no NVFP4 to BF16 materialization. Includes
+  `safetensors.h` (mmap-based sharded container parser), `nvfp4_loader.h` (name
+  mapping for both naming conventions, config.json parse), and `nvfp4.h` (dequant
+  oracle). See [`docs/nvfp4-safetensors.md`](docs/nvfp4-safetensors.md).
+- **Fused NVFP4 decode GEMV** (`cuda/nvfp4_gemv.cuh`): register-blocked (ROWS=4)
+  warp-per-row kernel reaching 152–193 GB/s, at/above dp4a Q4_0 decode parity.
+- **Weight-read-once batched NVFP4 spec-verify**: transposes X[K][in] to Xt[in][K],
+  dequantizing each nibble once for all K columns. MTP goes from net-negative
+  (11.2 tok/s) to profitable (~28 tok/s).
+- **Native HuggingFace BPE tokenizer** (`internal/tokenizer/hf_bpe.go`): reads a
+  checkpoint's `tokenizer.json` natively (byte-fallback BPE, metaspace), verified
+  token-for-token against the HF `tokenizers` library. NVFP4 checkpoints are now
+  self-contained; `--tokenizer` is no longer required.
+- **BF16 LM head GEMV register-blocking** (BF16_HEAD_ROWS=4): the 2 GB untied
+  head is decoded at register-blocked throughput instead of the latency-bound
+  warp-per-row path.
+- **`make nvfp4-test`**: host unit tests for the safetensors parser, dequant
+  oracle, and name-mapping, plus GPU correctness for the decode/verify kernels.
 
 ### Fixed
 - **Repeat-penalty silently disabled**: both the non-spec CLI loop and the one-shot
@@ -62,6 +83,9 @@ First public release as `github.com/hikmaai-io/fucina` (formerly the internal `g
 - **Whole-batch eviction on KV exhaustion** (high-sev): a single row unable to
   grow its block table returned -1 for the whole batch. Now `step_batch` admits
   per-row: a failing row is excluded, the others proceed.
+- **MTP drafter crash under NVFP4**: `mtp_forward` embedded the draft token via a
+  Q8_0 lookup over `weight_fp8(token_embd)`, which dereferenced a NULL `d_weights`
+  under NVFP4. Now routed through `embed_w` (BF16 table for NVFP4).
 
 ### Performance
 - Measured against `llama.cpp` on a fair side-by-side harness (`scripts/pi_bench.py`): decode at

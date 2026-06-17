@@ -62,6 +62,12 @@ struct ProjKeys { std::string packed, scale, gscale; };
 //   • compressed-tensors stores the LARGE reciprocal weight_global_scale = (6*448)/amax,
 //     and reconstruction DIVIDES by it → the multiplier is 1/weight_global_scale.
 //   • ModelOpt stores the SMALL weight_scale_2 = amax/(6*448) and MULTIPLIES → use as-is.
+//
+// The producer is detected upstream by the global-scale tensor KEY:
+//   weight_global_scale → compressed-tensors (DIVIDE); weight_scale_2 → ModelOpt (MULTIPLY).
+// INVARIANT: every downstream consumer assumes real = e2m1 * e4m3 * global_mul. If a third
+// producer with a different convention appears, extend BOTH the key detection (Naming) and the
+// branch below; do not let a new key fall through to the ModelOpt (multiply) default silently.
 inline float global_mul(Naming naming, float raw) {
     return (naming == Naming::COMPRESSED) ? (raw != 0.f ? 1.0f / raw : 0.f) : raw;
 }

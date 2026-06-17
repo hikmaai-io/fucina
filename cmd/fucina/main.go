@@ -79,7 +79,16 @@ func loadTokenizer(modelPath, override string) (*tokenizer.Tokenizer, error) {
 		return tokenizer.New(data, int64(len(data)))
 	}
 	if j := siblingTokenizerJSON(modelPath); j != "" {
-		return tokenizer.NewFromHFJSON(j)
+		// NewFromHFJSON validates the file up-front (BPE type, non-empty vocab,
+		// merge format) and returns a descriptive error; wrap it so the user can
+		// tell the tokenizer.json was AUTO-DETECTED next to the model (and can pass
+		// an explicit --tokenizer to override a bad one).
+		tok, err := tokenizer.NewFromHFJSON(j)
+		if err != nil {
+			return nil, fmt.Errorf("auto-detected tokenizer %s is not usable: %w "+
+				"(pass --tokenizer <gemma-4.gguf|tokenizer.json> to override)", j, err)
+		}
+		return tok, nil
 	}
 	data, err := os.ReadFile(modelPath)
 	if err != nil {

@@ -328,6 +328,14 @@ Both compressed-tensors (`RedHatAI/*`) and ModelOpt (`nvidia/*-FP4`) naming are 
 [docs/nvfp4-safetensors.md](docs/nvfp4-safetensors.md) for the schema, architecture, performance,
 and limits.
 
+> [!TIP]
+> **Speculative decoding with NVFP4.** The MTP draft head (`--assistant`) accepts NVFP4's tokens at
+> a lower rate (~42%) than the original model (~89%): the assistant is matched to the original
+> weights, not the NVFP4 checkpoint. For NVFP4, **prompt-lookup speculation** (model-agnostic,
+> enabled by default) is the recommended speculative path. MTP still works, but the throughput gain
+> is smaller (~28 tok/s vs ~57 with Q4_0+MTP). See
+> [docs/nvfp4-safetensors.md](docs/nvfp4-safetensors.md) for details.
+
 ---
 
 ## 🎯 Speculative decoding (MTP)
