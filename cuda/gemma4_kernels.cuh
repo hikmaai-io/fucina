@@ -28,14 +28,11 @@
 
 // ─── Compile-time constants ────────────────────────────────────────────
 
-#define GEMMA4_MAX_LAYERS        48
-#define GEMMA4_HIDDEN_SIZE       3840
-#define GEMMA4_INTERMEDIATE      15360   // 4× hidden
-#define GEMMA4_HEADS             16
-#define GEMMA4_KV_HEADS          8
-#define GEMMA4_GLOBAL_KV_HEADS   1
-#define GEMMA4_HEAD_DIM          256
-#define GEMMA4_GLOBAL_HEAD_DIM   512
+// Per-variant architecture constants (12B default; -DGEMMA4_VARIANT_31B selects 31B).
+// MAX_LAYERS, HIDDEN_SIZE, INTERMEDIATE, HEADS, KV_HEADS, GLOBAL_KV_HEADS, HEAD_DIM,
+// GLOBAL_HEAD_DIM are defined there. See docs/dense-31b-89tok-plan.md (M0).
+#include "gemma4_config.h"
+
 #define GEMMA4_SLIDING_WINDOW    1024
 #define GEMMA4_VOCAB_SIZE        262144
 #define GEMMA4_MAX_CTX           262144
