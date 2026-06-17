@@ -1534,19 +1534,30 @@ __device__ __forceinline__ void block_reduce_sum_vec(float *val, float *smem) {
 // dot is 5 shuffles as before.
 #define GEMMA4_GLOBAL_ATTN_TILE 32   // keys staged per smem tile (2*TILE*HD = 32 KB at HD 512)
 
-template<int NH, int HD>
+// NKV global KV heads (GQA fan-out NH/NKV). NKV==1 is the 12B broadcast layout
+// (cache [ctx_len][HD]); NKV>1 is the 31B GQA layout (cache [ctx_len][NKV][HD]),
+// each query warp h reading KV head h/(NH/NKV). The block stages ALL NKV*HD K/V
+// bytes of each token into smem once, so every head-warp consumes its KV head from
+// smem with zero extra DRAM traffic regardless of NKV.
+template<int NH, int NKV, int HD>
 __global__ void global_attn_splitk_kernel(
     float *part_acc,                          // [n_splits][NH][HD] (unnormalized)
     float *part_m, float *part_l,             // [n_splits][NH]
     const float *q,                           // [NH][HD]
-    const kv_t *k_cache, const kv_t *v_cache, // [ctx_len][HD]
+    const kv_t *k_cache, const kv_t *v_cache, // [ctx_len][NKV][HD]
     int head_dim, int ctx_len, int n_splits)
 {
-    constexpr int TILE = GEMMA4_GLOBAL_ATTN_TILE;
+    // Stage TILE tokens of NKV*HD bytes each per K and V slab. Hold the smem footprint
+    // (2*TILE*NKV*HD) at the 12B level (32 KB) regardless of NKV by shrinking TILE by NKV,
+    // so the static __shared__ tile stays under the 48 KB default cap for the 31B (NKV=4).
+    constexpr int TILE = GEMMA4_GLOBAL_ATTN_TILE / NKV;
     constexpr int E = HD / 128;               // uint words per lane (4 at HD 512)
+    constexpr int GQ = NH / NKV;              // query heads per KV head
     static_assert(HD % 128 == 0, "uint lane slices require HD multiple of 128");
-    __shared__ unsigned char sk[TILE * HD], sv[TILE * HD];
+    static_assert(TILE >= 1, "GEMMA4_GLOBAL_ATTN_TILE must be >= NKV");
+    __shared__ unsigned char sk[TILE * NKV * HD], sv[TILE * NKV * HD];
     int h    = threadIdx.x >> 5;              // warp = query head
+    int kvh  = h / GQ;                        // this query head's KV head
     int lane = threadIdx.x & 31;
     int split = blockIdx.x;
     int per = (ctx_len + n_splits - 1) / n_splits;
@@ -1562,18 +1573,18 @@ __global__ void global_attn_splitk_kernel(
 
     for (int tb = t0; tb < t1; tb += TILE) {
         int tn = min(TILE, t1 - tb);
-        {   // cooperative stage: tn rows of HD fp8 bytes for K and V (16 B vectors; KV rows
-            // are HD-byte aligned so the uint4 view is safe). Bounds are block-uniform.
-            int nvec = tn * (HD / 16);
-            const uint4 *gk = (const uint4 *)(k_cache + (size_t)tb * HD);
-            const uint4 *gv = (const uint4 *)(v_cache + (size_t)tb * HD);
+        {   // cooperative stage: tn tokens of NKV*HD fp8 bytes for K and V (16 B vectors;
+            // KV rows are HD-byte aligned so the uint4 view is safe). Bounds block-uniform.
+            int nvec = tn * (NKV * HD / 16);
+            const uint4 *gk = (const uint4 *)(k_cache + (size_t)tb * NKV * HD);
+            const uint4 *gv = (const uint4 *)(v_cache + (size_t)tb * NKV * HD);
             uint4 *sk4 = (uint4 *)sk, *sv4 = (uint4 *)sv;
             for (int i = threadIdx.x; i < nvec; i += NH*32) { sk4[i] = gk[i]; sv4[i] = gv[i]; }
         }
         __syncthreads();
         for (int tt = 0; tt < tn; tt++) {
-            const unsigned int *kw = (const unsigned int *)(sk + (size_t)tt * HD);
-            const unsigned int *vw = (const unsigned int *)(sv + (size_t)tt * HD);
+            const unsigned int *kw = (const unsigned int *)(sk + ((size_t)tt * NKV + kvh) * HD);
+            const unsigned int *vw = (const unsigned int *)(sv + ((size_t)tt * NKV + kvh) * HD);
             float dot = 0.0f;
             #pragma unroll
             for (int e = 0; e < E; e++) {
@@ -1754,18 +1765,20 @@ static __device__ __forceinline__ int attn_row_splits(int len, int chunk) {
 // made each verify row pay the full long-ctx decay. All tile bounds are block-uniform
 // (split/ctx_len derive from blockIdx and the row), so the __syncthreads are safe; the
 // tail-block early-return happens before the first barrier and is block-uniform too.
-template<int NH, int HD>
+template<int NH, int NKV, int HD>
 __global__ void global_attn_splitk_rows_kernel(
     float *part_acc, float *part_m, float *part_l,   // slot r*MAX_SPLITS+split
     const float *q,                                  // [K][NH*HD] (row-major)
-    const kv_t *k_cache, const kv_t *v_cache,        // [capacity][HD]
+    const kv_t *k_cache, const kv_t *v_cache,        // [capacity][NKV][HD]
     int n_tokens0,                                   // row r attends n_tokens0 + r keys
     const int *n_tokens0_ptr)                        // non-NULL: device override (graph path)
 {
-    constexpr int TILE = GEMMA4_GLOBAL_ATTN_TILE;
+    constexpr int TILE = GEMMA4_GLOBAL_ATTN_TILE / NKV;   // smem held at the 12B footprint
     constexpr int E = HD / 128;
+    constexpr int GQ = NH / NKV;
     static_assert(HD % 128 == 0, "uint lane slices require HD multiple of 128");
-    __shared__ unsigned char sk[TILE * HD], sv[TILE * HD];
+    static_assert(TILE >= 1, "GEMMA4_GLOBAL_ATTN_TILE must be >= NKV");
+    __shared__ unsigned char sk[TILE * NKV * HD], sv[TILE * NKV * HD];
     int r = blockIdx.y;
     if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
     int ctx_len = n_tokens0 + r;
@@ -1773,6 +1786,7 @@ __global__ void global_attn_splitk_rows_kernel(
     int split = blockIdx.x;
     if (split >= n_splits) return;                   // tail blocks of shorter rows
     int h    = threadIdx.x >> 5;
+    int kvh  = h / GQ;
     int lane = threadIdx.x & 31;
     int per = (ctx_len + n_splits - 1) / n_splits;
     int t0  = split * per;
@@ -1788,16 +1802,16 @@ __global__ void global_attn_splitk_rows_kernel(
     for (int tb = t0; tb < t1; tb += TILE) {
         int tn = min(TILE, t1 - tb);
         {
-            int nvec = tn * (HD / 16);
-            const uint4 *gk = (const uint4 *)(k_cache + (size_t)tb * HD);
-            const uint4 *gv = (const uint4 *)(v_cache + (size_t)tb * HD);
+            int nvec = tn * (NKV * HD / 16);
+            const uint4 *gk = (const uint4 *)(k_cache + (size_t)tb * NKV * HD);
+            const uint4 *gv = (const uint4 *)(v_cache + (size_t)tb * NKV * HD);
             uint4 *sk4 = (uint4 *)sk, *sv4 = (uint4 *)sv;
             for (int i = threadIdx.x; i < nvec; i += NH*32) { sk4[i] = gk[i]; sv4[i] = gv[i]; }
         }
         __syncthreads();
         for (int tt = 0; tt < tn; tt++) {
-            const unsigned int *kw = (const unsigned int *)(sk + (size_t)tt * HD);
-            const unsigned int *vw = (const unsigned int *)(sv + (size_t)tt * HD);
+            const unsigned int *kw = (const unsigned int *)(sk + ((size_t)tt * NKV + kvh) * HD);
+            const unsigned int *vw = (const unsigned int *)(sv + ((size_t)tt * NKV + kvh) * HD);
             float dot = 0.0f;
             #pragma unroll
             for (int e = 0; e < E; e++) {
@@ -4209,12 +4223,11 @@ gemma4_engine_t* gemma4_engine_create(
         if (cap < ring_floor)  cap = ring_floor;
         eng->sliding_kv_capacity = cap;
     }
-    // M0: the sliding cache is indexed by ABSOLUTE layer id, so it needs cfg.n_layers slots.
-    // KV-head count / head dim stay 12B geometry until the attention kernels are dispatched on
-    // the runtime head counts (Stage A3); on 12B cfg.n_layers == GEMMA4_MAX_LAYERS so this is
-    // byte-identical.
+    // M0 A3: the sliding cache is indexed by ABSOLUTE layer id (cfg.n_layers slots) and now
+    // sized by the runtime sliding KV-head count (8 on 12B, 16 on 31B). On 12B cfg.n_kv_sliding
+    // == GEMMA4_KV_HEADS and cfg.n_layers == GEMMA4_MAX_LAYERS so this is byte-identical.
     size_t sliding_kv_size = (size_t)eng->cfg.n_layers *
-        GEMMA4_KV_HEADS * (size_t)eng->sliding_kv_capacity * GEMMA4_HEAD_DIM * sizeof(kv_t);
+        (size_t)eng->cfg.n_kv_sliding * (size_t)eng->sliding_kv_capacity * GEMMA4_HEAD_DIM * sizeof(kv_t);
     if (cudaMalloc(&eng->d_sliding_k, sliding_kv_size) != cudaSuccess ||
         cudaMalloc(&eng->d_sliding_v, sliding_kv_size) != cudaSuccess) {
         fprintf(stderr, "fucina: failed to allocate sliding KV cache (%.1f MB ×2)\n",
@@ -4229,7 +4242,7 @@ gemma4_engine_t* gemma4_engine_create(
     // a slot (not all 48), so this is ~6× smaller than indexing by absolute id.
     eng->global_kv_capacity = context_size;
     size_t global_kv_size = (size_t)eng->n_layers_global *
-        context_size * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
+        context_size * (size_t)eng->cfg.n_kv_global * GEMMA4_GLOBAL_HEAD_DIM * sizeof(kv_t);
     if (cudaMalloc(&eng->d_global_k, global_kv_size) != cudaSuccess ||
         cudaMalloc(&eng->d_global_v, global_kv_size) != cudaSuccess) {
         fprintf(stderr, "fucina: failed to allocate global KV cache (%.1f MB ×2)\n",
@@ -4720,11 +4733,21 @@ static inline void global_attn_decode_broadcast(
     if (splits < 1) splits = 1;
     if (splits > GEMMA4_GLOBAL_MAX_SPLITS) splits = GEMMA4_GLOBAL_MAX_SPLITS;
     if (splits > ctx_len) splits = ctx_len;       // never launch an empty split
-    global_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
-        <<<splits, GEMMA4_HEADS*32, 0, stream>>>(
-        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, head_dim, ctx_len, splits);
-    flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
-        out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    // Dispatch on the runtime config: 12B = 16 heads / 1 global KV (broadcast),
+    // 31B = 32 heads / 4 global KV (GQA fan-out 8). head_dim is constant (512).
+    if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_global == 4) {
+        global_attn_splitk_kernel<32, 4, GEMMA4_GLOBAL_HEAD_DIM>
+            <<<splits, 32*32, 0, stream>>>(
+            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, head_dim, ctx_len, splits);
+        flash_decode_combine_kernel<32><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    } else {
+        global_attn_splitk_kernel<GEMMA4_HEADS, 1, GEMMA4_GLOBAL_HEAD_DIM>
+            <<<splits, GEMMA4_HEADS*32, 0, stream>>>(
+            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc, head_dim, ctx_len, splits);
+        flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    }
 }
 
 // Split-K sliding flash-decode for a single query token. Drop-in replacement for
@@ -4754,12 +4777,22 @@ static inline void sliding_attn_decode_broadcast(
     int splits = (window_len + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
     if (splits < 1) splits = 1;   // window_len==0 ⇒ one empty split ⇒ combine writes zeros
     if (splits > GEMMA4_GLOBAL_MAX_SPLITS) splits = GEMMA4_GLOBAL_MAX_SPLITS; // scratch cap
-    sliding_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
-        <<<splits, GEMMA4_KV_HEADS * 32, 0, stream>>>(
-            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc,
-            window, n_tokens, splits, eng->sliding_kv_capacity);
-    flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
-        out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    // Dispatch on the runtime config: 12B = 16 heads / 8 sliding KV, 31B = 32 / 16.
+    if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_sliding == 16) {
+        sliding_attn_splitk_kernel<32, 16, GEMMA4_HEAD_DIM>
+            <<<splits, 16 * 32, 0, stream>>>(
+                eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc,
+                window, n_tokens, splits, eng->sliding_kv_capacity);
+        flash_decode_combine_kernel<32><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    } else {
+        sliding_attn_splitk_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
+            <<<splits, GEMMA4_KV_HEADS * 32, 0, stream>>>(
+                eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q, kc, vc,
+                window, n_tokens, splits, eng->sliding_kv_capacity);
+        flash_decode_combine_kernel<GEMMA4_HEADS><<<n_heads, head_dim, 0, stream>>>(
+            out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, head_dim, splits);
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -4777,7 +4810,7 @@ static inline void sliding_attn_decode_broadcast(
 } while(0)
 
 // Device pointer to layer `layer`'s preloaded hidden-size norm weight.
-#define NORM_W(arr) (eng->arr + (size_t)layer * GEMMA4_HIDDEN_SIZE)
+#define NORM_W(arr) (eng->arr + (size_t)layer * eng->cfg.hidden_size)
 #define HEAD_NORM_W(arr) (eng->arr + (size_t)layer * GEMMA4_GLOBAL_HEAD_DIM)
 
 static void decode_timing_lap(gemma4_engine_t *eng);   // defined with the decode path
@@ -4940,15 +4973,19 @@ static int decode_layer(
     cudaStream_t     stream,
     const int       *d_pos = NULL)
 {
+    // Runtime model geometry (12B: 3840/15360; 31B: 5376/21504). On 12B these equal the
+    // old HS/IM defines so the path is byte-identical.
+    const int HS = eng->cfg.hidden_size;
+    const int IM = eng->cfg.intermediate;
     layer_type_t ltype = eng->layer_types[layer];
     if (eng->paged_read && ensure_ms_scratch(eng) != 0) return -1;  // 1-elem view + fa scratch
     int n_heads, n_kv_heads, head_dim, out_dim_q, out_dim_kv;
     if (ltype == LAYER_SLIDING) {
-        n_heads    = GEMMA4_HEADS;       head_dim = GEMMA4_HEAD_DIM;
-        n_kv_heads = GEMMA4_KV_HEADS;
+        n_heads    = eng->cfg.n_heads;   head_dim = GEMMA4_HEAD_DIM;
+        n_kv_heads = eng->cfg.n_kv_sliding;
     } else {
-        n_heads    = GEMMA4_HEADS;       head_dim = GEMMA4_GLOBAL_HEAD_DIM;
-        n_kv_heads = GEMMA4_GLOBAL_KV_HEADS;
+        n_heads    = eng->cfg.n_heads;   head_dim = GEMMA4_GLOBAL_HEAD_DIM;
+        n_kv_heads = eng->cfg.n_kv_global;
     }
     out_dim_q  = n_heads    * head_dim;
     out_dim_kv = n_kv_heads * head_dim;
@@ -4960,13 +4997,13 @@ static int decode_layer(
     // Save the pre-layer residual once; it will be added back after attn.
     // ─────────────────────────────────────────────────────────────────
     cudaMemcpyAsync(eng->d_residual, eng->d_x,
-                    GEMMA4_HIDDEN_SIZE * sizeof(float),
+                    HS * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
 
     // ── 1. Pre-attention RMSNorm ──────────────────────────────────────
     rms_norm_kernel<<<1, block, smem32, stream>>>(
         eng->d_norm, eng->d_x, NORM_W(d_w_attn_norm),
-        GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+        HS, GEMMA4_RMS_EPS);
 
     // ── 2-4. Q/K/V projections — quantize the attn-norm activation ONCE ───
     // (audit #30 lever 2): the three projections share one int8 quant of d_norm instead of
@@ -4977,11 +5014,11 @@ static int decode_layer(
         // NVFP4 store: the fused decode GEMV reads the float activation directly — no int8
         // quant (d_qx/d_dx/d_sx are neither produced nor consumed on this path). V on global
         // layers is the K-memcpy, NOT a PJ_V GEMV (proj_desc returns 0 there) — mirror that.
-        nvfp4_decode_proj(eng, layer, PJ_Q, eng->d_norm, eng->d_attn_q, GEMMA4_HIDDEN_SIZE, out_dim_q, stream);
-        nvfp4_decode_proj(eng, layer, PJ_K, eng->d_norm, eng->d_attn_k, GEMMA4_HIDDEN_SIZE, out_dim_kv, stream);
+        nvfp4_decode_proj(eng, layer, PJ_Q, eng->d_norm, eng->d_attn_q, HS, out_dim_q, stream);
+        nvfp4_decode_proj(eng, layer, PJ_K, eng->d_norm, eng->d_attn_k, HS, out_dim_kv, stream);
         PER_HEAD_NORM(eng->d_attn_q, HEAD_NORM_W(d_w_q_norm), n_heads, head_dim);
         if (ltype == LAYER_SLIDING) {
-            nvfp4_decode_proj(eng, layer, PJ_V, eng->d_norm, eng->d_attn_v, GEMMA4_HIDDEN_SIZE, out_dim_kv, stream);
+            nvfp4_decode_proj(eng, layer, PJ_V, eng->d_norm, eng->d_attn_v, HS, out_dim_kv, stream);
             PER_HEAD_NORM(eng->d_attn_v, NULL, n_kv_heads, head_dim);
         } else {
             cudaMemcpyAsync(eng->d_attn_v, eng->d_attn_k,
@@ -4990,21 +5027,21 @@ static int decode_layer(
         }
         PER_HEAD_NORM(eng->d_attn_k, HEAD_NORM_W(d_w_k_norm), n_kv_heads, head_dim);
     } else {
-    quantize_q8_1_kernel<<<GEMMA4_HIDDEN_SIZE/32, 32, 0, stream>>>(
-        eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE);
+    quantize_q8_1_kernel<<<HS/32, 32, 0, stream>>>(
+        eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, HS);
     mmvq_q4aware(eng, eng->d_attn_q, weight_fp8(eng, eng->tensors.layers[layer].attn_q),
-        eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, out_dim_q, (int)eng->format, stream);
+        eng->d_qx, eng->d_dx, eng->d_sx, HS, out_dim_q, (int)eng->format, stream);
     PER_HEAD_NORM(eng->d_attn_q, HEAD_NORM_W(d_w_q_norm), n_heads, head_dim);
 
     // ── 3. K projection → per-head RMSNorm ───────────────────────────────
     mmvq_q4aware(eng, eng->d_attn_k, weight_fp8(eng, eng->tensors.layers[layer].attn_k),
-        eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, out_dim_kv, (int)eng->format, stream);
+        eng->d_qx, eng->d_dx, eng->d_sx, HS, out_dim_kv, (int)eng->format, stream);
     // ── 4. V projection → plain RMSNorm (no weight) ──────────────────────
     // For global layers V = K BEFORE any norm/RoPE is applied.
     // For sliding layers V comes from a separate projection.
     if (ltype == LAYER_SLIDING) {
         mmvq_q4aware(eng, eng->d_attn_v, weight_fp8(eng, eng->tensors.layers[layer].attn_v),
-            eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, out_dim_kv, (int)eng->format, stream);
+            eng->d_qx, eng->d_dx, eng->d_sx, HS, out_dim_kv, (int)eng->format, stream);
         PER_HEAD_NORM(eng->d_attn_v, NULL, n_kv_heads, head_dim);
     } else {
         // Global: V = raw K projection (before K-norm)
@@ -5035,7 +5072,7 @@ static int decode_layer(
     unsigned kvg = (kv_size + 255) / 256;
     if (ltype == LAYER_SLIDING) {
         // FLAT (Step 3): write this token at its ABSOLUTE position `pos`.
-        size_t layer_stride = (size_t)eng->sliding_kv_capacity * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
+        size_t layer_stride = (size_t)eng->sliding_kv_capacity * eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM;
         kv_t *base_k = eng->d_sliding_k + (size_t)layer * layer_stride;
         kv_t *base_v = eng->d_sliding_v + (size_t)layer * layer_stride;
         if (d_pos) {
@@ -5059,15 +5096,19 @@ static int decode_layer(
     } else {
         int n = pos;   // == eng->cur.n_tokens at every call site
         int slot = eng->global_slot[layer];
-        size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+        // Per-token global cache stride = n_kv_global × head_dim (kv_size). For 12B
+        // (n_kv_global=1) this equals GEMMA4_GLOBAL_HEAD_DIM as before; for 31B it is
+        // 4×512 so the 4 KV heads of each token live contiguous in [ctx][NKV][HD].
+        size_t tok_stride   = (size_t)eng->cfg.n_kv_global * GEMMA4_GLOBAL_HEAD_DIM;
+        size_t layer_stride = (size_t)eng->global_kv_capacity * tok_stride;
         kv_t *base_k = eng->d_global_k + (size_t)slot * layer_stride;
         kv_t *base_v = eng->d_global_v + (size_t)slot * layer_stride;
         if (d_pos) {
-            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size, eng->global_kv_capacity);
-            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size, eng->global_kv_capacity);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_k, d_pos, (int)tok_stride, eng->d_attn_k, kv_size, eng->global_kv_capacity);
+            copy_f32_to_fp8_at_kernel<<<kvg, 256, 0, stream>>>(base_v, d_pos, (int)tok_stride, eng->d_attn_v, kv_size, eng->global_kv_capacity);
         } else {
-            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_k, kv_size);
-            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)n*GEMMA4_GLOBAL_HEAD_DIM, eng->d_attn_v, kv_size);
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_k + (size_t)n*tok_stride, eng->d_attn_k, kv_size);
+            copy_f32_to_fp8_kernel<<<kvg, 256, 0, stream>>>(base_v + (size_t)n*tok_stride, eng->d_attn_v, kv_size);
             // Mirror into the paged pool (global indexed by compact global_slot).
             if (eng->paged_enabled) {
                 size_t pls = (size_t)eng->glob_pool.n_blocks * PAGED_KV_BLOCK_TOKENS * kv_size;
@@ -5083,12 +5124,24 @@ static int decode_layer(
 
     // ── 7. Attention ─────────────────────────────────────────────────────
     if (ltype == LAYER_SLIDING) {
-        size_t lstride = (size_t)eng->sliding_kv_capacity * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
+        size_t lstride = (size_t)eng->sliding_kv_capacity * eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM;
         if (d_pos) {
             // Graph path: fixed-grid rows kernels (r=0) with device n_tokens = d_pos[1].
             // Max sliding splits = ceil(WINDOW/CHUNK); shorter windows tail-return.
             const int max_splits =
                 (GEMMA4_SLIDING_WINDOW + GEMMA4_SLIDING_SPLIT_CHUNK - 1) / GEMMA4_SLIDING_SPLIT_CHUNK;
+            if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_sliding == 16) {
+                sliding_attn_splitk_rows_kernel<32, 16, GEMMA4_HEAD_DIM>
+                    <<<dim3(max_splits, 1), 16*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                        eng->d_sliding_k + (size_t)layer * lstride,
+                        eng->d_sliding_v + (size_t)layer * lstride,
+                        GEMMA4_SLIDING_WINDOW, 0, eng->sliding_kv_capacity, d_pos + 1);
+                flash_decode_combine_rows_kernel<32>
+                    <<<dim3(32, 1), head_dim, 0, stream>>>(
+                        eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                        head_dim, GEMMA4_SLIDING_WINDOW, 0, d_pos + 1, n_heads*head_dim);
+            } else {
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(max_splits, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
@@ -5099,6 +5152,7 @@ static int decode_layer(
                 <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
                     eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     head_dim, GEMMA4_SLIDING_WINDOW, 0, d_pos + 1, n_heads*head_dim);
+            }
         } else if (eng->paged_read) {
             // Paged read: attend the pool through this sequence's block table,
             // via the SAME split-K kernels the batch path uses (B=1 view) — so the
@@ -5136,10 +5190,23 @@ static int decode_layer(
         // ctx at ~25K and failed silently past it).
         int n_ctx = pos + 1;   // pos == eng->cur.n_tokens at every call site
         int slot = eng->global_slot[layer];
-        size_t layer_stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+        size_t layer_stride = (size_t)eng->global_kv_capacity
+                            * (size_t)eng->cfg.n_kv_global * GEMMA4_GLOBAL_HEAD_DIM;
         if (d_pos) {
             // Graph path: fixed-grid rows kernels (r=0) with device n_tokens = d_pos[1].
-            global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
+            if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_global == 4) {
+                global_attn_splitk_rows_kernel<32, 4, GEMMA4_GLOBAL_HEAD_DIM>
+                    <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), 32*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
+                        eng->d_global_k + (size_t)slot * layer_stride,
+                        eng->d_global_v + (size_t)slot * layer_stride,
+                        0, d_pos + 1);
+                flash_decode_combine_rows_kernel<32>
+                    <<<dim3(32, 1), head_dim, 0, stream>>>(
+                        eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                        head_dim, /*window=*/0, 0, d_pos + 1, n_heads*head_dim);
+            } else {
+            global_attn_splitk_rows_kernel<GEMMA4_HEADS, 1, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_attn_q,
                     eng->d_global_k + (size_t)slot * layer_stride,
@@ -5149,6 +5216,7 @@ static int decode_layer(
                 <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
                     eng->d_attn_out, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     head_dim, /*window=*/0, 0, d_pos + 1, n_heads*head_dim);
+            }
         } else if (eng->paged_read) {
             // Paged read: attend the pool through this sequence's block table,
             // via the SAME split-K kernels the batch path uses (B=1 view).
@@ -5186,28 +5254,28 @@ static int decode_layer(
 
     // ── 8. Output projection → post-attn norm → residual add ─────────────
     if (nvfp4) {
-        nvfp4_decode_proj(eng, layer, PJ_O, eng->d_attn_out, eng->d_x, out_dim_q, GEMMA4_HIDDEN_SIZE, stream);
+        nvfp4_decode_proj(eng, layer, PJ_O, eng->d_attn_out, eng->d_x, out_dim_q, HS, stream);
     } else
     gemv_w(eng, eng->d_x,
         weight_fp8(eng, eng->tensors.layers[layer].attn_output),
-        eng->d_attn_out, out_dim_q, GEMMA4_HIDDEN_SIZE, stream);
+        eng->d_attn_out, out_dim_q, HS, stream);
     // Post-attention sandwich norm
     rms_norm_kernel<<<1, block, smem32, stream>>>(
         eng->d_norm, eng->d_x, NORM_W(d_w_post_attn_norm),
-        GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+        HS, GEMMA4_RMS_EPS);
     // Residual: normed_attn_proj + pre-layer input
-    residual_add_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
-        eng->d_norm, eng->d_residual, GEMMA4_HIDDEN_SIZE);
+    residual_add_kernel<<<(HS+255)/256, 256, 0, stream>>>(
+        eng->d_norm, eng->d_residual, HS);
     // d_norm = attn_out = new residual for FFN
     cudaMemcpyAsync(eng->d_x,        eng->d_norm,
-        GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        HS * sizeof(float), cudaMemcpyDeviceToDevice, stream);
     cudaMemcpyAsync(eng->d_residual,  eng->d_norm,
-        GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        HS * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 
     // ── 9. Pre-FFN RMSNorm ────────────────────────────────────────────────
     rms_norm_kernel<<<1, block, smem32, stream>>>(
         eng->d_norm, eng->d_x, NORM_W(d_w_ffn_norm),
-        GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
+        HS, GEMMA4_RMS_EPS);
 
     // ── 10+11. Fused Gate + Up + GeGLU (audit #30 lever 2) ────────────────
     // Quantize the shared FFN-norm activation ONCE (+ the per-block Σ for the Q4_0 −8 fold),
@@ -5217,41 +5285,41 @@ static int decode_layer(
     if (nvfp4) {
         // No fused FP4 GLU: two GEMVs into engine-resident gate/up scratch (graph-safe), then
         // the existing float geglu (gelu_tanh(gate)·up — matches the fused path) into d_ffn_out.
-        nvfp4_decode_proj(eng, layer, PJ_GATE, eng->d_norm, eng->d_ffn_gate, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE, stream);
-        nvfp4_decode_proj(eng, layer, PJ_UP,   eng->d_norm, eng->d_ffn_up,   GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE, stream);
-        geglu_kernel<<<(GEMMA4_INTERMEDIATE+255)/256, 256, 0, stream>>>(
-            eng->d_ffn_out, eng->d_ffn_gate, eng->d_ffn_up, GEMMA4_INTERMEDIATE);
+        nvfp4_decode_proj(eng, layer, PJ_GATE, eng->d_norm, eng->d_ffn_gate, HS, IM, stream);
+        nvfp4_decode_proj(eng, layer, PJ_UP,   eng->d_norm, eng->d_ffn_up,   HS, IM, stream);
+        geglu_kernel<<<(IM+255)/256, 256, 0, stream>>>(
+            eng->d_ffn_out, eng->d_ffn_gate, eng->d_ffn_up, IM);
     } else {
-    quantize_q8_1_kernel<<<GEMMA4_HIDDEN_SIZE/32, 32, 0, stream>>>(
-        eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE);
+    quantize_q8_1_kernel<<<HS/32, 32, 0, stream>>>(
+        eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, HS);
     mmvq_glu_launch(eng->d_ffn_out,
         weight_fp8(eng, eng->tensors.layers[layer].ffn_gate),
         weight_fp8(eng, eng->tensors.layers[layer].ffn_up),
-        eng->d_qx, eng->d_dx, eng->d_sx, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE,
+        eng->d_qx, eng->d_dx, eng->d_sx, HS, IM,
         (int)eng->format, stream);
     }
 
     // ── 12. FFN down projection ───────────────────────────────────────────
     if (nvfp4) {
-        nvfp4_decode_proj(eng, layer, PJ_DOWN, eng->d_ffn_out, eng->d_x, GEMMA4_INTERMEDIATE, GEMMA4_HIDDEN_SIZE, stream);
+        nvfp4_decode_proj(eng, layer, PJ_DOWN, eng->d_ffn_out, eng->d_x, IM, HS, stream);
     } else
     gemv_w(eng, eng->d_x,
         weight_fp8(eng, eng->tensors.layers[layer].ffn_down),
-        eng->d_ffn_out, GEMMA4_INTERMEDIATE, GEMMA4_HIDDEN_SIZE, stream);
+        eng->d_ffn_out, IM, HS, stream);
 
     // ── 13. Post-FFN sandwich norm → residual add ─────────────────────────
     rms_norm_kernel<<<1, block, smem32, stream>>>(
         eng->d_norm, eng->d_x, NORM_W(d_w_post_ffn_norm),
-        GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_EPS);
-    residual_add_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
-        eng->d_norm, eng->d_residual, GEMMA4_HIDDEN_SIZE);
+        HS, GEMMA4_RMS_EPS);
+    residual_add_kernel<<<(HS+255)/256, 256, 0, stream>>>(
+        eng->d_norm, eng->d_residual, HS);
     cudaMemcpyAsync(eng->d_x, eng->d_norm,
-        GEMMA4_HIDDEN_SIZE * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        HS * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 
     // ── 14. layer_output_scale (scalar preloaded at create) ──────────────
     if (eng->h_out_scale[layer] != 1.0f) {
-        scale_kernel<<<(GEMMA4_HIDDEN_SIZE+255)/256, 256, 0, stream>>>(
-            eng->d_x, GEMMA4_HIDDEN_SIZE, eng->h_out_scale[layer]);
+        scale_kernel<<<(HS+255)/256, 256, 0, stream>>>(
+            eng->d_x, HS, eng->h_out_scale[layer]);
     }
 
     return 0;
@@ -7094,10 +7162,10 @@ static void decode_batched_forward(
     gemma4_engine_t *eng, int K, int pos, cudaStream_t stream,
     const int *d_pos, int want_head)
 {
-    const int H   = GEMMA4_HIDDEN_SIZE;
-    const int I   = GEMMA4_INTERMEDIATE;
+    const int H   = eng->cfg.hidden_size;
+    const int I   = eng->cfg.intermediate;
     const int HD2 = 32 * sizeof(float);
-    const int HEADS = GEMMA4_HEADS;
+    const int HEADS = eng->cfg.n_heads;
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
 
     int32_t *d_tok  = (int32_t*)eng->d_sb[0];
@@ -7114,7 +7182,7 @@ static void decode_batched_forward(
     for (int l = 0; l < eng->cfg.n_layers; l++) {
         layer_type_t lt = eng->layer_types[l];
         int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
-        int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+        int nkv = (lt==LAYER_SLIDING)? eng->cfg.n_kv_sliding : eng->cfg.n_kv_global;
         int oq  = HEADS*hd, okv = nkv*hd;
         const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
         const float *w_post_a = eng->d_w_post_attn_norm + (size_t)l*H;
@@ -7195,6 +7263,15 @@ static void decode_batched_forward(
                 if (max_splits < 1) max_splits = 1;
                 if (max_splits > GEMMA4_GLOBAL_MAX_SPLITS) max_splits = GEMMA4_GLOBAL_MAX_SPLITS;
             }
+            if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_sliding == 16) {
+                sliding_attn_splitk_rows_kernel<32, 16, GEMMA4_HEAD_DIM>
+                    <<<dim3(max_splits, K), 16*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc,
+                        GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok);
+                flash_decode_combine_rows_kernel<32><<<dim3(HEADS, K), hd, 0, stream>>>(
+                    d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                    hd, GEMMA4_SLIDING_WINDOW, pos + 1, d_ntok, oq);
+            } else {
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(max_splits, K), GEMMA4_KV_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc,
@@ -7202,13 +7279,15 @@ static void decode_batched_forward(
             flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
                 d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                 hd, GEMMA4_SLIDING_WINDOW, pos + 1, d_ntok, oq);
+            }
         } else {
             int slot = eng->global_slot[l];
-            size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+            // Per-token global cache stride = okv (nkv*hd). 12B: nkv=1 ⇒ okv==hd ⇒ identical.
+            size_t lstride = (size_t)eng->global_kv_capacity * okv;
             kv_t *kc = eng->d_global_k + (size_t)slot*lstride;
             kv_t *vc = eng->d_global_v + (size_t)slot*lstride;
-            kv_write_global_kernel<<<dim3(grid1d(hd),K),256,0,stream>>>(
-                kc, vc, d_k, d_v, pos, K, hd, d_pos);
+            kv_write_global_kernel<<<dim3(grid1d(okv),K),256,0,stream>>>(
+                kc, vc, d_k, d_v, pos, K, okv, d_pos);
             int max_splits;
             if (d_pos) {
                 max_splits = GEMMA4_GLOBAL_MAX_SPLITS;
@@ -7217,12 +7296,21 @@ static void decode_batched_forward(
                 if (max_splits < 1) max_splits = 1;
                 if (max_splits > GEMMA4_GLOBAL_MAX_SPLITS) max_splits = GEMMA4_GLOBAL_MAX_SPLITS;
             }
-            global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
+            if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_global == 4) {
+                global_attn_splitk_rows_kernel<32, 4, GEMMA4_GLOBAL_HEAD_DIM>
+                    <<<dim3(max_splits, K), 32*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok);
+                flash_decode_combine_rows_kernel<32><<<dim3(HEADS, K), hd, 0, stream>>>(
+                    d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                    hd, /*window=*/0, pos + 1, d_ntok, oq);
+            } else {
+            global_attn_splitk_rows_kernel<GEMMA4_HEADS, 1, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(max_splits, K), GEMMA4_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
                 d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                 hd, /*window=*/0, pos + 1, d_ntok, oq);
+            }
         }
 
         // O projection (input d_attn is already fp32) → d_o; post-attn norm; residual.
@@ -7515,7 +7603,7 @@ static void decode_multiseq_body(
     for (int l = 0; l < eng->cfg.n_layers; l++) {
         layer_type_t lt = eng->layer_types[l];
         int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
-        int nkv = (lt==LAYER_SLIDING)? GEMMA4_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
+        int nkv = (lt==LAYER_SLIDING)? eng->cfg.n_kv_sliding : eng->cfg.n_kv_global;
         int oq  = HEADS*hd, okv = nkv*hd;
         const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
         const float *w_post_a = eng->d_w_post_attn_norm + (size_t)l*H;
@@ -8209,8 +8297,21 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
             // Fixed-grid split-K with device n_tokens (= *pos_ptr): same split formula
             // as global_attn_decode_broadcast, so the math is bit-identical to it.
             int slot = eng->global_slot[eng->cfg.n_layers - 1];
-            size_t lstride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
-            global_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_GLOBAL_HEAD_DIM>
+            size_t lstride = (size_t)eng->global_kv_capacity
+                           * (size_t)eng->cfg.n_kv_global * GEMMA4_GLOBAL_HEAD_DIM;
+            if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_global == 4) {
+                global_attn_splitk_rows_kernel<32, 4, GEMMA4_GLOBAL_HEAD_DIM>
+                    <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), 32*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
+                        eng->d_global_k + (size_t)slot * lstride,
+                        eng->d_global_v + (size_t)slot * lstride,
+                        0, pos_ptr);
+                flash_decode_combine_rows_kernel<32>
+                    <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                        eng->d_mtp_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                        head_dim, /*window=*/0, 0, pos_ptr, GEMMA4_HEADS*head_dim);
+            } else {
+            global_attn_splitk_rows_kernel<GEMMA4_HEADS, 1, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
                     eng->d_global_k + (size_t)slot * lstride,
@@ -8220,13 +8321,26 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
                 <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
                     eng->d_mtp_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     head_dim, /*window=*/0, 0, pos_ptr, GEMMA4_HEADS*head_dim);
+            }
         } else {
             rope_sliding_kernel<<<GEMMA4_HEADS, head_dim/2, 0, stream>>>(
                 eng->d_mtp_q, eng->d_mtp_q, 0, pos_ptr, GEMMA4_HEADS, /*n_kv_heads=*/0,
                 head_dim, 10000.0f);
             // target layer 46 = the LAST sliding layer (share(il)=n_layer-2); the
             // drafter attends window-1 keys of the frozen cache at n_tokens = *pos_ptr.
-            size_t lstride = (size_t)eng->sliding_kv_capacity * GEMMA4_KV_HEADS * GEMMA4_HEAD_DIM;
+            size_t lstride = (size_t)eng->sliding_kv_capacity * eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM;
+            if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_sliding == 16) {
+                sliding_attn_splitk_rows_kernel<32, 16, GEMMA4_HEAD_DIM>
+                    <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), 16*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
+                        eng->d_sliding_k + (size_t)(eng->cfg.n_layers - 2) * lstride,
+                        eng->d_sliding_v + (size_t)(eng->cfg.n_layers - 2) * lstride,
+                        GEMMA4_SLIDING_WINDOW - 1, 0, eng->sliding_kv_capacity, pos_ptr);
+                flash_decode_combine_rows_kernel<32>
+                    <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                        eng->d_mtp_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
+                        head_dim, GEMMA4_SLIDING_WINDOW - 1, 0, pos_ptr, GEMMA4_HEADS*head_dim);
+            } else {
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_mtp_q,
@@ -8237,6 +8351,7 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
                 <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
                     eng->d_mtp_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     head_dim, GEMMA4_SLIDING_WINDOW - 1, 0, pos_ptr, GEMMA4_HEADS*head_dim);
+            }
         }
         gemv_w(eng, eng->d_mtp_t1, mtp_w(eng, eng->mtp.wo[l]), eng->d_mtp_attn,
                qdim, AH, stream, FORMAT_Q8_0);
