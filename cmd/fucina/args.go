@@ -56,13 +56,14 @@ type CLIArgs struct {
 	MaxOutputToks int    // absolute per-request output-token ceiling; 0 = no extra cap
 
 	// System
-	System   string
-	Verbose  bool
-	Timings  bool
-	DeviceID int
-	Memory   string
-	Debug    bool
-	LogLevel string
+	System     string
+	Verbose    bool
+	Timings    bool
+	DeviceID   int
+	GPUMemUtil float64 // --gpu-mem-util: fraction of total device mem the engine may use (vLLM-style)
+	Memory     string
+	Debug      bool
+	LogLevel   string
 
 	// Mode
 	Interactive bool
@@ -166,6 +167,13 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.BoolVar(&a.Debug, "debug", false, "Dump full request bodies + rendered prompts to "+"/tmp/fucina_debug.log")
 	fs.StringVar(&a.LogLevel, "log-level", "info", "Log level: info|debug (debug also dumps requests)")
 	fs.IntVar(&a.DeviceID, "cuda-device", 0, "CUDA device ID")
+	// GPU-memory budget (vLLM-style). The engine fits weights + KV + scratch +
+	// (optionally) the packed-Q4_0 decode copy under this fraction of total device
+	// memory, auto-capping ctx and dropping the packed copy as needed to satisfy it.
+	// Default 0.90 is behavior-preserving where everything already fits (e.g. the
+	// 128 GB GB10); lower it to share the GPU or fit a smaller host.
+	fs.Float64Var(&a.GPUMemUtil, "gpu-mem-util", 0.90,
+		"Fraction of total GPU memory the engine may use (0<F<=1); caps ctx / drops the packed-Q4_0 copy to fit")
 	fs.StringVar(&a.Memory, "mlock", "", "mlock model in memory (unused on CUDA)")
 
 	fs.BoolVar(&a.Interactive, "interactive-first", false, "Force interactive mode")

@@ -54,6 +54,9 @@ Server options:
 
 Other options:
   --cuda-device N            CUDA device ID (default: 0)
+  --gpu-mem-util F           Fraction of total GPU memory the engine may use
+                             (0<F<=1, default 0.90; caps ctx / drops the packed
+                             Q4_0 decode copy to fit the budget, vLLM-style)
   -v, --verbose              Verbose output
   --timings                  Show detailed GPU timing (prefill/decode tok/s)
   -h, --help                 Show this help

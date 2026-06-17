@@ -142,6 +142,7 @@ func main() {
 		ModelPath:   args.ModelPath,
 		ContextSize: uint32(args.ContextSize),
 		DeviceID:    args.DeviceID,
+		GPUMemUtil:  args.GPUMemUtil,
 	})
 	if err != nil {
 		log.Fatalf("fucina: engine init failed: %v", err)
