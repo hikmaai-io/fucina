@@ -4430,6 +4430,17 @@ gemma4_engine_t* gemma4_engine_create(
         // scratch + norms). Clamp to ≥0 (free can wobble up if another proc released).
         uint64_t free_start = eng->free_mem;
         uint64_t resident = (free_start > free_now) ? (free_start - free_now) : 0;
+        // The free-delta is unreliable on this shared unified-memory box: another
+        // process releasing VRAM mid-load makes free_now ≥ free_start, collapsing the
+        // delta toward 0 and under-billing OUR weights — which would wrongly fit the
+        // packed copy and OOM later. Floor resident at a KNOWN hard lower bound: the
+        // bulk-weight bytes we actually uploaded (GGUF; NVFP4 has no contiguous blob,
+        // fall back to the delta). This keeps the balance sheet honest and the budget
+        // conservative regardless of neighbor churn.
+        if (eng->d_weights && eng->gguf_size > eng->tdata_start) {
+            uint64_t weight_floor = (uint64_t)(eng->gguf_size - eng->tdata_start);
+            if (weight_floor > resident) resident = weight_floor;
+        }
         // Headroom STILL free for our remaining allocs, with a small safety reserve so
         // CUDA-graph capture / activation scratch (lazy) don't immediately OOM.
         const uint64_t safety = 512ull << 20;   // 0.5 GiB
