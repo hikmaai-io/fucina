@@ -670,6 +670,11 @@ func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int3
 // row. When the C engine grows a per-sequence speculative step that emits a
 // variable number of accepted tokens per slot, this is the boundary that widens
 // each row's run; the scheduler already walks runs token-by-token.
+//
+// Sampling params are fixed per sequence at AddSeq time and reused for every
+// token; the current C ABI (gemma4_engine_step_batch) takes no per-step params,
+// so per-step overrides are not supported. The SeqParams in batch.BatchEngine
+// are reserved for a future per-step sampler.
 func (a *BatchAdapter) StepBatch(active []int32, inputs []int32) ([][]int32, error) {
 	toks, err := a.eng.StepBatch(active, inputs)
 	if err != nil {

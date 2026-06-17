@@ -42,7 +42,10 @@ the per-row sampler; the same env var also disables the spec-verify `batched_gra
 4 concurrent greedy requests replay B=1/3/4 with correct deterministic output.
 
 Known limitations: no spec decode / TTFT metrics in the batch path. (Per-sequence sampling
-params are now honored; see the sampling-params phase note.)
+params are now honored; see the sampling-params phase note.) Batch prefill is token-by-token:
+`gemma4_engine_seq_add` loops one `decode_multiseq_forward` per prompt position, so admitting a
+long prompt costs one kernel launch per token. This is correct but slow for long prompts; Phase 4
+adds a cuBLASLt batched prefill that processes the whole prompt in one weight pass.
 
 ---
 Original plan (branch `perf/continuous-batching-paged-kv`).

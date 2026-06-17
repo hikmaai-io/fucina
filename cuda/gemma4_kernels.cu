@@ -2788,7 +2788,10 @@ struct gemma4_engine {
     // launches. FUCINA_NO_BATCHED_GRAPH disables capture globally.
     cudaGraphExec_t multiseq_graph[GEMMA4_MAX_SEQS + 1];
     int      multiseq_graph_failed;    // global disable (env or capture failure)
-    unsigned multiseq_graph_logged;    // per-B "captured" log guard (bit b set once logged)
+    // per-B "captured" log guard (bit b set once logged). 64-bit so the (1ULL<<B)
+    // shift is well-defined for every B in 1..GEMMA4_MAX_SEQS (asserted below).
+    uint64_t multiseq_graph_logged;
+    static_assert(GEMMA4_MAX_SEQS <= 63, "multiseq_graph_logged bitmask overflow");
 
     // ── Paged KV pools (Phase 2; allocated only when paged mode is enabled) ──
     // The continuous-batching KV store: one physical block pool per cache class,
@@ -6931,9 +6934,9 @@ static int multiseq_graph_ensure(gemma4_engine_t *eng, int B)
         fprintf(stderr, "fucina: multiseq batch graph capture failed (B=%d) — per-kernel launches\n", B);
         return -1;
     }
-    if (!(eng->multiseq_graph_logged & (1u << B))) {
+    if (!(eng->multiseq_graph_logged & (1ULL << B))) {
         fprintf(stderr, "fucina: multiseq batch graph captured (B=%d)\n", B);
-        eng->multiseq_graph_logged |= (1u << B);
+        eng->multiseq_graph_logged |= (1ULL << B);
     }
     return 0;
 }
@@ -7072,6 +7075,11 @@ extern "C" int gemma4_engine_seq_add(
 
     gemma4_seq *one[1] = { s };
     int32_t last_tok = 0;
+    // NOTE: prefill is token-by-token here (one decode_multiseq_forward per prompt
+    // position). It is correct but slow for long prompts: each step is a separate
+    // kernel launch and the loop syncs through the sampling path. Phase 4 of the
+    // batching plan adds a cuBLASLt batched prefill that processes the whole prompt
+    // in one weight pass. See docs/continuous-batching.md (known limitations).
     for (int i = 0; i < n_prompt; i++) {
         int pos = s->n_tokens;
         if (paged_slot_sync(eng, s, pos) != 0) { gemma4_engine_seq_remove(eng, slot); return -1; }
@@ -8409,6 +8417,9 @@ __global__ void sample_logits_ms_kernel(
         int tid = threadIdx.x, T = blockDim.x;
         float best_val = -1e30f; int best_idx = 0;
         for (int i = tid; i < V; i += T) { if (lr[i] > best_val) { best_val = lr[i]; best_idx = i; } }
+        // Reduction arrays sized for the max blockDim.x (1024). This MUST match the
+        // launch config in decode_multiseq_forward (<<<B,1024,...>>>); changing the
+        // block size there requires resizing these arrays.
         __shared__ float vred[1024]; __shared__ int ired[1024];
         vred[tid] = best_val; ired[tid] = best_idx; __syncthreads();
         for (int s = T >> 1; s > 0; s >>= 1) {
