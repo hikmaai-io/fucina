@@ -129,6 +129,23 @@ chat-template server path (factual probe `17×23` returned **391 on both** FP8 a
 tool-eval-bench run is the remaining gate before NVFP4-KV could be considered for default. The
 implementation is the lever to run that gate.
 
-**Bottom line unchanged:** NVFP4-KV is memory-only (no speed win), costs a small but real quality
+**Bottom line:** NVFP4-KV is memory-only (no speed win), costs a small but real quality
 perturbation, and stays **opt-in behind the flag, default FP8**, pending a tool-bench quality gate
 and the packed-storage rewrite to actually bank the memory.
+
+## Packed 4.5-bit storage — codec landed & proven (the memory win)
+
+The real ~4.5-bit layout that banks the memory is implemented and verified (`pkv_pack_row`/
+`pkv_unpack` in `cuda/paged_kv_device.cuh`, test `make packed-kv-test`). A token row of `E`
+elements stores `E/2` E2M1 nibble bytes (native FP4 codes, 2/byte) + `E/16` E4M3 per-block scales
+= **0.5625 byte/elem (4.5 bit) vs 1.0 (FP8) — 1.78× smaller**. The test proves
+`pkv_unpack(pkv_pack_row(x))` is **BIT-IDENTICAL** (0 mismatches / 8.4M elements, hd 256/512/2048)
+to the fake-quant `pkv_nvfp4_roundtrip` the engine already benches — so swapping the FP8 cache for
+this packed layout changes **only memory, never the generation numerics**. That is the precondition
+for making NVFP4-KV the default.
+
+REMAINING (staged, to flip the default with a real memory win): allocate the KV pools at
+`PACKED_KV_BYTES(E)` and route the six KV read sites (contiguous + paged split-K sliding/global,
+reference decode) through `pkv_unpack` instead of `fp8_to_float`. The codec above makes that a
+mechanical, bit-faithful change; it is staged separately because it rewrites the engine's hottest
+kernels and must clear `make bench` + a tool-bench quality gate before becoming default.

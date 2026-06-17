@@ -100,6 +100,49 @@ __device__ inline float kv_codec_value(const float* row, int j) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Packed NVFP4 KV storage (the REAL ~4.5-bit layout that banks the memory). A
+// token row of E elements (E % 16 == 0; a block never crosses a head since
+// head_dim % 16 == 0) is stored as:
+//   nib[E/2]  — E2M1 4-bit codes, two per byte (even e = low nibble, odd e = high)
+//   scl[E/16] — one E4M3 per-16 block scale
+// → 0.5 + 1/16 = 0.5625 byte/elem (4.5 bit) vs 1.0 (8 bit) FP8: 1.78× smaller.
+// pkv_unpack(pkv_pack_row(x)) is BIT-IDENTICAL to pkv_nvfp4_roundtrip (same native
+// FP4 codes + E4M3 block scale), so swapping FP8 storage for this packed layout
+// changes ONLY memory, never the numerics the NVFP4 fake-quant already benched.
+// PACKED_KV_BYTES(E) gives the per-row byte count for allocation/stride math.
+// ─────────────────────────────────────────────────────────────────────────────
+#define PACKED_KV_BYTES(E) ((E) / 2 + (E) / 16)
+
+// Pack one E-element row into nib[E/2] + scl[E/16]. Reference packer (one thread
+// owns the row); the engine write kernels do the same per (even-e, block-head).
+__device__ inline void pkv_pack_row(const float* row, int E, uint8_t* nib, uint8_t* scl) {
+    for (int b = 0; b < E; b += 16) {
+        float amax = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 16; k++) amax = fmaxf(amax, fabsf(row[b + k]));
+        __nv_fp8_storage_t se = pkv_float_to_fp8(amax * (1.0f / 6.0f));
+        scl[b / 16] = (uint8_t)se;
+        float bs = pkv_fp8_to_float(se);
+        float inv = (bs != 0.0f) ? 1.0f / bs : 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 16; k += 2) {
+            __nv_fp4_storage_t lo = __nv_cvt_float_to_fp4(row[b + k]     * inv, __NV_E2M1, cudaRoundNearest);
+            __nv_fp4_storage_t hi = __nv_cvt_float_to_fp4(row[b + k + 1] * inv, __NV_E2M1, cudaRoundNearest);
+            nib[(b + k) / 2] = (uint8_t)(((hi & 0xF) << 4) | (lo & 0xF));
+        }
+    }
+}
+
+// Dequantize element e from a packed row (nib[E/2], scl[E/16]).
+__device__ inline float pkv_unpack(const uint8_t* nib, const uint8_t* scl, int e) {
+    uint8_t byte = nib[e >> 1];
+    __nv_fp4_storage_t code = (e & 1) ? (byte >> 4) : (byte & 0xF);
+    float v  = __half2float(__half(__nv_cvt_fp4_to_halfraw(code, __NV_E2M1)));
+    float bs = pkv_fp8_to_float((__nv_fp8_storage_t)scl[e >> 4]);
+    return v * bs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POD descriptors the engine fills per batched step. All pointers are DEVICE
 // pointers. There is no CUDA-runtime type in here so the engine can build these
 // on the host and memcpy them as plain bytes.

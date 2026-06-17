@@ -28,7 +28,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test \
-        paged-kv-device-test kv-quant-explore bench \
+        paged-kv-device-test packed-kv-test kv-quant-explore bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
 # `make` with no arguments builds everything (CUDA archive + Go binary).
@@ -105,6 +105,15 @@ paged-kv-device-test:
 	$(NVCC) -arch=$(CUDA_ARCH) -o /tmp/fucina_paged_kv_device_test \
 		cuda/paged_kv_device_test.cu -diag-suppress 550
 	/tmp/fucina_paged_kv_device_test
+
+# ─── Packed NVFP4 KV storage test (GPU) ─────────────────────────────────
+# Proves the real ~4.5-bit packed layout (pkv_pack_row/pkv_unpack) is bit-identical
+# to the FP8 NVFP4 fake-quant — so swapping FP8 storage for packed changes only
+# memory, not numerics. See docs/kv-quant-exploration.md.
+packed-kv-test:
+	$(NVCC) -arch=$(CUDA_ARCH) -o /tmp/fucina_packed_kv_test \
+		cuda/packed_kv_test.cu -diag-suppress 550
+	/tmp/fucina_packed_kv_test
 
 # ─── KV-quant exploration (host, Phase 6) ───────────────────────────────
 # Offline comparison of KV-cache quant codecs (FP8 / per-token FP8 / NVFP4 /
