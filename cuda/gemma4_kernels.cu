@@ -2283,19 +2283,23 @@ __global__ void kv_write_sliding_kernel(
 }
 
 // Scatter the batch's K/V into the linear global cache at positions base..base+rows-1.
-// k/vcache point at the layer slot's base [capacity][hd]. grid=(ceil(hd/256), rows).
+// k/vcache point at the layer slot's base [capacity][n_kv_global][head_dim]; per-token
+// width is kvhd = n_kv_global*head_dim (12B: kvhd == GEMMA4_GLOBAL_HEAD_DIM). kb/vb are
+// token-major [rows][kvhd] so all KV heads of a token are written contiguously — exactly
+// the [pos][NKV][HD] layout the decode/flash global attention reads. grid=(ceil(kvhd/256),
+// rows). For the 12B (n_kv_global=1) this is bit-identical to the old hd-only writer.
 __global__ void kv_write_global_kernel(
     kv_t *kcache, kv_t *vcache, const float *kb, const float *vb,
-    int base, int rows, int hd,
+    int base, int rows, int kvhd,
     const int *base_ptr = nullptr)                     // non-NULL: device override (graph path)
 {
     int t = blockIdx.y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= rows || j >= hd) return;
+    if (t >= rows || j >= kvhd) return;
     if (base_ptr) base = *base_ptr;
     int pos = base + t;
-    kcache[(size_t)pos * hd + j] = float_to_fp8(kv_codec_value(kb + (size_t)t * hd, j));
-    vcache[(size_t)pos * hd + j] = float_to_fp8(kv_codec_value(vb + (size_t)t * hd, j));
+    kcache[(size_t)pos * kvhd + j] = float_to_fp8(kv_codec_value(kb + (size_t)t * kvhd, j));
+    vcache[(size_t)pos * kvhd + j] = float_to_fp8(kv_codec_value(vb + (size_t)t * kvhd, j));
 }
 
 // =========================================================================
@@ -6365,11 +6369,13 @@ int gemma4_engine_prefill_batched(
                 kc, vc, d_k, d_v, base, 0, N, kvhd, GEMMA4_SLIDING_WINDOW,
                 eng->sliding_kv_capacity);
         } else {
+            // GQA global cache layout [capacity][n_kv_global][head_dim]: per-token width
+            // and stride are okv = nkv*hd (12B nkv=1 ⇒ okv==hd ⇒ bit-identical to before).
             int slot = eng->global_slot[l];
-            size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
-            kv_write_global_kernel<<<dim3(grid1d(hd),N),256,0,stream>>>(
+            size_t stride = (size_t)eng->global_kv_capacity * okv;
+            kv_write_global_kernel<<<dim3(grid1d(okv),N),256,0,stream>>>(
                 eng->d_global_k + slot*stride, eng->d_global_v + slot*stride,
-                d_k, d_v, base, N, hd);
+                d_k, d_v, base, N, okv);
         }
 
         // O projection → temp d_q ; post-attn norm ; fold into residual d_x
@@ -6602,10 +6608,16 @@ int gemma4_engine_prefill_flash(
                 const float a1 = 1.0f, b0 = 0.0f, b1 = 1.0f;
                 const int window = (lt==LAYER_SLIDING) ? GEMMA4_SLIDING_WINDOW : 0;
                 const bool global = (lt != LAYER_SLIDING);
+                // Wide single-KV-head GEMM fast path only when there is exactly ONE global
+                // KV head (12B): all HEADS query columns share it, so S / P·V are each one
+                // wide GEMM with non-broadcast keys [cn][hd]. With n_kv_global>1 (31B GQA)
+                // that broadcast is invalid — route through the per-head strided-batched
+                // path (same machinery as sliding), keys GQA-broadcast to [cn][HEADS*hd].
+                const bool global_wide = global && (nkv == 1);
 
                 f32_to_bf16_kernel<<<grid1d((size_t)cn*oq),256,0,stream>>>(
                     eng->d_fp_qb, d_q, (size_t)cn*oq);
-                if (global) {
+                if (global_wide) {
                     // 1 KV head: no GQA broadcast — keys/values stay [cn][hd].
                     f32_to_bf16_kernel<<<grid1d((size_t)cn*okv),256,0,stream>>>(
                         eng->d_fp_kbx, d_k, (size_t)cn*okv);
@@ -6623,17 +6635,19 @@ int gemma4_engine_prefill_flash(
                 // One tile pass over queries [q0, q0+qn); kbase = absolute
                 // position of tile key 0.
                 //
-                // GLOBAL layers (84% of attention FLOPs): Q token-major
-                // [cn][HEADS][hd] IS col-major [hd × HEADS·cn] with ld=hd, and
-                // all heads share the single KV head — so S and P·V are each
-                // ONE wide GEMM (n = HEADS·qn), no broadcast, no batching.
-                // Keys kt/vt are [tn][hd].
-                // SLIDING layers (GQA 16:8, window-bounded): strided-batched
-                // GEMM over heads with broadcast keys [tn][HEADS*hd].
+                // GLOBAL_WIDE (12B, n_kv_global==1; 84% of attention FLOPs): Q
+                // token-major [cn][HEADS][hd] IS col-major [hd × HEADS·cn] with
+                // ld=hd, and all heads share the single KV head — so S and P·V
+                // are each ONE wide GEMM (n = HEADS·qn), no broadcast, no
+                // batching. Keys kt/vt are [tn][hd].
+                // SLIDING (GQA 16:8, window-bounded) and 31B GLOBAL GQA
+                // (n_kv_global=4): strided-batched GEMM over heads with broadcast
+                // keys [tn][HEADS*hd]. The only global/sliding difference is the
+                // mask (window=0 for global), handled in fp_online_softmax_kernel.
                 auto tile_pass = [&](const __nv_bfloat16 *kt, const __nv_bfloat16 *vt,
                                      int tn, int kbase, int q0, int qn){
                     if (qn <= 0 || tn <= 0) return;
-                    if (global) {
+                    if (global_wide) {
                         // S(j, qi·H+h) = K_j·Q_(qi,h), col-major [tn × H·qn] ld=T.
                         cublasGemmEx(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                             tn, HEADS*qn, hd,
@@ -6685,23 +6699,25 @@ int gemma4_engine_prefill_flash(
                     hcap = eng->sliding_kv_capacity;
                 } else {
                     int slot = eng->global_slot[l];
-                    // NOTE: 31B global GQA (n_kv_global=4) not yet wired in the FLASH prefill
-                    // global-tile path; this stride is the 12B (n_kv_global=1) layout. Fresh
-                    // prompts ≤4096 tok use prefill_batched; flash is the >4096/suffix path.
-                    size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
+                    // GQA global cache [capacity][n_kv_global][head_dim]: per-token stride
+                    // is okv = nkv*hd (12B nkv=1 ⇒ okv==GEMMA4_GLOBAL_HEAD_DIM, identical).
+                    size_t stride = (size_t)eng->global_kv_capacity * okv;
                     hk = eng->d_global_k + (size_t)slot*stride;
                     hv = eng->d_global_v + (size_t)slot*stride;
                     hcap = eng->global_kv_capacity;
                 }
                 int hstart = 0;                           // sliding: only the window reach
                 if (window > 0) { hstart = abs0 - (window - 1); if (hstart < 0) hstart = 0; }
-                // Tile row stride: global keys are non-broadcast [tn][hd],
-                // sliding keys are broadcast [tn][HEADS*hd].
-                const size_t krow = global ? (size_t)okv : (size_t)oq;
+                // Tile row stride: the wide single-KV-head global GEMM uses non-broadcast
+                // keys [tn][hd] (okv==hd at nkv=1); every other path (sliding GQA, or 31B
+                // global GQA) uses broadcast keys [tn][HEADS*hd] (= oq). History tiles match:
+                // global_wide emits 1 KV head; else GQA-broadcast HEADS heads from nkv.
+                const size_t krow = global_wide ? (size_t)okv : (size_t)oq;
+                const int hist_nh = global_wide ? 1 : HEADS;
                 for (int t0 = hstart; t0 < abs0; t0 += T) {
                     int tn = (abs0 - t0 < T) ? (abs0 - t0) : T;
-                    fp_hist_tile_bf16_kernel<<<dim3(grid1d(hd),global?1:HEADS,tn),256,0,stream>>>(
-                        eng->d_fp_kt, eng->d_fp_vt, hk, hv, t0, tn, global?1:HEADS, nkv, hd, hcap);
+                    fp_hist_tile_bf16_kernel<<<dim3(grid1d(hd),hist_nh,tn),256,0,stream>>>(
+                        eng->d_fp_kt, eng->d_fp_vt, hk, hv, t0, tn, hist_nh, nkv, hd, hcap);
                     long long qe = cn;                    // queries that can see this tile
                     if (window > 0) {
                         qe = (long long)t0 + tn - 1 + window - abs0;
@@ -6732,11 +6748,13 @@ int gemma4_engine_prefill_flash(
                     d_k, d_v, abs0, 0, cn, kvhd, GEMMA4_SLIDING_WINDOW,
                     eng->sliding_kv_capacity);
             } else {
+                // GQA global cache [capacity][n_kv_global][head_dim]: per-token stride and
+                // width are okv = nkv*hd (12B nkv=1 ⇒ okv==hd ⇒ bit-identical to before).
                 int slot = eng->global_slot[l];
-                size_t stride = (size_t)eng->global_kv_capacity * GEMMA4_GLOBAL_HEAD_DIM;
-                kv_write_global_kernel<<<dim3(grid1d(hd),cn),256,0,stream>>>(
+                size_t stride = (size_t)eng->global_kv_capacity * okv;
+                kv_write_global_kernel<<<dim3(grid1d(okv),cn),256,0,stream>>>(
                     eng->d_global_k + slot*stride, eng->d_global_v + slot*stride,
-                    d_k, d_v, abs0, cn, hd);
+                    d_k, d_v, abs0, cn, okv);
             }
 
             f32_to_bf16_kernel<<<grid1d((size_t)cn*oq),256,0,stream>>>(d_inb, d_attn, (size_t)cn*oq);
