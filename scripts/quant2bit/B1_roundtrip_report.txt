@@ -1,0 +1,48 @@
+MXFP2 2-bit round-trip report (reference = Q4_0/Q4_K GGUF dequant)
+bytes/elt = 0.3125  (31B -> 9.69 GB)
+E1M0 levels = [-2.0, -1.0, 1.0, 2.0]
+NF2  levels = [-1.0, -0.27696, 0.27696, 1.0]
+====================================================================================================
+attn_q   (blk.0)  [Q4_0]  n=8808039  rms_w=0.01611
+                        e1m0 absmax  rel_mse=3.5356e-01 rms=9.5793e-03 maxabs=1.0938e-01 cos=0.88623 sqnr= 4.52dB
+                        e1m0 mse     rel_mse=1.4981e-01 rms=6.2356e-03 maxabs=1.2207e-01 cos=0.92206 sqnr= 8.24dB
+                        nf2 absmax   rel_mse=1.5139e-01 rms=6.2684e-03 maxabs=6.0585e-02 cos=0.93033 sqnr= 8.20dB
+                        nf2 mse      rel_mse=9.8685e-02 rms=5.0609e-03 maxabs=9.8633e-02 cos=0.94938 sqnr=10.06dB
+----------------------------------------------------------------------------------------------------
+ffn_down (blk.10)  [Q4_0]  n=8257536  rms_w=0.01272
+                        e1m0 absmax  rel_mse=3.7696e-01 rms=7.8113e-03 maxabs=1.0156e-01 cos=0.88033 sqnr= 4.24dB
+                        e1m0 mse     rel_mse=1.5629e-01 rms=5.0297e-03 maxabs=1.1328e-01 cos=0.91856 sqnr= 8.06dB
+                        nf2 absmax   rel_mse=1.5683e-01 rms=5.0385e-03 maxabs=6.5401e-02 cos=0.92848 sqnr= 8.05dB
+                        nf2 mse      rel_mse=1.0131e-01 rms=4.0495e-03 maxabs=8.9844e-02 cos=0.94799 sqnr= 9.94dB
+----------------------------------------------------------------------------------------------------
+ffn_gate (blk.0)  [Q4_0]  n=8257536  rms_w=0.01510
+                        e1m0 absmax  rel_mse=3.7712e-01 rms=9.2748e-03 maxabs=1.2500e-01 cos=0.88138 sqnr= 4.24dB
+                        e1m0 mse     rel_mse=1.5567e-01 rms=5.9590e-03 maxabs=1.4450e-01 cos=0.91888 sqnr= 8.08dB
+                        nf2 absmax   rel_mse=1.5532e-01 rms=5.9523e-03 maxabs=6.9240e-02 cos=0.92879 sqnr= 8.09dB
+                        nf2 mse      rel_mse=1.0163e-01 rms=4.8148e-03 maxabs=1.0544e-01 cos=0.94782 sqnr= 9.93dB
+----------------------------------------------------------------------------------------------------
+ffn_up   (blk.0)  [Q4_0]  n=8257536  rms_w=0.01527
+                        e1m0 absmax  rel_mse=3.7246e-01 rms=9.3162e-03 maxabs=9.3750e-02 cos=0.88210 sqnr= 4.29dB
+                        e1m0 mse     rel_mse=1.5491e-01 rms=6.0081e-03 maxabs=1.0889e-01 cos=0.91930 sqnr= 8.10dB
+                        nf2 absmax   rel_mse=1.5482e-01 rms=6.0064e-03 maxabs=5.1930e-02 cos=0.92919 sqnr= 8.10dB
+                        nf2 mse      rel_mse=1.0073e-01 rms=4.8449e-03 maxabs=9.3262e-02 cos=0.94830 sqnr= 9.97dB
+----------------------------------------------------------------------------------------------------
+attn_output(blk.0)  [Q4_0]  n=8808039  rms_w=0.01205
+                        e1m0 absmax  rel_mse=3.3126e-01 rms=6.9326e-03 maxabs=1.0156e-01 cos=0.89092 sqnr= 4.80dB
+                        e1m0 mse     rel_mse=1.4426e-01 rms=4.5750e-03 maxabs=1.0791e-01 cos=0.92507 sqnr= 8.41dB
+                        nf2 absmax   rel_mse=1.4782e-01 rms=4.6310e-03 maxabs=6.7394e-02 cos=0.93208 sqnr= 8.30dB
+                        nf2 mse      rel_mse=9.5655e-02 rms=3.7254e-03 maxabs=7.6538e-02 cos=0.95097 sqnr=10.19dB
+----------------------------------------------------------------------------------------------------
+token_embd  [Q4_K]  n=8007308  rms_w=0.01534
+                        e1m0 absmax  rel_mse=3.6110e-01 rms=9.2204e-03 maxabs=2.2782e-01 cos=0.88727 sqnr= 4.42dB
+                        e1m0 mse     rel_mse=1.4715e-01 rms=5.8859e-03 maxabs=2.5643e-01 cos=0.92351 sqnr= 8.32dB
+                        nf2 absmax   rel_mse=1.4759e-01 rms=5.8948e-03 maxabs=1.2327e-01 cos=0.93248 sqnr= 8.31dB
+                        nf2 mse      rel_mse=9.5848e-02 rms=4.7504e-03 maxabs=1.4706e-01 cos=0.95087 sqnr=10.18dB
+----------------------------------------------------------------------------------------------------
+====================================================================================================
+MEAN across tensors:
+  e1m0  mean rel_mse=3.6207e-01  mean sqnr=4.42 dB  mean cos=0.88470
+  e1m0_mse mean rel_mse=1.5135e-01  mean sqnr=8.20 dB  mean cos=0.92123
+  nf2   mean rel_mse=1.5230e-01  mean sqnr=8.17 dB  mean cos=0.93023
+  nf2_mse mean rel_mse=9.8976e-02  mean sqnr=10.05 dB  mean cos=0.94922
+WINNER: nf2 (lower mean rel_mse)
