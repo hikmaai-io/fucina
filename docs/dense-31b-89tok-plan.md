@@ -182,24 +182,33 @@ kills the tail). Trees are how τ gets to 3.5–6.
 
 ### M0 blast radius (Gemma-4-31B vs hardcoded 12B)
 
+**Constraint (hard):** fucina is ONE binary that **identifies the model from the checkpoint** — arch
+and format read from the GGUF kv / safetensors `config.json` at load time. **No compiler flags, no
+env vars** to select model size. So M0 is a *runtime* config, not a compile-time variant.
+
 From the dim survey — ~80 coupled locations. Hard blockers:
 
-* `gemma4_kernels.cuh:31-42` constants: `MAX_LAYERS 48→60`, `HIDDEN 3840→5376`,
-  `INTERMEDIATE 15360→21504`, `HEADS 16→32`, `KV_HEADS 8→16`, **`GLOBAL_KV_HEADS 1→4`**.
+* The 12B `#define`s (`gemma4_kernels.cuh`: `MAX_LAYERS 48`, `HIDDEN 3840`, `INTERMEDIATE 15360`,
+  `HEADS 16`, `KV_HEADS 8`, `GLOBAL_KV_HEADS 1`) become **fields of `gemma4_model_config_t`**
+  (`cuda/gemma4_config.h`) populated by the loader. Static arrays size to `GEMMA4_CAP_*` maxima;
+  loops/launches read the runtime counts. Head dims stay constant (`HEAD_DIM 256` / `GLOBAL 512`).
 * **Structural:** global attention was specialized for **1 KV head (broadcast)**; 31B global is
   **4-KV-head GQA**. The `global_attn_splitk*` family must handle NKV=4, not just broadcast.
 * `[GEMMA4_MAX_LAYERS]` fixed arrays in `gemma4_engine_t` (layers, layer_types,
-  global_layer_indices, global_slot, d_fp4_w*, h_out_scale) — grow to 60.
-* Kernel **template instantiations** on `<HEADS, KV_HEADS, HEAD_DIM>` (6 families) recompile from the
-  constants — fine once constants change, but static `__shared__` tiles sized by `HD` must still fit
-  (HD 256/512 unchanged → OK).
+  global_layer_indices, global_slot, d_fp4_w*, h_out_scale) → size to `GEMMA4_CAP_LAYERS` (64).
+* Kernel **template instantiations** on `<HEADS, KV_HEADS, HEAD_DIM>` (6 families): since head_dim
+  is constant and only a few `(n_heads, n_kv)` configs exist (12B 16/8/1, 31B 32/16/4), instantiate
+  the supported configs and **dispatch on the runtime value** at launch. Static `__shared__` tiles
+  size for the max head config (`GEMMA4_CAP_*`); HD 256/512 unchanged → fits.
 * Loader: `gemma4_kernels.cu:3535` asserts `n_layers == GEMMA4_MAX_LAYERS`; default layer pattern
-  `:3404-3415` hardcodes 48/8-global. 31B GGUF *does* carry `sliding_window_pattern[60]` and
-  per-layer `head_count_kv[60]` — read them (the parse path at `:3601-3643` already exists).
+  `:3404-3415` hardcodes 48/8-global. Replace both with reads of the GGUF `sliding_window_pattern[]`
+  and per-layer `head_count_kv[]` (the parse path at `:3601-3643` already exists) — the 31B GGUF
+  carries both, so the engine learns it's a 31B with 10 global / 4-KV-global layers from the file.
 
-**M0 approach:** compile-time **variant switch** first (a `gemma4_config.h` selecting 12B/31B
-constant sets) to get a baseline number fast; promote to a **runtime `gemma4_model_config_t`** once
-two variants exist and the global-GQA kernel is in. Runtime is the end state (one binary, any size).
+**M0 approach (runtime only):** add `gemma4_model_config_t`, populate it in the loader from the
+file metadata for *both* GGUF and safetensors, thread it through the engine replacing the `#define`
+reads, grow static arrays to `GEMMA4_CAP_*`, add the global-GQA kernel path + runtime head-count
+dispatch. One binary auto-selects 12B vs 31B (vs any future size) from the checkpoint alone.
 
 ---
 
