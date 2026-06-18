@@ -15,6 +15,12 @@ cuda/test_engine
 /runs/
 /data/
 scripts/__pycache__/
+scripts/quant2bit/__pycache__/
+# Multi-GB 2-bit quantized store artifact (produce_2bit_store.py) — never commit.
+/opt/spark/models/fucina-2bit-31b/
+fucina-2bit-31b/
+store.bin
+store.json
 
 # ─── Profiling output ─────────────────────────────────────────────────────
 # nsys / Nsight Systems profiles
