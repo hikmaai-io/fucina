@@ -8945,6 +8945,18 @@ __global__ void mtp_argmax_conf_kernel(
 // trims the bad tails. Threshold swept 0.60/0.75/0.85 → 21.7/22.4/22.0 tok/s.
 #define GEMMA4_MTP_PMIN 0.00f
 
+// ── Tree-spec de-risk diagnostic (FUCINA_SPEC_TOPK_DIAG=1) ──────────────────
+// Measures, at every draw-and-match REJECT (target sampled a token != the MTP head's
+// argmax), whether that target token was nonetheless in the head's top-4. A high hit
+// rate ⇒ a width-w token TREE would recover the reject ⇒ tree-spec is worth building.
+// Zero cost when off. g_diag_top4[step] = the head's top-4 ids at that draft step.
+static int   g_topk_diag = -1;
+static int   g_diag_top4[GEMMA4_SPEC_MAX][4];
+static long  g_diag_rej = 0, g_diag_hit2 = 0, g_diag_hit3 = 0, g_diag_hit4 = 0;
+__global__ void mask_one_neg_inf_kernel(float *logits, const int *idx) {
+    if (threadIdx.x == 0) logits[*idx] = -INFINITY;
+}
+
 // Draft up to max_draft tokens with the assistant; returns the count proposed.
 // Requires a valid recurrent h (eng->mtp_h_valid, paired with g). Greedy argmax
 // draft, cut at the first token whose draft prob < GEMMA4_MTP_PMIN — the verify's
@@ -9027,6 +9039,18 @@ static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int ma
                         cudaMemcpyDeviceToHost, stream);
         if (cudaStreamSynchronize(stream) != cudaSuccess) break;
         if (conf < pmin) break;   // low confidence → stop drafting here (FUCINA_MTP_PMIN)
+        // Diagnostic: capture this step's top-4 head ids (4× masked-argmax). Runs AFTER the
+        // chain token is fixed (d_mtp_tok already written), then trashes d_logits — safe, the
+        // next replay recomputes it. d_sample_id is free during drafting.
+        if (g_topk_diag > 0 && j < GEMMA4_SPEC_MAX) {
+            for (int t = 0; t < 4; t++) {
+                argmax_kernel<<<1, 32, 0, stream>>>(eng->d_logits, eng->d_sample_id, GEMMA4_VOCAB_SIZE);
+                cudaMemcpyAsync(&g_diag_top4[j][t], eng->d_sample_id, sizeof(int),
+                                cudaMemcpyDeviceToHost, stream);
+                mask_one_neg_inf_kernel<<<1, 1, 0, stream>>>(eng->d_logits, eng->d_sample_id);
+            }
+            cudaStreamSynchronize(stream);
+        }
         produced++;
     }
     if (produced == 0) return 0;
@@ -9275,6 +9299,8 @@ static int run_spec_loop(
     auto is_stop = [&](int t){ for (int s=0;s<n_stop;s++) if (stop_ids[s]==t) return 1; return 0; };
 
     uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
+    if (g_topk_diag < 0) { const char *e = getenv("FUCINA_SPEC_TOPK_DIAG"); g_topk_diag = (e && e[0]=='1') ? 1 : 0; }
+    g_diag_rej = g_diag_hit2 = g_diag_hit3 = g_diag_hit4 = 0;
     long mtp_calls = 0, mtp_drafted = 0, mtp_accepted = 0;   // drafter diagnostics
     long mtp_declines = 0;   // assistant invoked but drafted 0 (paid ≥1 forward, invisible otherwise)
     long lk_calls  = 0, lk_drafted  = 0, lk_accepted  = 0, lk_displaced = 0;
@@ -9441,6 +9467,16 @@ static int run_spec_loop(
         eng->n_decode_tokens += K;
         int a = 0;
         while (a < D && ids[a] == batch[1+a]) a++;   // first mismatch = accept length
+        // Tree-spec de-risk: at the reject row a, was the target token in the head's top-4?
+        // top4[a][0] == batch[1+a] (the rejected argmax) by construction, so a hit means
+        // a width-2/3/4 tree branch would have carried the verify past this position.
+        if (g_topk_diag > 0 && from_mtp && a < D) {
+            g_diag_rej++;
+            int tgt = ids[a];
+            if      (tgt == g_diag_top4[a][1]) g_diag_hit2++;
+            else if (tgt == g_diag_top4[a][2]) g_diag_hit3++;
+            else if (tgt == g_diag_top4[a][3]) g_diag_hit4++;
+        }
         total_accepted += a;
         // Cumulative acceptance accounting for /metrics (τ vs other engines). Each verify
         // step is one target forward yielding (a accepted drafts + 1 committed bonus/resample).
@@ -9491,6 +9527,12 @@ static int run_spec_loop(
                 lk_calls, lk_drafted, lk_accepted,
                 100.0 * lk_accepted / (double)(lk_drafted > 0 ? lk_drafted : 1),
                 lk_displaced);
+    if (g_topk_diag > 0 && g_diag_rej > 0) {
+        long c2 = g_diag_hit2, c4 = g_diag_hit2 + g_diag_hit3 + g_diag_hit4;
+        fprintf(stderr, "fucina: [tree-diag] %ld rejects — target in head top-2: %ld (%.0f%%), "
+                "top-4: %ld (%.0f%%) | a width-w tree recovers this fraction of rejects\n",
+                g_diag_rej, c2, 100.0*c2/g_diag_rej, c4, 100.0*c4/g_diag_rej);
+    }
     if (n_accepted_out) *n_accepted_out = total_accepted;
     return generated;
 }
