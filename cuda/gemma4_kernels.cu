@@ -8957,6 +8957,114 @@ __global__ void mask_one_neg_inf_kernel(float *logits, const int *idx) {
     if (threadIdx.x == 0) logits[*idx] = -INFINITY;
 }
 
+// =========================================================================
+// ─── Tree speculative decode (T1) — KV-free drafter ─────────────────────
+// =========================================================================
+// The MTP head is a PURE recurrence in h: mtp_forward(tok, h) → (children logits, h').
+// Its attention reads the FROZEN target prefix at a FIXED position, never drafted tokens
+// (docs/tree-spec-plan.md). So a token TREE is drafted with NO KV bookkeeping: each node N
+// runs the head once on (tok[N], h[N]); all of N's children inherit the SAME output h'[N]
+// and differ only by token (the top-w of N's logits). Verify (T1b) forwards the whole tree
+// in ONE target weight pass under an ancestor mask. Acceptance stays per-edge draw-and-match,
+// so the target distribution is preserved exactly — at temp=0 a width-1 tree is byte-identical
+// to the linear chain (the correctness gate).
+#define GEMMA4_TREE_MAX 16   // ≤ GEMMA4_SPEC_MAX: tree nodes reuse the K-row verify buffers
+
+struct spec_tree {
+    int    n;                         // node count (node 0 = root = committed g)
+    int    parent[GEMMA4_TREE_MAX];   // parent[0] = -1
+    int    depth [GEMMA4_TREE_MAX];   // pos offset from the committed position (root = 0)
+    int    nchild[GEMMA4_TREE_MAX];   // children drafted under this node (head top-w)
+    int32_t tok  [GEMMA4_TREE_MAX];   // token at the node (filled by the drafter)
+    uint32_t anc [GEMMA4_TREE_MAX];   // bit c set iff node c is on the root→node path (incl self)
+};
+
+// Build a static template: a depth-`depth` rank-0 trunk, plus at each trunk node shallower
+// than `branch_until` add (width-1) sibling branches (the parent's ranks 1..width-1), each
+// continuing rank-0 for `branch_len` more steps. width=1 ⇒ a pure linear chain (the T1a gate).
+// Fills topology only (parent/depth/nchild/anc + node count); tokens are filled by the drafter.
+// `rank[i]` = which of the parent's top-w tokens node i takes (0 = argmax trunk).
+static int tree_build_template(spec_tree *t, int rank_out[GEMMA4_TREE_MAX],
+                               int depth, int width, int branch_until, int branch_len)
+{
+    for (int i = 0; i < GEMMA4_TREE_MAX; i++) { t->parent[i] = -1; t->depth[i] = 0;
+        t->nchild[i] = 0; t->anc[i] = 0; rank_out[i] = 0; }
+    int n = 1; t->parent[0] = -1; t->depth[0] = 0; t->anc[0] = 1u;   // root
+    int trunk_prev = 0;
+    for (int d = 1; d <= depth && n < GEMMA4_TREE_MAX; d++) {
+        int trunk = n++;                                   // rank-0 continuation of the trunk
+        t->parent[trunk] = trunk_prev; t->depth[trunk] = d; rank_out[trunk] = 0;
+        t->anc[trunk] = t->anc[trunk_prev] | (1u << trunk);
+        t->nchild[trunk_prev]++;
+        // sibling branches off the SAME parent (alternative tokens at this depth)
+        if (d <= branch_until) {
+            for (int w = 1; w < width && n < GEMMA4_TREE_MAX; w++) {
+                int br = n++; int bprev = br;
+                t->parent[br] = trunk_prev; t->depth[br] = d; rank_out[br] = w;
+                t->anc[br] = t->anc[trunk_prev] | (1u << br);
+                t->nchild[trunk_prev]++;
+                for (int k = 1; k <= branch_len && n < GEMMA4_TREE_MAX; k++) {
+                    int c = n++;
+                    t->parent[c] = bprev; t->depth[c] = d + k; rank_out[c] = 0;
+                    t->anc[c] = t->anc[bprev] | (1u << c);
+                    t->nchild[bprev]++; bprev = c;
+                }
+            }
+        }
+        trunk_prev = trunk;
+    }
+    t->n = n;
+    return n;
+}
+
+// Device scratch for the per-node output h (h'[N], the children's input h). Lazily sized.
+static float *g_tree_hout = NULL;   // [GEMMA4_TREE_MAX][H]
+
+// Draft the tree: fill t->tok by running the head once per node in parent-before-child order.
+// Returns the node count produced (≥1; tok[0]=g). Falls back to n=1 (root only) on any error.
+static int mtp_draft_tree(gemma4_engine_t *eng, int32_t g, spec_tree *t,
+                          const int rank[GEMMA4_TREE_MAX])
+{
+    if (!eng->mtp.loaded || !eng->mtp_h_valid || eng->cur.n_tokens <= 0) return 0;
+    cudaStream_t stream = eng->stream;
+    const int H = eng->cfg.hidden_size;
+    if (!g_tree_hout && cudaMalloc(&g_tree_hout, (size_t)GEMMA4_TREE_MAX * H * sizeof(float)) != cudaSuccess)
+        { cudaGetLastError(); return 0; }
+    // Root input h = the committed recurrent h (currently in d_mtp_h). Stash it so the first
+    // forward (which overwrites d_mtp_h) doesn't lose it; it is hout of a virtual "parent".
+    int posv = eng->cur.n_tokens;
+    cudaMemcpyAsync(eng->d_mtp_pos, &posv, sizeof(int), cudaMemcpyHostToDevice, stream);
+    t->tok[0] = g;
+    // Process nodes in index order — template guarantees parent index < child index.
+    for (int N = 0; N < t->n; N++) {
+        if (t->nchild[N] == 0) continue;                       // leaf: no forward needed
+        // Set the head's input: this node's token + this node's input h (= hout[parent], or
+        // the committed h for the root which still sits in d_mtp_h on the first iteration).
+        cudaMemcpyAsync(eng->d_mtp_tok, &t->tok[N], sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+        if (N != 0)
+            cudaMemcpyAsync(eng->d_mtp_h, g_tree_hout + (size_t)t->parent[N] * H, H * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        mtp_forward(eng, eng->d_mtp_tok, eng->d_mtp_pos, stream);   // → d_logits + d_mtp_h(=h')
+        cudaMemcpyAsync(g_tree_hout + (size_t)N * H, eng->d_mtp_h, H * sizeof(float),
+                        cudaMemcpyDeviceToDevice, stream);
+        // Children tokens = the head's top-(nchild) ids. Siblings are stored in rank order
+        // (template builds the rank-0 trunk child first, then ranks 1..w-1), so consecutive
+        // argmax+pop on d_logits yields rank 0,1,2,… exactly. (rank[] is kept for clarity/asserts.)
+        int got = 0;
+        for (int c = 0; c < t->n && got < t->nchild[N]; c++) {
+            if (t->parent[c] != N) continue;
+            argmax_kernel<<<1, 32, 0, stream>>>(eng->d_logits, eng->d_sample_id, GEMMA4_VOCAB_SIZE);
+            int id = -1;
+            cudaMemcpyAsync(&id, eng->d_sample_id, sizeof(int), cudaMemcpyDeviceToHost, stream);
+            if (cudaStreamSynchronize(stream) != cudaSuccess) return (N == 0) ? 0 : N;
+            mask_one_neg_inf_kernel<<<1, 1, 0, stream>>>(eng->d_logits, eng->d_sample_id);  // pop for next sibling
+            t->tok[c] = id; got++;
+            (void)rank;
+        }
+    }
+    return t->n;
+}
+
 // Draft up to max_draft tokens with the assistant; returns the count proposed.
 // Requires a valid recurrent h (eng->mtp_h_valid, paired with g). Greedy argmax
 // draft, cut at the first token whose draft prob < GEMMA4_MTP_PMIN — the verify's
@@ -9385,6 +9493,33 @@ static int run_spec_loop(
         int lk_ng = 0, lk_nocc = 0;
         int D = prompt_lookup_draft(hist, n, batch+1, maxd_lk, 2, draft_k, &lk_ng, &lk_nocc);
         int from_mtp = 0;
+        // T1a debug: one-shot — draft a tree at this step and print it next to the linear
+        // chain, to verify the KV-free drafter (width-1 trunk MUST equal the linear drafts).
+        static int g_tree_dbg = -1;
+        if (g_tree_dbg < 0) { const char *e = getenv("FUCINA_SPEC_TREE_DEBUG"); g_tree_dbg = (e && e[0]=='1') ? 1 : 0; }
+        if (g_tree_dbg == 1 && eng->mtp.loaded && eng->mtp_h_valid && maxd_mtp > 0) {
+            g_tree_dbg = 2;   // one-shot
+            int wdt = 2; { const char *w = getenv("FUCINA_SPEC_TREE_WIDTH"); if (w) wdt = atoi(w); }
+            spec_tree tt; int rk[GEMMA4_TREE_MAX];
+            tree_build_template(&tt, rk, /*depth=*/6, /*width=*/wdt, /*branch_until=*/2, /*branch_len=*/2);
+            // Both drafters consume the committed recurrent h from d_mtp_h and overwrite it;
+            // snapshot it so the linear and tree drafts start from the SAME (g, h) state.
+            const int Hd = eng->cfg.hidden_size;
+            float *h0 = NULL; cudaMalloc(&h0, (size_t)Hd*sizeof(float));
+            cudaMemcpyAsync(h0, eng->d_mtp_h, (size_t)Hd*sizeof(float), cudaMemcpyDeviceToDevice, eng->stream);
+            int32_t lin[GEMMA4_SPEC_MAX]; int Dl = mtp_draft(eng, g, lin, 6);
+            cudaMemcpyAsync(eng->d_mtp_h, h0, (size_t)Hd*sizeof(float), cudaMemcpyDeviceToDevice, eng->stream);
+            eng->mtp_h_valid = 1;
+            int nn = mtp_draft_tree(eng, g, &tt, rk);
+            cudaMemcpyAsync(eng->d_mtp_h, h0, (size_t)Hd*sizeof(float), cudaMemcpyDeviceToDevice, eng->stream);
+            cudaStreamSynchronize(eng->stream); cudaFree(h0);
+            fprintf(stderr, "fucina: [tree-dbg] width=%d nodes=%d  linear(%d): ", wdt, nn, Dl);
+            for (int i = 0; i < Dl; i++) fprintf(stderr, "%d ", lin[i]);
+            fprintf(stderr, "\nfucina: [tree-dbg] tree nodes [idx:parent@depth=tok]:\n");
+            for (int i = 0; i < nn; i++)
+                fprintf(stderr, "   %2d: p%-2d @d%d  tok=%d%s\n", i, tt.parent[i], tt.depth[i],
+                        tt.tok[i], (tt.parent[i]<0?"  (root=g)":""));
+        }
         // The displacement bar stays pinned to the MTP budget: to displace MTP a
         // lookup draft must reach the full length MTP would have been allowed,
         // with a >=3-gram match corroborated by >=2 occurrences. (Pinning to the
