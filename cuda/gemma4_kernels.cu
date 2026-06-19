@@ -8040,6 +8040,37 @@ static int decode_tree_dev(gemma4_engine_t *eng, const spec_tree *t) {
     return 0;
 }
 
+// Commit an accepted tree path: move its scattered KV (slot pos+path[d]) into the contiguous
+// slots pos+d for every layer (K and V). No-op when the path is already contiguous (path[d]==d,
+// e.g. the width-1 trunk) — so the linear case pays nothing. path[0]=root(=0); d runs 1..L.
+// Safe in-place: src slot (pos+path[d]) ≥ dst (pos+d) and strictly above every earlier dst,
+// so no source is clobbered before it is read (nodes are created parent-before-child).
+static void tree_commit_kv(gemma4_engine_t *eng, int pos, const int *path, int L) {
+    cudaStream_t stream = eng->stream;
+    for (int d = 1; d <= L; d++) {
+        int src = pos + path[d], dst = pos + d;
+        if (src == dst) continue;
+        for (int l = 0; l < eng->cfg.n_layers; l++) {
+            layer_type_t lt = eng->layer_types[l];
+            int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+            int nkv = (lt==LAYER_SLIDING)? eng->cfg.n_kv_sliding : eng->cfg.n_kv_global;
+            size_t okv = (size_t)nkv * hd;
+            if (lt == LAYER_SLIDING) {
+                size_t cap = eng->sliding_kv_capacity, base = (size_t)l * cap * okv;
+                size_t s = base + (size_t)(src % (int)cap) * okv, t = base + (size_t)(dst % (int)cap) * okv;
+                cudaMemcpyAsync(eng->d_sliding_k + t, eng->d_sliding_k + s, okv*sizeof(kv_t), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(eng->d_sliding_v + t, eng->d_sliding_v + s, okv*sizeof(kv_t), cudaMemcpyDeviceToDevice, stream);
+            } else {
+                int slot = eng->global_slot[l]; size_t cap = eng->global_kv_capacity;
+                size_t base = (size_t)slot * cap * okv;
+                size_t s = base + (size_t)src * okv, t = base + (size_t)dst * okv;
+                cudaMemcpyAsync(eng->d_global_k + t, eng->d_global_k + s, okv*sizeof(kv_t), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(eng->d_global_v + t, eng->d_global_v + s, okv*sizeof(kv_t), cudaMemcpyDeviceToDevice, stream);
+            }
+        }
+    }
+}
+
 // =========================================================================
 // ─── Multi-sequence batched decode (Phase 3: B INDEPENDENT sequences) ────
 // =========================================================================
@@ -9540,6 +9571,64 @@ static int run_spec_loop(
         // assistant pass + a stream sync, so medium-confidence tokens the gate admits
         // past the recent accepted run don't pay for themselves.
         int lk_ng = 0, lk_nocc = 0;
+        // ── Tree spec path (FUCINA_SPEC_TREE=width; 1 ⇒ linear-as-tree, ≥2 ⇒ branching) ──
+        // Runs BEFORE the linear drafter so the committed recurrent h (d_mtp_h) is intact for
+        // the root forward. On success it commits the longest draw-match path and `continue`s;
+        // any failure falls through to the linear path (which re-establishes h from its verify).
+        static int g_tree_w = -2;
+        if (g_tree_w == -2) { const char *e = getenv("FUCINA_SPEC_TREE"); g_tree_w = e ? atoi(e) : 0; }
+        if (g_tree_w >= 1 && mtp_ready && eng->mtp_h_valid && maxd_mtp > 0 && eng->cur.n_tokens > 0) {
+            const int Hh = eng->cfg.hidden_size;
+            spec_tree tt; int rk[GEMMA4_TREE_MAX];
+            int tdepth = maxd_mtp < draft_k ? maxd_mtp : draft_k;
+            tree_build_template(&tt, rk, tdepth, g_tree_w, /*branch_until=*/2, /*branch_len=*/2);
+            int nn = mtp_draft_tree(eng, g, &tt, rk);
+            int posT = eng->cur.n_tokens;
+            if (nn >= 2 && decode_tree_dev(eng, &tt) == 0) {
+                double vt0 = now_ms();
+                float rnds[GEMMA4_TREE_MAX]; for (int i = 0; i < nn; i++) rnds[i] = (float)spec_rng(&rng);
+                cudaMemcpyAsync(eng->d_spec_rnd, rnds, (size_t)nn*sizeof(float), cudaMemcpyHostToDevice, eng->stream);
+                sample_logits_batched_kernel<<<nn, 1024, 0, eng->stream>>>(
+                    decode_batched_dev_logits(eng), V, temp, top_k, top_p, min_p,
+                    eng->d_spec_rnd, eng->d_spec_ids);
+                int ids[GEMMA4_TREE_MAX];
+                cudaMemcpyAsync(ids, eng->d_spec_ids, (size_t)nn*sizeof(int), cudaMemcpyDeviceToHost, eng->stream);
+                if (cudaStreamSynchronize(eng->stream) != cudaSuccess) { stop = 1; break; }
+                eng->decode_time_ms += (float)(now_ms() - vt0); eng->n_decode_tokens += nn;
+                // Longest root→leaf path where each edge's draft token == the parent's target sample.
+                int path[GEMMA4_TREE_MAX]; int Lp = 0, cur = 0;
+                for (;;) {
+                    int tgt = ids[cur], nx = -1;
+                    for (int c = 0; c < nn; c++) if (tt.parent[c] == cur && tt.tok[c] == tgt) { nx = c; break; }
+                    if (nx < 0) break;
+                    path[++Lp] = nx; cur = nx;
+                }
+                tree_commit_kv(eng, posT, path, Lp);               // no-op when the path is contiguous
+                if (eng->mtp.loaded) {
+                    cudaMemcpyAsync(eng->d_mtp_h, eng->d_sb[2] + (size_t)cur * Hh,
+                                    (size_t)Hh * sizeof(float), cudaMemcpyDeviceToDevice, eng->stream);
+                    eng->mtp_h_valid = 1;
+                }
+                int keep = posT + 1 + Lp;
+                if (keep < eng->cur.n_tokens && gemma4_engine_rewind(eng, keep) != 0) { stop = 1; break; }
+                eng->spec_steps++; eng->spec_drafted += (nn - 1); eng->spec_accepted += Lp; eng->spec_emitted += (Lp + 1);
+                mtp_calls++; mtp_drafted += (nn - 1); mtp_accepted += Lp;
+                ema_mtp = 0.5f*ema_mtp + 0.5f*(float)Lp;
+                total_accepted += Lp;
+                for (int d = 1; d <= Lp && generated < max_new; d++) {
+                    int tk = tt.tok[path[d]]; out_tokens[generated++] = tk; hist[n++] = tk;
+                    if (cb && cb(tk, cb_ud)) { stop = 1; break; }
+                    if (is_stop(tk)) { stop = 1; break; }
+                }
+                if (stop) break;
+                g = ids[cur];
+                continue;
+            }
+            // decode_tree_dev advanced n_tokens but we did not commit — rewind to the prefix so
+            // the linear fallthrough starts clean. (h was clobbered by drafting; the linear
+            // verify re-establishes it from d_sb[2], so output stays correct.)
+            if (eng->cur.n_tokens > posT) gemma4_engine_rewind(eng, posT);
+        }
         int D = prompt_lookup_draft(hist, n, batch+1, maxd_lk, 2, draft_k, &lk_ng, &lk_nocc);
         int from_mtp = 0;
         // T1a debug: one-shot — draft a tree at this step and print it next to the linear
