@@ -2847,6 +2847,7 @@ struct gemma4_engine {
     uint8_t *d_fp4_wsc_lin[GEMMA4_CAP_LAYERS][PJ_COUNT]; // linear E4M3 [out_dim × in_dim/16]
     float   *d_fp4_gsw;        // device [MAX_LAYERS*PJ_COUNT] weight per-tensor global scales
     int      fp4_ready;        // 1 once persistent NVFP4 weights are built
+    int      fp4_budget_ok;    // --gpu-mem-util verdict: 1 if the NVFP4-prefill copy fits the budget
     int      nvfp4_decode_ready; // 1 once NVFP4 store + linear scales + embed + norms are resident
     // BF16 non-quant tensors loaded from the safetensors checkpoint (FORMAT_NVFP4 only): the
     // embedding table doubles as the (tied) LM head. d_lmhead_bf16 ALIASES d_embed_bf16 when tied
@@ -3559,6 +3560,45 @@ static void gemma4_apply_cfg(gemma4_engine_t *eng) {
     eng->n_layers_global = eng->n_global;
 }
 
+// Compute the NVFP4-prefill weight footprint (bytes) WITHOUT building anything: the sum
+// over (layer, projection) of the packed E2M1 weights [out_dim × in_dim/2] plus the
+// swizzled E4M3 block scales [pad(out,128) × pad(in/16,4)]. Mirrors the per-projection
+// sizing in build_fp4_weights (the d_fp4_w / d_fp4_wsc cudaMallocs) and the projection
+// dimensions in proj_desc — kept self-contained because both live AFTER engine_create.
+// Used by the --gpu-mem-util budget block to decide whether the lazy NVFP4-prefill copy
+// (~= the model weight bytes, ~16.5 GiB on the 31B) can be afforded co-resident.
+static uint64_t gemma4_fp4_prefill_footprint(const gemma4_engine_t *eng) {
+    const int BLK = 16;  // NVFP4 block size (NVFP4_BLK, defined later)
+    auto pad = [](int x, int m) { return ((x + m - 1) / m) * m; };
+    uint64_t bytes = 0;
+    int H = eng->cfg.hidden_size, I = eng->cfg.intermediate;
+    for (int l = 0; l < eng->cfg.n_layers; l++) {
+        layer_type_t lt = eng->layer_types[l];
+        int hd  = (lt == LAYER_SLIDING) ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+        int nkv = (lt == LAYER_SLIDING) ? eng->cfg.n_kv_sliding : eng->cfg.n_kv_global;
+        int oq  = eng->cfg.n_heads * hd;
+        int okv = nkv * hd;
+        for (int p = 0; p < PJ_COUNT; p++) {
+            int in_dim, out_dim;
+            switch (p) {
+                case PJ_Q:    in_dim = H;  out_dim = oq;  break;
+                case PJ_K:    in_dim = H;  out_dim = okv; break;
+                case PJ_V:    if (lt != LAYER_SLIDING) continue;  // global: V=K, no weight
+                              in_dim = H;  out_dim = okv; break;
+                case PJ_O:    in_dim = oq; out_dim = H;   break;
+                case PJ_GATE: in_dim = H;  out_dim = I;   break;
+                case PJ_UP:   in_dim = H;  out_dim = I;   break;
+                case PJ_DOWN: in_dim = I;  out_dim = H;   break;
+                default:      continue;
+            }
+            uint64_t packed = (uint64_t)out_dim * (in_dim / 2);
+            uint64_t swsz   = (uint64_t)pad(out_dim, 128) * pad(in_dim / BLK, 4);
+            bytes += packed + swsz;
+        }
+    }
+    return bytes;
+}
+
 gemma4_engine_t* gemma4_engine_create(
     const char    *model_path,
     tensor_format_t format,
@@ -4015,7 +4055,7 @@ gemma4_engine_t* gemma4_engine_create(
     }
     eng->d_pf_qx = NULL; eng->d_pf_dx = NULL; eng->d_pf_sx = NULL; eng->mmq_ready = 0;
     // NVFP4 prefill (FUCINA_FP4) — all lazy, built on first prefill if enabled
-    eng->cublaslt = NULL; eng->fp4_ready = 0; eng->fp4_desc = NULL;
+    eng->cublaslt = NULL; eng->fp4_ready = 0; eng->fp4_budget_ok = 0; eng->fp4_desc = NULL;
     eng->d_fp4_gsw = NULL; eng->d_fp4_act = NULL; eng->d_fp4_actsc = NULL;
     eng->d_fp4_actlin = NULL; eng->d_fp4_gsact = NULL; eng->d_fp4_alpha = NULL;
     eng->d_fp4_amax = NULL; eng->fp4_act_cap = 0; eng->d_fp4_ws = NULL;
@@ -4516,6 +4556,32 @@ gemma4_engine_t* gemma4_engine_create(
             budget_packed = 0;
         }
 
+        // ── NVFP4-prefill copy budget (the lazy ~16.5 GiB build_fp4_weights store) ──
+        // The prefill speed path (FUCINA_FP4, ~2.4× BF16) builds a THIRD weight copy on
+        // first long prefill: packed E2M1 [out×in/2] + swizzled E4M3 scales, ~= the model
+        // weight bytes. It was never billed here, so a util-0.4 budget that excludes it let
+        // the 31B climb to ~64 GiB. Bill it now: fp4_budget_ok is TRUE only if it fits the
+        // remaining room (after resident + packed + the min-global KV floor) under BOTH the
+        // util budget and the physically-free ceiling. When false, the use_fp4 prefill
+        // decision (gemm path) declines to build it and falls back to BF16/MMQ (slower, but
+        // no extra copy). An EXPLICIT FUCINA_FP4=1 force-overrides at the prefill site.
+        // FORMAT_NVFP4 residency keeps no separate prefill copy (the store IS the residency),
+        // so there is nothing extra to bill there — gate on a GGUF d_weights model.
+        bool fp4_possible = eng->d_weights && eng->format != FORMAT_NVFP4;
+        // EXPLICIT FUCINA_FP4=0 opts the prefill copy out entirely — it will never be built,
+        // so don't reserve its bytes here (give that room to ctx) and report it as such.
+        const char *fp4_env = getenv("FUCINA_FP4");
+        bool fp4_env_off = (fp4_env && fp4_env[0] == '0');
+        uint64_t fp4_prefill_bytes = (fp4_possible && !fp4_env_off)
+                                     ? gemma4_fp4_prefill_footprint(eng) : 0;
+        if (fp4_possible && !fp4_env_off) {
+            // Must fit alongside the minimum global KV that the budget guarantees.
+            eng->fp4_budget_ok = (fp4_prefill_bytes + min_global <= avail) ? 1 : 0;
+            if (eng->fp4_budget_ok) avail -= fp4_prefill_bytes;
+        } else {
+            eng->fp4_budget_ok = 0;
+        }
+
         // Effective global ctx = min(user ctx, avail / per-token global cost).
         uint32_t eff_ctx = context_size;
         if (glob_per_tok > 0) {
@@ -4531,7 +4597,8 @@ gemma4_engine_t* gemma4_engine_create(
         // Recompute the final global KV at the (possibly capped) ctx for the log.
         uint64_t global_bytes = glob_per_tok * (uint64_t)eff_ctx;
         uint64_t total_use = resident + sliding_bytes + global_bytes +
-                             (budget_packed ? packed_bytes : 0);
+                             (budget_packed ? packed_bytes : 0) +
+                             (eng->fp4_budget_ok ? fp4_prefill_bytes : 0);
 
         // ── Balance sheet ────────────────────────────────────────────────────
         fprintf(stderr,
@@ -4544,6 +4611,7 @@ gemma4_engine_t* gemma4_engine_create(
             "fucina:   KV sliding ring  : %8.2f GiB  (cap %d, ctx-independent)\n"
             "fucina:   KV global        : %8.2f GiB  (ctx %u%s)\n"
             "fucina:   packed Q4_0 copy : %8.2f GiB  (%s)\n"
+            "fucina:   NVFP4 prefill wts: %8.2f GiB  (%s)\n"
             "fucina:   ─────────────────────────────────────────────────\n"
             "fucina:   our total        : %8.2f GiB  (%s budget by %.2f GiB)\n",
             total_mem / GiB,
@@ -4557,6 +4625,10 @@ gemma4_engine_t* gemma4_engine_create(
                 (packed_forced_off ? "OFF — no budget" :
                  (env_no_packed ? "OFF — FUCINA_NO_PACKED" :
                   (packed_possible ? "OFF" : "n/a"))),
+            (eng->fp4_budget_ok ? fp4_prefill_bytes : 0) / GiB,
+            !fp4_possible ? "n/a" :
+                (fp4_env_off ? "OFF — FUCINA_FP4=0" :
+                 (eng->fp4_budget_ok ? "ON — budget" : "OFF — budget")),
             total_use / GiB,
             total_use <= budget ? "within" : "OVER",
             (total_use <= budget ? (budget - total_use) : (total_use - budget)) / GiB);
@@ -6312,12 +6384,27 @@ int gemma4_engine_prefill_batched(
     // (90/100) — FP4 on the 256-1024 multi-turn prefills was the culprit. FUCINA_FP4=0 opts
     // out entirely; FUCINA_FP4_MIN overrides the floor. Lazy: weights build only when a
     // prefill actually clears the floor, so short-prompt sessions pay nothing.
-    static int fp4_opt = -1, fp4_min = 1024;
+    static int fp4_opt = -1, fp4_min = 1024, fp4_force = 0;
     if (fp4_opt < 0) {
         const char *e = getenv("FUCINA_FP4"); fp4_opt = (e && e[0]=='0') ? 0 : 1;  // on unless =0
+        fp4_force = (e && e[0]=='1') ? 1 : 0;   // EXPLICIT =1 force-overrides the mem budget
         const char *mn = getenv("FUCINA_FP4_MIN"); if (mn) fp4_min = atoi(mn);
     }
-    bool use_fp4 = fp4_opt && !use_mmq && N >= fp4_min
+    // The --gpu-mem-util budget block decided whether the lazy NVFP4-prefill copy (~16.5 GiB
+    // on the 31B) fits co-resident. Honor that by DEFAULT: if it doesn't fit, never build it —
+    // prefill falls back to BF16/MMQ (correct, slower). An EXPLICIT FUCINA_FP4=1 force-overrides
+    // (build anyway, with a one-time over-budget warning). FORMAT_NVFP4 is handled below and is
+    // unaffected (no separate copy; fp4_budget_ok is irrelevant there).
+    bool fp4_budget = eng->fp4_budget_ok || fp4_force;
+    if (fp4_force && !eng->fp4_budget_ok && !eng->fp4_ready && fp4_opt && !use_mmq && N >= fp4_min) {
+        static int warned = 0;
+        if (!warned) { warned = 1;
+            fprintf(stderr, "fucina: WARNING FUCINA_FP4=1 forces the NVFP4-prefill copy "
+                            "(~%.2f GiB) which EXCEEDS the --gpu-mem-util budget\n",
+                            gemma4_fp4_prefill_footprint(eng) / (1024.0*1024.0*1024.0));
+        }
+    }
+    bool use_fp4 = fp4_opt && fp4_budget && !use_mmq && N >= fp4_min
                          && build_fp4_weights(eng) == 0 && ensure_fp4_act(eng, N) == 0;
     // FORMAT_NVFP4 has NO Q4_0/BF16 fallback store (eng->d_weights is NULL): the prefill MUST
     // always use gemm_nvfp4, for EVERY N. Bypass the 1024-token floor and the MMQ/BF16 paths.
