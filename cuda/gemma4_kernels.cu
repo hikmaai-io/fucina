@@ -8998,6 +8998,12 @@ static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int ma
     if (!eng->d_mtp_ids || !eng->d_mtp_conf) return 0;
     if (!eng->d_mtp_tok || !eng->d_mtp_pos) return 0;
     cudaStream_t stream = eng->stream;
+    // Draft confidence gate (llama.cpp --draft-p-min): cut the chain at the first token
+    // whose draft prob < pmin. Disabled by default (0.0); FUCINA_MTP_PMIN tunes it. The
+    // verify accept rule preserves the target distribution regardless of where we cut, so
+    // this only trades raw draft length for acceptance precision (a measured win on prose).
+    static float pmin = -1.0f;
+    if (pmin < 0.0f) { const char *e = getenv("FUCINA_MTP_PMIN"); pmin = e ? (float)atof(e) : GEMMA4_MTP_PMIN; }
     // Per-call device state: the chain position (n_past, same for every draft token)
     // and the first input token. Chained tokens are written into d_mtp_tok on-device
     // by mtp_argmax_conf_kernel — no id ever crosses the bus mid-chain.
@@ -9020,7 +9026,7 @@ static int mtp_draft(gemma4_engine_t *eng, int32_t g, int32_t *draft_out, int ma
         cudaMemcpyAsync(&conf, eng->d_mtp_conf + j, sizeof(float),
                         cudaMemcpyDeviceToHost, stream);
         if (cudaStreamSynchronize(stream) != cudaSuccess) break;
-        if (conf < GEMMA4_MTP_PMIN) break;   // low confidence → stop drafting here
+        if (conf < pmin) break;   // low confidence → stop drafting here (FUCINA_MTP_PMIN)
         produced++;
     }
     if (produced == 0) return 0;
