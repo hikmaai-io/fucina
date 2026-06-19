@@ -9097,11 +9097,18 @@ static int tree_build_template(spec_tree *t, int rank_out[GEMMA4_TREE_MAX],
     return n;
 }
 
-// Device scratch for the per-node output h (h'[N], the children's input h). Lazily sized.
-static float *g_tree_hout = NULL;   // [GEMMA4_TREE_MAX][H]
+static int mtp_graph_ensure(gemma4_engine_t *eng);   // fwd decl (defined with the linear drafter)
+
+// Device scratch for the per-node output h (h'[N], the children's input h) and the per-node
+// token (chained ON-DEVICE so the drafter never syncs mid-tree). Lazily sized.
+static float   *g_tree_hout   = NULL;   // [GEMMA4_TREE_MAX][H]
+static int32_t *g_d_treetok   = NULL;   // [GEMMA4_TREE_MAX] node tokens (device)
 
 // Draft the tree: fill t->tok by running the head once per node in parent-before-child order.
-// Returns the node count produced (≥1; tok[0]=g). Falls back to n=1 (root only) on any error.
+// T2: FULLY ON-DEVICE — each node's children are argmax'd straight into g_d_treetok[child]
+// (which the child's own forward then reads as input), and h flows through g_tree_hout. The
+// ONLY host sync is a single D2H of the n tokens at the very end. (The old version synced once
+// PER CHILD — ~30 host round-trips/step — which dominated the step cost.) Returns node count.
 static int mtp_draft_tree(gemma4_engine_t *eng, int32_t g, spec_tree *t,
                           const int rank[GEMMA4_TREE_MAX])
 {
@@ -9110,38 +9117,45 @@ static int mtp_draft_tree(gemma4_engine_t *eng, int32_t g, spec_tree *t,
     const int H = eng->cfg.hidden_size;
     if (!g_tree_hout && cudaMalloc(&g_tree_hout, (size_t)GEMMA4_TREE_MAX * H * sizeof(float)) != cudaSuccess)
         { cudaGetLastError(); return 0; }
-    // Root input h = the committed recurrent h (currently in d_mtp_h). Stash it so the first
-    // forward (which overwrites d_mtp_h) doesn't lose it; it is hout of a virtual "parent".
+    if (!g_d_treetok && cudaMalloc(&g_d_treetok, GEMMA4_TREE_MAX * sizeof(int32_t)) != cudaSuccess)
+        { cudaGetLastError(); return 0; }
     int posv = eng->cur.n_tokens;
     cudaMemcpyAsync(eng->d_mtp_pos, &posv, sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(g_d_treetok, &g, sizeof(int32_t), cudaMemcpyHostToDevice, stream);  // root token
     t->tok[0] = g;
-    // Process nodes in index order — template guarantees parent index < child index.
+    // Each node's head forward is replayed from the captured mtp_graph (ONE op/node) instead of
+    // ~48 raw kernel launches — the head's kernels are tiny/latency-bound, so per-node launches
+    // dominated the step. The graph reads eng->d_mtp_tok + eng->d_mtp_h (set per node below).
+    int use_graph = (mtp_graph_ensure(eng) == 0);
+    // Process nodes in index order (template: parent index < child index). All on-stream, no sync.
     for (int N = 0; N < t->n; N++) {
         if (t->nchild[N] == 0) continue;                       // leaf: no forward needed
-        // Set the head's input: this node's token + this node's input h (= hout[parent], or
-        // the committed h for the root which still sits in d_mtp_h on the first iteration).
-        cudaMemcpyAsync(eng->d_mtp_tok, &t->tok[N], sizeof(int32_t), cudaMemcpyHostToDevice, stream);
-        if (N != 0)
+        // Set the graph's inputs: token N (chained on-device) and input h.
+        cudaMemcpyAsync(eng->d_mtp_tok, g_d_treetok + N, sizeof(int32_t), cudaMemcpyDeviceToDevice, stream);
+        if (N != 0)                                            // root keeps the committed h in d_mtp_h
             cudaMemcpyAsync(eng->d_mtp_h, g_tree_hout + (size_t)t->parent[N] * H, H * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);
-        mtp_forward(eng, eng->d_mtp_tok, eng->d_mtp_pos, stream);   // → d_logits + d_mtp_h(=h')
+        if (use_graph && cudaGraphLaunch(eng->mtp_graph, stream) != cudaSuccess) {
+            use_graph = 0; cudaGetLastError();
+        }
+        if (!use_graph)
+            mtp_forward(eng, eng->d_mtp_tok, eng->d_mtp_pos, stream);   // → d_logits + h'
         cudaMemcpyAsync(g_tree_hout + (size_t)N * H, eng->d_mtp_h, H * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
-        // Children tokens = the head's top-(nchild) ids. Siblings are stored in rank order
-        // (template builds the rank-0 trunk child first, then ranks 1..w-1), so consecutive
-        // argmax+pop on d_logits yields rank 0,1,2,… exactly. (rank[] is kept for clarity/asserts.)
-        int got = 0;
-        for (int c = 0; c < t->n && got < t->nchild[N]; c++) {
+        // Children = head top-(nchild): argmax straight into g_d_treetok[child], then pop. Siblings
+        // are stored in rank order so consecutive argmax+pop yields ranks 0,1,2,… No host sync.
+        for (int c = 0; c < t->n; c++) {
             if (t->parent[c] != N) continue;
-            argmax_kernel<<<1, 32, 0, stream>>>(eng->d_logits, eng->d_sample_id, GEMMA4_VOCAB_SIZE);
-            int id = -1;
-            cudaMemcpyAsync(&id, eng->d_sample_id, sizeof(int), cudaMemcpyDeviceToHost, stream);
-            if (cudaStreamSynchronize(stream) != cudaSuccess) return (N == 0) ? 0 : N;
-            mask_one_neg_inf_kernel<<<1, 1, 0, stream>>>(eng->d_logits, eng->d_sample_id);  // pop for next sibling
-            t->tok[c] = id; got++;
-            (void)rank;
+            argmax_kernel<<<1, 32, 0, stream>>>(eng->d_logits, g_d_treetok + c, GEMMA4_VOCAB_SIZE);
+            mask_one_neg_inf_kernel<<<1, 1, 0, stream>>>(eng->d_logits, g_d_treetok + c);
         }
     }
+    (void)rank;
+    // Single sync: pull all node tokens to host (the verify uploads them; topology needs them).
+    int32_t htok[GEMMA4_TREE_MAX];
+    cudaMemcpyAsync(htok, g_d_treetok, (size_t)t->n * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { cudaGetLastError(); return 0; }
+    for (int i = 1; i < t->n; i++) t->tok[i] = htok[i];
     return t->n;
 }
 
