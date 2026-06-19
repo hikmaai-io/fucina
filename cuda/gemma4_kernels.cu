@@ -1558,6 +1558,7 @@ __global__ void global_attn_splitk_kernel(
     static_assert(HD % 128 == 0, "uint lane slices require HD multiple of 128");
     static_assert(TILE >= 1, "GEMMA4_GLOBAL_ATTN_TILE must be >= NKV");
     __shared__ unsigned char sk[TILE * NKV * HD], sv[TILE * NKV * HD];
+    const uint32_t rmask = 0u; const int treebase = 0;   // single-row: tree mask never applies (no-op)
     int h    = threadIdx.x >> 5;              // warp = query head
     int kvh  = h / GQ;                        // this query head's KV head
     int lane = threadIdx.x & 31;
@@ -1585,6 +1586,8 @@ __global__ void global_attn_splitk_kernel(
         }
         __syncthreads();
         for (int tt = 0; tt < tn; tt++) {
+            int kabs = tb + tt;
+            if (rmask && kabs >= treebase && !((rmask >> (kabs - treebase)) & 1u)) continue;  // non-ancestor tree key
             const unsigned int *kw = (const unsigned int *)(sk + ((size_t)tt * NKV + kvh) * HD);
             const unsigned int *vw = (const unsigned int *)(sv + ((size_t)tt * NKV + kvh) * HD);
             float dot = 0.0f;
@@ -1773,7 +1776,9 @@ __global__ void global_attn_splitk_rows_kernel(
     const float *q,                                  // [K][NH*HD] (row-major)
     const kv_t *k_cache, const kv_t *v_cache,        // [capacity][NKV][HD]
     int n_tokens0,                                   // row r attends n_tokens0 + r keys
-    const int *n_tokens0_ptr)                        // non-NULL: device override (graph path)
+    const int *n_tokens0_ptr,                        // non-NULL: device override (graph path)
+    int treebase = 0,                                // TREE: first tree-region key index (= committed pos)
+    const uint32_t *anc = nullptr)                   // TREE: per-row ancestor bitmask over [treebase, …)
 {
     constexpr int TILE = GEMMA4_GLOBAL_ATTN_TILE / NKV;   // smem held at the 12B footprint
     constexpr int E = HD / 128;
@@ -1783,6 +1788,10 @@ __global__ void global_attn_splitk_rows_kernel(
     __shared__ unsigned char sk[TILE * NKV * HD], sv[TILE * NKV * HD];
     int r = blockIdx.y;
     if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
+    // TREE mask: when `anc` is set, a key in the tree region [treebase, ctx_len) is attended
+    // only if it is this row's ancestor (bit set). anc[r] includes bit (r) for the node itself.
+    // anc==NULL (linear path) ⇒ no masking ⇒ bit-identical to the contiguous causal verify.
+    uint32_t rmask = anc ? anc[r] : 0u;
     int ctx_len = n_tokens0 + r;
     int n_splits = attn_row_splits(ctx_len, GEMMA4_GLOBAL_SPLIT_CHUNK);
     int split = blockIdx.x;
@@ -1812,6 +1821,8 @@ __global__ void global_attn_splitk_rows_kernel(
         }
         __syncthreads();
         for (int tt = 0; tt < tn; tt++) {
+            int kabs = tb + tt;
+            if (rmask && kabs >= treebase && !((rmask >> (kabs - treebase)) & 1u)) continue;  // non-ancestor tree key
             const unsigned int *kw = (const unsigned int *)(sk + ((size_t)tt * NKV + kvh) * HD);
             const unsigned int *vw = (const unsigned int *)(sv + ((size_t)tt * NKV + kvh) * HD);
             float dot = 0.0f;
@@ -1854,12 +1865,15 @@ __global__ void sliding_attn_splitk_rows_kernel(
     const float *q,                                  // [K][NH*HD]
     const kv_t *k_cache, const kv_t *v_cache,        // RING [cap][NKV][HD]
     int window, int n_tokens0, int cap,
-    const int *n_tokens0_ptr)                        // non-NULL: device override (graph path)
+    const int *n_tokens0_ptr,                        // non-NULL: device override (graph path)
+    int treebase = 0,                                // TREE: first tree-region absolute position
+    const uint32_t *anc = nullptr)                   // TREE: per-row ancestor bitmask
 {
     constexpr int GQ = NH / NKV;
     constexpr int slice = HD / 32;
     int r = blockIdx.y;
     if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
+    uint32_t rmask = anc ? anc[r] : 0u;   // TREE mask; 0 (NULL) ⇒ no masking (linear path)
     int n_tokens = n_tokens0 + r;
     int window_len = min(n_tokens, window);
     int n_splits = attn_row_splits(window_len, GEMMA4_SLIDING_SPLIT_CHUNK);
@@ -1883,7 +1897,9 @@ __global__ void sliding_attn_splitk_rows_kernel(
     }
 
     for (int i = i0; i < i1; i++) {
-        size_t pos = (size_t)(lo + i) % (size_t)cap;   // ring slot for absolute pos lo+i
+        int ap = lo + i;                               // absolute position of this key
+        if (rmask && ap >= treebase && !((rmask >> (ap - treebase)) & 1u)) continue;  // non-ancestor tree key
+        size_t pos = (size_t)ap % (size_t)cap;         // ring slot for absolute pos lo+i
         const kv_t *kp = k_cache + (pos*NKV + kv_head)*HD;
         const kv_t *vp = v_cache + (pos*NKV + kv_head)*HD;
         float kd[slice], vd[slice];
@@ -2202,14 +2218,15 @@ __global__ void attn_softmax_batched_kernel(
 __global__ void rope_rows_kernel(
     float *q, float *k, int base_pos, int n_heads, int n_kv_heads,
     int head_dim, int rows, float theta_base, const float *freq_factors,
-    const int *base_pos_ptr = nullptr)               // non-NULL: device override (graph path)
+    const int *base_pos_ptr = nullptr,               // non-NULL: device override (graph path)
+    const int *depth = nullptr)                      // TREE: row's pos offset = depth[row] (else row)
 {
     int d = threadIdx.x, half = head_dim / 2;
     if (d >= half) return;
     int head = blockIdx.x, row = blockIdx.y;
     if (row >= rows) return;
     if (base_pos_ptr) base_pos = *base_pos_ptr;
-    int pos = base_pos + row;
+    int pos = base_pos + (depth ? depth[row] : row);
     float ff    = freq_factors ? freq_factors[d] : 1.0f;
     float theta = powf(theta_base, -2.0f * d / head_dim) / ff;
     float c = cosf(pos * theta), s = sinf(pos * theta);
@@ -7633,7 +7650,10 @@ static int ensure_spec_scratch(gemma4_engine_t *eng)
 // D2H, sampling). Bit-identical to the old inline body when d_pos==NULL.
 static void decode_batched_forward(
     gemma4_engine_t *eng, int K, int pos, cudaStream_t stream,
-    const int *d_pos, int want_head)
+    const int *d_pos, int want_head,
+    int tree_base = 0,                 // TREE: committed prefix length (first tree key index)
+    const uint32_t *d_anc = nullptr,   // TREE: [K] per-row ancestor bitmask (device)
+    const int *d_depth = nullptr)      // TREE: [K] per-row depth (RoPE pos offset)
 {
     const int H   = eng->cfg.hidden_size;
     const int I   = eng->cfg.intermediate;
@@ -7706,9 +7726,9 @@ static void decode_batched_forward(
         } // else (non-NVFP4 q/k/v batched)
 
         if (lt == LAYER_SLIDING)
-            rope_rows_kernel<<<dim3(HEADS,K),hd/2,0,stream>>>(d_q, d_k, pos, HEADS, nkv, hd, K, 10000.0f, NULL, d_pos);
+            rope_rows_kernel<<<dim3(HEADS,K),hd/2,0,stream>>>(d_q, d_k, pos, HEADS, nkv, hd, K, 10000.0f, NULL, d_pos, d_depth);
         else
-            rope_rows_kernel<<<dim3(HEADS,K),hd/2,0,stream>>>(d_q, d_k, pos, HEADS, nkv, hd, K, 1000000.0f, eng->d_rope_freqs, d_pos);
+            rope_rows_kernel<<<dim3(HEADS,K),hd/2,0,stream>>>(d_q, d_k, pos, HEADS, nkv, hd, K, 1000000.0f, eng->d_rope_freqs, d_pos, d_depth);
 
         // Attention, all K rows in ONE causal launch (row-batched): first scatter the
         // K rows' K/V to their absolute positions pos..pos+K-1 (one write launch —
@@ -7740,7 +7760,7 @@ static void decode_batched_forward(
                 sliding_attn_splitk_rows_kernel<32, 16, GEMMA4_HEAD_DIM>
                     <<<dim3(max_splits, K), 16*32, 0, stream>>>(
                         eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc,
-                        GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok);
+                        GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok, tree_base, d_anc);
                 flash_decode_combine_rows_kernel<32><<<dim3(HEADS, K), hd, 0, stream>>>(
                     d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     hd, GEMMA4_SLIDING_WINDOW, pos + 1, d_ntok, oq);
@@ -7748,7 +7768,7 @@ static void decode_batched_forward(
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(max_splits, K), GEMMA4_KV_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc,
-                    GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok);
+                    GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok, tree_base, d_anc);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
                 d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                 hd, GEMMA4_SLIDING_WINDOW, pos + 1, d_ntok, oq);
@@ -7772,14 +7792,14 @@ static void decode_batched_forward(
             if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_global == 4) {
                 global_attn_splitk_rows_kernel<32, 4, GEMMA4_GLOBAL_HEAD_DIM>
                     <<<dim3(max_splits, K), 32*32, 0, stream>>>(
-                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok);
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok, tree_base, d_anc);
                 flash_decode_combine_rows_kernel<32><<<dim3(HEADS, K), hd, 0, stream>>>(
                     d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     hd, /*window=*/0, pos + 1, d_ntok, oq);
             } else {
             global_attn_splitk_rows_kernel<GEMMA4_HEADS, 1, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(max_splits, K), GEMMA4_HEADS*32, 0, stream>>>(
-                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok);
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok, tree_base, d_anc);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
                 d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                 hd, /*window=*/0, pos + 1, d_ntok, oq);
@@ -7980,6 +8000,44 @@ int gemma4_engine_decode_batched(
 // d_sb[11] device logits accessor for the GPU-side verify (a).
 static inline float *decode_batched_dev_logits(gemma4_engine_t *eng) {
     return eng->d_sb[11];
+}
+
+// ─── Tree spec data structures (used by the verify forward AND the drafter) ──
+#define GEMMA4_TREE_MAX 16   // ≤ GEMMA4_SPEC_MAX: tree nodes reuse the K-row verify buffers
+struct spec_tree {
+    int    n;                         // node count (node 0 = root = committed g)
+    int    parent[GEMMA4_TREE_MAX];   // parent[0] = -1
+    int    depth [GEMMA4_TREE_MAX];   // pos offset from the committed position (root = 0)
+    int    nchild[GEMMA4_TREE_MAX];   // children drafted under this node (head top-w)
+    int32_t tok  [GEMMA4_TREE_MAX];   // token at the node (filled by the drafter)
+    uint32_t anc [GEMMA4_TREE_MAX];   // bit c set iff node c is on the root→node path (incl self)
+};
+
+// Tree spec-verify forward: forwards the t->n tree-node tokens in ONE target weight pass under
+// the ancestor mask. Node r writes KV to slot pos+r, is RoPE'd at pos+depth[r], and attends the
+// committed prefix [0,pos) + its ancestor tree slots. Leaves t->n logit rows on-device (d_sb[11];
+// row r = node r's next-token distribution) and advances eng->cur.n_tokens by t->n (the caller
+// must rewind to the committed prefix after picking the accepted path). No CUDA graph (the tree
+// shape/mask varies per step); per-kernel launches like decode_batched_dev's fallback path.
+static uint32_t *g_d_anc = NULL;   // [GEMMA4_TREE_MAX] device ancestor masks
+static int      *g_d_depth = NULL; // [GEMMA4_TREE_MAX] device depths
+static int decode_tree_dev(gemma4_engine_t *eng, const spec_tree *t) {
+    if (!eng->loaded || t->n <= 0 || t->n > GEMMA4_SPEC_MAX) return -1;
+    if (ensure_spec_scratch(eng) != 0) return -1;
+    cudaStream_t stream = eng->stream;
+    const int pos = eng->cur.n_tokens;
+    int32_t *d_tok = (int32_t*)eng->d_sb[0];
+    if (!g_d_anc   && cudaMalloc(&g_d_anc,   GEMMA4_TREE_MAX*sizeof(uint32_t)) != cudaSuccess) { cudaGetLastError(); return -1; }
+    if (!g_d_depth && cudaMalloc(&g_d_depth, GEMMA4_TREE_MAX*sizeof(int))      != cudaSuccess) { cudaGetLastError(); return -1; }
+    int32_t htok[GEMMA4_TREE_MAX]; uint32_t hanc[GEMMA4_TREE_MAX]; int hdep[GEMMA4_TREE_MAX];
+    for (int i = 0; i < t->n; i++) { htok[i] = t->tok[i]; hanc[i] = t->anc[i]; hdep[i] = t->depth[i]; }
+    cudaMemcpyAsync(d_tok,    htok, (size_t)t->n*sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(g_d_anc,  hanc, (size_t)t->n*sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(g_d_depth,hdep, (size_t)t->n*sizeof(int),      cudaMemcpyHostToDevice, stream);
+    decode_batched_forward(eng, t->n, pos, stream, /*d_pos=*/NULL, /*want_head=*/1,
+                           /*tree_base=*/pos, g_d_anc, g_d_depth);
+    eng->cur.n_tokens += t->n;
+    return 0;
 }
 
 // =========================================================================
@@ -8967,17 +9025,8 @@ __global__ void mask_one_neg_inf_kernel(float *logits, const int *idx) {
 // and differ only by token (the top-w of N's logits). Verify (T1b) forwards the whole tree
 // in ONE target weight pass under an ancestor mask. Acceptance stays per-edge draw-and-match,
 // so the target distribution is preserved exactly — at temp=0 a width-1 tree is byte-identical
-// to the linear chain (the correctness gate).
-#define GEMMA4_TREE_MAX 16   // ≤ GEMMA4_SPEC_MAX: tree nodes reuse the K-row verify buffers
-
-struct spec_tree {
-    int    n;                         // node count (node 0 = root = committed g)
-    int    parent[GEMMA4_TREE_MAX];   // parent[0] = -1
-    int    depth [GEMMA4_TREE_MAX];   // pos offset from the committed position (root = 0)
-    int    nchild[GEMMA4_TREE_MAX];   // children drafted under this node (head top-w)
-    int32_t tok  [GEMMA4_TREE_MAX];   // token at the node (filled by the drafter)
-    uint32_t anc [GEMMA4_TREE_MAX];   // bit c set iff node c is on the root→node path (incl self)
-};
+// to the linear chain (the correctness gate). spec_tree / GEMMA4_TREE_MAX are declared above
+// (before decode_tree_dev, which consumes the same struct).
 
 // Build a static template: a depth-`depth` rank-0 trunk, plus at each trunk node shallower
 // than `branch_until` add (width-1) sibling branches (the parent's ranks 1..width-1), each
