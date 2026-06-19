@@ -1777,8 +1777,7 @@ __global__ void global_attn_splitk_rows_kernel(
     const kv_t *k_cache, const kv_t *v_cache,        // [capacity][NKV][HD]
     int n_tokens0,                                   // row r attends n_tokens0 + r keys
     const int *n_tokens0_ptr,                        // non-NULL: device override (graph path)
-    int treebase = 0,                                // TREE: first tree-region key index (= committed pos)
-    const uint32_t *anc = nullptr)                   // TREE: per-row ancestor bitmask over [treebase, …)
+    const uint32_t *anc = nullptr)                   // TREE: per-row ancestor bitmask
 {
     constexpr int TILE = GEMMA4_GLOBAL_ATTN_TILE / NKV;   // smem held at the 12B footprint
     constexpr int E = HD / 128;
@@ -1789,9 +1788,11 @@ __global__ void global_attn_splitk_rows_kernel(
     int r = blockIdx.y;
     if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
     // TREE mask: when `anc` is set, a key in the tree region [treebase, ctx_len) is attended
-    // only if it is this row's ancestor (bit set). anc[r] includes bit (r) for the node itself.
-    // anc==NULL (linear path) ⇒ no masking ⇒ bit-identical to the contiguous causal verify.
+    // only if it is this row's ancestor (bit set). The committed prefix is [0, pos); row 0 (the
+    // root) sits at pos, so treebase = pos = n_tokens0-1 (n_tokens0 is pos+1) — DERIVED here so
+    // the graph path needs no extra scalar. anc==NULL (linear) ⇒ no masking ⇒ bit-identical.
     uint32_t rmask = anc ? anc[r] : 0u;
+    int treebase = n_tokens0 - 1;
     int ctx_len = n_tokens0 + r;
     int n_splits = attn_row_splits(ctx_len, GEMMA4_GLOBAL_SPLIT_CHUNK);
     int split = blockIdx.x;
@@ -1866,7 +1867,6 @@ __global__ void sliding_attn_splitk_rows_kernel(
     const kv_t *k_cache, const kv_t *v_cache,        // RING [cap][NKV][HD]
     int window, int n_tokens0, int cap,
     const int *n_tokens0_ptr,                        // non-NULL: device override (graph path)
-    int treebase = 0,                                // TREE: first tree-region absolute position
     const uint32_t *anc = nullptr)                   // TREE: per-row ancestor bitmask
 {
     constexpr int GQ = NH / NKV;
@@ -1874,6 +1874,7 @@ __global__ void sliding_attn_splitk_rows_kernel(
     int r = blockIdx.y;
     if (n_tokens0_ptr) n_tokens0 = *n_tokens0_ptr;
     uint32_t rmask = anc ? anc[r] : 0u;   // TREE mask; 0 (NULL) ⇒ no masking (linear path)
+    int treebase = n_tokens0 - 1;         // committed pos (n_tokens0 = pos+1); DERIVED for graph-safety
     int n_tokens = n_tokens0 + r;
     int window_len = min(n_tokens, window);
     int n_splits = attn_row_splits(window_len, GEMMA4_SLIDING_SPLIT_CHUNK);
@@ -7651,8 +7652,7 @@ static int ensure_spec_scratch(gemma4_engine_t *eng)
 static void decode_batched_forward(
     gemma4_engine_t *eng, int K, int pos, cudaStream_t stream,
     const int *d_pos, int want_head,
-    int tree_base = 0,                 // TREE: committed prefix length (first tree key index)
-    const uint32_t *d_anc = nullptr,   // TREE: [K] per-row ancestor bitmask (device)
+    const uint32_t *d_anc = nullptr,   // TREE: [K] per-row ancestor bitmask (device; treebase derived)
     const int *d_depth = nullptr)      // TREE: [K] per-row depth (RoPE pos offset)
 {
     const int H   = eng->cfg.hidden_size;
@@ -7760,7 +7760,7 @@ static void decode_batched_forward(
                 sliding_attn_splitk_rows_kernel<32, 16, GEMMA4_HEAD_DIM>
                     <<<dim3(max_splits, K), 16*32, 0, stream>>>(
                         eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc,
-                        GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok, tree_base, d_anc);
+                        GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok, d_anc);
                 flash_decode_combine_rows_kernel<32><<<dim3(HEADS, K), hd, 0, stream>>>(
                     d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     hd, GEMMA4_SLIDING_WINDOW, pos + 1, d_ntok, oq);
@@ -7768,7 +7768,7 @@ static void decode_batched_forward(
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(max_splits, K), GEMMA4_KV_HEADS*32, 0, stream>>>(
                     eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc,
-                    GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok, tree_base, d_anc);
+                    GEMMA4_SLIDING_WINDOW, pos + 1, eng->sliding_kv_capacity, d_ntok, d_anc);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
                 d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                 hd, GEMMA4_SLIDING_WINDOW, pos + 1, d_ntok, oq);
@@ -7792,14 +7792,14 @@ static void decode_batched_forward(
             if (eng->cfg.n_heads == 32 && eng->cfg.n_kv_global == 4) {
                 global_attn_splitk_rows_kernel<32, 4, GEMMA4_GLOBAL_HEAD_DIM>
                     <<<dim3(max_splits, K), 32*32, 0, stream>>>(
-                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok, tree_base, d_anc);
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok, d_anc);
                 flash_decode_combine_rows_kernel<32><<<dim3(HEADS, K), hd, 0, stream>>>(
                     d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                     hd, /*window=*/0, pos + 1, d_ntok, oq);
             } else {
             global_attn_splitk_rows_kernel<GEMMA4_HEADS, 1, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(max_splits, K), GEMMA4_HEADS*32, 0, stream>>>(
-                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok, tree_base, d_anc);
+                    eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, kc, vc, pos + 1, d_ntok, d_anc);
             flash_decode_combine_rows_kernel<GEMMA4_HEADS><<<dim3(HEADS, K), hd, 0, stream>>>(
                 d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
                 hd, /*window=*/0, pos + 1, d_ntok, oq);
@@ -8017,10 +8017,46 @@ struct spec_tree {
 // the ancestor mask. Node r writes KV to slot pos+r, is RoPE'd at pos+depth[r], and attends the
 // committed prefix [0,pos) + its ancestor tree slots. Leaves t->n logit rows on-device (d_sb[11];
 // row r = node r's next-token distribution) and advances eng->cur.n_tokens by t->n (the caller
-// must rewind to the committed prefix after picking the accepted path). No CUDA graph (the tree
-// shape/mask varies per step); per-kernel launches like decode_batched_dev's fallback path.
-static uint32_t *g_d_anc = NULL;   // [GEMMA4_TREE_MAX] device ancestor masks
+// rewinds after picking the accepted path).
+//
+// GRAPHED (T2.2): the per-step measurement showed the ungraphed forward at ~232ms/step (vs ~80ms
+// for the linear graphed verify) — ~660 raw launches/step were the bottleneck, NOT the drafter.
+// We capture one graph per K (node count), reading pos from d_specpos and the mask/depth/tokens
+// from device buffers updated before each replay (treebase is derived in-kernel, so the graph is
+// pos-independent — same trick as batched_graph). Tree shape varies but only the buffer CONTENTS
+// change, not the graph, so a single per-K graph serves every tree of that size.
+static uint32_t *g_d_anc = NULL;   // [GEMMA4_TREE_MAX] device ancestor masks (graph reads by ptr)
 static int      *g_d_depth = NULL; // [GEMMA4_TREE_MAX] device depths
+static cudaGraphExec_t g_tree_graph[GEMMA4_SPEC_MAX + 1] = {0};
+static int g_tree_graph_failed = 0;
+
+static int tree_graph_ensure(gemma4_engine_t *eng, int K) {
+    if (K < 1 || K > GEMMA4_SPEC_MAX) return -1;
+    if (g_tree_graph[K]) return 0;
+    if (g_tree_graph_failed) return -1;
+    if (getenv("FUCINA_NO_TREE_GRAPH")) { g_tree_graph_failed = 1; return -1; }
+    if (ensure_spec_scratch(eng) != 0) { g_tree_graph_failed = 1; return -1; }
+    if (!eng->d_specpos && cudaMalloc(&eng->d_specpos, 2*sizeof(int)) != cudaSuccess) {
+        eng->d_specpos = NULL; g_tree_graph_failed = 1; cudaGetLastError(); return -1; }
+    if (!g_d_anc   && cudaMalloc(&g_d_anc,   GEMMA4_TREE_MAX*sizeof(uint32_t)) != cudaSuccess) { cudaGetLastError(); g_tree_graph_failed=1; return -1; }
+    if (!g_d_depth && cudaMalloc(&g_d_depth, GEMMA4_TREE_MAX*sizeof(int))      != cudaSuccess) { cudaGetLastError(); g_tree_graph_failed=1; return -1; }
+    cudaMemset(eng->d_specpos, 0, 2*sizeof(int));
+    cudaStream_t cs = NULL; cudaGraph_t g = NULL;
+    int ok = cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) == cudaSuccess;
+    if (ok && cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+        decode_batched_forward(eng, K, /*pos=*/0, cs, /*d_pos=*/eng->d_specpos, /*want_head=*/1,
+                               g_d_anc, g_d_depth);
+        ok = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != NULL;
+    } else ok = 0;
+    if (ok) ok = cudaGraphInstantiate(&g_tree_graph[K], g, 0) == cudaSuccess;
+    if (g)  cudaGraphDestroy(g);
+    if (cs) cudaStreamDestroy(cs);
+    if (!ok || !g_tree_graph[K]) { g_tree_graph[K] = NULL; g_tree_graph_failed = 1; cudaGetLastError();
+        fprintf(stderr, "fucina: tree spec-verify graph capture failed (K=%d) — per-kernel launches\n", K); return -1; }
+    fprintf(stderr, "fucina: tree spec-verify CUDA graph captured (K=%d)\n", K);
+    return 0;
+}
+
 static int decode_tree_dev(gemma4_engine_t *eng, const spec_tree *t) {
     if (!eng->loaded || t->n <= 0 || t->n > GEMMA4_SPEC_MAX) return -1;
     if (ensure_spec_scratch(eng) != 0) return -1;
@@ -8034,8 +8070,14 @@ static int decode_tree_dev(gemma4_engine_t *eng, const spec_tree *t) {
     cudaMemcpyAsync(d_tok,    htok, (size_t)t->n*sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(g_d_anc,  hanc, (size_t)t->n*sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(g_d_depth,hdep, (size_t)t->n*sizeof(int),      cudaMemcpyHostToDevice, stream);
-    decode_batched_forward(eng, t->n, pos, stream, /*d_pos=*/NULL, /*want_head=*/1,
-                           /*tree_base=*/pos, g_d_anc, g_d_depth);
+    // Graph fast path: pos via d_specpos, mask/depth/tokens via the device buffers just updated.
+    if (tree_graph_ensure(eng, t->n) == 0) {
+        int pv[2] = { pos, pos + 1 };
+        cudaMemcpyAsync(eng->d_specpos, pv, sizeof(pv), cudaMemcpyHostToDevice, stream);
+        if (cudaGraphLaunch(g_tree_graph[t->n], stream) == cudaSuccess) { eng->cur.n_tokens += t->n; return 0; }
+        cudaGetLastError();   // replay failed → per-kernel fallback
+    }
+    decode_batched_forward(eng, t->n, pos, stream, /*d_pos=*/NULL, /*want_head=*/1, g_d_anc, g_d_depth);
     eng->cur.n_tokens += t->n;
     return 0;
 }
@@ -9596,9 +9638,17 @@ static int run_spec_loop(
             spec_tree tt; int rk[GEMMA4_TREE_MAX];
             int tdepth = maxd_mtp < draft_k ? maxd_mtp : draft_k;
             tree_build_template(&tt, rk, tdepth, g_tree_w, /*branch_until=*/2, /*branch_len=*/2);
+            static int g_tt = -1; static double g_dt = 0, g_vt = 0; static long g_ns = 0, g_nnodes = 0;
+            if (g_tt < 0) { const char *e = getenv("FUCINA_SPEC_TREE_TIMING"); g_tt = (e && e[0]=='1') ? 1 : 0; }
+            double _t0 = g_tt ? (cudaStreamSynchronize(eng->stream), now_ms()) : 0;
             int nn = mtp_draft_tree(eng, g, &tt, rk);
+            if (g_tt) { cudaStreamSynchronize(eng->stream); g_dt += now_ms() - _t0; g_ns++; g_nnodes += nn; }
+            double _t1 = g_tt ? now_ms() : 0;
             int posT = eng->cur.n_tokens;
             if (nn >= 2 && decode_tree_dev(eng, &tt) == 0) {
+                if (g_tt) { cudaStreamSynchronize(eng->stream); g_vt += now_ms() - _t1;
+                    if ((g_ns % 20) == 0) fprintf(stderr, "fucina: [tree-timing] %ld steps  draft=%.1fms/step verify=%.1fms/step  avg %.1f nodes\n",
+                        g_ns, g_dt/g_ns, g_vt/g_ns, (double)g_nnodes/g_ns); }
                 double vt0 = now_ms();
                 float rnds[GEMMA4_TREE_MAX]; for (int i = 0; i < nn; i++) rnds[i] = (float)spec_rng(&rng);
                 cudaMemcpyAsync(eng->d_spec_rnd, rnds, (size_t)nn*sizeof(float), cudaMemcpyHostToDevice, eng->stream);
