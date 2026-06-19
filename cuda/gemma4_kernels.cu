@@ -2809,14 +2809,15 @@ struct gemma4_engine {
         uint64_t ffn_norm[4], gate[4], up[4], down[4], post_ffw_norm[4];
         float    out_scale[4];
         int      is_global[4];
+        int      wfmt;             // FORMAT_Q8_0 (12B head) or FORMAT_Q4_0 (31B head)
     } mtp;
     int     mtp_h_valid;       // d_mtp_h holds the h paired with the pending token g
-    float  *d_mtp_h;           // [3840] target post-output-norm hidden (recurrent h)
-    float  *d_mtp_xh;          // [7680] concat(embed(tok)·√3840, h)
+    float  *d_mtp_h;           // [cfg.hidden_size] target post-output-norm hidden (recurrent h)
+    float  *d_mtp_xh;          // [2×cfg.hidden_size] concat(embed(tok)·√hidden, h)
     float  *d_mtp_cur;         // [1024] residual stream
     float  *d_mtp_t1, *d_mtp_t2;  // [1024] norm/proj scratch
-    float  *d_mtp_q;           // [16×512] worst-case Q
-    float  *d_mtp_attn;        // [16×512] attention output
+    float  *d_mtp_q;           // [cfg.n_heads×512] worst-case Q
+    float  *d_mtp_attn;        // [cfg.n_heads×512] attention output
     float  *d_mtp_ffa, *d_mtp_ffb;  // [8192] FFN gate/up
     int8_t *d_qx;              // [GEMMA4_INTERMEDIATE] int8 activation for dp4a MMVQ
     float  *d_dx;              // [GEMMA4_INTERMEDIATE/32] per-block activation scales
@@ -8633,8 +8634,13 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
     if (ok) ok &= cudaMemcpy(eng->mtp.d_w, host, fsize, cudaMemcpyHostToDevice) == cudaSuccess;
 
     uint64_t n_el = 0;
-    // Weights must be Q8_0 (the mmvq path assumes it) and norms/scales F32 — reject any
-    // other assistant quantization instead of silently producing garbage drafts.
+    // Matrix weights are EITHER Q8_0 (the 12B head) OR Q4_0 (the 31B QAT head) — the mmvq
+    // path handles both; we detect the format from the first matrix tensor and require every
+    // matrix tensor to match it. Norms/scales/rope_freqs are F32. Reject anything else instead
+    // of silently producing garbage drafts. mtp.wfmt is later passed to every drafter gemv.
+    uint32_t mtp_mat_ty = 0;   // 0 = not yet seen; first matrix tensor sets it
+    // MTP_FIND  → a matrix (Q8_0 or Q4_0; consistent across all matrix tensors)
+    // MTP_FINDF → an F32 norm/scale
     #define MTP_FIND_T(dst, want_type, namefmt, ...) do { \
         char _nm[128]; snprintf(_nm, sizeof(_nm), namefmt, ##__VA_ARGS__); \
         uint64_t _off = 0; uint32_t _ty = 0; \
@@ -8645,7 +8651,19 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
                     _nm, _ty, (uint32_t)(want_type)); ok = 0; \
         } else { (dst) = _off; } \
     } while (0)
-    #define MTP_FIND(dst, namefmt, ...)  MTP_FIND_T(dst, GGML_TYPE_Q8_0, namefmt, ##__VA_ARGS__)
+    #define MTP_FIND(dst, namefmt, ...) do { \
+        char _nm[128]; snprintf(_nm, sizeof(_nm), namefmt, ##__VA_ARGS__); \
+        uint64_t _off = 0; uint32_t _ty = 0; \
+        if (gguf_find_tensor(host, fsize, _nm, &_off, &n_el, &_ty) != 0) { \
+            fprintf(stderr, "fucina: assistant tensor missing: %s\n", _nm); ok = 0; \
+        } else if (_ty != GGML_TYPE_Q8_0 && _ty != GGML_TYPE_Q4_0) { \
+            fprintf(stderr, "fucina: assistant matrix %s has type %u (want Q8_0/Q4_0)\n", \
+                    _nm, _ty); ok = 0; \
+        } else if (mtp_mat_ty && _ty != mtp_mat_ty) { \
+            fprintf(stderr, "fucina: assistant matrix %s type %u != %u (mixed quant)\n", \
+                    _nm, _ty, mtp_mat_ty); ok = 0; \
+        } else { mtp_mat_ty = _ty; (dst) = _off; } \
+    } while (0)
     #define MTP_FINDF(dst, namefmt, ...) MTP_FIND_T(dst, GGML_TYPE_F32,  namefmt, ##__VA_ARGS__)
 
     if (ok) {
@@ -8680,18 +8698,27 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
             }
         }
     }
+    // Drafter gemv weight format: Q8_0 (12B head) or Q4_0 (31B QAT head). The MTP weights
+    // live in eng->mtp.d_w (NOT eng->d_weights), so use_packed_q4 is false and gemv_w takes
+    // the native dp4a MMVQ path for whichever format — bit-correct for any weight pointer.
+    eng->mtp.wfmt = (mtp_mat_ty == GGML_TYPE_Q4_0) ? FORMAT_Q4_0 : FORMAT_Q8_0;
     #undef MTP_FIND
     #undef MTP_FINDF
     #undef MTP_FIND_T
 
     // scratch
-    ok &= cudaMalloc(&eng->d_mtp_h,    GEMMA4_HIDDEN_SIZE   * sizeof(float)) == cudaSuccess;
-    ok &= cudaMalloc(&eng->d_mtp_xh,   2*GEMMA4_HIDDEN_SIZE * sizeof(float)) == cudaSuccess;
+    // Target-interfacing scratch is sized from the RUNTIME target config (31B hidden=5376,
+    // n_heads=32) — NOT the 12B #defines, which would under-allocate and corrupt memory when
+    // gemma4_decode copies cfg.hidden_size floats into d_mtp_h / the drafter writes 32 heads.
+    const int MH  = eng->cfg.hidden_size;
+    const int MNH = eng->cfg.n_heads;
+    ok &= cudaMalloc(&eng->d_mtp_h,    MH   * sizeof(float)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_mtp_xh,   2*MH * sizeof(float)) == cudaSuccess;
     ok &= cudaMalloc(&eng->d_mtp_cur,  GEMMA4_MTP_HIDDEN    * sizeof(float)) == cudaSuccess;
     ok &= cudaMalloc(&eng->d_mtp_t1,   GEMMA4_MTP_HIDDEN    * sizeof(float)) == cudaSuccess;
     ok &= cudaMalloc(&eng->d_mtp_t2,   GEMMA4_MTP_HIDDEN    * sizeof(float)) == cudaSuccess;
-    ok &= cudaMalloc(&eng->d_mtp_q,    GEMMA4_HEADS*GEMMA4_GLOBAL_HEAD_DIM * sizeof(float)) == cudaSuccess;
-    ok &= cudaMalloc(&eng->d_mtp_attn, GEMMA4_HEADS*GEMMA4_GLOBAL_HEAD_DIM * sizeof(float)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_mtp_q,    MNH*GEMMA4_GLOBAL_HEAD_DIM * sizeof(float)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_mtp_attn, MNH*GEMMA4_GLOBAL_HEAD_DIM * sizeof(float)) == cudaSuccess;
     ok &= cudaMalloc(&eng->d_mtp_ffa,  GEMMA4_MTP_FFN       * sizeof(float)) == cudaSuccess;
     ok &= cudaMalloc(&eng->d_mtp_ffb,  GEMMA4_MTP_FFN       * sizeof(float)) == cudaSuccess;
     if (!eng->d_sample_id)
@@ -8735,10 +8762,16 @@ int gemma4_engine_load_assistant(gemma4_engine_t *eng, const char *path)
 static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
                         const int *pos_ptr, cudaStream_t stream)
 {
-    const int H = GEMMA4_HIDDEN_SIZE, AH = GEMMA4_MTP_HIDDEN, FF = GEMMA4_MTP_FFN;
+    // H is the TARGET hidden (3840 @12B / 5376 @31B) — the MTP head's pre_projection
+    // in-dim is 2*H (embed‖h) and its post_projection out-dim is H. AH/FF are the
+    // MTP-INTERNAL widths (1024/8192) and stay constant across target sizes. NH is the
+    // target's query-head count (16/32): the drafter's Q-only attention runs NH heads
+    // against the target's KV.
+    const int H = eng->cfg.hidden_size, AH = GEMMA4_MTP_HIDDEN, FF = GEMMA4_MTP_FFN;
+    const int NH = eng->cfg.n_heads;
     const int smem32 = 32 * (int)sizeof(float);
 
-    // x = target_embd(tok)·√3840  ‖  h   → pre_projection → cur [1024]
+    // x = target_embd(tok)·√H  ‖  h   → pre_projection (2H→1024) → cur [1024]
     // The MTP head shares the TARGET model's token embedding — so embed via embed_w, which reads
     // the BF16 table (d_embed_bf16) for NVFP4 and the Q8_0 table otherwise. The previous hard
     // Q8_0 lookup deref'd a NULL d_weights under NVFP4, garbaging h → the drafter always declined.
@@ -8747,24 +8780,24 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
     cudaMemcpyAsync(eng->d_mtp_xh + H, eng->d_mtp_h, H * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
     gemv_w(eng, eng->d_mtp_cur, mtp_w(eng, eng->mtp.pre_proj), eng->d_mtp_xh,
-           2*H, AH, stream, FORMAT_Q8_0);
+           2*H, AH, stream, eng->mtp.wfmt);
 
     for (int l = 0; l < GEMMA4_MTP_LAYERS; l++) {
         const int is_g     = eng->mtp.is_global[l];
         const int head_dim = is_g ? GEMMA4_GLOBAL_HEAD_DIM : GEMMA4_HEAD_DIM;
-        const int qdim     = GEMMA4_HEADS * head_dim;
+        const int qdim     = NH * head_dim;   // NH = target query heads (16 @12B / 32 @31B)
 
         // attention (Q-only; K/V come from the target's cache)
         rms_norm_kernel<<<1, 256, smem32, stream>>>(
             eng->d_mtp_t1, eng->d_mtp_cur, mtp_f32(eng, eng->mtp.attn_norm[l]), AH, GEMMA4_RMS_EPS);
         gemv_w(eng, eng->d_mtp_q, mtp_w(eng, eng->mtp.wq[l]), eng->d_mtp_t1,
-               AH, qdim, stream, FORMAT_Q8_0);
-        per_head_rms_norm_kernel<<<GEMMA4_HEADS, head_dim, smem32, stream>>>(
+               AH, qdim, stream, eng->mtp.wfmt);
+        per_head_rms_norm_kernel<<<NH, head_dim, smem32, stream>>>(
             eng->d_mtp_q, mtp_f32(eng, eng->mtp.q_norm[l]), head_dim, GEMMA4_RMS_EPS);
         if (is_g) {
-            rope_global_kernel<<<GEMMA4_HEADS, head_dim/2, 0, stream>>>(
-                eng->d_mtp_q, eng->d_mtp_q, 0, pos_ptr, 0, GEMMA4_HEADS, /*n_kv_heads=*/0,
-                head_dim, 1000000.0f, mtp_f32(eng, eng->mtp.rope_freqs));
+            rope_global_kernel<<<NH, head_dim/2, 0, stream>>>(
+                eng->d_mtp_q, eng->d_mtp_q, 0, pos_ptr, 0, NH, /*n_kv_heads=*/0,
+                head_dim, eng->cfg.rope_theta_global, mtp_f32(eng, eng->mtp.rope_freqs));
             // target layer 47 = the LAST global layer (llama.cpp share(il)=n_layer-1).
             // Fixed-grid split-K with device n_tokens (= *pos_ptr): same split formula
             // as global_attn_decode_broadcast, so the math is bit-identical to it.
@@ -8779,9 +8812,9 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
                         eng->d_global_v + (size_t)slot * lstride,
                         0, pos_ptr);
                 flash_decode_combine_rows_kernel<32>
-                    <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                    <<<dim3(32, 1), head_dim, 0, stream>>>(
                         eng->d_mtp_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
-                        head_dim, /*window=*/0, 0, pos_ptr, GEMMA4_HEADS*head_dim);
+                        head_dim, /*window=*/0, 0, pos_ptr, 32*head_dim);
             } else {
             global_attn_splitk_rows_kernel<GEMMA4_HEADS, 1, GEMMA4_GLOBAL_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_HEADS*32, 0, stream>>>(
@@ -8795,9 +8828,9 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
                     head_dim, /*window=*/0, 0, pos_ptr, GEMMA4_HEADS*head_dim);
             }
         } else {
-            rope_sliding_kernel<<<GEMMA4_HEADS, head_dim/2, 0, stream>>>(
-                eng->d_mtp_q, eng->d_mtp_q, 0, pos_ptr, GEMMA4_HEADS, /*n_kv_heads=*/0,
-                head_dim, 10000.0f);
+            rope_sliding_kernel<<<NH, head_dim/2, 0, stream>>>(
+                eng->d_mtp_q, eng->d_mtp_q, 0, pos_ptr, NH, /*n_kv_heads=*/0,
+                head_dim, eng->cfg.rope_theta_sliding);
             // target layer 46 = the LAST sliding layer (share(il)=n_layer-2); the
             // drafter attends window-1 keys of the frozen cache at n_tokens = *pos_ptr.
             size_t lstride = (size_t)eng->sliding_kv_capacity * eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM;
@@ -8809,9 +8842,9 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
                         eng->d_sliding_v + (size_t)(eng->cfg.n_layers - 2) * lstride,
                         GEMMA4_SLIDING_WINDOW - 1, 0, eng->sliding_kv_capacity, pos_ptr);
                 flash_decode_combine_rows_kernel<32>
-                    <<<dim3(GEMMA4_HEADS, 1), head_dim, 0, stream>>>(
+                    <<<dim3(32, 1), head_dim, 0, stream>>>(
                         eng->d_mtp_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l,
-                        head_dim, GEMMA4_SLIDING_WINDOW - 1, 0, pos_ptr, GEMMA4_HEADS*head_dim);
+                        head_dim, GEMMA4_SLIDING_WINDOW - 1, 0, pos_ptr, 32*head_dim);
             } else {
             sliding_attn_splitk_rows_kernel<GEMMA4_HEADS, GEMMA4_KV_HEADS, GEMMA4_HEAD_DIM>
                 <<<dim3(GEMMA4_GLOBAL_MAX_SPLITS, 1), GEMMA4_KV_HEADS*32, 0, stream>>>(
@@ -8826,7 +8859,7 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
             }
         }
         gemv_w(eng, eng->d_mtp_t1, mtp_w(eng, eng->mtp.wo[l]), eng->d_mtp_attn,
-               qdim, AH, stream, FORMAT_Q8_0);
+               qdim, AH, stream, eng->mtp.wfmt);
 
         rms_norm_kernel<<<1, 256, smem32, stream>>>(
             eng->d_mtp_t2, eng->d_mtp_t1, mtp_f32(eng, eng->mtp.post_attn_norm[l]), AH, GEMMA4_RMS_EPS);
@@ -8836,12 +8869,12 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
         rms_norm_kernel<<<1, 256, smem32, stream>>>(
             eng->d_mtp_t1, eng->d_mtp_t2, mtp_f32(eng, eng->mtp.ffn_norm[l]), AH, GEMMA4_RMS_EPS);
         gemv_w(eng, eng->d_mtp_ffa, mtp_w(eng, eng->mtp.gate[l]), eng->d_mtp_t1,
-               AH, FF, stream, FORMAT_Q8_0);
+               AH, FF, stream, eng->mtp.wfmt);
         gemv_w(eng, eng->d_mtp_ffb, mtp_w(eng, eng->mtp.up[l]), eng->d_mtp_t1,
-               AH, FF, stream, FORMAT_Q8_0);
+               AH, FF, stream, eng->mtp.wfmt);
         geglu_kernel<<<(FF+255)/256, 256, 0, stream>>>(eng->d_mtp_ffa, eng->d_mtp_ffa, eng->d_mtp_ffb, FF);
         gemv_w(eng, eng->d_mtp_t1, mtp_w(eng, eng->mtp.down[l]), eng->d_mtp_ffa,
-               FF, AH, stream, FORMAT_Q8_0);
+               FF, AH, stream, eng->mtp.wfmt);
         rms_norm_kernel<<<1, 256, smem32, stream>>>(
             eng->d_mtp_cur, eng->d_mtp_t1, mtp_f32(eng, eng->mtp.post_ffw_norm[l]), AH, GEMMA4_RMS_EPS);
         residual_add_kernel<<<(AH+255)/256, 256, 0, stream>>>(eng->d_mtp_cur, eng->d_mtp_t2, AH);
@@ -8853,9 +8886,9 @@ static void mtp_forward(gemma4_engine_t *eng, const int32_t *tok_ptr,
     rms_norm_kernel<<<1, 256, smem32, stream>>>(
         eng->d_mtp_t1, eng->d_mtp_cur, mtp_f32(eng, eng->mtp.out_norm), AH, GEMMA4_RMS_EPS);
     gemv_w(eng, eng->d_logits, mtp_w(eng, eng->mtp.tok_embd), eng->d_mtp_t1,
-           AH, GEMMA4_VOCAB_SIZE, stream, FORMAT_Q8_0);
+           AH, GEMMA4_VOCAB_SIZE, stream, eng->mtp.wfmt);
     gemv_w(eng, eng->d_mtp_h, mtp_w(eng, eng->mtp.post_proj), eng->d_mtp_t1,
-           AH, GEMMA4_HIDDEN_SIZE, stream, FORMAT_Q8_0);
+           AH, H, stream, eng->mtp.wfmt);
 }
 
 // Fused argmax + top-1 softmax probability of the drafter's logits in ONE pass:
