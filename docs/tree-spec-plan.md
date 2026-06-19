@@ -55,6 +55,19 @@ is highest) — e.g. depth-4 with width-2 at depths 0–1.
 - **T3 — adaptive.** Size/shape the tree per-step from head confidence (wide when unsure, deep
   when confident), the dynamic-tree analog of the per-drafter EMA already in GenerateSpec.
 
+## Key architectural finding (reshapes T1)
+`mtp_forward` is a **pure recurrence in h**: it consumes (token, h), and its attention reads the
+FROZEN target KV at a FIXED position (`pos_ptr = n_tokens`) for every draft step — it never
+attends previously-drafted tokens. The recurrence is carried entirely through `d_mtp_h`, which
+the head OVERWRITES on each call (line ~8890, `post_proj → d_mtp_h`). Consequences:
+- **Tree drafter is trivial / KV-free.** For node N: set `d_mtp_h=h[N]`, `d_mtp_tok=tok[N]`, run
+  `mtp_forward` → logits (N's children dist) + `h'[N]`. All of N's children inherit the SAME
+  `h'[N]`; they differ only in their token (top-k of N's logits). Just save `h'[N]` per node
+  ([n_nodes][H] ≈ 344 KB) and fork. No per-node position math (head pos is fixed at n_tokens).
+- **All the hard work is the TARGET verify**, which IS a full causal forward and DOES need the
+  tree mask. Isolate the risk there; keep a separate tree-attention kernel variant so the linear
+  path is untouched.
+
 ## Hard parts / risks
 1. **Ancestor-mask attention.** Reuse the existing prefix attention for `[0,pos)` (dense, shared
    by all rows); add a small tree-block pass that, per row, reduces only over its ≤depth ancestor
