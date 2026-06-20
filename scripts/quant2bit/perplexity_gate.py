@@ -57,18 +57,32 @@ def variant_for(role, recipe):
         return "nf2"
     if recipe == "lean":
         return "nf3" if role in ("embed", "attn_k", "attn_v") else "nf2"
+    if recipe == "nf3":          # all-3-bit floor (the viable fallback after 2-bit NO-GO)
+        return "nf3"
+    if recipe == "lean3":        # FFN@3bit, embed/k/v@3bit too — i.e. 3-bit everywhere but a label for sweeps
+        return "nf3"
     raise ValueError(recipe)
 
 def fake_quant_(tensor, variant, encoder):
     import torch
-    w = tensor.detach().to(torch.float32).cpu().numpy().reshape(-1)
-    if encoder == "mse":
-        idx, scale, n = mxfp2.quantize_mse(w, variant)
-        rec = mxfp2.dequantize(idx, scale, n, variant)
-    else:
-        rec = mxfp2.roundtrip(w, variant)
-    rec = torch.from_numpy(np.ascontiguousarray(rec)).reshape(tensor.shape)
-    tensor.copy_(rec.to(tensor.dtype).to(tensor.device))
+    BLK = 16                      # codec block size; chunk on multiples so blocks never split
+    flat = tensor.detach().to(torch.float32).cpu().numpy().reshape(-1)
+    n = flat.size
+    out = np.empty_like(flat)
+    CHUNK = (64 * 1024 * 1024 // BLK) * BLK   # ~64M elems/chunk → bounded transient (~GB, not 20GB)
+    for s in range(0, n, CHUNK):
+        e = min(s + CHUNK, n)
+        w = flat[s:e]
+        if encoder == "mse":
+            idx, scale, nn = mxfp2.quantize_mse(w, variant)
+            out[s:e] = mxfp2.dequantize(idx, scale, nn, variant)
+        else:
+            out[s:e] = mxfp2.roundtrip(w, variant)
+    del flat
+    rec = torch.from_numpy(out.reshape(tensor.shape))
+    with torch.no_grad():   # in-place copy_ onto a leaf Parameter (requires_grad) needs no_grad
+        tensor.copy_(rec.to(tensor.dtype).to(tensor.device))
+    del rec, out
 
 def perplexity(model, input_ids):
     import torch
