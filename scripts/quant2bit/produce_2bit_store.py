@@ -117,59 +117,31 @@ def pack_codes(idx, bits):
 # no bit-straddle. We exploit this to parallelize the giant tensors (token_embd,
 # ffn_*) across pool workers as (name, blk_start, blk_count) sub-jobs.
 
-def quantize_block_range(w_range, variant, err_cap_blocks):
-    """Quantize one block-aligned fp32 slice. Returns (codes_bytes, scales_bytes,
-    sse, ss_ref, n_err_elems) where the error stats cover the first
-    err_cap_blocks*16 elems of THIS slice (the caller decides which slices to
-    sample). w_range length must be a multiple of BLOCK except possibly the very
-    last slice of the tensor (zero-padded by quantize_mse)."""
+def quantize_block_range(w_range, variant, measure_err):
+    """Quantize one block-aligned fp32 slice. Returns
+    (codes_bytes, scales_bytes, n_blocks, sse, ss_ref, n_err) where the error
+    stats cover up to ERR_CAP elems of THIS slice when measure_err is True.
+    w_range length must be a multiple of BLOCK except possibly the very last
+    slice of the tensor (zero-padded by quantize_mse)."""
     bits = BITS[variant]
-    idx, scale, m = M.quantize_mse(w_range, variant)  # idx [nb,BLOCK], scale[nb]
+    idx, scale, n = M.quantize_mse(w_range, variant)  # idx [nb,BLOCK], scale[nb]
+    nb = scale.shape[0]
     codes = pack_codes(idx.reshape(-1).astype(np.uint8), bits).tobytes()
     scales = _e4m3_to_byte(scale).tobytes()
     sse = ss_ref = 0.0
     n_err = 0
-    if err_cap_blocks > 0:
-        take = min(err_cap_blocks * M.BLOCK, w_range.size)
-        wref = w_range[:take].astype(np.float64)
-        rec = M.dequantize(idx, scale, m, variant)[:take].astype(np.float64)
-        d = rec - wref
-        sse = float(np.dot(d, d))
-        ss_ref = float(np.dot(wref, wref))
-        n_err = int(take)
-    return codes, scales, sse, ss_ref, n_err
-
-
-# ---- multiprocessing worker: quantize ONE (sub-)job, return payload bytes ----
-_WORKER_READER = None
-
-
-def _worker_init(gguf_path):
-    global _WORKER_READER
-    _WORKER_READER = G.GGUFReader(gguf_path)
-
-
-def _worker_job(job):
-    """job = dict(name, kind, [blk_start, blk_count, sample]).
-    kind 'f32' -> return raw bytes. kind 'q' -> quantize the block range."""
-    r = _WORKER_READER
-    name = job["name"]
-    if job["kind"] == "f32":
-        w = r.dequant(name).astype(np.float32)
-        return {"name": name, "part": 0,
-                "codes": b"", "scales": np.ascontiguousarray(w).tobytes(),
-                "sse": 0.0, "ss_ref": 0.0, "n_err": 0}
-    variant = job["variant"]
-    bs, bc = job["blk_start"], job["blk_count"]
-    w = r.dequant(name).astype(np.float32).reshape(-1)
-    s = bs * M.BLOCK
-    e = min(s + bc * M.BLOCK, w.size)
-    err_cap_blocks = job["sample_blocks"]  # >0 only on part 0 of each tensor
-    codes, scales, sse, ss_ref, n_err = quantize_block_range(
-        w[s:e], variant, err_cap_blocks)
-    return {"name": name, "part": job["part"],
-            "codes": codes, "scales": scales,
-            "sse": sse, "ss_ref": ss_ref, "n_err": n_err}
+    if measure_err:
+        take = min(ERR_CAP, w_range.size)
+        # snap to whole blocks for a clean per-block sample
+        take = (take // M.BLOCK) * M.BLOCK
+        if take > 0:
+            wref = np.asarray(w_range[:take], dtype=np.float64)
+            rec = M.dequantize(idx, scale, n, variant)[:take].astype(np.float64)
+            d = rec - wref
+            sse = float(np.dot(d, d))
+            ss_ref = float(np.dot(wref, wref))
+            n_err = int(take)
+    return codes, scales, nb, sse, ss_ref, n_err
 
 
 # ---- E4M3 float -> nearest representable byte (inverse of mxfp2.e4m3_decode) ----
@@ -198,14 +170,11 @@ def _e4m3_to_byte(scale_f32):
 
 
 def main(argv):
-    import multiprocessing as mp
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", default=DEFAULT_GGUF)
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--limit", type=int, default=0,
                     help="only process first N tensors (debug)")
-    ap.add_argument("--workers", type=int, default=0,
-                    help="pool size (0 -> nproc-2, capped at 16)")
     args = ap.parse_args(argv[1:])
 
     os.makedirs(args.out, exist_ok=True)
@@ -218,61 +187,106 @@ def main(argv):
     if args.limit:
         names = names[:args.limit]
 
-    nworkers = args.workers or min(16, max(1, (os.cpu_count() or 4) - 2))
     records = []
     role_sse = {}     # role -> list of (rel_mse, n_elem, sampled)
     elem_by_variant = {"nf2": 0, "nf3": 0, "f32": 0}
 
     t0 = time.time()
     off = 0
-    # imap preserves input order, so we can stream-write store.bin sequentially
-    # while workers run ahead. maxtasksperchild=2 recycles workers to release the
-    # peak RAM of the biggest tensors. chunksize=1 keeps the biggest tensor
-    # (token_embd) from blocking a whole batch.
-    print("producing LEAN 2-bit store: %d tensors, %d workers" % (len(names), nworkers),
+    print("producing LEAN 2-bit store: %d tensors -> %s" % (len(names), args.out),
           flush=True)
-    ctx = mp.get_context("spawn")
-    with open(bin_path, "wb") as fbin, \
-            ctx.Pool(nworkers, initializer=_worker_init, initargs=(args.gguf,),
-                     maxtasksperchild=2) as pool:
-        for i, res in enumerate(pool.imap(_worker_quantize, names, chunksize=1)):
-            if res["variant"] == "f32":
-                fbin.write(res["raw"])
-                rb = len(res["raw"])
+
+    # Single-process, sequential, memory-bounded. Each tensor is dequantized to
+    # fp32 once; quantized tensors are processed in producer-level chunks of whole
+    # blocks (CHUNK_BLOCKS) so peak RAM is ~one chunk (+ quantize_mse's internal
+    # sub-chunk). store.bin is written strictly in GGUF file order so the byte
+    # offsets in store.json are exact.
+    with open(bin_path, "wb") as fbin:
+        for i, name in enumerate(names):
+            ti = r.tensors[name]
+            role, _layer = classify(name)
+            src = G.GGML_TYPE_NAME.get(ti.ggml_type, ti.ggml_type)
+            dims = [int(d) for d in ti.dims]
+            n_elem = int(ti.n_elem)
+
+            if ti.ggml_type not in QUANT_TYPES:
+                # raw f32 payload (norms / scalars / rope). dequant() upcasts any
+                # of F32/F16/BF16 to fp32.
+                w = np.ascontiguousarray(r.dequant(name).astype(np.float32))
+                raw = w.tobytes()
+                fbin.write(raw)
+                rb = len(raw)
                 records.append({
-                    "name": res["name"], "dims": res["dims"], "n_elem": res["n_elem"],
-                    "src_type": res["src_type"], "variant": "f32", "role": res["role"],
+                    "name": name, "dims": dims, "n_elem": n_elem,
+                    "src_type": src, "variant": "f32", "role": role,
                     "n_blocks": 0, "codes_off": 0, "codes_bytes": 0,
                     "scales_off": 0, "scales_bytes": 0,
-                    "raw_off": off, "raw_bytes": rb,
+                    "raw_off": int(off), "raw_bytes": int(rb),
                 })
                 off += rb
-                elem_by_variant["f32"] += res["n_elem"]
+                elem_by_variant["f32"] += n_elem
+                variant = "f32"
+                rel_mse = 0.0
+                del w
             else:
+                variant = variant_for(role)
+                w = r.dequant(name).astype(np.float32).reshape(-1)
+                # process in whole-block chunks; codes/scales bytes concatenate
+                # cleanly because each 16-elt block packs to whole bytes.
                 codes_off = off
-                cb = len(res["codes"])
-                sb = len(res["scales"])
-                fbin.write(res["codes"])
-                fbin.write(res["scales"])
+                cb_total = 0
+                sb_total = 0
+                nb_total = 0
+                sse = ss_ref = 0.0
+                n_err = 0
+                chunk_elems = CHUNK_BLOCKS * M.BLOCK
+                pos = 0
+                codes_parts = []
+                scales_parts = []
+                while pos < w.size:
+                    end = min(pos + chunk_elems, w.size)
+                    # only the LAST chunk may carry a partial trailing block.
+                    if end != w.size:
+                        end = pos + ((end - pos) // M.BLOCK) * M.BLOCK
+                    wslice = w[pos:end]
+                    # sample error from the FIRST chunk only (per-block quantizer
+                    # error is sampling-invariant); cap at ERR_CAP elems.
+                    measure = (pos == 0)
+                    c, s, nb, csse, css_ref, cn = quantize_block_range(
+                        wslice, variant, measure)
+                    codes_parts.append(c)
+                    scales_parts.append(s)
+                    cb_total += len(c)
+                    sb_total += len(s)
+                    nb_total += nb
+                    sse += csse
+                    ss_ref += css_ref
+                    n_err += cn
+                    pos = end
+                fbin.write(b"".join(codes_parts))
+                fbin.write(b"".join(scales_parts))
+                assert sb_total == nb_total, (name, sb_total, nb_total)
                 records.append({
-                    "name": res["name"], "dims": res["dims"], "n_elem": res["n_elem"],
-                    "src_type": res["src_type"], "variant": res["variant"],
-                    "role": res["role"], "n_blocks": res["n_blocks"],
-                    "codes_off": int(codes_off), "codes_bytes": int(cb),
-                    "scales_off": int(codes_off + cb), "scales_bytes": int(sb),
+                    "name": name, "dims": dims, "n_elem": n_elem,
+                    "src_type": src, "variant": variant, "role": role,
+                    "n_blocks": int(nb_total),
+                    "codes_off": int(codes_off), "codes_bytes": int(cb_total),
+                    "scales_off": int(codes_off + cb_total),
+                    "scales_bytes": int(sb_total),
                     "raw_off": 0, "raw_bytes": 0,
                 })
-                off += cb + sb
-                elem_by_variant[res["variant"]] += res["n_elem"]
-                role_sse.setdefault(res["role"], []).append(
-                    (res["rel_mse"], res["n_elem"], res["sampled"]))
+                off += cb_total + sb_total
+                elem_by_variant[variant] += n_elem
+                rel_mse = (sse / ss_ref) if ss_ref > 0 else 0.0
+                sampled = (n_err < n_elem)
+                role_sse.setdefault(role, []).append((rel_mse, n_elem, sampled))
+                del w, codes_parts, scales_parts
 
-            if (i + 1) % 20 == 0 or i == len(names) - 1:
-                dt = time.time() - t0
-                gb = off / (1024 ** 3)
-                print("  [%3d/%3d] %-30s %-3s rel_mse=%.4f  store=%.2f GiB (%.0fs)"
-                      % (i + 1, len(names), res["name"], res["variant"],
-                         res["rel_mse"], gb, dt), flush=True)
+            dt = time.time() - t0
+            gb = off / (1024 ** 3)
+            print("  [%3d/%3d] %-30s %-3s rel_mse=%.4f  store=%.2f GiB (%.0fs)"
+                  % (i + 1, len(names), name, variant, rel_mse, gb, dt),
+                  flush=True)
 
     # ---- header ----
     header = {
