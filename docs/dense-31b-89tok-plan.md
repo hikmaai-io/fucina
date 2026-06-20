@@ -220,3 +220,49 @@ dispatch. One binary auto-selects 12B vs 31B (vs any future size) from the check
   safe, and the gate must hold before it's a default.
 * No 31B MTP/assistant head may exist publicly → M2 may start on prompt-lookup + self-spec (M5.3).
 * Memory is not the constraint (128 GB unified); even hybrid 2-bit + NVFP4 storage (~27 GB) + KV fits.
+
+---
+
+## 8. RESULTS & CONCLUSIONS (2026-06-19/20) — what the plan actually yielded
+
+**Bottom line: 89 tok/s is NOT reachable by `F_bytes × F_bw × F_τ` with available methods.**
+Both big multipliers were measured and capped. The effort banked a verified ~2× (MTP) and a
+viable 3-bit F_bytes point, plus a clean map of the wall.
+
+### What shipped / was verified
+* **Dense 31B engine** — runtime auto-detect (no flags), Q4_1/Q4_K loader dequant, flash-prefill
+  GQA fix, `--gpu-mem-util` budget (incl. the lazy NVFP4-prefill copy). Coherent ~11 tok/s raw.
+* **MTP speculative decode — verified ~2×.** 31B MTP head (267 MB) runtime-verified: **23 tok/s
+  code (τ=2.96, 63% accept), 14 tok/s prose** (from 11 raw). 12B byte-identical (no regression).
+  `FUCINA_MTP_PMIN` draft-gate knob (+8% on code). **This is the headline deliverable.**
+
+### F_τ (speculation) — CAPPED at ~2×
+* Rejection-sampling verify: investigated → **dead end**. fucina drafts argmax, so the rejection
+  rule reduces to the existing draw-and-match; draw-and-match is already near the single-chain
+  ceiling (code 58% @temp1 vs 63% @temp0). No verify-rule lever moves it.
+* **Tree-spec: built, correct (byte-identical), τ-positive (+31%), but NET-NEGATIVE on GB10.**
+  Measured breakdown: draft ~30ms/step, verify ~240ms/step, and graphing the verify changed
+  nothing → the verify is **per-row compute-bound, not launch-bound**. The de-risk premise
+  ("candidates are free because weights are read once/step") is FALSE on this hardware: a width-w
+  tree pays ~w× per step for sub-linear τ. Left default-OFF (`FUCINA_SPEC_TREE=0`); machinery
+  intact for future HW or a much smaller draft head.
+
+### F_bytes (low-bit) — 2-bit DEAD, 3-bit VIABLE
+Perplexity gate ran on the real BF16 31B (fp16 ppl = 4.0208, encoder=absmax lower bound):
+* uniform 2-bit = **32.6M** ppl; lean 2-bit (embed/k/v@nf3 + FFN@nf2) = **1.27M** → **HARD NO-GO.**
+  FFN 2-bit error (~0.30–0.38 rel/tensor) compounds multiplicatively through 50 layers → collapse.
+  MSE encoder only improves per-tensor error **1.24×** — cannot close a 300,000× gap (4h MSE run
+  skipped as futile). Role-protection helps 25× but nowhere near enough.
+* **all-nf3 (3-bit) = 4.50 ppl = +11.9%** → **VIABLE** (MARGINAL; MSE would push toward GO). The
+  cliff is razor-sharp: 2-bit collapses, 3-bit lands. nf3 ≈ 3.5 bit/elt vs Q4_0 4.5 → ~**1.29×
+  fewer bytes** (~22% faster decode + 22% smaller, valuable for memory-constrained clients).
+
+### Realistic ceiling & the only route to a BIG F_bytes win
+Stacking the viable pieces: 11 raw → ~14 (nf3) → ~28 (×MTP). A real modest win, **not 89**. The
+89-class F_bytes multiplier (true 2-bit) needs **advanced PTQ (QuIP#/AQLM — incoherence +
+codebooks)** or **QAT** — both large efforts, and no 31B 2-bit QAT exists. The gate did its job:
+it killed the 2-bit store *before* we wired 1.27M-ppl garbage into the decode kernel.
+
+### Recommended next build (if pursued)
+Wire **nf3 decode GEMV** into the engine (mirror the existing NVFP4 4-bit codec path) to ship the
+3-bit ~1.29× + smaller model. Everything else is banked on `feat/dense-31b-tau`.
