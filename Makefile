@@ -28,7 +28,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test \
-        paged-kv-device-test packed-kv-test kv-quant-explore bench \
+        paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
 # `make` with no arguments builds everything (CUDA archive + Go binary).
@@ -130,6 +130,13 @@ kv-quant-explore:
 # exit on failure); perf is reported. Override the model with MODEL=/path.gguf.
 bench: fucina
 	MODEL=$(if $(MODEL),$(MODEL),model.gguf) scripts/bench.sh
+
+# tool-bench launches fucina and runs the agentic tool-call benchmark with the
+# corrected --max-turns 12 (the upstream default 8 truncates TC-46/TC-62 mid-chain).
+# Pass-through args via ARGS=, e.g.: make tool-bench ARGS="--perf"
+# Continuous batching for the concurrency columns: make tool-bench BATCH=1 ARGS="--perf"
+tool-bench: fucina
+	MODEL=$(if $(MODEL),$(MODEL),model.gguf) BATCH=$(BATCH) scripts/tool_eval_bench.sh $(ARGS)
 
 test-vectors: fucina
 	./fucina --test-vectors tests/vectors/official.vec
@@ -264,6 +271,10 @@ nvfp4-test:
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_test.cc          -o /tmp/nvfp4_test  && /tmp/nvfp4_test
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_loader_test.cc   -o /tmp/nvfp4_ld    && /tmp/nvfp4_ld
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 cuda/test_nvfp4_gemv.cu -o /tmp/nvfp4_gemv && /tmp/nvfp4_gemv
+
+# Native Q4_K LM-head matvec unit test (kernel vs host reference decode).
+q4k-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 cuda/test_q4k_gemv.cu -o /tmp/q4k_gemv && /tmp/q4k_gemv
 
 # ─── Clean ──────────────────────────────────────────────────────────────
 clean:

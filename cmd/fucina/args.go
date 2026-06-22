@@ -54,6 +54,8 @@ type CLIArgs struct {
 	APIKey        string // optional bearer token required on /v1/* (empty = auth off)
 	MaxConcurrent int    // admission-queue depth (in-flight + waiting); 0 = default
 	MaxOutputToks int    // absolute per-request output-token ceiling; 0 = no extra cap
+	PagedKV       bool   // --paged-kv: allocate the paged multi-sequence KV pools (sets FUCINA_PAGED_KV)
+	Batch         bool   // --batch: route /v1/* through the continuous-batching scheduler (implies --paged-kv)
 
 	// System
 	System     string
@@ -158,6 +160,16 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 		"Admission-queue depth (in-flight + waiting requests); excess requests get 503. 0 = default (4).")
 	fs.IntVar(&a.MaxOutputToks, "max-output-tokens", 0,
 		"Absolute per-request output-token ceiling (independent of context window). 0 = no extra cap.")
+	// Continuous batching: serve concurrent requests in one batched forward pass via the
+	// per-step scheduler over a paged multi-sequence KV cache, instead of the per-request
+	// kv lock that serializes prefill+generation (TTFT scales linearly with clients).
+	// OFF by default: the batch path has no MTP spec decode yet and pays a ~10% split-K
+	// single-stream tax, so it is a deliberate opt-in for genuinely concurrent deployments.
+	// Equivalent to the legacy FUCINA_PAGED_KV=1 FUCINA_BATCH=1 env pair.
+	fs.BoolVar(&a.PagedKV, "paged-kv", false,
+		"Allocate the paged multi-sequence KV pools (prerequisite for --batch; equivalent to FUCINA_PAGED_KV=1)")
+	fs.BoolVar(&a.Batch, "batch", false,
+		"Continuous batching: serve concurrent requests through the per-step scheduler (implies --paged-kv). OFF by default; no MTP spec decode in this path.")
 
 	fs.StringVar(&a.System, "s", "", "System prompt")
 	fs.StringVar(&a.System, "system", "", "System prompt")
@@ -195,6 +207,10 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	if a.DiffModelPath != "" {
 		a.ModelPath = a.DiffModelPath
 		a.FP4MoE = true
+	}
+	// --batch needs the paged multi-sequence engine; the scheduler is a no-op without it.
+	if a.Batch {
+		a.PagedKV = true
 	}
 	return a, t, nil
 }

@@ -72,6 +72,10 @@ type Engine struct {
 	// until the next Prefill/Decode call — callers must sample/consume it before
 	// re-entering the engine (which the single-flight server does).
 	logitsBuf []float32
+
+	// hasMTP is set once LoadAssistant succeeds: the batch scheduler then routes
+	// StepBatch through the speculative step_batch_spec ABI instead of plain decode.
+	hasMTP bool
 }
 
 // Config holds engine configuration. The weight format (Q4_0/Q8_0/NVFP4) is
@@ -131,6 +135,7 @@ func (e *Engine) LoadAssistant(path string) error {
 	if C.gemma4_engine_load_assistant(e.ptr, cPath) != 0 {
 		return fmt.Errorf("fucina: assistant load failed for %s", path)
 	}
+	e.hasMTP = true
 	return nil
 }
 
@@ -558,6 +563,10 @@ func (e *Engine) GraphStats() (hits, misses, captures, launches int) {
 // Capacity() contract by tracking how many slots it currently holds.
 const maxBatchSeqs = 16
 
+// specMax mirrors GEMMA4_SPEC_MAX: the max length of a per-slot speculative run, and
+// the stride of the flattened out_tokens buffer that step_batch_spec writes.
+const specMax = 16
+
 // SeqAdd prefills prompt into a fresh paged slot and returns the slot id and the
 // first sampled token. The per-sequence sampling params are stored on the slot
 // and applied on-device to every token of this sequence (temp<=0 ⇒ greedy). err
@@ -617,6 +626,58 @@ func (e *Engine) StepBatch(slots []int32, inputs []int32) ([]int32, error) {
 		return nil, fmt.Errorf("fucina: step_batch failed")
 	}
 	return out, nil
+}
+
+// StepBatchSpec is the MTP-speculative batched step: it drafts per slot and verifies
+// all slots in one batched target forward, returning a token RUN per slot (the accepted
+// drafts plus the bonus/resampled token). Output is byte-identical to StepBatch; the
+// runs are just longer when drafts are accepted. A run of {-1} marks a KV-exhausted slot.
+func (e *Engine) StepBatchSpec(slots []int32, inputs []int32) ([][]int32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(slots) != len(inputs) {
+		return nil, fmt.Errorf("fucina: step_batch_spec: %d slots vs %d inputs", len(slots), len(inputs))
+	}
+	b := len(slots)
+	if b == 0 {
+		return nil, nil
+	}
+	if b > maxBatchSeqs {
+		return nil, fmt.Errorf("fucina: step_batch_spec: batch %d exceeds max %d", b, maxBatchSeqs)
+	}
+	cslots := make([]C.int, b)
+	for i, s := range slots {
+		cslots[i] = C.int(s)
+	}
+	// out_tokens is [B * specMax] (each row's run, contiguous); out_lens[B] the run length.
+	out := make([]int32, b*specMax)
+	lens := make([]C.int, b)
+	ret := C.gemma4_engine_step_batch_spec(
+		e.ptr,
+		&cslots[0],
+		(*C.int32_t)(unsafe.Pointer(&inputs[0])),
+		C.int(b),
+		(*C.int32_t)(unsafe.Pointer(&out[0])),
+		&lens[0],
+	)
+	if ret != 0 {
+		return nil, fmt.Errorf("fucina: step_batch_spec failed")
+	}
+	runs := make([][]int32, b)
+	for i := 0; i < b; i++ {
+		n := int(lens[i])
+		if n < 0 { // KV-exhausted sentinel → scheduler stops just this row
+			runs[i] = []int32{-1}
+			continue
+		}
+		if n == 0 {
+			runs[i] = nil
+			continue
+		}
+		base := i * specMax
+		runs[i] = append([]int32(nil), out[base:base+n]...)
+	}
+	return runs, nil
 }
 
 // SeqRemove frees a slot's paged KV back to the pool and marks it reusable.
@@ -680,6 +741,13 @@ func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int3
 // so per-step overrides are not supported. The SeqParams in batch.BatchEngine
 // are reserved for a future per-step sampler.
 func (a *BatchAdapter) StepBatch(active []int32, inputs []int32) ([][]int32, error) {
+	// When the MTP assistant is loaded, route through the speculative step: it drafts
+	// per slot and verifies all slots in one batched target forward, returning a
+	// variable-length run per slot. Output is byte-identical to the non-spec path; the
+	// scheduler already walks runs token-by-token (stopping mid-run on stop/budget/evict).
+	if a.eng.hasMTP {
+		return a.eng.StepBatchSpec(active, inputs)
+	}
 	toks, err := a.eng.StepBatch(active, inputs)
 	if err != nil {
 		return nil, err

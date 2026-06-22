@@ -165,6 +165,24 @@ func TestParseArgsTestFlags(t *testing.T) {
 	}
 }
 
+func TestParseArgsBatchImpliesPagedKV(t *testing.T) {
+	// Default: both off.
+	a, _ := mustParse(t, nil)
+	if a.Batch || a.PagedKV {
+		t.Errorf("defaults: Batch=%v PagedKV=%v, want both false", a.Batch, a.PagedKV)
+	}
+	// --paged-kv alone enables the paged engine but not the scheduler.
+	a, _ = mustParse(t, []string{"--paged-kv"})
+	if !a.PagedKV || a.Batch {
+		t.Errorf("--paged-kv: PagedKV=%v Batch=%v, want true/false", a.PagedKV, a.Batch)
+	}
+	// --batch implies --paged-kv (scheduler is a no-op without the paged engine).
+	a, _ = mustParse(t, []string{"--batch"})
+	if !a.Batch || !a.PagedKV {
+		t.Errorf("--batch: Batch=%v PagedKV=%v, want both true", a.Batch, a.PagedKV)
+	}
+}
+
 func TestParseThinkingLevel(t *testing.T) {
 	falseInputs := []string{"off", "none", "false"}
 	for _, in := range falseInputs {

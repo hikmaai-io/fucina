@@ -77,6 +77,8 @@ typedef enum {
     FORMAT_NVFP4 = 4,  // NVFP4 from safetensors (ModelOpt/compressed-tensors): E2M1 + per-16
                        // E4M3 block scales + per-tensor FP32 global. Single weight store feeds
                        // both the cuBLASLt block-scaled prefill and the fused decode GEMV.
+    FORMAT_Q4_K  = 5,  // GGML Q4_K super-blocks — wfmt override for the native Unsloth-UD tied LM
+                       // head (reads raw 4.5-bit head vs the Q8_0 upconvert); not a whole-model format.
 } tensor_format_t;
 
 // ─── GGML Q8_0 block ──────────────────────────────────────────────────
@@ -298,6 +300,12 @@ int  gemma4_engine_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_pr
                            float temp, int top_k, float top_p, float min_p, uint64_t seed);
 int  gemma4_engine_step_batch(gemma4_engine_t *eng, const int *slots,
                               const int32_t *in_tokens, int B, int32_t *out_tokens);
+// MTP speculative batched step: per-slot draft + one batched verify. out_tokens is
+// [B*GEMMA4_SPEC_MAX] (each row's emitted run), out_lens[B] the per-row run length
+// (>=1) or -1 if the slot hit its KV limit. Output is byte-identical to step_batch.
+int  gemma4_engine_step_batch_spec(gemma4_engine_t *eng, const int *slots,
+                                   const int32_t *in_tokens, int B,
+                                   int32_t *out_tokens, int *out_lens);
 void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot);
 int  gemma4_engine_seq_capacity(gemma4_engine_t *eng);
 

@@ -51,6 +51,14 @@ Server options:
   --think-budget N           Max reasoning tokens per turn before the thought
                              channel is force-closed (0 = auto: max_tokens/2;
                              negative = unlimited)
+  --max-concurrent N         Admission-queue depth (in-flight + waiting); excess
+                             requests get 503 (0 = default 4)
+  --paged-kv                 Allocate the paged multi-sequence KV pools
+                             (prerequisite for --batch)
+  --batch                    Continuous batching: serve concurrent requests in one
+                             batched forward pass (implies --paged-kv). OFF by
+                             default — no MTP spec decode in this path, ~10%
+                             single-stream tax; opt in for concurrent serving.
 
 Other options:
   --cuda-device N            CUDA device ID (default: 0)

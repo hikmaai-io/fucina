@@ -1,9 +1,18 @@
 # Continuous batching + paged KV — design & plan
 
-Status: **FUNCTIONAL** (on `main`). Behind `FUCINA_PAGED_KV=1 FUCINA_BATCH=1`; default
-path unchanged. Concurrent smoke: 4 parallel requests served concurrently (4.43s vs 5.56s
-sequential), correct outputs, no serialization. Remaining: perf (split-K paged attention),
-per-seq spec decode, sampling params in the batch kernels, CUDA graphs per batch size.
+Status: **FUNCTIONAL** (on `main`). Enable with the `--batch` CLI flag (implies `--paged-kv`),
+or the legacy `FUCINA_PAGED_KV=1 FUCINA_BATCH=1` env pair — both converge on the same path.
+Default path unchanged (single-flight). Concurrent smoke: 4 parallel requests served
+concurrently (4.43s vs 5.56s sequential), correct outputs, no serialization. Remaining: perf
+(split-K paged attention), per-seq spec decode, sampling params in the batch kernels, CUDA
+graphs per batch size.
+
+Why default-off (deliberate, not just caution): the batch path has **no MTP speculative
+decode** yet (the per-slot paged+batched drafter kernel is unbuilt — see "Spec decode in the
+batch" below) and pays a **~10% split-K single-stream tax**, so for single-stream / low-
+concurrency traffic the single-flight path is faster. Turn `--batch` on only when you are
+actually serving concurrent clients, where flat TTFT and aggregate scaling dominate. Bench it
+both ways: `make tool-bench ARGS="--perf"` vs `make tool-bench BATCH=1 ARGS="--perf"`.
 
 How it works end to end:
 - `FUCINA_PAGED_KV` allocates the block pools (capacity-sized; `paged_cap = min(MAX_SEQS,
