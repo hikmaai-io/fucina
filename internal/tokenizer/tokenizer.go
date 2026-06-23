@@ -37,6 +37,11 @@ type Tokenizer struct {
 	EOS int32
 	PAD int32
 
+	// ChatTemplate is the model's embedded Jinja chat template (GGUF
+	// tokenizer.chat_template), empty if the GGUF omits it. Used by the --jinja
+	// rendering path (internal/chat) to format messages exactly like llama.cpp.
+	ChatTemplate string
+
 	// Gemma-4 turn / channel control tokens. EndOfTurn (<turn|>) terminates an
 	// assistant turn and must be treated as a stop token alongside EOS.
 	StartOfTurn int32 // <|turn>   = 105
@@ -324,6 +329,14 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 		case "tokenizer.ggml.padding_token_id":
 			if v, ok := p.readScalarInt(valType); ok {
 				t.PAD = v
+			}
+		case "tokenizer.chat_template":
+			if valType == ggufTypeString {
+				if s, ok := p.readString(); ok {
+					t.ChatTemplate = s
+				}
+			} else if !p.skipValue(valType) {
+				return nil, fmt.Errorf("tokenizer: failed to read chat_template")
 			}
 
 		default:
