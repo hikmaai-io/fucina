@@ -115,6 +115,7 @@ struct e4b_engine {
         __nv_bfloat16 *hidden=nullptr,*norm=nullptr,*tmpH=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,
                       *attn=nullptr,*gate=nullptr,*up=nullptr,*act=nullptr,*pleg=nullptr,*ctx_bf=nullptr;
         float *ple_lookup=nullptr,*ple_ctx=nullptr,*pli=nullptr,*logits_f=nullptr,*invf_s=nullptr,*invf_f=nullptr;
+        int  *npast=nullptr;   // device-resident position for the graph-captured decode kernels
     } dec;
     // Prefill (T>1) dequant scratch: when use_q40 the BF16 projection weights are freed,
     // so prefill dequants each Q4_0 projection → this reused BF16 buffer for the cuBLAS GEMM.
@@ -626,7 +627,7 @@ extern "C" void e4b_engine_destroy(e4b_engine_t *eng) {
     if (eng->d_q6k_head) cudaFree(eng->d_q6k_head);
     { auto& d=eng->dec; F(d.ids); F(d.hidden); F(d.norm); F(d.tmpH); F(d.q); F(d.k); F(d.v); F(d.attn);
       F(d.gate); F(d.up); F(d.act); F(d.pleg); F(d.ctx_bf); F(d.ple_lookup); F(d.ple_ctx); F(d.pli);
-      F(d.logits_f); F(d.invf_s); F(d.invf_f); }
+      F(d.logits_f); F(d.invf_s); F(d.invf_f); F(d.npast); }
     for (Slot& s : eng->slots) e4b_slot_free(eng, s);
     if (eng->cublas) cublasDestroy(eng->cublas);
     delete eng;
@@ -794,6 +795,73 @@ __global__ void kv_store_kernel(const bf16* __restrict__ src, bf16* __restrict__
     if (i < T*row) cache[(size_t)n_past*row + i] = src[i];
 }
 
+// ── CUDA-graph-friendly decode (T==1) kernels: DEVICE-resident position, FIXED smem ──
+// kv_store reading the position from device memory (one new token at *d_npast).
+__global__ void kv_store_dev_kernel(const bf16* __restrict__ src, bf16* __restrict__ cache,
+                                    int row, const int* __restrict__ d_npast){
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i < row) cache[(size_t)(*d_npast)*row + i] = src[i];
+}
+
+// Flash (online-softmax, tiled) decode attention for T==1. Unlike attn_cache_kernel — whose
+// scores[] smem grows with n_past and which takes n_past as a host arg — this uses FIXED smem
+// (TILE scores + hd accumulator) and reads the position from device memory, so the whole decode
+// forward can be captured once into a CUDA graph and replayed each token. One block per head.
+template<int TILE>
+__global__ void attn_flash_decode_kernel(
+    const bf16* __restrict__ q, const bf16* __restrict__ kcache, const bf16* __restrict__ vcache,
+    bf16* __restrict__ out, const int* __restrict__ d_npast,
+    int n_heads, int n_kv, int hd, float scaling, int window)
+{
+    int h = blockIdx.x; if (h >= n_heads) return;
+    const int P = *d_npast;                       // query absolute position (t=0)
+    const int group = n_heads / n_kv, kvh = h / group;
+    int lo = (window > 0) ? (P - window + 1) : 0; if (lo < 0) lo = 0;
+    const bf16* qv = q + (size_t)h * hd;
+
+    extern __shared__ float smem[];
+    float* sc  = smem;          // [TILE] tile scores
+    float* acc = smem + TILE;   // [hd]   running weighted-V accumulator
+    __shared__ float m_run, l_run, corr;
+
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) acc[d] = 0.f;
+    if (threadIdx.x == 0) { m_run = -1e30f; l_run = 0.f; }
+    __syncthreads();
+
+    for (int base = lo; base <= P; base += TILE) {
+        const int tlen = min(TILE, P - base + 1);
+        for (int j = threadIdx.x; j < tlen; j += blockDim.x) {
+            const bf16* kv = kcache + ((size_t)(base + j) * n_kv + kvh) * hd;
+            float dot = 0.f;
+            for (int d = 0; d < hd; d++) dot += b2f(qv[d]) * b2f(kv[d]);
+            sc[j] = dot * scaling;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {                   // online-softmax state update for this tile
+            float tm = -1e30f;
+            for (int j = 0; j < tlen; j++) tm = fmaxf(tm, sc[j]);
+            float new_m = fmaxf(m_run, tm);
+            corr = expf(m_run - new_m);
+            float tl = 0.f;
+            for (int j = 0; j < tlen; j++) { float e = expf(sc[j] - new_m); sc[j] = e; tl += e; }
+            l_run = l_run * corr + tl; m_run = new_m;
+        }
+        __syncthreads();
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+            float a = acc[d] * corr;
+            for (int j = 0; j < tlen; j++) {
+                const bf16* vv = vcache + ((size_t)(base + j) * n_kv + kvh) * hd;
+                a += sc[j] * b2f(vv[d]);
+            }
+            acc[d] = a;
+        }
+        __syncthreads();
+    }
+    const float inv = 1.f / l_run;
+    bf16* ov = out + (size_t)h * hd;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) ov[d] = f2b(acc[d] * inv);
+}
+
 // ── batched (multi-sequence) variants: B sequences, one new token each ──
 // RoPE with a per-sequence absolute position. x:[B,n_heads,hd], pos:[B].
 __global__ void rope_batch_kernel(bf16* __restrict__ x, const float* __restrict__ inv_freq,
@@ -948,6 +1016,7 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         ok2&=CKF(cudaMalloc(&d.act,(size_t)FF*2)); ok2&=CKF(cudaMalloc(&d.pleg,(size_t)PD*2)); ok2&=CKF(cudaMalloc(&d.ctx_bf,(size_t)W*2));
         ok2&=CKF(cudaMalloc(&d.ple_lookup,(size_t)W*4)); ok2&=CKF(cudaMalloc(&d.ple_ctx,(size_t)W*4)); ok2&=CKF(cudaMalloc(&d.pli,(size_t)W*4));
         ok2&=CKF(cudaMalloc(&d.logits_f,(size_t)V*4));
+        ok2&=CKF(cudaMalloc(&d.npast,sizeof(int)));
         d.invf_s = make_inv_freq_sliding(c.head_dim, c.rope_theta_sliding);
         d.invf_f = make_inv_freq_proportional(c.global_head_dim, c.rope_theta_full, c.rope_partial_full);
         if(!ok2 || !d.invf_s || !d.invf_f) return -1;
@@ -980,6 +1049,7 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         if(!ok) return -1;
     }
     cudaMemcpy(d_ids,tokens,T*sizeof(int32_t),cudaMemcpyHostToDevice);
+    if (persist) cudaMemcpy(eng->dec.npast,&n_past,sizeof(int),cudaMemcpyHostToDevice);
 
     auto GRID=[&](int n){ return (n+255)/256; };
 
@@ -1042,7 +1112,8 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         else if (eng->use_q40) prefill_q40(d_q, L.q40_wq, d_norm, qd, H);
         else                   linear(eng->cublas,L.wq,d_norm,d_q,T,qd,H);
         head_rmsnorm_kernel<<<T*c.n_heads,256>>>(d_q,L.q_norm,T,c.n_heads,hd,eps);
-        rope_kernel<<<T*c.n_heads,256>>>(d_q,d_invf,T,c.n_heads,hd,n_past);
+        if (persist) rope_batch_kernel<<<c.n_heads,256>>>(d_q,d_invf,1,c.n_heads,hd,eng->dec.npast);
+        else         rope_kernel<<<T*c.n_heads,256>>>(d_q,d_invf,T,c.n_heads,hd,n_past);
 
         // K/V: non-shared layers project + store into their cache; shared layers
         // skip (their provider — an earlier layer this same step — already wrote it).
@@ -1061,15 +1132,28 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
                 linear(eng->cublas,L.wv,d_norm,d_v,T,kvd,H);
             }
             head_rmsnorm_kernel<<<T*c.n_kv_heads,256>>>(d_k,L.k_norm,T,c.n_kv_heads,hd,eps);
-            rope_kernel<<<T*c.n_kv_heads,256>>>(d_k,d_invf,T,c.n_kv_heads,hd,n_past);
             head_rmsnorm_kernel<<<T*c.n_kv_heads,256>>>(d_v,nullptr,T,c.n_kv_heads,hd,eps); // v_norm (no weight)
-            kv_store_kernel<<<GRID(T*kvd),256>>>(d_k,kcache,T,kvd,n_past);
-            kv_store_kernel<<<GRID(T*kvd),256>>>(d_v,vcache,T,kvd,n_past);
+            if (persist){
+                rope_batch_kernel<<<c.n_kv_heads,256>>>(d_k,d_invf,1,c.n_kv_heads,hd,eng->dec.npast);
+                kv_store_dev_kernel<<<GRID(kvd),256>>>(d_k,kcache,kvd,eng->dec.npast);
+                kv_store_dev_kernel<<<GRID(kvd),256>>>(d_v,vcache,kvd,eng->dec.npast);
+            } else {
+                rope_kernel<<<T*c.n_kv_heads,256>>>(d_k,d_invf,T,c.n_kv_heads,hd,n_past);
+                kv_store_kernel<<<GRID(T*kvd),256>>>(d_k,kcache,T,kvd,n_past);
+                kv_store_kernel<<<GRID(T*kvd),256>>>(d_v,vcache,T,kvd,n_past);
+            }
         }
 
-        // attention over the cache [0, n_past+T)
-        dim3 ag(c.n_heads,T); size_t sh=(size_t)(n_past+T)*sizeof(float);
-        attn_cache_kernel<<<ag,256,sh>>>(d_q,kcache,vcache,d_attn,T,n_past,c.n_heads,c.n_kv_heads,hd,1.0f,window);
+        // attention over the cache [0, n_past+T). Decode (T==1) uses the fixed-smem, device-
+        // position flash kernel (CUDA-graph-able); prefill uses the dynamic-smem multi-query path.
+        if (persist){
+            const int smemF = (256 + hd) * (int)sizeof(float);
+            attn_flash_decode_kernel<256><<<c.n_heads,256,smemF>>>(
+                d_q,kcache,vcache,d_attn,eng->dec.npast,c.n_heads,c.n_kv_heads,hd,1.0f,window);
+        } else {
+            dim3 ag(c.n_heads,T); size_t sh=(size_t)(n_past+T)*sizeof(float);
+            attn_cache_kernel<<<ag,256,sh>>>(d_q,kcache,vcache,d_attn,T,n_past,c.n_heads,c.n_kv_heads,hd,1.0f,window);
+        }
 
         // o_proj → d_norm; post_attention_layernorm; hidden = residual + that
         if      (q40_dec)      q40dec(d_norm, L.q40_wo, d_attn, H, qd);
