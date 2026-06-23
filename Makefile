@@ -26,7 +26,9 @@ NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo --use_fast_math \
 CGO_CFLAGS   := -I$(CUDA_HOME)/include
 CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 
-.PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
+.PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test e4b-test \
+        e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
+        e4b-bench e4b-all \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench \
         dg dg-dequant-test dg-forward-test dg-generate
@@ -52,10 +54,18 @@ cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh \
                        cuda/paged_kv.h cuda/paged_kv_device.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
 
-cuda/gemma4_kernels_link.o: cuda/gemma4_kernels.o Makefile
-	$(NVCC) $(NVCCFLAGS) -dlink -o $@ $<
+# The standalone E4B engine (runtime dims, PLE, KV-sharing) is bundled into the
+# same archive so the Go cgo bridge (internal/engine/e4b) links it. It is a
+# self-contained TU (no gemma4 symbols); -dc + a combined -dlink resolves its
+# device runtime alongside the dense engine. -std=c++17 for gemma4_e4b.h.
+cuda/e4b_engine.o: cuda/e4b_engine.cu cuda/e4b_engine.h cuda/gemma4_e4b.h \
+                   cuda/e4b_ple_fp8.cuh cuda/safetensors.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -dc -o $@ cuda/e4b_engine.cu
 
-cuda/libfucina.a: cuda/gemma4_kernels.o cuda/gemma4_kernels_link.o
+cuda/gemma4_kernels_link.o: cuda/gemma4_kernels.o cuda/e4b_engine.o Makefile
+	$(NVCC) $(NVCCFLAGS) -dlink -o $@ cuda/gemma4_kernels.o cuda/e4b_engine.o
+
+cuda/libfucina.a: cuda/gemma4_kernels.o cuda/e4b_engine.o cuda/gemma4_kernels_link.o
 	ar rcs $@ $^
 	@arches="$$($(CUDA_HOME)/bin/cuobjdump --list-elf $@ 2>/dev/null | sed -n 's/.*\.\(sm_[0-9a-z]*\)\.cubin/\1/p' | sort -u)"; \
 	echo "libfucina.a cubin arch(es): $$arches"; \
@@ -264,6 +274,47 @@ nvfp4-test:
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_test.cc          -o /tmp/nvfp4_test  && /tmp/nvfp4_test
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_loader_test.cc   -o /tmp/nvfp4_ld    && /tmp/nvfp4_ld
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 cuda/test_nvfp4_gemv.cu -o /tmp/nvfp4_gemv && /tmp/nvfp4_gemv
+
+# Gemma-4-E4B foundation: runtime config detection + FP8 Per-Layer-Embedding
+# "index" codec, validated against the real BF16 checkpoint (cosine gate).
+# Pass MODEL_DIR=... to point at a different E4B snapshot.
+e4b-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_ple_fp8.cu -o /tmp/e4b_ple_test && /tmp/e4b_ple_test $(MODEL_DIR)
+
+# E4B engine BF16 weight loader: load the real checkpoint, report residency.
+e4b-load-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_load.cu cuda/e4b_engine.cu -o /tmp/e4b_load -lcudart -lcublas && /tmp/e4b_load $(MODEL_DIR)
+
+# E4B GGUF (Q4_0-QAT/Q6_K) loader: load the real GGUF through the same engine
+# (dequant → BF16 + FP8 PLE), check dims/residency, run a forward sanity
+# (finite logits, in-range argmax, no illegal access) + optional BF16 parity.
+# Pass GGUF=... to point at a different GGUF; MODEL_DIR=... for the BF16 reference.
+e4b-gguf-load-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_gguf_load.cu cuda/e4b_engine.cu -o /tmp/e4b_gguf_load -lcudart -lcublas && /tmp/e4b_gguf_load $(GGUF) $(MODEL_DIR)
+
+# E4B forward pass validated against an HF reference dump (/tmp/e4b_ref.bin).
+e4b-fwd-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_forward.cu cuda/e4b_engine.cu -o /tmp/e4b_fwd -lcudart -lcublas && /tmp/e4b_fwd $(MODEL_DIR)
+
+# E4B incremental decode (KV cache) validated against HF greedy (/tmp/e4b_gen_ref.bin).
+e4b-gen-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_generate.cu cuda/e4b_engine.cu -o /tmp/e4b_gen -lcudart -lcublas && /tmp/e4b_gen $(MODEL_DIR)
+
+# E4B continuous batching: B concurrent sequences == independent decode.
+e4b-batch-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_batch.cu cuda/e4b_engine.cu -o /tmp/e4b_batch -lcudart -lcublas && /tmp/e4b_batch $(MODEL_DIR)
+
+# E4B NVFP4 weight-path foundation: quantizer + tuned decode GEMV, validated vs the
+# host dequant oracle (kernel correctness) and full precision (FP4 SNR), with bandwidth.
+e4b-nvfp4-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_nvfp4.cu -o /tmp/e4b_nvfp4_test -lcudart && /tmp/e4b_nvfp4_test
+
+# E4B throughput baseline (prefill + decode tok/s), not a correctness test.
+e4b-bench:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_bench.cu cuda/e4b_engine.cu -o /tmp/e4b_bench -lcudart -lcublas && /tmp/e4b_bench $(MODEL_DIR)
+
+# All E4B tests.
+e4b-all: e4b-test e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test
 
 # ─── Clean ──────────────────────────────────────────────────────────────
 clean:
