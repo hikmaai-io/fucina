@@ -12,7 +12,7 @@
 #include "gemma4_e4b.h"
 #include "e4b_ple_fp8.cuh"
 #include "e4b_nvfp4.cuh"   // NVFP4 weight path (quantizer + decode GEMV) — FUCINA_E4B_FP4
-#include "e4b_q4_0.cuh"    // native Q4_0 weight path (dp4a decode GEMV off the on-disk nibbles)
+#include "mmvq.cuh"        // shared dp4a MMVQ kernels (native Q4_0/Q6_K decode; same as dense 12B)
 #include "e4b_gguf.cuh"    // GGUF weight source (Q4_0/Q6_K/F16/F32 → BF16 front-end)
 
 #include <cuda_runtime.h>
@@ -39,10 +39,12 @@ struct Layer {
     //   index/decision (drives softmax routing) → FP8 E4M3: attention Q/K.
     e4bfp4::Weight    fp4_gate, fp4_up, fp4_down, fp4_wv, fp4_wo;
     e4bfp4::Fp8Weight fp8_wq, fp8_wk;
-    // Native Q4_0 decode (GGUF Q4_0 checkpoints): the original QAT nibbles kept
-    // bit-for-bit (no BF16 round-trip, no NVFP4 re-quant), decoded via dp4a. Used
-    // for ALL matmul projections — Q4_0 SNR (~24 dB) beats the NVFP4 hybrid (~20 dB).
-    e4bq40::Q40Weight q40_wq, q40_wk, q40_wv, q40_wo, q40_gate, q40_up, q40_down;
+    // Native Q4_0 decode (GGUF Q4_0): the original QAT 18-byte blocks copied verbatim
+    // from the GGUF and decoded via the SHARED dp4a MMVQ kernels (mmvq.cuh) — the same
+    // path the dense 12B uses. Prefill dequants these → BF16 scratch for the cuBLAS GEMM.
+    // Dims are derivable from cfg per layer, so only the device block streams are stored.
+    uint8_t *q40_wq=nullptr, *q40_wk=nullptr, *q40_wv=nullptr, *q40_wo=nullptr;
+    uint8_t *q40_gate=nullptr, *q40_up=nullptr, *q40_down=nullptr;
     // norms [hidden]
     __nv_bfloat16 *input_ln=nullptr, *post_attn_ln=nullptr;
     __nv_bfloat16 *pre_ff_ln=nullptr, *post_ff_ln=nullptr, *post_ple_ln=nullptr;
@@ -93,13 +95,15 @@ struct e4b_engine {
     float *d_fp4_xf=nullptr, *d_fp4_yf=nullptr;
     e4bfp4::Fp8Weight fp8_head;   // tied LM head (decision projection) — FP8 E4M3
 
-    // Native Q4_0 decode path (GGUF Q4_0; mutually exclusive with use_fp4/NVFP4). The
-    // 7 matmul projections decode straight off the on-disk Q4_0 nibbles via dp4a; the
-    // tied head stays FP8 (fp8_head). Activation Q8_1 scratch: qa[FF]+da[FF/32]+sa[FF/32].
+    // Native Q4_0 decode path (GGUF Q4_0; mutually exclusive with use_fp4/NVFP4). The 7
+    // matmul projections decode straight off the on-disk Q4_0 nibbles via the SHARED MMVQ
+    // kernels (mmvq.cuh); the tied head is the native Q6_K token_embd (mmvq_q6_k). Activation
+    // Q8_1 scratch sized for the batched path (max_seqs rows): qa[S*FF]+da/sa[S*FF/32].
     int      use_q40=0;
-    int8_t  *d_q40_qa=nullptr;
-    float   *d_q40_da=nullptr;
-    int32_t *d_q40_sa=nullptr;
+    int8_t  *d_q40_qa=nullptr;   // [max_seqs*FF] int8
+    float   *d_q40_da=nullptr;   // [max_seqs*FF/32]
+    int32_t *d_q40_sa=nullptr;   // [max_seqs*FF/32]
+    uint8_t *d_q6k_head=nullptr; // native Q6_K tied LM head [vocab][hidden/256*210]
     // Prefill (T>1) dequant scratch: when use_q40 the BF16 projection weights are freed,
     // so prefill dequants each Q4_0 projection → this reused BF16 buffer for the cuBLAS GEMM.
     // Sized to the largest projection (FF×H). Serial reuse is safe — all on the null stream.
@@ -210,27 +214,32 @@ __nv_bfloat16* up_bf16_gguf(const e4bgguf::GgufFile& g, const std::string& name,
     return d;
 }
 
-// Build a native Q4_0 SoA weight straight from the GGUF Q4_0 source bytes (no BF16
-// round-trip). Requires the tensor to BE Q4_0; logs + returns false otherwise so the
-// caller can fall back. Adds the SoA bytes to *total.
-bool build_q40_gguf(const e4bgguf::GgufFile& g, const std::string& name,
-                    int out_dim, int in_dim, e4bq40::Q40Weight* w, uint64_t* total) {
+// Copy a GGUF tensor's raw quantized block stream verbatim to device (no dequant). Used
+// for the native Q4_0 projections (18 B/32-elem block) and the Q6_K tied head (210 B/256).
+// Validates the ggml type and element count; logs + returns false on any mismatch.
+bool copy_blocks_gguf(const e4bgguf::GgufFile& g, const std::string& name, uint32_t want_type,
+                      size_t block_bytes, int block_elems, int64_t expect_elems,
+                      uint8_t** d_out, uint64_t* total) {
     uint64_t off, n_el; uint32_t gtype;
     if (!g.find(name.c_str(), &off, &n_el, &gtype)) {
-        fprintf(stderr, "e4b: missing GGUF tensor %s (q40)\n", name.c_str()); return false;
+        fprintf(stderr, "e4b: missing GGUF tensor %s\n", name.c_str()); return false;
     }
-    if (gtype != e4bgguf::GGML_TYPE_Q4_0) {
-        fprintf(stderr, "e4b: %s is ggml type %u, not Q4_0 — native Q4_0 decode needs Q4_0\n",
-                name.c_str(), gtype); return false;
+    if (gtype != want_type) {
+        fprintf(stderr, "e4b: %s is ggml type %u, expected %u (native decode)\n",
+                name.c_str(), gtype, want_type); return false;
     }
-    if ((int64_t)n_el != (int64_t)out_dim * in_dim) {
-        fprintf(stderr, "e4b: %s q40 elem mismatch (%llu vs %lld)\n", name.c_str(),
-                (unsigned long long)n_el, (long long)out_dim * in_dim); return false;
+    if ((int64_t)n_el != expect_elems) {
+        fprintf(stderr, "e4b: %s elem mismatch (%llu vs %lld)\n", name.c_str(),
+                (unsigned long long)n_el, (long long)expect_elems); return false;
     }
-    if (!e4bq40::e4b_q4_0_from_gguf(g.data + off, out_dim, in_dim, w)) {
-        fprintf(stderr, "e4b: q40 build %s failed\n", name.c_str()); return false;
+    const size_t bytes = ((size_t)n_el / block_elems) * block_bytes;
+    if (cudaMalloc(d_out, bytes) != cudaSuccess) {
+        fprintf(stderr, "e4b: cudaMalloc %zu for %s failed\n", bytes, name.c_str()); return false;
     }
-    *total += w->bytes;
+    if (cudaMemcpy(*d_out, g.data + off, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        fprintf(stderr, "e4b: H2D %s failed\n", name.c_str()); cudaFree(*d_out); *d_out=nullptr; return false;
+    }
+    *total += bytes;
     return true;
 }
 
@@ -428,45 +437,46 @@ static bool e4b_load_weights_gguf(e4b_engine* eng, const char* model_path) {
     }
 
     // ── native Q4_0 decode setup (default ON for Q4_0 GGUF; opt-out FUCINA_E4B_FP4=0) ──
-    // Build the 7 matmul projections as native Q4_0 SoA off the on-disk nibbles — same
-    // 4.5-bit footprint as the NVFP4 hybrid but the ORIGINAL QAT weights (no re-quant),
-    // and decoded via dp4a. The tied head stays FP8 (precision for argmax). BF16 is kept
-    // for the T>1 prefill GEMM (freed later by an on-the-fly dequant prefill path).
+    // Copy the 7 matmul projections (Q4_0) + the tied head (Q6_K) verbatim from the GGUF and
+    // decode them through the SHARED dp4a MMVQ kernels (mmvq.cuh) — the exact path the dense
+    // 12B uses (native Q4_0 batched GEMV + native Q6_K head). The BF16 projections are freed;
+    // prefill dequants Q4_0 → BF16 scratch for the cuBLAS GEMM.
     if (ok) if (const char* e = getenv("FUCINA_E4B_FP4"); !(e && e[0]=='0')) {
-        const int H_ = H, FF = c.intermediate_size, V_ = V;
+        const int H_ = H, FF = c.intermediate_size, V_ = V, S = 8;  // S = max concurrent seqs
         bool q40 = true;
         for (int i = 0; i < c.n_layers && q40; ++i) {
             Layer& L = eng->layers[i];
             const bool full = (c.layer_types[i] == e4b::Attn::FULL);
             const int hd = full ? c.global_head_dim : c.head_dim;
             const int qd = c.n_heads * hd, kvd = c.n_kv_heads * hd;
-            q40 &= build_q40_gguf(g, nm.L(i, "attn_q.weight"),      qd,  H_, &L.q40_wq,   &eng->dev_bytes);
-            q40 &= build_q40_gguf(g, nm.L(i, "attn_output.weight"), H_,  qd, &L.q40_wo,   &eng->dev_bytes);
-            q40 &= build_q40_gguf(g, nm.L(i, "ffn_gate.weight"),    FF,  H_, &L.q40_gate, &eng->dev_bytes);
-            q40 &= build_q40_gguf(g, nm.L(i, "ffn_up.weight"),      FF,  H_, &L.q40_up,   &eng->dev_bytes);
-            q40 &= build_q40_gguf(g, nm.L(i, "ffn_down.weight"),    H_,  FF, &L.q40_down, &eng->dev_bytes);
+            auto cp = [&](const char* t, int64_t el, uint8_t** d){
+                return copy_blocks_gguf(g, nm.L(i, t), e4bgguf::GGML_TYPE_Q4_0, 18, 32, el, d, &eng->dev_bytes); };
+            q40 &= cp("attn_q.weight",      (int64_t)qd*H_,  &L.q40_wq);
+            q40 &= cp("attn_output.weight", (int64_t)H_*qd,  &L.q40_wo);
+            q40 &= cp("ffn_gate.weight",    (int64_t)FF*H_,  &L.q40_gate);
+            q40 &= cp("ffn_up.weight",      (int64_t)FF*H_,  &L.q40_up);
+            q40 &= cp("ffn_down.weight",    (int64_t)H_*FF,  &L.q40_down);
             if (!c.layer_shares_kv(i)) {
-                q40 &= build_q40_gguf(g, nm.L(i, "attn_k.weight"), kvd, H_, &L.q40_wk, &eng->dev_bytes);
-                q40 &= build_q40_gguf(g, nm.L(i, "attn_v.weight"), kvd, H_, &L.q40_wv, &eng->dev_bytes);
+                q40 &= cp("attn_k.weight", (int64_t)kvd*H_, &L.q40_wk);
+                q40 &= cp("attn_v.weight", (int64_t)kvd*H_, &L.q40_wv);
             }
         }
-        // tied head → FP8 (decode reads it once/token; argmax wants >4-bit precision).
-        q40 &= e4bfp4::e4b_fp8_quantize(eng->d_embed, V_, H_, &eng->fp8_head);
-        // activation Q8_1 scratch + f32 GEMV output (max dim = FF), plus the FP8 head's xf.
-        q40 &= (cudaMalloc(&eng->d_q40_qa, (size_t)FF)              == cudaSuccess);
-        q40 &= (cudaMalloc(&eng->d_q40_da, (size_t)(FF/32)*sizeof(float))   == cudaSuccess);
-        q40 &= (cudaMalloc(&eng->d_q40_sa, (size_t)(FF/32)*sizeof(int32_t)) == cudaSuccess);
-        q40 &= (cudaMalloc(&eng->d_fp4_xf, (size_t)FF*sizeof(float)) == cudaSuccess);
-        q40 &= (cudaMalloc(&eng->d_fp4_yf, (size_t)FF*sizeof(float)) == cudaSuccess);
-        // Prefill dequant scratch: largest projection is FF×H (also ≥ qd×H, kvd×H).
+        // tied LM head: native Q6_K token_embd (mmvq_q6_k) — 6.5-bit, no re-quant, argmax-precise.
+        q40 &= copy_blocks_gguf(g, nm.token_embd(), e4bgguf::GGML_TYPE_Q6_K, 210, 256,
+                                (int64_t)V_*H_, &eng->d_q6k_head, &eng->dev_bytes);
+        // activation Q8_1 scratch (batched: up to S rows) + f32 MMVQ output (S*FF) + prefill dequant.
+        q40 &= (cudaMalloc(&eng->d_q40_qa, (size_t)S*FF)                      == cudaSuccess);
+        q40 &= (cudaMalloc(&eng->d_q40_da, (size_t)S*(FF/32)*sizeof(float))   == cudaSuccess);
+        q40 &= (cudaMalloc(&eng->d_q40_sa, (size_t)S*(FF/32)*sizeof(int32_t)) == cudaSuccess);
+        q40 &= (cudaMalloc(&eng->d_fp4_yf, (size_t)S*FF*sizeof(float))        == cudaSuccess);
         const size_t maxproj = (size_t)FF * H_;
-        q40 &= (cudaMalloc(&eng->d_q40_wdq, maxproj * sizeof(__nv_bfloat16)) == cudaSuccess);
+        q40 &= (cudaMalloc(&eng->d_q40_wdq, maxproj * sizeof(__nv_bfloat16))  == cudaSuccess);
         if (cudaDeviceSynchronize() != cudaSuccess || !q40) {
             fprintf(stderr, "e4b: native Q4_0 decode setup failed — falling back to BF16 decode\n");
         } else {
             eng->use_q40 = 1;
-            // The BF16 projection weights are no longer needed — prefill dequants from Q4_0
-            // into d_q40_wdq, decode reads the Q4_0 nibbles. Free them (the ~half-memory win).
+            // BF16 projections no longer needed — prefill dequants Q4_0→scratch, decode reads
+            // the native nibbles. Free them (the ~half-memory win).
             uint64_t freed = 0;
             auto FR = [&](__nv_bfloat16*& p, int64_t elems){ if (p){ cudaFree(p); p=nullptr; freed += (uint64_t)elems*sizeof(__nv_bfloat16); } };
             for (int i = 0; i < c.n_layers; ++i) {
@@ -479,15 +489,10 @@ static bool e4b_load_weights_gguf(e4b_engine* eng, const char* model_path) {
                 if (!c.layer_shares_kv(i)) { FR(L.wk, (int64_t)kvd*H_); FR(L.wv, (int64_t)kvd*H_); }
             }
             eng->dev_bytes -= freed;
-            uint64_t qb = eng->fp8_head.bytes;
-            for (Layer& L : eng->layers)
-                qb += L.q40_wq.bytes + L.q40_wo.bytes + L.q40_gate.bytes + L.q40_up.bytes +
-                      L.q40_down.bytes + L.q40_wk.bytes + L.q40_wv.bytes;
-            eng->dev_bytes += (size_t)FF + (size_t)(FF/32)*8 + 2*(uint64_t)FF*sizeof(float)
+            eng->dev_bytes += (size_t)S*FF + (size_t)S*(FF/32)*8 + (size_t)S*FF*sizeof(float)
                             + maxproj*sizeof(__nv_bfloat16);
-            fprintf(stderr, "e4b: native Q4_0 decode ON (%.2f GB: matmuls@Q4_0 + head@FP8; "
-                    "original QAT nibbles, dp4a GEMV; freed %.2f GB BF16 projections, "
-                    "prefill dequants on the fly)\n", qb / 1e9, freed / 1e9);
+            fprintf(stderr, "e4b: native Q4_0 decode ON (matmuls@Q4_0 + head@Q6_K via shared MMVQ; "
+                    "freed %.2f GB BF16 projections, prefill dequants on the fly)\n", freed / 1e9);
         }
     }
 
@@ -596,13 +601,17 @@ extern "C" void e4b_engine_destroy(e4b_engine_t *eng) {
         e4bfp4::weight_free(&L.fp4_gate); e4bfp4::weight_free(&L.fp4_up); e4bfp4::weight_free(&L.fp4_down);
         e4bfp4::weight_free(&L.fp4_wv);   e4bfp4::weight_free(&L.fp4_wo);
         e4bfp4::fp8_weight_free(&L.fp8_wq); e4bfp4::fp8_weight_free(&L.fp8_wk);
-        e4bq40::q40_free(&L.q40_wq); e4bq40::q40_free(&L.q40_wk); e4bq40::q40_free(&L.q40_wv);
-        e4bq40::q40_free(&L.q40_wo); e4bq40::q40_free(&L.q40_gate); e4bq40::q40_free(&L.q40_up);
-        e4bq40::q40_free(&L.q40_down);
+        auto FU = [](uint8_t* p){ if (p) cudaFree(p); };
+        FU(L.q40_wq); FU(L.q40_wk); FU(L.q40_wv); FU(L.q40_wo);
+        FU(L.q40_gate); FU(L.q40_up); FU(L.q40_down);
     }
     e4bfp4::fp8_weight_free(&eng->fp8_head);
     F(eng->d_fp4_xf); F(eng->d_fp4_yf);
-    F(eng->d_q40_qa); F(eng->d_q40_da); F(eng->d_q40_sa); F(eng->d_q40_wdq);
+    if (eng->d_q40_qa) cudaFree(eng->d_q40_qa);
+    if (eng->d_q40_da) cudaFree(eng->d_q40_da);
+    if (eng->d_q40_sa) cudaFree(eng->d_q40_sa);
+    if (eng->d_q40_wdq) cudaFree(eng->d_q40_wdq);
+    if (eng->d_q6k_head) cudaFree(eng->d_q6k_head);
     for (Slot& s : eng->slots) e4b_slot_free(eng, s);
     if (eng->cublas) cublasDestroy(eng->cublas);
     delete eng;
@@ -970,23 +979,25 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         rmsnorm_kernel<<<T,256>>>(d_hidden,L.input_ln,d_norm,T,H,eps);
 
         // Decode quant (T==1). Two mutually exclusive strategies:
-        //   use_q40 (GGUF Q4_0): every matmul via native Q4_0 dp4a GEMV off the on-disk nibbles.
+        //   use_q40 (GGUF Q4_0): every matmul via the SHARED dp4a MMVQ (mmvq.cuh), off the native
+        //   on-disk nibbles — quantize the bf16 activation to Q8_1, mmvq → f32, cast to bf16.
         //   use_fp4 (safetensors): Q/K via FP8 (index precision), V/O+FFN via NVFP4 (content).
-        // Prefill (T>1) and the BF16 fallback keep cuBLAS.
+        // Prefill (T>1) under use_q40 dequants Q4_0→scratch then cuBLAS; the BF16 path keeps cuBLAS.
         const bool fp4_dec = eng->use_fp4 && T==1;
         const bool q40_dec = eng->use_q40 && T==1;
-        auto q40gemv = [&](bf16* y, const e4bq40::Q40Weight& w, const bf16* x){
-            e4bq40::e4b_q4_0_gemv_bf16(y, w, x, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, eng->d_fp4_yf, 0);
+        auto q40dec = [&](bf16* y, const uint8_t* wb, const bf16* x, int out, int in){
+            quantize_q8_1_bf16_kernel<<<in/32,32,0,0>>>(x, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in);
+            mmvq_launch(eng->d_fp4_yf, wb, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in, out, 2, 0);
+            e4bfp4::to_bf16<<<(out+255)/256,256,0,0>>>(eng->d_fp4_yf, y, out);
         };
-        // Prefill (T>1) under use_q40: BF16 projections were freed, so dequant Q4_0 → scratch
-        // (reused; serial on the null stream) then the cuBLAS tensor-core GEMM, identical math.
-        auto prefill_q40 = [&](bf16* y, const e4bq40::Q40Weight& w, const bf16* x, int out, int in){
-            e4bq40::e4b_q4_0_dequant_bf16(w, eng->d_q40_wdq, 0);
+        auto prefill_q40 = [&](bf16* y, const uint8_t* wb, const bf16* x, int out, int in){
+            int64_t nblk=(int64_t)out*(in/32);
+            dequant_q4_0_to_bf16_kernel<<<(unsigned)((nblk+255)/256),256,0,0>>>(wb, eng->d_q40_wdq, in, nblk);
             linear(eng->cublas, eng->d_q40_wdq, x, y, T, out, in);
         };
 
         // Q (always projected) — q_norm, rope at absolute positions
-        if      (q40_dec)      q40gemv(d_q, L.q40_wq, d_norm);
+        if      (q40_dec)      q40dec(d_q, L.q40_wq, d_norm, qd, H);
         else if (fp4_dec)      e4bfp4::e4b_fp8_gemv_bf16(d_q, L.fp8_wq, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
         else if (eng->use_q40) prefill_q40(d_q, L.q40_wq, d_norm, qd, H);
         else                   linear(eng->cublas,L.wq,d_norm,d_q,T,qd,H);
@@ -997,8 +1008,8 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         // skip (their provider — an earlier layer this same step — already wrote it).
         if (!shared){
             if (q40_dec){
-                q40gemv(d_k, L.q40_wk, d_norm);
-                q40gemv(d_v, L.q40_wv, d_norm);
+                q40dec(d_k, L.q40_wk, d_norm, kvd, H);
+                q40dec(d_v, L.q40_wv, d_norm, kvd, H);
             } else if (fp4_dec){
                 e4bfp4::e4b_fp8_gemv_bf16(d_k, L.fp8_wk, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
                 e4bfp4::e4b_nvfp4_gemv_bf16(d_v, L.fp4_wv, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
@@ -1021,7 +1032,7 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         attn_cache_kernel<<<ag,256,sh>>>(d_q,kcache,vcache,d_attn,T,n_past,c.n_heads,c.n_kv_heads,hd,1.0f,window);
 
         // o_proj → d_norm; post_attention_layernorm; hidden = residual + that
-        if      (q40_dec)      q40gemv(d_norm, L.q40_wo, d_attn);
+        if      (q40_dec)      q40dec(d_norm, L.q40_wo, d_attn, H, qd);
         else if (fp4_dec)      e4bfp4::e4b_nvfp4_gemv_bf16(d_norm, L.fp4_wo, d_attn, eng->d_fp4_xf, eng->d_fp4_yf, 0);
         else if (eng->use_q40) prefill_q40(d_norm, L.q40_wo, d_attn, H, qd);
         else                   linear(eng->cublas,L.wo,d_attn,d_norm,T,H,qd);
@@ -1036,10 +1047,12 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         // bandwidth-tuned GEMV (default; unless FUCINA_E4B_FP4=0); prefill (T>1) stays on the BF16
         // tensor-core GEMM. GeGLU and the surrounding norms/residual are identical.
         if (q40_dec){
-            q40gemv(d_gate, L.q40_gate, d_norm);
-            q40gemv(d_up,   L.q40_up,   d_norm);
+            // Unfused gate/up + GeGLU + down (matches the batched path bit-for-bit; the fused
+            // mmvq_glu keeps gate·up in f32 and would diverge from the batched unfused rounding).
+            q40dec(d_gate, L.q40_gate, d_norm, FF, H);
+            q40dec(d_up,   L.q40_up,   d_norm, FF, H);
             geglu_kernel<<<GRID(T*FF),256>>>(d_gate,d_up,d_act,T*FF);
-            q40gemv(d_norm, L.q40_down, d_act);
+            q40dec(d_norm, L.q40_down, d_act, H, FF);
         } else if (fp4_dec){
             e4bfp4::e4b_nvfp4_gemv_bf16(d_gate, L.fp4_gate, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
             e4bfp4::e4b_nvfp4_gemv_bf16(d_up,   L.fp4_up,   d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
@@ -1081,14 +1094,17 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         to_f32_kernel<<<GRID(T*H),256>>>(d_norm,tmp,T*H);
         cudaMemcpy(fin_out,tmp,(size_t)T*H*4,cudaMemcpyDeviceToHost); cudaFree(tmp); }
 
-    // logits of the last token (tied head + softcap). This is ALWAYS a 1-row projection
-    // (last token only), so the FP8 decision head applies whenever quant is on — including
-    // the last-token logits of prefill — not just decode. It writes fp32 logits directly
-    // (no bf16 round-trip); xf scratch is d_fp4_xf (H ≤ FF floats).
+    // logits of the last token (tied head + softcap). ALWAYS a 1-row projection (last token
+    // only), so the quantized head applies whenever quant is on — including prefill's last
+    // token. Writes fp32 logits directly. use_q40 → native Q6_K head (mmvq_q6_k); the
+    // safetensors NVFP4 path → FP8 head; BF16 fallback → cuBLAS.
     if (logits_last_out){
         const bf16* xrow = d_norm + (size_t)(T-1)*H;
         float* d_logits_f; cudaMalloc(&d_logits_f,(size_t)V*4);
-        if (eng->use_fp4 || eng->use_q40){   // both keep the tied head in FP8
+        if (eng->use_q40){   // native Q6_K tied head via shared MMVQ
+            quantize_q8_1_bf16_kernel<<<H/32,32,0,0>>>(xrow, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, H);
+            mmvq_q6_k_launch(d_logits_f, eng->d_q6k_head, eng->d_q40_qa, eng->d_q40_da, H, V, 0);
+        } else if (eng->use_fp4){
             e4bfp4::e4b_fp8_gemv_f32(d_logits_f, eng->fp8_head, xrow, eng->d_fp4_xf, 0);
         } else {
             bf16* d_logits_bf; cudaMalloc(&d_logits_bf,(size_t)V*2);
@@ -1213,10 +1229,17 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
         float* d_invf=full?d_invf_f:d_invf_s;
         // Projection over B rows. Under use_q40 the BF16 weights were freed, so dequant the
         // Q4_0 nibbles → scratch then GEMM (weights still read once for the B-token batch).
-        auto bproj = [&](bf16* y, __nv_bfloat16* Wbf, const e4bq40::Q40Weight& w40, const bf16* x, int out, int in){
-            if (eng->use_q40){ e4bq40::e4b_q4_0_dequant_bf16(w40, eng->d_q40_wdq, 0);
-                               linear(eng->cublas, eng->d_q40_wdq, x, y, B, out, in); }
-            else             linear(eng->cublas, Wbf, x, y, B, out, in);
+        auto bproj = [&](bf16* y, __nv_bfloat16* Wbf, const uint8_t* wb40, const bf16* x, int out, int in){
+            if (eng->use_q40){
+                // Per-token MMVQ — identical kernel to the single-seq decode (q40dec), so batched
+                // output is bit-for-bit == independent decode. (True batched dp4a — weight read once
+                // for all B tokens via mmvq_batched — is a follow-up; the kernel exists in mmvq.cuh.)
+                for (int n = 0; n < B; n++) {
+                    quantize_q8_1_bf16_kernel<<<in/32,32,0,0>>>(x + (size_t)n*in, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in);
+                    mmvq_launch(eng->d_fp4_yf, wb40, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in, out, 2, 0);
+                    e4bfp4::to_bf16<<<(out+255)/256,256,0,0>>>(eng->d_fp4_yf, y + (size_t)n*out, out);
+                }
+            } else linear(eng->cublas, Wbf, x, y, B, out, in);
         };
         // gather this layer's per-slot cache pointers
         for (int b=0;b<B;b++){ Slot& s=eng->slots[slot_ids[b]]; hk[b]=s.kc[li]; hv[b]=s.vc[li]; }
@@ -1264,11 +1287,20 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
         cudaMemcpy(d_hidden,d_tmpH,(size_t)B*H*2,cudaMemcpyDeviceToDevice);
     }
     rmsnorm_kernel<<<B,256>>>(d_hidden,eng->d_final_norm,d_norm,B,H,eps);
-    // logits for all B rows → argmax each
-    bf16* d_logits_bf; cudaMalloc(&d_logits_bf,(size_t)B*V*2);
-    linear(eng->cublas, eng->d_embed, d_norm, d_logits_bf, B, V, H);
+    // logits for all B rows → argmax each. use_q40 → native Q6_K head per row (same kernel as
+    // single-seq, so batched == independent); else cuBLAS over the BF16 tied embedding.
     float* d_logits_f; cudaMalloc(&d_logits_f,(size_t)B*V*4);
-    to_f32_kernel<<<GRID(B*V),256>>>(d_logits_bf,d_logits_f,B*V);
+    if (eng->use_q40){
+        for (int n = 0; n < B; n++) {
+            quantize_q8_1_bf16_kernel<<<H/32,32,0,0>>>(d_norm + (size_t)n*H, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, H);
+            mmvq_q6_k_launch(d_logits_f + (size_t)n*V, eng->d_q6k_head, eng->d_q40_qa, eng->d_q40_da, H, V, 0);
+        }
+    } else {
+        bf16* d_logits_bf; cudaMalloc(&d_logits_bf,(size_t)B*V*2);
+        linear(eng->cublas, eng->d_embed, d_norm, d_logits_bf, B, V, H);
+        to_f32_kernel<<<GRID(B*V),256>>>(d_logits_bf,d_logits_f,B*V);
+        cudaFree(d_logits_bf);
+    }
     softcap_kernel<<<GRID(B*V),256>>>(d_logits_f,B*V,c.final_logit_softcap);
     std::vector<float> hl((size_t)B*V);
     cudaMemcpy(hl.data(),d_logits_f,(size_t)B*V*4,cudaMemcpyDeviceToHost);
@@ -1279,7 +1311,7 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
     cudaFree(d_ids);cudaFree(d_pos);cudaFree(d_kptr);cudaFree(d_vptr);cudaFree(d_hidden);cudaFree(d_norm);
     cudaFree(d_tmpH);cudaFree(d_q);cudaFree(d_k);cudaFree(d_v);cudaFree(d_attn);cudaFree(d_gate);cudaFree(d_up);
     cudaFree(d_act);cudaFree(d_pleg);cudaFree(d_ple_lookup);cudaFree(d_ple_ctx);cudaFree(d_pli);
-    cudaFree(d_logits_bf);cudaFree(d_logits_f);cudaFree(d_invf_s);cudaFree(d_invf_f);
+    cudaFree(d_logits_f);cudaFree(d_invf_s);cudaFree(d_invf_f);
     return err==cudaSuccess?0:-1;
 }
 

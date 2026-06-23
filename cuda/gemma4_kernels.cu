@@ -38,6 +38,7 @@
 // decode_layer) stays raw-pointer C-style — no STL ever crosses into the hot loop.
 #include "safetensors.h"
 #include "nvfp4.h"
+#include "mmvq.cuh"   // shared dp4a MMVQ kernels (moved out of this TU; single source)
 #include "nvfp4_loader.h"
 #include "nvfp4_gemv.cuh"
 // =========================================================================
@@ -520,11 +521,6 @@ __global__ void softmax_kernel(float *x, int n) {
 // Requires a __shared__ float buf[32] visible to the caller.
 // Warp-level butterfly sum — the reduced value ends up in ALL 32 lanes (no smem,
 // no __syncthreads). Used by the tiled flash-prefill kernels (warp-per-query).
-__device__ __forceinline__ float warp_reduce_sum_all(float v) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, o);
-    return v;
-}
 
 __device__ float block_reduce_sum(float val, float *smem) {
     int lane = threadIdx.x & 31;
@@ -660,37 +656,10 @@ __global__ void rms_norm_rows_kernel(
 
 // Read 4 packed int8 as one int, tolerating the 2-byte alignment of a Q8_0 block's
 // qs (it starts at byte offset 2 within the 34-byte block).
-static __device__ __forceinline__ int q8_get_int_b2(const void *p, int i32) {
-    const uint16_t *x16 = (const uint16_t *)p;
-    return (int)x16[2*i32] | ((int)x16[2*i32 + 1] << 16);
-}
 
 // Quantize x[in_dim] to symmetric per-32-block int8 + per-block scale. qx[in_dim]
 // is 4-byte aligned at every block boundary (32 | offset); dx[in_dim/32]. One warp
 // per block. in_dim is a multiple of 32 for every gemma4 projection.
-__global__ void quantize_q8_1_kernel(
-    const float *x, int8_t *qx, float *dx, int *sx, int in_dim)
-{
-    int b = blockIdx.x, lane = threadIdx.x;     // 32 threads = one block
-    int i = b*32 + lane;
-    float v = (i < in_dim) ? x[i] : 0.0f;
-    float a = fabsf(v);
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, o));
-    float d  = a / 127.0f;
-    float id = (d > 0.0f) ? 1.0f / d : 0.0f;
-    int q = __float2int_rn(v * id);
-    q = max(-127, min(127, q));
-    if (i < in_dim) qx[i] = (int8_t)q;
-    // Per-block Σ of the int8 activations. Folds the Q4_0 −8 nibble correction
-    // (out = dw·dx·(Σ nibble·qx − 8·Σ qx)) so mmvq_q4_0 reads this instead of recomputing
-    // Σqx via 8 dp4a/block. Identical integer to the old dp4a(0x01010101,·) sum → bit-exact.
-    // in_dim is always a multiple of 32 for gemma4 projections (no partial block). (#6b.)
-    int qsum = q;
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) qsum += __shfl_xor_sync(0xFFFFFFFF, qsum, o);
-    if (lane == 0) { dx[b] = d; sx[b] = qsum; }
-}
 
 // BF16-input variant of quantize_q8_1_kernel: the prefill projection activation
 // already lives as BF16 in d_inb (rms-norm / attn-out / geglu outputs), so the
@@ -698,55 +667,10 @@ __global__ void quantize_q8_1_kernel(
 // copy. Same per-32-block symmetric int8 + Σqx layout; one warp per block. The
 // only difference is the load (BF16→float); the math is identical to the FP32
 // kernel above, so MMQ prefill and the dp4a decode path are numerically aligned.
-__global__ void quantize_q8_1_bf16_kernel(
-    const __nv_bfloat16 *x, int8_t *qx, float *dx, int *sx, int in_dim)
-{
-    int b = blockIdx.x, lane = threadIdx.x;     // 32 threads = one block
-    int i = b*32 + lane;
-    float v = (i < in_dim) ? __bfloat162float(x[i]) : 0.0f;
-    float a = fabsf(v);
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, o));
-    float d  = a / 127.0f;
-    float id = (d > 0.0f) ? 1.0f / d : 0.0f;
-    int q = __float2int_rn(v * id);
-    q = max(-127, min(127, q));
-    if (i < in_dim) qx[i] = (int8_t)q;
-    int qsum = q;
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) qsum += __shfl_xor_sync(0xFFFFFFFF, qsum, o);
-    if (lane == 0) { dx[b] = d; sx[b] = qsum; }
-}
 
 // MMVQ (warp-per-row): out[idx] = Σ_block d_w_b · d_x_b · Σ_k __dp4a(weight_qs[k], act_qs[k]).
 // Each WARP owns one output row; its 32 lanes stride the nb blocks and reduce via __shfl
 // (no block_reduce_sum / __syncthreads). nwarps rows per block. (DECODE-30-35 Step 5.)
-__global__ void mmvq_q8_0_kernel(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
-    int in_dim, int out_dim)
-{
-    int nwarps = blockDim.x >> 5;
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int idx = blockIdx.x * nwarps + warp;
-    if (idx >= out_dim) return;
-    int nb = in_dim >> 5;
-    const uint8_t *wrow = weight + (size_t)idx * (size_t)nb * 34;
-    float acc = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
-        const uint8_t *blk = wrow + (size_t)b * 34;
-        __half_raw hr; hr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
-        float dw = __half2float(__half(hr));
-        const void *wqs = blk + 2;                       // weight int8 (2-byte aligned)
-        const int  *xqs = (const int *)(qx + (size_t)b * 32);  // act int8 (4-byte aligned)
-        int sumi = 0;
-        #pragma unroll
-        for (int k = 0; k < 8; k++)
-            sumi = __dp4a(q8_get_int_b2(wqs, k), xqs[k], sumi);
-        acc += dw * dx[b] * (float)sumi;
-    }
-    acc = warp_reduce_sum_all(acc);
-    if (lane == 0) out[idx] = acc;
-}
 
 // MMVQ for Q4_0 weights (the QAT 4-bit layers). Q4_0 block = fp16 scale + 16 bytes of
 // 32 nibbles; value = dw*(nibble-8). The -8 offset makes it asymmetric, so unlike Q8_0
@@ -754,37 +678,6 @@ __global__ void mmvq_q8_0_kernel(
 // per-block int8 quantization as the Q8_0 path (quantize_q8_1_kernel); the block sum is
 // computed here from qx via dp4a(0x01010101,·). nibble layout matches llama.cpp
 // (byte j → elem j low, elem j+16 high), read 4-bytes-at-a-time (8 nibbles).
-__global__ void mmvq_q4_0_kernel(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
-    int in_dim, int out_dim)
-{
-    int nwarps = blockDim.x >> 5;
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int idx = blockIdx.x * nwarps + warp;
-    if (idx >= out_dim) return;
-    int nb = in_dim >> 5;
-    const uint8_t *wrow = weight + (size_t)idx * (size_t)nb * 18;
-    float acc = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
-        const uint8_t *blk = wrow + (size_t)b * 18;
-        __half_raw hr; hr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
-        float dw = __half2float(__half(hr));
-        const void *wqs = blk + 2;                            // 16 nibble-bytes (2-byte aligned)
-        const int  *xqs = (const int *)(qx + (size_t)b * 32); // 32 act int8 (4-byte aligned)
-        int sumi = 0;
-        #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            int w   = q8_get_int_b2(wqs, k);     // 4 bytes = 8 nibbles
-            int vlo = w & 0x0F0F0F0F;            // elems 4k..4k+3   (raw nibble 0..15)
-            int vhi = (w >> 4) & 0x0F0F0F0F;     // elems 4k+16..4k+19
-            sumi = __dp4a(vlo, xqs[k],     sumi);
-            sumi = __dp4a(vhi, xqs[k + 4], sumi);
-        }
-        acc += dw * dx[b] * (float)(sumi - 8 * sx[b]);   // sx[b] = Σqx (precomputed in quantize)
-    }
-    acc = warp_reduce_sum_all(acc);
-    if (lane == 0) out[idx] = acc;
-}
 
 // Batched MMVQ for Q4_0 weights: the dp4a analogue of gemv_batched_kernel_t. Reads each
 // weight ROW once (12.65 GB / pass), decodes the 32 nibbles once, then reuses them across
@@ -793,121 +686,12 @@ __global__ void mmvq_q4_0_kernel(
 // that decode_weight hits. qx/dx are token-major: qx[n*in_dim + i], dx[n*(in_dim/32) + b],
 // matching quantize_q8_1_kernel run over the whole [NK × in_dim] activation block at once.
 // Per-block correction mirrors mmvq_q4_0_kernel: out = Σ_b dw·dx·(Σ nibble·qx − 8·Σ qx).
-template<int NK>
-__global__ void mmvq_q4_0_batched_kernel(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
-    int in_dim, int out_dim)
-{
-    int nwarps = blockDim.x >> 5;
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int idx = blockIdx.x * nwarps + warp;
-    if (idx >= out_dim) return;
-    int nb = in_dim >> 5;
-    const uint8_t *wrow = weight + (size_t)idx * (size_t)nb * 18;
-    float acc[NK];
-    #pragma unroll
-    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
-        const uint8_t *blk = wrow + (size_t)b * 18;
-        __half_raw hr; hr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
-        float dw = __half2float(__half(hr));
-        const void *wqs = blk + 2;                       // 16 nibble-bytes (2-byte aligned)
-        int wv[8];                                       // decode the 32 nibbles ONCE
-        #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            int w = q8_get_int_b2(wqs, k);
-            wv[2*k]   =  w        & 0x0F0F0F0F;          // elems 4k..4k+3   (low nibble)
-            wv[2*k+1] = (w >> 4)  & 0x0F0F0F0F;          // elems 4k+16..4k+19 (high nibble)
-        }
-        #pragma unroll
-        for (int n = 0; n < NK; n++) {
-            const int *xqs = (const int *)(qx + (size_t)n*in_dim + (size_t)b*32);
-            int sumi = 0;
-            #pragma unroll
-            for (int k = 0; k < 4; k++) {
-                sumi = __dp4a(wv[2*k],   xqs[k],     sumi);
-                sumi = __dp4a(wv[2*k+1], xqs[k + 4], sumi);
-            }
-            acc[n] += dw * dx[(size_t)n*nb + b] * (float)(sumi - 8*sx[(size_t)n*nb + b]);
-        }
-    }
-    #pragma unroll
-    for (int n = 0; n < NK; n++) {
-        float s = warp_reduce_sum_all(acc[n]);
-        if (lane == 0) out[(size_t)n*out_dim + idx] = s;
-    }
-}
 
 // Batched MMVQ for Q8_0 weights — same weight-row-reuse idea, no nibble unpack / -8 term.
-template<int NK>
-__global__ void mmvq_q8_0_batched_kernel(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
-    int in_dim, int out_dim)
-{
-    int nwarps = blockDim.x >> 5;
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int idx = blockIdx.x * nwarps + warp;
-    if (idx >= out_dim) return;
-    int nb = in_dim >> 5;
-    const uint8_t *wrow = weight + (size_t)idx * (size_t)nb * 34;
-    float acc[NK];
-    #pragma unroll
-    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
-        const uint8_t *blk = wrow + (size_t)b * 34;
-        __half_raw hr; hr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
-        float dw = __half2float(__half(hr));
-        const void *wqs = blk + 2;                       // 32 weight int8 (2-byte aligned)
-        int wv[8];
-        #pragma unroll
-        for (int k = 0; k < 8; k++) wv[k] = q8_get_int_b2(wqs, k);
-        #pragma unroll
-        for (int n = 0; n < NK; n++) {
-            const int *xqs = (const int *)(qx + (size_t)n*in_dim + (size_t)b*32);
-            int sumi = 0;
-            #pragma unroll
-            for (int k = 0; k < 8; k++) sumi = __dp4a(wv[k], xqs[k], sumi);
-            acc[n] += dw * dx[(size_t)n*nb + b] * (float)sumi;
-        }
-    }
-    #pragma unroll
-    for (int n = 0; n < NK; n++) {
-        float s = warp_reduce_sum_all(acc[n]);
-        if (lane == 0) out[(size_t)n*out_dim + idx] = s;
-    }
-}
 
 // Dispatch the batched MMVQ (dp4a) to the compile-time-NK kernel. qx/dx must already hold
 // the NK quantized activation vectors (token-major). K ≤ 8 → one weight pass; K > 8 splits
 // into ≤8-wide chunks (each re-reads the weight, still far cheaper than K scalar decodes).
-static void mmvq_batched_launch(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
-    int in_dim, int out_dim, int K, int fmt, cudaStream_t stream)
-{
-    const int NWARPS = 8; int b = NWARPS*32;             // warp-per-row (Step 5): no smem
-    dim3 g((out_dim + NWARPS - 1) / NWARPS);
-    #define LAUNCH(NK)                                                                  \
-        do { if (fmt == 2)                                                              \
-            mmvq_q4_0_batched_kernel<NK><<<g,b,0,stream>>>(out,weight,qx,dx,sx,in_dim,out_dim); \
-        else                                                                           \
-            mmvq_q8_0_batched_kernel<NK><<<g,b,0,stream>>>(out,weight,qx,dx,in_dim,out_dim); \
-        } while (0)
-    switch (K) {
-        case 1: LAUNCH(1); break;  case 2: LAUNCH(2); break;
-        case 3: LAUNCH(3); break;  case 4: LAUNCH(4); break;
-        case 5: LAUNCH(5); break;  case 6: LAUNCH(6); break;
-        case 7: LAUNCH(7); break;  case 8: LAUNCH(8); break;
-        default:
-            for (int o = 0; o < K; o += 8) {
-                int kk = (K - o < 8) ? (K - o) : 8;
-                mmvq_batched_launch(out + (size_t)o*out_dim, weight,
-                                    qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
-                                    sx + (size_t)o*(in_dim>>5),
-                                    in_dim, out_dim, kk, fmt, stream);
-            }
-    }
-    #undef LAUNCH
-}
 
 // ─── FUCINA_PACKED: repacked-Q4_0 decode GEMV (coalesced uint4 loads) ─────────────────────
 // Repack one projection's native Q4_0 blocks (18 B = fp16 scale ‖ 16 nibble bytes) into a
@@ -915,92 +699,14 @@ static void mmvq_batched_launch(
 // i's quants land 16-B aligned at quants+i·16; its scale at scales[i] (raw fp16 bits). One
 // thread per block; bandwidth-bound but runs ONCE at load. Total bytes per projection equal
 // the native 18·nb·out_dim, so packed offsets mirror native offsets (no overlap).
-__global__ void repack_q4_0_kernel(
-    const uint8_t *src, uint8_t *quants, uint16_t *scales, size_t nblocks)
-{
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nblocks) return;
-    const uint8_t *blk = src + i * 18;
-    scales[i] = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));   // raw fp16 scale bits
-    uint8_t *d = quants + i * 16;
-    #pragma unroll
-    for (int k = 0; k < 16; k++) d[k] = blk[2 + k];            // 32 packed 4-bit weights
-}
 
 // Batched MMVQ over the REPACKED layout. Identical to mmvq_q4_0_batched_kernel — same warp-
 // per-row, same nibble unpack, same dp4a + (Σnibble − 8·Σqx) fold, same output — except each
 // block's 16 quant bytes arrive via one aligned uint4 load and the scale from a separate
 // 2-B array. Bit-for-bit equal results; the only change is memory-access granularity.
-template<int NK>
-__global__ void mmvq_q4_0_packed_batched_kernel(
-    float *out, const uint8_t *quants, const uint16_t *scales,
-    const int8_t *qx, const float *dx, const int *sx, int in_dim, int out_dim)
-{
-    int nwarps = blockDim.x >> 5;
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int idx = blockIdx.x * nwarps + warp;
-    if (idx >= out_dim) return;
-    int nb = in_dim >> 5;
-    const uint8_t  *qrow = quants + (size_t)idx * nb * 16;
-    const uint16_t *srow = scales + (size_t)idx * nb;
-    float acc[NK];
-    #pragma unroll
-    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
-        uint4 q = *(const uint4 *)(qrow + (size_t)b * 16);   // 128-bit coalesced load
-        __half_raw hr; hr.x = srow[b];
-        float dw = __half2float(__half(hr));
-        int wv[8];                                            // unpack 32 nibbles ONCE
-        int w0 = (int)q.x, w1 = (int)q.y, w2 = (int)q.z, w3 = (int)q.w;
-        wv[0] = w0 & 0x0F0F0F0F; wv[1] = (w0 >> 4) & 0x0F0F0F0F;
-        wv[2] = w1 & 0x0F0F0F0F; wv[3] = (w1 >> 4) & 0x0F0F0F0F;
-        wv[4] = w2 & 0x0F0F0F0F; wv[5] = (w2 >> 4) & 0x0F0F0F0F;
-        wv[6] = w3 & 0x0F0F0F0F; wv[7] = (w3 >> 4) & 0x0F0F0F0F;
-        #pragma unroll
-        for (int n = 0; n < NK; n++) {
-            const int *xqs = (const int *)(qx + (size_t)n*in_dim + (size_t)b*32);
-            int sumi = 0;
-            #pragma unroll
-            for (int k = 0; k < 4; k++) {
-                sumi = __dp4a(wv[2*k],   xqs[k],     sumi);
-                sumi = __dp4a(wv[2*k+1], xqs[k + 4], sumi);
-            }
-            acc[n] += dw * dx[(size_t)n*nb + b] * (float)(sumi - 8*sx[(size_t)n*nb + b]);
-        }
-    }
-    #pragma unroll
-    for (int n = 0; n < NK; n++) {
-        float s = warp_reduce_sum_all(acc[n]);
-        if (lane == 0) out[(size_t)n*out_dim + idx] = s;
-    }
-}
 
 // Dispatch the packed batched MMVQ to its compile-time-NK kernel (K ≤ 8 → one weight pass;
 // K > 8 splits into ≤8-wide chunks, each re-reading the weight). Q4_0 only.
-static void mmvq_q4_0_packed_batched_launch(
-    float *out, const uint8_t *quants, const uint16_t *scales,
-    const int8_t *qx, const float *dx, const int *sx,
-    int in_dim, int out_dim, int K, cudaStream_t stream)
-{
-    const int NWARPS = 8; int b = NWARPS*32;
-    dim3 g((out_dim + NWARPS - 1) / NWARPS);
-    #define LP(NK) mmvq_q4_0_packed_batched_kernel<NK><<<g,b,0,stream>>>( \
-        out, quants, scales, qx, dx, sx, in_dim, out_dim)
-    switch (K) {
-        case 1: LP(1); break;  case 2: LP(2); break;
-        case 3: LP(3); break;  case 4: LP(4); break;
-        case 5: LP(5); break;  case 6: LP(6); break;
-        case 7: LP(7); break;  case 8: LP(8); break;
-        default:
-            for (int o = 0; o < K; o += 8) {
-                int kk = (K - o < 8) ? (K - o) : 8;
-                mmvq_q4_0_packed_batched_launch(out + (size_t)o*out_dim, quants, scales,
-                    qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
-                    sx + (size_t)o*(in_dim>>5), in_dim, out_dim, kk, stream);
-            }
-    }
-    #undef LP
-}
 
 // ─── Tiled MMQ GEMM for Q4_0 (prefill projections, dp4a) ────────────────────────────────
 // Y[out_dim × N] = W_q4_0[out_dim × in_dim] · X_int8[in_dim × N], token-major output
@@ -1121,17 +827,6 @@ static void mmq_q4_0_launch(
 }
 
 // Single-token warp-per-row MMVQ launch (Step 5). NWARPS output rows per block, no smem.
-static inline void mmvq_launch(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
-    int in_dim, int out_dim, int fmt, cudaStream_t stream)
-{
-    const int NWARPS = 8; int b = NWARPS*32;
-    int g = (out_dim + NWARPS - 1) / NWARPS;
-    if (fmt == 2 /*Q4_0*/)
-        mmvq_q4_0_kernel<<<g, b, 0, stream>>>(out, weight, qx, dx, sx, in_dim, out_dim);
-    else
-        mmvq_q8_0_kernel<<<g, b, 0, stream>>>(out, weight, qx, dx, in_dim, out_dim);
-}
 
 // ── Q6_K matvec for the native tied LM head (DECODE-30-35 Step 8, dp4a rework) ───────────
 // The QAT model's tied token_embd/LM-head is Q6_K. Reading it NATIVELY (0.82 B/elem) instead
@@ -1152,121 +847,11 @@ static inline void mmvq_launch(
 //   base = (slot&1)*32, scale = sc[half*8 + slot*2 + (l>>4)]
 // which matches the fp32 kernel this replaces / ggml dequantize_row_q6_K exactly (the
 // scalar form indexed the same bytes as q1/q2/q3/q4 with is = l>>4).
-__global__ void mmvq_q6_k_kernel(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
-    int in_dim, int out_dim)
-{
-    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int idx = blockIdx.x * nwarps + warp;
-    if (idx >= out_dim) return;
-    int n_super = in_dim >> 8;                       // in_dim / 256
-    int nb32 = in_dim >> 5;                          // 32-elem activation blocks
-    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * 210;
-    float acc = 0.0f;
-    for (int b = lane; b < nb32; b += 32) {
-        const uint8_t *blk = wrow + (size_t)(b >> 3) * 210;
-        int jj   = b & 7;
-        int half = jj >> 2, slot = jj & 3;
-        const uint8_t *qlp = blk + half*64 + (slot & 1)*32;
-        const uint8_t *qhp = blk + 128 + half*32;
-        const int8_t  *sc  = (const int8_t *)(blk + 192) + half*8 + slot*2;
-        __half_raw hr; hr.x = (uint16_t)(blk[208] | ((uint16_t)blk[209] << 8));
-        float d = __half2float(__half(hr));
-        const int *xqs = (const int *)(qx + (size_t)b * 32);
-        int shift = slot * 2;
-        int sumi0 = 0, sumi1 = 0;
-        #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            int qlw = q8_get_int_b2(qlp, k);
-            int qhw = q8_get_int_b2(qhp, k);
-            int nib = (slot < 2) ? (qlw & 0x0F0F0F0F) : ((qlw >> 4) & 0x0F0F0F0F);
-            int w   = __vsubss4(nib | (((qhw >> shift) & 0x03030303) << 4), 0x20202020);
-            if (k < 4) sumi0 = __dp4a(w, xqs[k], sumi0);
-            else       sumi1 = __dp4a(w, xqs[k], sumi1);
-        }
-        acc += d * dx[b] * (float)(sc[0]*sumi0 + sc[1]*sumi1);
-    }
-    acc = warp_reduce_sum_all(acc);
-    if (lane == 0) out[idx] = acc;
-}
 
 // Batched Q6_K matvec (spec-verify LM head): unpack each 32-elem sub-block ONCE, dp4a it
 // against all NK activation rows — the head is read once per verify pass, like Q8_0/Q4_0.
-template<int NK>
-__global__ void mmvq_q6_k_batched_kernel(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
-    int in_dim, int out_dim)
-{
-    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int idx = blockIdx.x * nwarps + warp;
-    if (idx >= out_dim) return;
-    int n_super = in_dim >> 8;
-    int nb32 = in_dim >> 5;
-    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * 210;
-    float acc[NK];
-    #pragma unroll
-    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
-    for (int b = lane; b < nb32; b += 32) {
-        const uint8_t *blk = wrow + (size_t)(b >> 3) * 210;
-        int jj   = b & 7;
-        int half = jj >> 2, slot = jj & 3;
-        const uint8_t *qlp = blk + half*64 + (slot & 1)*32;
-        const uint8_t *qhp = blk + 128 + half*32;
-        const int8_t  *sc  = (const int8_t *)(blk + 192) + half*8 + slot*2;
-        __half_raw hr; hr.x = (uint16_t)(blk[208] | ((uint16_t)blk[209] << 8));
-        float d = __half2float(__half(hr));
-        int shift = slot * 2;
-        int sumi0[NK], sumi1[NK];
-        #pragma unroll
-        for (int n = 0; n < NK; n++) { sumi0[n] = 0; sumi1[n] = 0; }
-        #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            int qlw = q8_get_int_b2(qlp, k);
-            int qhw = q8_get_int_b2(qhp, k);
-            int nib = (slot < 2) ? (qlw & 0x0F0F0F0F) : ((qlw >> 4) & 0x0F0F0F0F);
-            int w   = __vsubss4(nib | (((qhw >> shift) & 0x03030303) << 4), 0x20202020);
-            #pragma unroll
-            for (int n = 0; n < NK; n++) {
-                int xv = *(const int *)(qx + (size_t)n*in_dim + (size_t)b*32 + k*4);
-                if (k < 4) sumi0[n] = __dp4a(w, xv, sumi0[n]);
-                else       sumi1[n] = __dp4a(w, xv, sumi1[n]);
-            }
-        }
-        #pragma unroll
-        for (int n = 0; n < NK; n++)
-            acc[n] += d * dx[(size_t)n*nb32 + b] * (float)(sc[0]*sumi0[n] + sc[1]*sumi1[n]);
-    }
-    #pragma unroll
-    for (int n = 0; n < NK; n++) { float v = warp_reduce_sum_all(acc[n]); if (lane==0) out[(size_t)n*out_dim+idx] = v; }
-}
 
-static inline void mmvq_q6_k_launch(
-    float *out, const uint8_t *w, const int8_t *qx, const float *dx,
-    int in_dim, int out_dim, cudaStream_t stream)
-{
-    const int NWARPS = 8; int b = NWARPS*32; int g = (out_dim + NWARPS - 1) / NWARPS;
-    mmvq_q6_k_kernel<<<g, b, 0, stream>>>(out, w, qx, dx, in_dim, out_dim);
-}
 
-static void mmvq_q6_k_batched_launch(
-    float *out, const uint8_t *w, const int8_t *qx, const float *dx,
-    int in_dim, int out_dim, int K, cudaStream_t stream)
-{
-    const int NWARPS = 8; int b = NWARPS*32; dim3 g((out_dim + NWARPS - 1) / NWARPS);
-    #define LQ6(NK) mmvq_q6_k_batched_kernel<NK><<<g,b,0,stream>>>(out,w,qx,dx,in_dim,out_dim)
-    switch (K) {
-        case 1: LQ6(1); break; case 2: LQ6(2); break; case 3: LQ6(3); break; case 4: LQ6(4); break;
-        case 5: LQ6(5); break; case 6: LQ6(6); break; case 7: LQ6(7); break; case 8: LQ6(8); break;
-        default:
-            for (int o = 0; o < K; o += 8) {
-                int kk = (K - o < 8) ? (K - o) : 8;
-                mmvq_q6_k_batched_launch(out + (size_t)o*out_dim, w,
-                                         qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
-                                         in_dim, out_dim, kk, stream);
-            }
-    }
-    #undef LQ6
-}
 
 
 // =========================================================================
@@ -2313,92 +1898,10 @@ __global__ void geglu_kernel(
 // which is where llama.cpp's fused kernel pulls ahead. BIT-IDENTICAL to the unfused path:
 // ga/ua are accumulated by the exact same dp4a/scale arithmetic as mmvq_q*_kernel and the
 // final gelu_tanh(ga)·ua matches geglu_kernel.
-__global__ void mmvq_q4_0_glu_kernel(
-    float *out, const uint8_t *wgate, const uint8_t *wup,
-    const int8_t *qx, const float *dx, const int *sx, int in_dim, int out_dim)
-{
-    int nwarps = blockDim.x >> 5;
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int idx = blockIdx.x * nwarps + warp;
-    if (idx >= out_dim) return;
-    int nb = in_dim >> 5;
-    const uint8_t *grow = wgate + (size_t)idx * (size_t)nb * 18;
-    const uint8_t *urow = wup   + (size_t)idx * (size_t)nb * 18;
-    float ga = 0.0f, ua = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
-        const int *xqs = (const int *)(qx + (size_t)b * 32);
-        const uint8_t *gb = grow + (size_t)b * 18;
-        const uint8_t *ub = urow + (size_t)b * 18;
-        __half_raw gh; gh.x = (uint16_t)(gb[0] | ((uint16_t)gb[1] << 8));
-        __half_raw uh; uh.x = (uint16_t)(ub[0] | ((uint16_t)ub[1] << 8));
-        float dwg = __half2float(__half(gh)), dwu = __half2float(__half(uh));
-        const void *gqs = gb + 2, *uqs = ub + 2;
-        int gsum = 0, usum = 0;
-        #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            int gw = q8_get_int_b2(gqs, k), uw = q8_get_int_b2(uqs, k);
-            int xa = xqs[k], xb = xqs[k + 4];
-            gsum = __dp4a(gw & 0x0F0F0F0F, xa, gsum);
-            gsum = __dp4a((gw >> 4) & 0x0F0F0F0F, xb, gsum);
-            usum = __dp4a(uw & 0x0F0F0F0F, xa, usum);
-            usum = __dp4a((uw >> 4) & 0x0F0F0F0F, xb, usum);
-        }
-        ga += dwg * dx[b] * (float)(gsum - 8 * sx[b]);
-        ua += dwu * dx[b] * (float)(usum - 8 * sx[b]);
-    }
-    ga = warp_reduce_sum_all(ga);
-    ua = warp_reduce_sum_all(ua);
-    if (lane == 0) out[idx] = gelu_tanh(ga) * ua;
-}
 
-__global__ void mmvq_q8_0_glu_kernel(
-    float *out, const uint8_t *wgate, const uint8_t *wup,
-    const int8_t *qx, const float *dx, int in_dim, int out_dim)
-{
-    int nwarps = blockDim.x >> 5;
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int idx = blockIdx.x * nwarps + warp;
-    if (idx >= out_dim) return;
-    int nb = in_dim >> 5;
-    const uint8_t *grow = wgate + (size_t)idx * (size_t)nb * 34;
-    const uint8_t *urow = wup   + (size_t)idx * (size_t)nb * 34;
-    float ga = 0.0f, ua = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
-        const int *xqs = (const int *)(qx + (size_t)b * 32);
-        const uint8_t *gb = grow + (size_t)b * 34;
-        const uint8_t *ub = urow + (size_t)b * 34;
-        __half_raw gh; gh.x = (uint16_t)(gb[0] | ((uint16_t)gb[1] << 8));
-        __half_raw uh; uh.x = (uint16_t)(ub[0] | ((uint16_t)ub[1] << 8));
-        float dwg = __half2float(__half(gh)), dwu = __half2float(__half(uh));
-        const void *gqs = gb + 2, *uqs = ub + 2;
-        int gsum = 0, usum = 0;
-        #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            gsum = __dp4a(q8_get_int_b2(gqs, k), xqs[k], gsum);
-            usum = __dp4a(q8_get_int_b2(uqs, k), xqs[k], usum);
-        }
-        ga += dwg * dx[b] * (float)gsum;
-        ua += dwu * dx[b] * (float)usum;
-    }
-    ga = warp_reduce_sum_all(ga);
-    ua = warp_reduce_sum_all(ua);
-    if (lane == 0) out[idx] = gelu_tanh(ga) * ua;
-}
 
 // Dispatch the fused gate+up+GLU MMVQ. qx/dx/sx already hold the FFN-norm activation's
 // int8 quant (shared with the unfused path); fmt selects Q4_0 (2) or Q8_0.
-static inline void mmvq_glu_launch(
-    float *out, const uint8_t *wgate, const uint8_t *wup,
-    const int8_t *qx, const float *dx, const int *sx,
-    int in_dim, int out_dim, int fmt, cudaStream_t stream)
-{
-    const int NWARPS = 8; int b = NWARPS * 32;
-    int g = (out_dim + NWARPS - 1) / NWARPS;
-    if (fmt == 2 /*Q4_0*/)
-        mmvq_q4_0_glu_kernel<<<g, b, 0, stream>>>(out, wgate, wup, qx, dx, sx, in_dim, out_dim);
-    else
-        mmvq_q8_0_glu_kernel<<<g, b, 0, stream>>>(out, wgate, wup, qx, dx, in_dim, out_dim);
-}
 
 // =========================================================================
 // ─── Logit Softcap ──────────────────────────────────────────────────────

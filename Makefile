@@ -317,17 +317,12 @@ e4b-batch-test:
 e4b-nvfp4-test:
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_nvfp4.cu -o /tmp/e4b_nvfp4_test -lcudart && /tmp/e4b_nvfp4_test
 
-# E4B native Q4_0 dp4a decode GEMV: reads the original QAT nibbles bit-for-bit (no
-# BF16 round-trip, no NVFP4 re-quant), validated vs host dequant oracle + FP32 SNR.
-e4b-q40-test:
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_q4_0.cu -o /tmp/e4b_q40_test -lcudart && /tmp/e4b_q40_test
-
 # E4B throughput baseline (prefill + decode tok/s), not a correctness test.
 e4b-bench:
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_bench.cu cuda/e4b_engine.cu -o /tmp/e4b_bench -lcudart -lcublas && /tmp/e4b_bench $(MODEL_DIR)
 
 # All E4B tests.
-e4b-all: e4b-test e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test e4b-q40-test
+e4b-all: e4b-test e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test
 
 # ─── Clean ──────────────────────────────────────────────────────────────
 clean:
