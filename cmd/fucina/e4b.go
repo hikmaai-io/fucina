@@ -51,7 +51,7 @@ func runE4B(args CLIArgs) {
 	case args.Prompt != "" || args.PromptFile != "":
 		runE4BOneShot(eng, tok, args)
 	default:
-		log.Fatalf("fucina: E4B server mode is not wired yet — use --interactive or -p <prompt>")
+		runE4BServer(eng, tok, args) // OpenAI-compatible HTTP server (no spec/MTP for E4B)
 	}
 }
 
