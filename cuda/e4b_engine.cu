@@ -104,6 +104,18 @@ struct e4b_engine {
     float   *d_q40_da=nullptr;   // [max_seqs*FF/32]
     int32_t *d_q40_sa=nullptr;   // [max_seqs*FF/32]
     uint8_t *d_q6k_head=nullptr; // native Q6_K tied LM head [vocab][hidden/256*210]
+
+    // Persistent single-token (T==1) decode scratch — allocated once at create, reused every
+    // token instead of ~17 cudaMalloc/cudaFree + two RoPE-table recomputes per step. Removes
+    // per-token alloc/launch-serialization overhead and is the prerequisite for CUDA-graph
+    // decode capture (a graph cannot contain cudaMalloc). Prefill (T>1) still mallocs per call.
+    struct DecodeScratch {
+        bool ready=false;
+        int32_t* ids=nullptr;
+        __nv_bfloat16 *hidden=nullptr,*norm=nullptr,*tmpH=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,
+                      *attn=nullptr,*gate=nullptr,*up=nullptr,*act=nullptr,*pleg=nullptr,*ctx_bf=nullptr;
+        float *ple_lookup=nullptr,*ple_ctx=nullptr,*pli=nullptr,*logits_f=nullptr,*invf_s=nullptr,*invf_f=nullptr;
+    } dec;
     // Prefill (T>1) dequant scratch: when use_q40 the BF16 projection weights are freed,
     // so prefill dequants each Q4_0 projection → this reused BF16 buffer for the cuBLAS GEMM.
     // Sized to the largest projection (FF×H). Serial reuse is safe — all on the null stream.
@@ -612,6 +624,9 @@ extern "C" void e4b_engine_destroy(e4b_engine_t *eng) {
     if (eng->d_q40_sa) cudaFree(eng->d_q40_sa);
     if (eng->d_q40_wdq) cudaFree(eng->d_q40_wdq);
     if (eng->d_q6k_head) cudaFree(eng->d_q6k_head);
+    { auto& d=eng->dec; F(d.ids); F(d.hidden); F(d.norm); F(d.tmpH); F(d.q); F(d.k); F(d.v); F(d.attn);
+      F(d.gate); F(d.up); F(d.act); F(d.pleg); F(d.ctx_bf); F(d.ple_lookup); F(d.ple_ctx); F(d.pli);
+      F(d.logits_f); F(d.invf_s); F(d.invf_f); }
     for (Slot& s : eng->slots) e4b_slot_free(eng, s);
     if (eng->cublas) cublasDestroy(eng->cublas);
     delete eng;
@@ -920,26 +935,50 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
     cudaSetDevice(eng->device_id);
     auto CKF=[&](cudaError_t e)->bool{ if(e!=cudaSuccess){ fprintf(stderr,"e4b step: %s\n",cudaGetErrorString(e)); return false;} return true; };
 
-    // RoPE tables (sliding default, full proportional).
-    float* d_invf_s = make_inv_freq_sliding(c.head_dim, c.rope_theta_sliding);
-    float* d_invf_f = make_inv_freq_proportional(c.global_head_dim, c.rope_theta_full, c.rope_partial_full);
-    if(!d_invf_s||!d_invf_f) return -1;
+    const int QMAX=c.n_heads*c.global_head_dim, KVMAX=c.n_kv_heads*c.global_head_dim;
+    // Single-token decode reuses persistent scratch (no per-token cudaMalloc/free, no RoPE-table
+    // recompute) — the hot path and the CUDA-graph prerequisite. Prefill (T>1) mallocs per call.
+    const bool persist = (T==1);
+    if (persist && !eng->dec.ready) {
+        auto& d = eng->dec; bool ok2=true;
+        ok2&=CKF(cudaMalloc(&d.ids,sizeof(int32_t)));
+        ok2&=CKF(cudaMalloc(&d.hidden,(size_t)H*2)); ok2&=CKF(cudaMalloc(&d.norm,(size_t)H*2)); ok2&=CKF(cudaMalloc(&d.tmpH,(size_t)H*2));
+        ok2&=CKF(cudaMalloc(&d.q,(size_t)QMAX*2)); ok2&=CKF(cudaMalloc(&d.k,(size_t)KVMAX*2)); ok2&=CKF(cudaMalloc(&d.v,(size_t)KVMAX*2));
+        ok2&=CKF(cudaMalloc(&d.attn,(size_t)QMAX*2)); ok2&=CKF(cudaMalloc(&d.gate,(size_t)FF*2)); ok2&=CKF(cudaMalloc(&d.up,(size_t)FF*2));
+        ok2&=CKF(cudaMalloc(&d.act,(size_t)FF*2)); ok2&=CKF(cudaMalloc(&d.pleg,(size_t)PD*2)); ok2&=CKF(cudaMalloc(&d.ctx_bf,(size_t)W*2));
+        ok2&=CKF(cudaMalloc(&d.ple_lookup,(size_t)W*4)); ok2&=CKF(cudaMalloc(&d.ple_ctx,(size_t)W*4)); ok2&=CKF(cudaMalloc(&d.pli,(size_t)W*4));
+        ok2&=CKF(cudaMalloc(&d.logits_f,(size_t)V*4));
+        d.invf_s = make_inv_freq_sliding(c.head_dim, c.rope_theta_sliding);
+        d.invf_f = make_inv_freq_proportional(c.global_head_dim, c.rope_theta_full, c.rope_partial_full);
+        if(!ok2 || !d.invf_s || !d.invf_f) return -1;
+        d.ready = true;
+    }
 
-    // ── scratch (sized to the T new tokens) ──
+    float *d_invf_s, *d_invf_f;
     int32_t* d_ids; bf16 *d_hidden,*d_norm,*d_tmpH,*d_q,*d_k,*d_v,*d_attn,*d_gate,*d_up,*d_act,*d_pleg;
     float *d_ple_lookup,*d_ple_ctx,*d_pli;
-    const int QMAX=c.n_heads*c.global_head_dim, KVMAX=c.n_kv_heads*c.global_head_dim;
     bool ok=true;
-    ok&=CKF(cudaMalloc(&d_ids,T*sizeof(int32_t)));
-    ok&=CKF(cudaMalloc(&d_hidden,(size_t)T*H*2)); ok&=CKF(cudaMalloc(&d_norm,(size_t)T*H*2));
-    ok&=CKF(cudaMalloc(&d_tmpH,(size_t)T*H*2));
-    ok&=CKF(cudaMalloc(&d_q,(size_t)T*QMAX*2)); ok&=CKF(cudaMalloc(&d_k,(size_t)T*KVMAX*2));
-    ok&=CKF(cudaMalloc(&d_v,(size_t)T*KVMAX*2)); ok&=CKF(cudaMalloc(&d_attn,(size_t)T*QMAX*2));
-    ok&=CKF(cudaMalloc(&d_gate,(size_t)T*FF*2)); ok&=CKF(cudaMalloc(&d_up,(size_t)T*FF*2));
-    ok&=CKF(cudaMalloc(&d_act,(size_t)T*FF*2)); ok&=CKF(cudaMalloc(&d_pleg,(size_t)T*PD*2));
-    ok&=CKF(cudaMalloc(&d_ple_lookup,(size_t)T*W*4)); ok&=CKF(cudaMalloc(&d_ple_ctx,(size_t)T*W*4));
-    ok&=CKF(cudaMalloc(&d_pli,(size_t)T*W*4));
-    if(!ok) return -1;
+    if (persist) {
+        auto& d = eng->dec;
+        d_invf_s=d.invf_s; d_invf_f=d.invf_f; d_ids=d.ids;
+        d_hidden=d.hidden; d_norm=d.norm; d_tmpH=d.tmpH; d_q=d.q; d_k=d.k; d_v=d.v; d_attn=d.attn;
+        d_gate=d.gate; d_up=d.up; d_act=d.act; d_pleg=d.pleg;
+        d_ple_lookup=d.ple_lookup; d_ple_ctx=d.ple_ctx; d_pli=d.pli;
+    } else {
+        d_invf_s = make_inv_freq_sliding(c.head_dim, c.rope_theta_sliding);
+        d_invf_f = make_inv_freq_proportional(c.global_head_dim, c.rope_theta_full, c.rope_partial_full);
+        if(!d_invf_s||!d_invf_f) return -1;
+        ok&=CKF(cudaMalloc(&d_ids,T*sizeof(int32_t)));
+        ok&=CKF(cudaMalloc(&d_hidden,(size_t)T*H*2)); ok&=CKF(cudaMalloc(&d_norm,(size_t)T*H*2));
+        ok&=CKF(cudaMalloc(&d_tmpH,(size_t)T*H*2));
+        ok&=CKF(cudaMalloc(&d_q,(size_t)T*QMAX*2)); ok&=CKF(cudaMalloc(&d_k,(size_t)T*KVMAX*2));
+        ok&=CKF(cudaMalloc(&d_v,(size_t)T*KVMAX*2)); ok&=CKF(cudaMalloc(&d_attn,(size_t)T*QMAX*2));
+        ok&=CKF(cudaMalloc(&d_gate,(size_t)T*FF*2)); ok&=CKF(cudaMalloc(&d_up,(size_t)T*FF*2));
+        ok&=CKF(cudaMalloc(&d_act,(size_t)T*FF*2)); ok&=CKF(cudaMalloc(&d_pleg,(size_t)T*PD*2));
+        ok&=CKF(cudaMalloc(&d_ple_lookup,(size_t)T*W*4)); ok&=CKF(cudaMalloc(&d_ple_ctx,(size_t)T*W*4));
+        ok&=CKF(cudaMalloc(&d_pli,(size_t)T*W*4));
+        if(!ok) return -1;
+    }
     cudaMemcpy(d_ids,tokens,T*sizeof(int32_t),cudaMemcpyHostToDevice);
 
     auto GRID=[&](int n){ return (n+255)/256; };
@@ -952,10 +991,11 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
     // ── PLE precompute (token-identity lookup + context projection, combined) ──
     e4b_ple_lookup_launch(eng->d_ple_fp8, eng->d_ple_scale, d_ids, d_ple_lookup, T, W);
     {
-        bf16* d_ctx_bf; cudaMalloc(&d_ctx_bf,(size_t)T*W*2);
+        bf16* d_ctx_bf = persist ? eng->dec.ctx_bf : nullptr;
+        if (!persist) cudaMalloc(&d_ctx_bf,(size_t)T*W*2);
         linear(eng->cublas, eng->d_plm_proj, d_hidden, d_ctx_bf, T, W, H);
         to_f32_kernel<<<GRID(T*W),256>>>(d_ctx_bf,d_ple_ctx,T*W);
-        cudaFree(d_ctx_bf);
+        if (!persist) cudaFree(d_ctx_bf);
         // The 1/sqrt(H) scale on the projection is a no-op before per-256 RMSNorm
         // (RMSNorm is scale-invariant), so we skip it and normalize directly.
         rmsnorm_f32_grouped<<<T*c.n_layers,256>>>(d_ple_ctx, eng->d_ple_proj_norm, T*c.n_layers, PD, eps);
@@ -1100,7 +1140,8 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
     // safetensors NVFP4 path → FP8 head; BF16 fallback → cuBLAS.
     if (logits_last_out){
         const bf16* xrow = d_norm + (size_t)(T-1)*H;
-        float* d_logits_f; cudaMalloc(&d_logits_f,(size_t)V*4);
+        float* d_logits_f = persist ? eng->dec.logits_f : nullptr;
+        if (!persist) cudaMalloc(&d_logits_f,(size_t)V*4);
         if (eng->use_q40){   // native Q6_K tied head via shared MMVQ
             quantize_q8_1_bf16_kernel<<<H/32,32,0,0>>>(xrow, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, H);
             mmvq_q6_k_launch(d_logits_f, eng->d_q6k_head, eng->d_q40_qa, eng->d_q40_da, H, V, 0);
@@ -1114,14 +1155,16 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         }
         softcap_kernel<<<GRID(V),256>>>(d_logits_f,V,c.final_logit_softcap);
         cudaMemcpy(logits_last_out,d_logits_f,(size_t)V*4,cudaMemcpyDeviceToHost);
-        cudaFree(d_logits_f);
+        if (!persist) cudaFree(d_logits_f);
     }
 
     cudaError_t err=cudaDeviceSynchronize();
-    cudaFree(d_ids);cudaFree(d_hidden);cudaFree(d_norm);cudaFree(d_tmpH);cudaFree(d_q);cudaFree(d_k);
-    cudaFree(d_v);cudaFree(d_attn);cudaFree(d_gate);cudaFree(d_up);cudaFree(d_act);cudaFree(d_pleg);
-    cudaFree(d_ple_lookup);cudaFree(d_ple_ctx);cudaFree(d_pli);
-    cudaFree(d_invf_s);cudaFree(d_invf_f);
+    if (!persist){   // prefill scratch is per-call; decode scratch is persistent (freed at destroy)
+        cudaFree(d_ids);cudaFree(d_hidden);cudaFree(d_norm);cudaFree(d_tmpH);cudaFree(d_q);cudaFree(d_k);
+        cudaFree(d_v);cudaFree(d_attn);cudaFree(d_gate);cudaFree(d_up);cudaFree(d_act);cudaFree(d_pleg);
+        cudaFree(d_ple_lookup);cudaFree(d_ple_ctx);cudaFree(d_pli);
+        cudaFree(d_invf_s);cudaFree(d_invf_f);
+    }
     if(err!=cudaSuccess){ fprintf(stderr,"e4b step sync: %s\n",cudaGetErrorString(err)); return -1; }
     slot.n_past += T;     // commit the new tokens to the cache
     return 0;
