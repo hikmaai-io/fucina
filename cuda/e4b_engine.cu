@@ -1231,14 +1231,12 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
         // Q4_0 nibbles → scratch then GEMM (weights still read once for the B-token batch).
         auto bproj = [&](bf16* y, __nv_bfloat16* Wbf, const uint8_t* wb40, const bf16* x, int out, int in){
             if (eng->use_q40){
-                // Per-token MMVQ — identical kernel to the single-seq decode (q40dec), so batched
-                // output is bit-for-bit == independent decode. (True batched dp4a — weight read once
-                // for all B tokens via mmvq_batched — is a follow-up; the kernel exists in mmvq.cuh.)
-                for (int n = 0; n < B; n++) {
-                    quantize_q8_1_bf16_kernel<<<in/32,32,0,0>>>(x + (size_t)n*in, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in);
-                    mmvq_launch(eng->d_fp4_yf, wb40, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in, out, 2, 0);
-                    e4bfp4::to_bf16<<<(out+255)/256,256,0,0>>>(eng->d_fp4_yf, y + (size_t)n*out, out);
-                }
+                // Batched MMVQ: each weight ROW is read once and dp4a'd against all B tokens
+                // (token-major qx/dx/sx). Per-token math is identical to mmvq_launch, so batched
+                // == single-seq decode bit-for-bit — the continuous-batching weight-reuse win.
+                quantize_q8_1_bf16_kernel<<<(B*in)/32,32,0,0>>>(x, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, B*in);
+                mmvq_batched_launch(eng->d_fp4_yf, wb40, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in, out, B, 2, 0);
+                e4bfp4::to_bf16<<<(unsigned)(((size_t)B*out+255)/256),256,0,0>>>(eng->d_fp4_yf, y, B*out);
             } else linear(eng->cublas, Wbf, x, y, B, out, in);
         };
         // gather this layer's per-slot cache pointers
@@ -1290,11 +1288,9 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
     // logits for all B rows → argmax each. use_q40 → native Q6_K head per row (same kernel as
     // single-seq, so batched == independent); else cuBLAS over the BF16 tied embedding.
     float* d_logits_f; cudaMalloc(&d_logits_f,(size_t)B*V*4);
-    if (eng->use_q40){
-        for (int n = 0; n < B; n++) {
-            quantize_q8_1_bf16_kernel<<<H/32,32,0,0>>>(d_norm + (size_t)n*H, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, H);
-            mmvq_q6_k_launch(d_logits_f + (size_t)n*V, eng->d_q6k_head, eng->d_q40_qa, eng->d_q40_da, H, V, 0);
-        }
+    if (eng->use_q40){   // native Q6_K head, batched over B rows (read once); bit-matches single-seq
+        quantize_q8_1_bf16_kernel<<<(B*H)/32,32,0,0>>>(d_norm, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, B*H);
+        mmvq_q6_k_batched_launch(d_logits_f, eng->d_q6k_head, eng->d_q40_qa, eng->d_q40_da, H, V, B, 0);
     } else {
         bf16* d_logits_bf; cudaMalloc(&d_logits_bf,(size_t)B*V*2);
         linear(eng->cublas, eng->d_embed, d_norm, d_logits_bf, B, V, H);
