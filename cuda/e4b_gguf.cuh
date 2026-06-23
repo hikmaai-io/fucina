@@ -68,7 +68,10 @@ typedef enum {
     GGML_TYPE_F16  = 1,
     GGML_TYPE_Q4_0 = 2,
     GGML_TYPE_Q8_0 = 8,
+    GGML_TYPE_Q4_K = 12,   // K-quant 4-bit (Q4_K_M community quants)
+    GGML_TYPE_Q5_K = 13,   // K-quant 5-bit (Q5_K_M / mixed)
     GGML_TYPE_Q6_K = 14,
+    GGML_TYPE_BF16 = 30,   // native bfloat16 (some converters keep proj tensors here)
 } ggml_type_t;
 
 #define E4BGGUF_ALIGNMENT 32
@@ -314,9 +317,78 @@ static void dequant_q6_k_to_bf16(const uint8_t* src, int64_t n, __nv_bfloat16* d
     }
 }
 
+// K-quant 6-bit scale/min unpack (ggml get_scale_min_k4): the 8 sub-block scales
+// and mins are packed into the 12-byte `scales[]` array. Used by Q4_K and Q5_K.
+static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) { *d = q[j] & 63;  *m = q[j + 4] & 63; }
+    else       { *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+                 *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4); }
+}
+
+// Q4_K: super-block = 256 elems (d(fp16) + dmin(fp16) + scales[12] + qs[128] =
+//   144 B). Eight 32-elem sub-blocks; each has a 6-bit scale and min. Exact unpack
+//   from ggml dequantize_row_q4_K, emitting bf16 directly in storage order.
+static void dequant_q4_k_to_bf16(const uint8_t* src, int64_t n, __nv_bfloat16* dst) {
+    const int64_t n_super = n / 256;
+    for (int64_t s = 0; s < n_super; s++) {
+        const uint8_t* blk = src + (size_t)s * 144;
+        uint16_t dr, dmr; memcpy(&dr, blk, 2); memcpy(&dmr, blk + 2, 2);
+        const float d   = h2f_host(dr);
+        const float min = h2f_host(dmr);
+        const uint8_t* scales = blk + 4;
+        const uint8_t* q = blk + 16;
+        __nv_bfloat16* y = dst + (size_t)s * 256;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, &sc, &m);
+            const float d1 = d * sc, m1 = min * m;
+            get_scale_min_k4(is + 1, scales, &sc, &m);
+            const float d2 = d * sc, m2 = min * m;
+            for (int l = 0; l < 32; l++) *y++ = f2bf16_host(d1 * (q[l] & 0xF) - m1);
+            for (int l = 0; l < 32; l++) *y++ = f2bf16_host(d2 * (q[l] >>  4) - m2);
+            q += 32; is += 2;
+        }
+    }
+}
+
+// Q5_K: super-block = 256 elems (d + dmin + scales[12] + qh[32] + qs[128] = 176 B).
+//   Like Q4_K but each quant gets a 5th (high) bit from qh. Exact unpack from ggml
+//   dequantize_row_q5_K.
+static void dequant_q5_k_to_bf16(const uint8_t* src, int64_t n, __nv_bfloat16* dst) {
+    const int64_t n_super = n / 256;
+    for (int64_t s = 0; s < n_super; s++) {
+        const uint8_t* blk = src + (size_t)s * 176;
+        uint16_t dr, dmr; memcpy(&dr, blk, 2); memcpy(&dmr, blk + 2, 2);
+        const float d   = h2f_host(dr);
+        const float min = h2f_host(dmr);
+        const uint8_t* scales = blk + 4;
+        const uint8_t* qh = blk + 16;
+        const uint8_t* ql = blk + 48;
+        __nv_bfloat16* y = dst + (size_t)s * 256;
+        int is = 0; uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, scales, &sc, &m);
+            const float d1 = d * sc, m1 = min * m;
+            get_scale_min_k4(is + 1, scales, &sc, &m);
+            const float d2 = d * sc, m2 = min * m;
+            for (int l = 0; l < 32; l++)
+                *y++ = f2bf16_host(d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1);
+            for (int l = 0; l < 32; l++)
+                *y++ = f2bf16_host(d2 * ((ql[l] >>  4) + ((qh[l] & u2) ? 16 : 0)) - m2);
+            ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+        }
+    }
+}
+
 static void dequant_f16_to_bf16(const uint8_t* src, int64_t n, __nv_bfloat16* dst) {
     const uint16_t* h = (const uint16_t*)src;
     for (int64_t i = 0; i < n; i++) dst[i] = f2bf16_host(h2f_host(h[i]));
+}
+// BF16 stored natively → just copy the 16-bit payload (no rounding: it IS bf16).
+static void copy_bf16_to_bf16(const uint8_t* src, int64_t n, __nv_bfloat16* dst) {
+    memcpy(dst, src, (size_t)n * sizeof(__nv_bfloat16));
 }
 static void copy_f32_to_bf16(const uint8_t* src, int64_t n, __nv_bfloat16* dst) {
     const float* f = (const float*)src;
@@ -330,10 +402,15 @@ static bool gguf_dequant_to_bf16(const uint8_t* src, int64_t n_el, uint32_t ggml
     switch (ggml_type) {
         case GGML_TYPE_F32:  copy_f32_to_bf16(src, n_el, host_dst);    return true;
         case GGML_TYPE_F16:  dequant_f16_to_bf16(src, n_el, host_dst); return true;
+        case GGML_TYPE_BF16: copy_bf16_to_bf16(src, n_el, host_dst);   return true;
         case GGML_TYPE_Q4_0: dequant_q4_0_to_bf16(src, n_el, host_dst);return true;
+        case GGML_TYPE_Q4_K: dequant_q4_k_to_bf16(src, n_el, host_dst);return true;
+        case GGML_TYPE_Q5_K: dequant_q5_k_to_bf16(src, n_el, host_dst);return true;
         case GGML_TYPE_Q6_K: dequant_q6_k_to_bf16(src, n_el, host_dst);return true;
         default:
-            fprintf(stderr, "e4b-gguf: unsupported ggml type %u\n", ggml_type);
+            fprintf(stderr, "e4b-gguf: unsupported ggml tensor type %u — this E4B GGUF "
+                    "uses a quant fucina can't load yet (supported: F32/F16/BF16/Q4_0/"
+                    "Q4_K/Q5_K/Q6_K). Try a Q4_0-QAT or Q4_K_M build.\n", ggml_type);
             return false;
     }
 }
