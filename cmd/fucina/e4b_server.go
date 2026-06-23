@@ -133,6 +133,17 @@ func runE4BServer(eng *e4b.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	if args.Debug {
 		srv.SetDebug(true)
 	}
+	// Continuous batching (--parallel / --cont-batching): drive E4B's slot-based
+	// step_batch through the scheduler so concurrent requests share one weight pass.
+	// Greedy per sequence (the E4B batched kernel argmaxes), so per-request temp/top-p
+	// are not applied in batched mode.
+	if args.ContBatching {
+		if srv.SetBatchEngine(e4b.NewBatchAdapter(eng)) {
+			log.Printf("fucina: E4B continuous batching ENABLED (up to %d concurrent sequences, greedy)", eng.SeqCapacity())
+		} else {
+			log.Printf("fucina: WARNING — --cont-batching requested but no free E4B slots; single-flight")
+		}
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

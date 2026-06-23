@@ -55,6 +55,14 @@ type CLIArgs struct {
 	APIKey        string // optional bearer token required on /v1/* (empty = auth off)
 	MaxConcurrent int    // admission-queue depth (in-flight + waiting); 0 = default
 	MaxOutputToks int    // absolute per-request output-token ceiling; 0 = no extra cap
+	// Continuous batching (llama.cpp-compatible). Batching is enabled when ContBatching
+	// is set or Parallel > 1. Parallel is the desired concurrent-slot count (capped by the
+	// engine's slot budget). FlashAttn is accepted for llama compatibility (fucina always
+	// uses flash/FP8 attention) and is otherwise a no-op.
+	Parallel     int
+	ContBatching bool
+	FlashAttn    string
+	ThreadsHTTP  int // alias of MaxConcurrent (llama --threads-http)
 
 	// System
 	System   string
@@ -162,6 +170,11 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.StringVar(&a.System, "s", "", "System prompt")
 	fs.StringVar(&a.System, "system", "", "System prompt")
 	fs.BoolVar(&a.Raw, "raw", false, "-p: feed the prompt verbatim, no chat template (base completion / benchmarks)")
+	// Continuous batching (llama.cpp-compatible aliases).
+	fs.IntVar(&a.Parallel, "parallel", 0, "Server: max concurrent sequences via continuous batching (>1 enables it; like llama --parallel)")
+	fs.BoolVar(&a.ContBatching, "cont-batching", false, "Server: enable continuous batching (like llama --cont-batching)")
+	fs.StringVar(&a.FlashAttn, "flash-attn", "", "Accepted for llama compatibility; fucina always uses flash/FP8 attention (no-op)")
+	fs.IntVar(&a.ThreadsHTTP, "threads-http", 0, "Server: max concurrent HTTP inference requests (alias of --max-concurrent)")
 	fs.BoolVar(&a.Verbose, "v", false, "Verbose output")
 	fs.BoolVar(&a.Verbose, "verbose", false, "Verbose output")
 	fs.BoolVar(&a.Timings, "timings", false, "Show timing information")
@@ -189,6 +202,17 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	if a.DiffModelPath != "" {
 		a.ModelPath = a.DiffModelPath
 		a.FP4MoE = true
+	}
+	// llama-compatible aliases: --threads-http feeds the admission limit; --parallel implies
+	// continuous batching (and seeds the admission limit if --max-concurrent is unset).
+	if a.ThreadsHTTP > 0 && a.MaxConcurrent == 0 {
+		a.MaxConcurrent = a.ThreadsHTTP
+	}
+	if a.Parallel > 1 {
+		a.ContBatching = true
+		if a.MaxConcurrent == 0 {
+			a.MaxConcurrent = a.Parallel
+		}
 	}
 	return a, t, nil
 }

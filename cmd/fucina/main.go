@@ -232,11 +232,11 @@ func main() {
 		// per-request kv lock. Requires the engine to be in paged mode
 		// (FUCINA_PAGED_KV=1); SetBatchEngine is a no-op otherwise, so the
 		// single-flight path stays intact.
-		if os.Getenv("FUCINA_BATCH") != "" {
+		if os.Getenv("FUCINA_BATCH") != "" || args.ContBatching {
 			if srv.SetBatchEngine(cuda.NewBatchAdapter(eng)) {
 				log.Printf("fucina: continuous batching ENABLED (paged KV multi-sequence)")
 			} else {
-				log.Printf("fucina: WARNING — FUCINA_BATCH set but engine not in paged mode (FUCINA_PAGED_KV); batching disabled")
+				log.Printf("fucina: WARNING — continuous batching requested but engine not in paged mode (FUCINA_PAGED_KV); batching disabled")
 			}
 		}
 		// Debug request dumping: --debug or --log-level debug.

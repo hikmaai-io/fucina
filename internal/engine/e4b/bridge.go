@@ -143,6 +143,66 @@ func (e *Engine) Decode(token int32) ([]float32, error) {
 	return e.logits, nil
 }
 
+// ─── Continuous-batching ABI ───────────────────────────────────────
+// The E4B engine decodes multiple sequences in ONE weight pass (step_batch). These
+// expose its slot API so the server's scheduler can drive continuous batching. Greedy
+// only (the batched kernel argmaxes per slot), so per-sequence sampling params are not
+// applied in batched mode.
+
+// SeqAdd prefills `prompt` into a fresh slot and returns the slot id (>=1) plus the
+// first greedy token. Error if no slot is free or prefill fails.
+func (e *Engine) SeqAdd(prompt []int32) (slot int, first int32, err error) {
+	if len(prompt) == 0 {
+		return -1, 0, fmt.Errorf("e4b: empty prompt")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var ft C.int32_t
+	sid := C.e4b_engine_seq_add(e.ptr,
+		(*C.int32_t)(unsafe.Pointer(&prompt[0])), C.int(len(prompt)), &ft)
+	if sid < 0 {
+		return -1, 0, fmt.Errorf("e4b: seq_add failed (no free slot or prefill error)")
+	}
+	return int(sid), int32(ft), nil
+}
+
+// StepBatch advances each slots[i] by inTokens[i] in ONE batched forward and returns
+// the next greedy token per slot (len == len(slots)).
+func (e *Engine) StepBatch(slots []int32, inTokens []int32) ([]int32, error) {
+	b := len(slots)
+	if b == 0 || len(inTokens) != b {
+		return nil, fmt.Errorf("e4b: step_batch size mismatch (%d slots, %d tokens)", b, len(inTokens))
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cslots := make([]C.int, b)
+	for i, s := range slots {
+		cslots[i] = C.int(s)
+	}
+	out := make([]int32, b)
+	rc := C.e4b_engine_step_batch(e.ptr, &cslots[0],
+		(*C.int32_t)(unsafe.Pointer(&inTokens[0])), C.int(b),
+		(*C.int32_t)(unsafe.Pointer(&out[0])))
+	if rc != 0 {
+		return nil, fmt.Errorf("e4b: step_batch failed (rc=%d)", int(rc))
+	}
+	return out, nil
+}
+
+// SeqRemove releases a slot (its KV caches are kept for reuse by a later SeqAdd).
+func (e *Engine) SeqRemove(slot int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	C.e4b_engine_seq_remove(e.ptr, C.int(slot))
+}
+
+// SeqCapacity reports the number of currently-free sequence slots.
+func (e *Engine) SeqCapacity() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return int(C.e4b_engine_seq_capacity(e.ptr))
+}
+
 // ConfigDir returns the directory holding the checkpoint (for sibling lookups
 // like tokenizer.json). For a file path it is the parent dir.
 func ConfigDir(path string) string {
