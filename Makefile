@@ -208,7 +208,11 @@ check: vet lint go-test-race
 DG_GGUF ?= ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
 DG_NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo -Xcompiler -O3 -Xcompiler -pthread --threads 8
 # CUTLASS (vendored under flashinfer) for the grouped NVFP4 expert GEMM (cuda/dg_fp4_moe.cu).
-CUTLASS_DIR ?= /path/to/cutlass
+# Auto-detected: import flashinfer if it's on the default python, else glob the venv. Override
+# with `make all CUTLASS_DIR=/path/to/cutlass` for a checkout elsewhere.
+CUTLASS_DIR ?= $(shell \
+	python3 -c "import flashinfer,os;print(os.path.join(os.path.dirname(flashinfer.__file__),'data','cutlass'))" 2>/dev/null \
+	|| ls -d $(HOME)/.venv/lib/python*/site-packages/flashinfer/data/cutlass 2>/dev/null | head -1)
 DG_FP4_NVCCFLAGS := -arch=$(CUDA_ARCH) -std=c++17 -O3 -lineinfo --expt-relaxed-constexpr \
 	--expt-extended-lambda -DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 \
 	-I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include -Xcompiler -O3 -Xcompiler -pthread
@@ -220,6 +224,10 @@ cuda/diffusion_gemma_engine.o: cuda/diffusion_gemma_engine.cu cuda/diffusion_gem
 	$(NVCC) $(DG_NVCCFLAGS) -dc -o $@ cuda/diffusion_gemma_engine.cu
 
 cuda/dg_fp4_moe.o: cuda/dg_fp4_moe.cu Makefile
+	@test -f "$(CUTLASS_DIR)/include/cutlass/cutlass.h" || { \
+	  echo "ERROR: CUTLASS not found (CUTLASS_DIR='$(CUTLASS_DIR)'). The DiffusionGemma NVFP4"; \
+	  echo "  MoE needs CUTLASS. Install flashinfer (pip install flashinfer) or pass a checkout:"; \
+	  echo "  make all CUTLASS_DIR=/path/to/cutlass"; exit 1; }
 	$(NVCC) $(DG_FP4_NVCCFLAGS) -dc -o $@ cuda/dg_fp4_moe.cu
 
 cuda/libdg_link.o: cuda/diffusion_gemma_kernels.o cuda/diffusion_gemma_engine.o cuda/dg_fp4_moe.o Makefile
@@ -309,12 +317,17 @@ e4b-batch-test:
 e4b-nvfp4-test:
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_nvfp4.cu -o /tmp/e4b_nvfp4_test -lcudart && /tmp/e4b_nvfp4_test
 
+# E4B native Q4_0 dp4a decode GEMV: reads the original QAT nibbles bit-for-bit (no
+# BF16 round-trip, no NVFP4 re-quant), validated vs host dequant oracle + FP32 SNR.
+e4b-q40-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_q4_0.cu -o /tmp/e4b_q40_test -lcudart && /tmp/e4b_q40_test
+
 # E4B throughput baseline (prefill + decode tok/s), not a correctness test.
 e4b-bench:
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_bench.cu cuda/e4b_engine.cu -o /tmp/e4b_bench -lcudart -lcublas && /tmp/e4b_bench $(MODEL_DIR)
 
 # All E4B tests.
-e4b-all: e4b-test e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test
+e4b-all: e4b-test e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test e4b-q40-test
 
 # ─── Clean ──────────────────────────────────────────────────────────────
 clean:
