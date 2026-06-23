@@ -47,8 +47,8 @@ func TestJSONStartRequiresObject(t *testing.T) {
 	if al[int(eos)] {
 		t.Fatal("EOS must be forbidden before any value")
 	}
-	if al[int(idx[" "])] == false {
-		t.Fatal("leading whitespace should be allowed")
+	if al[int(idx[" "])] {
+		t.Fatal("leading whitespace must be forbidden under json_object (force '{' immediately)")
 	}
 }
 

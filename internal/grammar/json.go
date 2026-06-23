@@ -22,6 +22,11 @@ type Constraint interface {
 	Accept(id int32)
 	// Done reports whether generation may stop here (the structure is complete).
 	Done() bool
+	// Close returns the minimal byte sequence that completes the structure from the
+	// current state (e.g. close an open string + close open containers). Empty when
+	// already complete. Used to finish a truncated structure at the token cap so the
+	// output is valid even when generation is cut short.
+	Close() []byte
 }
 
 // json automaton modes.
@@ -110,6 +115,12 @@ func (s *jsonState) step(b byte) bool {
 				return true
 			}
 			return false
+		}
+		// Top-level start under json_object: force '{' immediately. Leading whitespace IS
+		// valid JSON, but the model (greedy) can loop on newlines/spaces forever and never
+		// start the object; disallowing it here keeps the output valid and unblocks it.
+		if s.requireObj && len(s.stack) == 0 && s.mode == mValue {
+			return s.beginValue(b)
 		}
 		if isWS(b) {
 			return true // whitespace is legal between tokens (not inside strings/numbers, handled above)
@@ -240,6 +251,37 @@ func NewJSON(pieces [][]byte, eos int32) *JSON {
 }
 
 func (j *JSON) Done() bool { return j.st.complete() }
+
+// Close completes a truncated JSON value: close an in-progress string/value, then close
+// every open container (top of stack first). Approximate for rare mid-token states but
+// yields parseable JSON for the common truncation cases (mid-string, mid-value, open
+// objects/arrays).
+func (j *JSON) Close() []byte {
+	s := &j.st
+	if s.complete() {
+		return nil
+	}
+	var b []byte
+	switch s.mode {
+	case mString:
+		if s.esc {
+			b = append(b, '\\') // dangling backslash → escape itself
+		}
+		b = append(b, '"') // close the string
+	case mColon:
+		b = append(b, ':', 'n', 'u', 'l', 'l') // a key with no value yet
+	case mValue:
+		b = append(b, 'n', 'u', 'l', 'l') // expected a value
+	}
+	for i := len(s.stack) - 1; i >= 0; i-- {
+		if s.stack[i] == 'o' {
+			b = append(b, '}')
+		} else {
+			b = append(b, ']')
+		}
+	}
+	return b
+}
 
 func (j *JSON) allows(piece []byte) bool {
 	if len(piece) == 0 {

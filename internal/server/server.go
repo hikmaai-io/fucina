@@ -15,10 +15,12 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/hikmaai-io/fucina/internal/chat"
+	"github.com/hikmaai-io/fucina/internal/grammar"
 	"github.com/hikmaai-io/fucina/internal/sampler"
 	"github.com/hikmaai-io/fucina/internal/server/batch"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
@@ -70,6 +72,11 @@ type Server struct {
 	specEmitted  atomic.Int64
 	metrics      Metrics
 	httpServer   *http.Server
+
+	// jsonPieces caches the decoded UTF-8 bytes of every token id (control tokens →
+	// nil), built once and reused by every json_object request's grammar constraint.
+	piecesOnce sync.Once
+	jsonPieces [][]byte
 
 	debugDumpFull atomic.Bool // set once the debug dump file hits its size cap
 
@@ -143,6 +150,10 @@ type GenerationParams struct {
 	Stream           bool     `json:"stream"`
 	Stop             []string `json:"stop,omitempty"`
 	Tools            []Tool   `json:"-"` // request tool schemas, for required-param validation
+	// Constraint, when non-nil (response_format json_object/json_schema), masks the
+	// sampler each step so the output is always valid JSON. It forces the host-sampling
+	// path (the on-device spec sampler cannot take a host mask).
+	Constraint grammar.Constraint `json:"-"`
 }
 
 type ChatMessage struct {
@@ -228,6 +239,16 @@ type ChatRequest struct {
 	Thinking         *bool           `json:"thinking,omitempty"`
 	EnableThinking   *bool           `json:"enable_thinking,omitempty"`
 	ChatTemplateArgs json.RawMessage `json:"chat_template_kwargs,omitempty"`
+
+	// ResponseFormat: OpenAI structured-output. type "json_object" (and "json_schema")
+	// constrain decoding so the output is always a syntactically valid JSON object —
+	// malformed/unterminated JSON becomes structurally impossible (see internal/grammar).
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+}
+
+// ResponseFormat is the OpenAI response_format object.
+type ResponseFormat struct {
+	Type string `json:"type"` // "text" | "json_object" | "json_schema"
 }
 
 // resolveThinking decides whether the gemma-4 reasoning channel is enabled for
@@ -950,6 +971,12 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	}
 	params.Stream = req.Stream
 	params.Stop = req.Stop
+
+	// Structured output: response_format json_object/json_schema constrains decoding so
+	// the result is always a valid JSON object (the host-sampling path is forced).
+	if rf := req.ResponseFormat; rf != nil && (rf.Type == "json_object" || rf.Type == "json_schema") {
+		params.Constraint = s.jsonConstraint()
+	}
 
 	// Absolute output ceiling (independent of the context window): one client must
 	// not be able to monopolize the single-flight GPU for a ctx/2 (up to ~131k)
@@ -1717,7 +1744,11 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
 		var err error
 		var specFinish string
-		toks, specFinish, err = s.runSpec(ctx, params, logits, stops, emit)
+		if params.Constraint != nil {
+			toks, specFinish, err = s.runConstrained(ctx, params, logits, stops, params.Constraint, emit)
+		} else {
+			toks, specFinish, err = s.runSpec(ctx, params, logits, stops, emit)
+		}
 		if err != nil {
 			if len(toks) == 0 {
 				http.Error(w, fmt.Sprintf("generation failed: %v", err), http.StatusInternalServerError)
@@ -2080,7 +2111,13 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 		// repeat_penalty != 1.0 no longer drops to a per-token CPU decode loop
 		// (1 MB logits D2H + host top-k per token, and no drafting).
 		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
-		_, specFinish, err := s.runSpec(ctx, params, logits, stops, processToken)
+		var specFinish string
+		var err error
+		if params.Constraint != nil {
+			_, specFinish, err = s.runConstrained(ctx, params, logits, stops, params.Constraint, processToken)
+		} else {
+			_, specFinish, err = s.runSpec(ctx, params, logits, stops, processToken)
+		}
 		if err != nil {
 			log.Printf("fucina: generation error after %d tokens: %v", generated, err)
 		}
@@ -2145,6 +2182,84 @@ func (s *Server) logGenSpeed(start time.Time, generated int) {
 	s.metrics.recordDecode(generated, elapsed.Seconds())
 	log.Printf("fucina: generated %d tokens in %.2fs (%.1f tok/s)",
 		generated, elapsed.Seconds(), tps)
+}
+
+// jsonConstraint returns a fresh json_object decoding constraint. The per-token byte
+// pieces (decoded UTF-8 per id; control/special tokens → nil so they can't appear in the
+// JSON) are built once and cached, then shared by every request's fresh automaton.
+func (s *Server) jsonConstraint() grammar.Constraint {
+	s.piecesOnce.Do(func() {
+		tok := s.tokenizer
+		n := tok.NumTokens()
+		p := make([][]byte, n)
+		for id := 0; id < n; id++ {
+			p[id] = []byte(tok.Decode([]int32{int32(id)}))
+		}
+		for _, sp := range []int32{tok.BOS, tok.StartOfTurn, tok.EndOfTurn, tok.ChannelOpen,
+			tok.ChannelEnd, tok.ToolOpen, tok.ToolEnd, tok.ToolCallOpen, tok.ToolCallEnd,
+			tok.ToolRespOpen, tok.ToolRespEnd, tok.StringDelim} {
+			if sp >= 0 && int(sp) < n {
+				p[sp] = nil
+			}
+		}
+		s.jsonPieces = p
+	})
+	return grammar.NewJSON(s.jsonPieces, s.tokenizer.EOS)
+}
+
+// runConstrained generates under a grammar constraint via host sampling (the on-device
+// spec sampler cannot take a host token mask). Same shape as runSpec: it masks the logits
+// each step, host-samples, streams via emit (return true = stop), decodes the next token,
+// and advances the constraint. Stops only at a stop token (which the constraint forbids
+// until the structure is complete) or max_tokens. The caller holds the kv lock.
+func (s *Server) runConstrained(ctx context.Context, params GenerationParams, logits []float32,
+	stops []int32, c grammar.Constraint, emit func(int32) bool) ([]int32, string, error) {
+	seed := uint64(params.Seed)
+	if params.Seed < 0 {
+		seed = uint64(time.Now().UnixNano())
+	}
+	rng := rand.New(rand.NewSource(int64(seed)))
+	var all []int32
+	for remaining := params.MaxTokens; remaining > 0; remaining-- {
+		if ctx.Err() != nil {
+			return all, "cancelled", nil
+		}
+		c.Mask(logits) // forbid any token that would break JSON (and EOS until complete)
+		tok, err := sampler.Sample(logits, sampler.Params{
+			Temperature: params.Temperature, TopK: params.TopK, TopP: params.TopP,
+			MinP: params.MinP, RepeatPenalty: params.RepeatPenalty,
+		}, rng, s.kv.CurrentTokens())
+		if err != nil {
+			return all, "length", err
+		}
+		for _, sid := range stops { // a stop token ends the turn; never appended or rendered
+			if sid == tok {
+				return all, "stop", nil
+			}
+		}
+		all = append(all, tok)
+		if emit != nil && emit(tok) {
+			return all, "", nil
+		}
+		c.Accept(tok)
+		if logits, err = s.engine.Decode(tok); err != nil {
+			return all, "length", err
+		}
+		s.kv.AppendDecoded(tok)
+	}
+	// Token cap hit before the structure completed: force-close it so the output stays
+	// valid (tokenize the minimal completion and emit those tokens into the response).
+	if !c.Done() {
+		if closing := c.Close(); len(closing) > 0 {
+			for _, id := range s.tokenizer.Encode(string(closing), false, false) {
+				all = append(all, id)
+				if emit != nil {
+					emit(id)
+				}
+			}
+		}
+	}
+	return all, "length", nil
 }
 
 // sampleToken applies repeat-penalty → temperature → top-k → top-p → min-p →
