@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/hikmaai-io/fucina/internal/chat"
 	"github.com/hikmaai-io/fucina/internal/engine/cuda"
 	"github.com/hikmaai-io/fucina/internal/sampler"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
@@ -29,12 +30,27 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	if prompt == "" {
 		log.Fatalf("fucina: empty prompt. Use -p or -f")
 	}
-	if args.System != "" {
-		prompt = fmt.Sprintf("System: %s\n\n%s", args.System, prompt)
-	}
 
-	// Tokenize
-	tokens := tok.Encode(prompt, true, false)
+	// Build the tokenized input. By default the IT model gets the gemma-4 chat template
+	// (same as --interactive and the E4B path), honoring --system and --thinking; --raw
+	// feeds the prompt verbatim for base completion / benchmark parity.
+	var promptStr string
+	if args.Raw {
+		if args.System != "" {
+			promptStr = fmt.Sprintf("System: %s\n\n%s", args.System, prompt)
+		} else {
+			promptStr = prompt
+		}
+	} else {
+		var history []chat.Message
+		if args.System != "" {
+			history = append(history, chat.Message{Role: "system", Content: args.System})
+		}
+		history = append(history, chat.Message{Role: "user", Content: prompt})
+		thinkOn, _ := thinkSetting(args.Thinking, args.Predict)
+		promptStr = chat.Render(history, thinkOn, "", nil)
+	}
+	tokens := tok.Encode(promptStr, true, false)
 	log.Printf("fucina: prompt has %d tokens", len(tokens))
 
 	// Spec enabled → prompt-lookup/MTP speculative decode. Works for greedy AND

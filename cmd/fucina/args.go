@@ -42,6 +42,7 @@ type CLIArgs struct {
 	Spec         bool
 	DraftK       int
 	ThinkBudget  int     // server: reasoning-channel token budget (0=auto, <0=off)
+	Raw          bool    // -p: feed the prompt verbatim (no chat template) — base completion / benchmarks
 	KVSnapshotGB float64 // server: host-memory budget for saved KV sequences (0 = off)
 	CudaGraphs   bool    // --cuda-graphs (experimental, off by default)
 
@@ -160,6 +161,7 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 
 	fs.StringVar(&a.System, "s", "", "System prompt")
 	fs.StringVar(&a.System, "system", "", "System prompt")
+	fs.BoolVar(&a.Raw, "raw", false, "-p: feed the prompt verbatim, no chat template (base completion / benchmarks)")
 	fs.BoolVar(&a.Verbose, "v", false, "Verbose output")
 	fs.BoolVar(&a.Verbose, "verbose", false, "Verbose output")
 	fs.BoolVar(&a.Timings, "timings", false, "Show timing information")
