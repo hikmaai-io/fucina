@@ -116,6 +116,12 @@ struct e4b_engine {
                       *attn=nullptr,*gate=nullptr,*up=nullptr,*act=nullptr,*pleg=nullptr,*ctx_bf=nullptr;
         float *ple_lookup=nullptr,*ple_ctx=nullptr,*pli=nullptr,*logits_f=nullptr,*invf_s=nullptr,*invf_f=nullptr;
         int  *npast=nullptr;   // device-resident position for the graph-captured decode kernels
+        // CUDA-graph decode: the T==1 forward runs on cstream; captured once and replayed per
+        // token (only dec.ids/dec.npast change, updated OUTSIDE the graph; logits D2H'd after the
+        // replay). FUCINA_E4B_NOGRAPH=1 keeps the per-kernel-launch path.
+        cudaStream_t    cstream=nullptr;
+        cudaGraphExec_t gexec=nullptr;
+        bool graph_ready=false, graph_disabled=false;
     } dec;
     // Prefill (T>1) dequant scratch: when use_q40 the BF16 projection weights are freed,
     // so prefill dequants each Q4_0 projection → this reused BF16 buffer for the cuBLAS GEMM.
@@ -627,7 +633,8 @@ extern "C" void e4b_engine_destroy(e4b_engine_t *eng) {
     if (eng->d_q6k_head) cudaFree(eng->d_q6k_head);
     { auto& d=eng->dec; F(d.ids); F(d.hidden); F(d.norm); F(d.tmpH); F(d.q); F(d.k); F(d.v); F(d.attn);
       F(d.gate); F(d.up); F(d.act); F(d.pleg); F(d.ctx_bf); F(d.ple_lookup); F(d.ple_ctx); F(d.pli);
-      F(d.logits_f); F(d.invf_s); F(d.invf_f); F(d.npast); }
+      F(d.logits_f); F(d.invf_s); F(d.invf_f); F(d.npast);
+      if(d.gexec) cudaGraphExecDestroy(d.gexec); if(d.cstream) cudaStreamDestroy(d.cstream); }
     for (Slot& s : eng->slots) e4b_slot_free(eng, s);
     if (eng->cublas) cublasDestroy(eng->cublas);
     delete eng;
@@ -1020,6 +1027,10 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         d.invf_s = make_inv_freq_sliding(c.head_dim, c.rope_theta_sliding);
         d.invf_f = make_inv_freq_proportional(c.global_head_dim, c.rope_theta_full, c.rope_partial_full);
         if(!ok2 || !d.invf_s || !d.invf_f) return -1;
+        // Capture stream for the CUDA-graph decode (a non-default stream is required for stream
+        // capture). FUCINA_E4B_NOGRAPH=1 forces the per-kernel path.
+        if (const char* e=getenv("FUCINA_E4B_NOGRAPH"); e && e[0]=='1') d.graph_disabled=true;
+        if (!d.graph_disabled && cudaStreamCreateWithFlags(&d.cstream,cudaStreamNonBlocking)!=cudaSuccess) d.graph_disabled=true;
         d.ready = true;
     }
 
@@ -1048,29 +1059,40 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         ok&=CKF(cudaMalloc(&d_pli,(size_t)T*W*4));
         if(!ok) return -1;
     }
-    cudaMemcpy(d_ids,tokens,T*sizeof(int32_t),cudaMemcpyHostToDevice);
-    if (persist) cudaMemcpy(eng->dec.npast,&n_past,sizeof(int),cudaMemcpyHostToDevice);
+    // The whole T==1 decode forward runs on a capture stream so it can be captured into a CUDA
+    // graph and replayed; prefill (T>1) and the no-graph fallback use the default stream (st=0).
+    cudaStream_t st = (persist && !eng->dec.graph_disabled) ? eng->dec.cstream : (cudaStream_t)0;
+    cublasSetStream(eng->cublas, st);
+    // Inputs onto the stream (for the graph these are the only per-replay updates, done before
+    // the launch — see the capture/replay block below).
+    cudaMemcpyAsync(d_ids,tokens,T*sizeof(int32_t),cudaMemcpyHostToDevice,st);
+    if (persist) cudaMemcpyAsync(eng->dec.npast,&n_past,sizeof(int),cudaMemcpyHostToDevice,st);
 
     auto GRID=[&](int n){ return (n+255)/256; };
 
+    // The entire forward (embed → layers → final norm → head logits into dec.logits_f) is
+    // wrapped so it can be either captured into a CUDA graph (single-token decode) or run
+    // eagerly (prefill / capture fallback). Everything inside runs on `st`; the only per-step
+    // inputs (token id, n_past) were H2D'd before this lambda, and the logits D2H is after it.
+    auto forward = [&](){
     // ── embedding (×sqrt(H)) ──
-    embed_kernel<<<T,256>>>(eng->d_embed,d_ids,d_hidden,T,H,sqrtf((float)H));
-    if(emb_out){ float* tmp; cudaMalloc(&tmp,(size_t)T*H*4); to_f32_kernel<<<GRID(T*H),256>>>(d_hidden,tmp,T*H);
+    embed_kernel<<<T,256, 0, st>>>(eng->d_embed,d_ids,d_hidden,T,H,sqrtf((float)H));
+    if(emb_out){ float* tmp; cudaMalloc(&tmp,(size_t)T*H*4); to_f32_kernel<<<GRID(T*H),256, 0, st>>>(d_hidden,tmp,T*H);
         cudaMemcpy(emb_out,tmp,(size_t)T*H*4,cudaMemcpyDeviceToHost); cudaFree(tmp); }
 
     // ── PLE precompute (token-identity lookup + context projection, combined) ──
-    e4b_ple_lookup_launch(eng->d_ple_fp8, eng->d_ple_scale, d_ids, d_ple_lookup, T, W);
+    e4b_ple_lookup_launch(eng->d_ple_fp8, eng->d_ple_scale, d_ids, d_ple_lookup, T, W, st);
     {
         bf16* d_ctx_bf = persist ? eng->dec.ctx_bf : nullptr;
         if (!persist) cudaMalloc(&d_ctx_bf,(size_t)T*W*2);
         linear(eng->cublas, eng->d_plm_proj, d_hidden, d_ctx_bf, T, W, H);
-        to_f32_kernel<<<GRID(T*W),256>>>(d_ctx_bf,d_ple_ctx,T*W);
+        to_f32_kernel<<<GRID(T*W),256, 0, st>>>(d_ctx_bf,d_ple_ctx,T*W);
         if (!persist) cudaFree(d_ctx_bf);
         // The 1/sqrt(H) scale on the projection is a no-op before per-256 RMSNorm
         // (RMSNorm is scale-invariant), so we skip it and normalize directly.
-        rmsnorm_f32_grouped<<<T*c.n_layers,256>>>(d_ple_ctx, eng->d_ple_proj_norm, T*c.n_layers, PD, eps);
+        rmsnorm_f32_grouped<<<T*c.n_layers,256, 0, st>>>(d_ple_ctx, eng->d_ple_proj_norm, T*c.n_layers, PD, eps);
     }
-    ple_combine_kernel<<<GRID(T*W),256>>>(d_ple_lookup, d_ple_ctx, d_pli, T*W);
+    ple_combine_kernel<<<GRID(T*W),256, 0, st>>>(d_ple_lookup, d_ple_ctx, d_pli, T*W);
 
     // ── decoder layers ──
     for (int li=0; li<c.n_layers; ++li){
@@ -1085,8 +1107,8 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         bf16* vcache = slot.vc[li];
 
         // residual = hidden; input_layernorm
-        cudaMemcpy(d_tmpH,d_hidden,(size_t)T*H*2,cudaMemcpyDeviceToDevice);
-        rmsnorm_kernel<<<T,256>>>(d_hidden,L.input_ln,d_norm,T,H,eps);
+        cudaMemcpyAsync(d_tmpH,d_hidden,(size_t)T*H*2,cudaMemcpyDeviceToDevice,st);
+        rmsnorm_kernel<<<T,256, 0, st>>>(d_hidden,L.input_ln,d_norm,T,H,eps);
 
         // Decode quant (T==1). Two mutually exclusive strategies:
         //   use_q40 (GGUF Q4_0): every matmul via the SHARED dp4a MMVQ (mmvq.cuh), off the native
@@ -1096,9 +1118,9 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         const bool fp4_dec = eng->use_fp4 && T==1;
         const bool q40_dec = eng->use_q40 && T==1;
         auto q40dec = [&](bf16* y, const uint8_t* wb, const bf16* x, int out, int in){
-            quantize_q8_1_bf16_kernel<<<in/32,32,0,0>>>(x, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in);
-            mmvq_launch(eng->d_fp4_yf, wb, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in, out, 2, 0);
-            e4bfp4::to_bf16<<<(out+255)/256,256,0,0>>>(eng->d_fp4_yf, y, out);
+            quantize_q8_1_bf16_kernel<<<in/32,32,0,st>>>(x, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in);
+            mmvq_launch(eng->d_fp4_yf, wb, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in, out, 2, st);
+            e4bfp4::to_bf16<<<(out+255)/256,256,0,st>>>(eng->d_fp4_yf, y, out);
         };
         auto prefill_q40 = [&](bf16* y, const uint8_t* wb, const bf16* x, int out, int in){
             int64_t nblk=(int64_t)out*(in/32);
@@ -1108,12 +1130,12 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
 
         // Q (always projected) — q_norm, rope at absolute positions
         if      (q40_dec)      q40dec(d_q, L.q40_wq, d_norm, qd, H);
-        else if (fp4_dec)      e4bfp4::e4b_fp8_gemv_bf16(d_q, L.fp8_wq, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
+        else if (fp4_dec)      e4bfp4::e4b_fp8_gemv_bf16(d_q, L.fp8_wq, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, st);
         else if (eng->use_q40) prefill_q40(d_q, L.q40_wq, d_norm, qd, H);
         else                   linear(eng->cublas,L.wq,d_norm,d_q,T,qd,H);
-        head_rmsnorm_kernel<<<T*c.n_heads,256>>>(d_q,L.q_norm,T,c.n_heads,hd,eps);
-        if (persist) rope_batch_kernel<<<c.n_heads,256>>>(d_q,d_invf,1,c.n_heads,hd,eng->dec.npast);
-        else         rope_kernel<<<T*c.n_heads,256>>>(d_q,d_invf,T,c.n_heads,hd,n_past);
+        head_rmsnorm_kernel<<<T*c.n_heads,256, 0, st>>>(d_q,L.q_norm,T,c.n_heads,hd,eps);
+        if (persist) rope_batch_kernel<<<c.n_heads,256, 0, st>>>(d_q,d_invf,1,c.n_heads,hd,eng->dec.npast);
+        else         rope_kernel<<<T*c.n_heads,256, 0, st>>>(d_q,d_invf,T,c.n_heads,hd,n_past);
 
         // K/V: non-shared layers project + store into their cache; shared layers
         // skip (their provider — an earlier layer this same step — already wrote it).
@@ -1122,8 +1144,8 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
                 q40dec(d_k, L.q40_wk, d_norm, kvd, H);
                 q40dec(d_v, L.q40_wv, d_norm, kvd, H);
             } else if (fp4_dec){
-                e4bfp4::e4b_fp8_gemv_bf16(d_k, L.fp8_wk, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
-                e4bfp4::e4b_nvfp4_gemv_bf16(d_v, L.fp4_wv, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
+                e4bfp4::e4b_fp8_gemv_bf16(d_k, L.fp8_wk, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, st);
+                e4bfp4::e4b_nvfp4_gemv_bf16(d_v, L.fp4_wv, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, st);
             } else if (eng->use_q40){
                 prefill_q40(d_k, L.q40_wk, d_norm, kvd, H);
                 prefill_q40(d_v, L.q40_wv, d_norm, kvd, H);
@@ -1131,16 +1153,16 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
                 linear(eng->cublas,L.wk,d_norm,d_k,T,kvd,H);
                 linear(eng->cublas,L.wv,d_norm,d_v,T,kvd,H);
             }
-            head_rmsnorm_kernel<<<T*c.n_kv_heads,256>>>(d_k,L.k_norm,T,c.n_kv_heads,hd,eps);
-            head_rmsnorm_kernel<<<T*c.n_kv_heads,256>>>(d_v,nullptr,T,c.n_kv_heads,hd,eps); // v_norm (no weight)
+            head_rmsnorm_kernel<<<T*c.n_kv_heads,256, 0, st>>>(d_k,L.k_norm,T,c.n_kv_heads,hd,eps);
+            head_rmsnorm_kernel<<<T*c.n_kv_heads,256, 0, st>>>(d_v,nullptr,T,c.n_kv_heads,hd,eps); // v_norm (no weight)
             if (persist){
-                rope_batch_kernel<<<c.n_kv_heads,256>>>(d_k,d_invf,1,c.n_kv_heads,hd,eng->dec.npast);
-                kv_store_dev_kernel<<<GRID(kvd),256>>>(d_k,kcache,kvd,eng->dec.npast);
-                kv_store_dev_kernel<<<GRID(kvd),256>>>(d_v,vcache,kvd,eng->dec.npast);
+                rope_batch_kernel<<<c.n_kv_heads,256, 0, st>>>(d_k,d_invf,1,c.n_kv_heads,hd,eng->dec.npast);
+                kv_store_dev_kernel<<<GRID(kvd),256, 0, st>>>(d_k,kcache,kvd,eng->dec.npast);
+                kv_store_dev_kernel<<<GRID(kvd),256, 0, st>>>(d_v,vcache,kvd,eng->dec.npast);
             } else {
-                rope_kernel<<<T*c.n_kv_heads,256>>>(d_k,d_invf,T,c.n_kv_heads,hd,n_past);
-                kv_store_kernel<<<GRID(T*kvd),256>>>(d_k,kcache,T,kvd,n_past);
-                kv_store_kernel<<<GRID(T*kvd),256>>>(d_v,vcache,T,kvd,n_past);
+                rope_kernel<<<T*c.n_kv_heads,256, 0, st>>>(d_k,d_invf,T,c.n_kv_heads,hd,n_past);
+                kv_store_kernel<<<GRID(T*kvd),256, 0, st>>>(d_k,kcache,T,kvd,n_past);
+                kv_store_kernel<<<GRID(T*kvd),256, 0, st>>>(d_v,vcache,T,kvd,n_past);
             }
         }
 
@@ -1148,25 +1170,25 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         // position flash kernel (CUDA-graph-able); prefill uses the dynamic-smem multi-query path.
         if (persist){
             const int smemF = (256 + hd) * (int)sizeof(float);
-            attn_flash_decode_kernel<256><<<c.n_heads,256,smemF>>>(
+            attn_flash_decode_kernel<256><<<c.n_heads,256,smemF, st>>>(
                 d_q,kcache,vcache,d_attn,eng->dec.npast,c.n_heads,c.n_kv_heads,hd,1.0f,window);
         } else {
             dim3 ag(c.n_heads,T); size_t sh=(size_t)(n_past+T)*sizeof(float);
-            attn_cache_kernel<<<ag,256,sh>>>(d_q,kcache,vcache,d_attn,T,n_past,c.n_heads,c.n_kv_heads,hd,1.0f,window);
+            attn_cache_kernel<<<ag,256,sh, st>>>(d_q,kcache,vcache,d_attn,T,n_past,c.n_heads,c.n_kv_heads,hd,1.0f,window);
         }
 
         // o_proj → d_norm; post_attention_layernorm; hidden = residual + that
         if      (q40_dec)      q40dec(d_norm, L.q40_wo, d_attn, H, qd);
-        else if (fp4_dec)      e4bfp4::e4b_nvfp4_gemv_bf16(d_norm, L.fp4_wo, d_attn, eng->d_fp4_xf, eng->d_fp4_yf, 0);
+        else if (fp4_dec)      e4bfp4::e4b_nvfp4_gemv_bf16(d_norm, L.fp4_wo, d_attn, eng->d_fp4_xf, eng->d_fp4_yf, st);
         else if (eng->use_q40) prefill_q40(d_norm, L.q40_wo, d_attn, H, qd);
         else                   linear(eng->cublas,L.wo,d_attn,d_norm,T,H,qd);
-        rmsnorm_kernel<<<T,256>>>(d_norm,L.post_attn_ln,d_norm,T,H,eps);
-        add_kernel<<<GRID(T*H),256>>>(d_tmpH,d_norm,T*H);
-        cudaMemcpy(d_hidden,d_tmpH,(size_t)T*H*2,cudaMemcpyDeviceToDevice);
+        rmsnorm_kernel<<<T,256, 0, st>>>(d_norm,L.post_attn_ln,d_norm,T,H,eps);
+        add_kernel<<<GRID(T*H),256, 0, st>>>(d_tmpH,d_norm,T*H);
+        cudaMemcpyAsync(d_hidden,d_tmpH,(size_t)T*H*2,cudaMemcpyDeviceToDevice,st);
 
         // FFN: residual; pre_ff norm; GeGLU; post_ff norm; residual add
-        cudaMemcpy(d_tmpH,d_hidden,(size_t)T*H*2,cudaMemcpyDeviceToDevice);
-        rmsnorm_kernel<<<T,256>>>(d_hidden,L.pre_ff_ln,d_norm,T,H,eps);
+        cudaMemcpyAsync(d_tmpH,d_hidden,(size_t)T*H*2,cudaMemcpyDeviceToDevice,st);
+        rmsnorm_kernel<<<T,256, 0, st>>>(d_hidden,L.pre_ff_ln,d_norm,T,H,eps);
         // FFN projections. Single-token decode (T==1) reads the NVFP4 weights via the
         // bandwidth-tuned GEMV (default; unless FUCINA_E4B_FP4=0); prefill (T>1) stays on the BF16
         // tensor-core GEMM. GeGLU and the surrounding norms/residual are identical.
@@ -1175,47 +1197,47 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
             // mmvq_glu keeps gate·up in f32 and would diverge from the batched unfused rounding).
             q40dec(d_gate, L.q40_gate, d_norm, FF, H);
             q40dec(d_up,   L.q40_up,   d_norm, FF, H);
-            geglu_kernel<<<GRID(T*FF),256>>>(d_gate,d_up,d_act,T*FF);
+            geglu_kernel<<<GRID(T*FF),256, 0, st>>>(d_gate,d_up,d_act,T*FF);
             q40dec(d_norm, L.q40_down, d_act, H, FF);
         } else if (fp4_dec){
-            e4bfp4::e4b_nvfp4_gemv_bf16(d_gate, L.fp4_gate, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
-            e4bfp4::e4b_nvfp4_gemv_bf16(d_up,   L.fp4_up,   d_norm, eng->d_fp4_xf, eng->d_fp4_yf, 0);
-            geglu_kernel<<<GRID(T*FF),256>>>(d_gate,d_up,d_act,T*FF);
-            e4bfp4::e4b_nvfp4_gemv_bf16(d_norm, L.fp4_down, d_act,  eng->d_fp4_xf, eng->d_fp4_yf, 0);
+            e4bfp4::e4b_nvfp4_gemv_bf16(d_gate, L.fp4_gate, d_norm, eng->d_fp4_xf, eng->d_fp4_yf, st);
+            e4bfp4::e4b_nvfp4_gemv_bf16(d_up,   L.fp4_up,   d_norm, eng->d_fp4_xf, eng->d_fp4_yf, st);
+            geglu_kernel<<<GRID(T*FF),256, 0, st>>>(d_gate,d_up,d_act,T*FF);
+            e4bfp4::e4b_nvfp4_gemv_bf16(d_norm, L.fp4_down, d_act,  eng->d_fp4_xf, eng->d_fp4_yf, st);
         } else if (eng->use_q40){
             prefill_q40(d_gate, L.q40_gate, d_norm, FF, H);
             prefill_q40(d_up,   L.q40_up,   d_norm, FF, H);
-            geglu_kernel<<<GRID(T*FF),256>>>(d_gate,d_up,d_act,T*FF);
+            geglu_kernel<<<GRID(T*FF),256, 0, st>>>(d_gate,d_up,d_act,T*FF);
             prefill_q40(d_norm, L.q40_down, d_act,  H, FF);
         } else {
             linear(eng->cublas,L.w_gate,d_norm,d_gate,T,FF,H);
             linear(eng->cublas,L.w_up,d_norm,d_up,T,FF,H);
-            geglu_kernel<<<GRID(T*FF),256>>>(d_gate,d_up,d_act,T*FF);
+            geglu_kernel<<<GRID(T*FF),256, 0, st>>>(d_gate,d_up,d_act,T*FF);
             linear(eng->cublas,L.w_down,d_act,d_norm,T,H,FF);
         }
-        rmsnorm_kernel<<<T,256>>>(d_norm,L.post_ff_ln,d_norm,T,H,eps);
-        add_kernel<<<GRID(T*H),256>>>(d_tmpH,d_norm,T*H);
-        cudaMemcpy(d_hidden,d_tmpH,(size_t)T*H*2,cudaMemcpyDeviceToDevice);
+        rmsnorm_kernel<<<T,256, 0, st>>>(d_norm,L.post_ff_ln,d_norm,T,H,eps);
+        add_kernel<<<GRID(T*H),256, 0, st>>>(d_tmpH,d_norm,T*H);
+        cudaMemcpyAsync(d_hidden,d_tmpH,(size_t)T*H*2,cudaMemcpyDeviceToDevice,st);
 
         // PLE combine: residual; gate(hidden)→256; gelu; ×per_layer_input; proj; norm; add
-        cudaMemcpy(d_tmpH,d_hidden,(size_t)T*H*2,cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(d_tmpH,d_hidden,(size_t)T*H*2,cudaMemcpyDeviceToDevice,st);
         linear(eng->cublas,L.ple_in_gate,d_hidden,d_pleg,T,PD,H);
-        ple_gate_strided<<<GRID(T*PD),256>>>(d_pleg, d_pli, T, PD, W, li);
+        ple_gate_strided<<<GRID(T*PD),256, 0, st>>>(d_pleg, d_pli, T, PD, W, li);
         linear(eng->cublas,L.ple_proj,d_pleg,d_norm,T,H,PD);
-        rmsnorm_kernel<<<T,256>>>(d_norm,L.post_ple_ln,d_norm,T,H,eps);
-        add_kernel<<<GRID(T*H),256>>>(d_tmpH,d_norm,T*H);
-        scale_kernel<<<GRID(T*H),256>>>(d_tmpH,L.layer_scalar,T*H);  // ×layer_scalar
-        cudaMemcpy(d_hidden,d_tmpH,(size_t)T*H*2,cudaMemcpyDeviceToDevice);
+        rmsnorm_kernel<<<T,256, 0, st>>>(d_norm,L.post_ple_ln,d_norm,T,H,eps);
+        add_kernel<<<GRID(T*H),256, 0, st>>>(d_tmpH,d_norm,T*H);
+        scale_kernel<<<GRID(T*H),256, 0, st>>>(d_tmpH,L.layer_scalar,T*H);  // ×layer_scalar
+        cudaMemcpyAsync(d_hidden,d_tmpH,(size_t)T*H*2,cudaMemcpyDeviceToDevice,st);
 
         if (li==0 && l0_out){ float* tmp; cudaMalloc(&tmp,(size_t)T*H*4);
-            to_f32_kernel<<<GRID(T*H),256>>>(d_hidden,tmp,T*H);
+            to_f32_kernel<<<GRID(T*H),256, 0, st>>>(d_hidden,tmp,T*H);
             cudaMemcpy(l0_out,tmp,(size_t)T*H*4,cudaMemcpyDeviceToHost); cudaFree(tmp); }
     }
 
     // final norm
-    rmsnorm_kernel<<<T,256>>>(d_hidden,eng->d_final_norm,d_norm,T,H,eps);
+    rmsnorm_kernel<<<T,256, 0, st>>>(d_hidden,eng->d_final_norm,d_norm,T,H,eps);
     if(fin_out){ float* tmp; cudaMalloc(&tmp,(size_t)T*H*4);
-        to_f32_kernel<<<GRID(T*H),256>>>(d_norm,tmp,T*H);
+        to_f32_kernel<<<GRID(T*H),256, 0, st>>>(d_norm,tmp,T*H);
         cudaMemcpy(fin_out,tmp,(size_t)T*H*4,cudaMemcpyDeviceToHost); cudaFree(tmp); }
 
     // logits of the last token (tied head + softcap). ALWAYS a 1-row projection (last token
@@ -1227,22 +1249,61 @@ static int e4b_step(e4b_engine* eng, Slot& slot, const int32_t* tokens, int T,
         float* d_logits_f = persist ? eng->dec.logits_f : nullptr;
         if (!persist) cudaMalloc(&d_logits_f,(size_t)V*4);
         if (eng->use_q40){   // native Q6_K tied head via shared MMVQ
-            quantize_q8_1_bf16_kernel<<<H/32,32,0,0>>>(xrow, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, H);
-            mmvq_q6_k_launch(d_logits_f, eng->d_q6k_head, eng->d_q40_qa, eng->d_q40_da, H, V, 0);
+            quantize_q8_1_bf16_kernel<<<H/32,32,0,st>>>(xrow, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, H);
+            mmvq_q6_k_launch(d_logits_f, eng->d_q6k_head, eng->d_q40_qa, eng->d_q40_da, H, V, st);
         } else if (eng->use_fp4){
-            e4bfp4::e4b_fp8_gemv_f32(d_logits_f, eng->fp8_head, xrow, eng->d_fp4_xf, 0);
+            e4bfp4::e4b_fp8_gemv_f32(d_logits_f, eng->fp8_head, xrow, eng->d_fp4_xf, st);
         } else {
             bf16* d_logits_bf; cudaMalloc(&d_logits_bf,(size_t)V*2);
             linear(eng->cublas, eng->d_embed, xrow, d_logits_bf, 1, V, H);
-            to_f32_kernel<<<GRID(V),256>>>(d_logits_bf,d_logits_f,V);
+            to_f32_kernel<<<GRID(V),256, 0, st>>>(d_logits_bf,d_logits_f,V);
             cudaFree(d_logits_bf);
         }
-        softcap_kernel<<<GRID(V),256>>>(d_logits_f,V,c.final_logit_softcap);
-        cudaMemcpy(logits_last_out,d_logits_f,(size_t)V*4,cudaMemcpyDeviceToHost);
-        if (!persist) cudaFree(d_logits_f);
+        softcap_kernel<<<GRID(V),256, 0, st>>>(d_logits_f,V,c.final_logit_softcap);
+        // Decode (persist): logits stay in dec.logits_f; the D2H is issued AFTER the graph
+        // replay below (it must not be part of the captured region). Prefill (!persist):
+        // per-call scratch, copy + free here.
+        if (!persist){ cudaMemcpy(logits_last_out,d_logits_f,(size_t)V*4,cudaMemcpyDeviceToHost); cudaFree(d_logits_f); }
+    }
+    };  // end forward
+
+    // ── run the forward: CUDA-graph capture/replay for single-token decode, else direct ──
+    // The decode body is identical every step except for the two device inputs (token id,
+    // n_past) already H2D'd above; capture it once and replay, eliding ~250 launch overheads.
+    const bool graph_path = persist && !eng->dec.graph_disabled &&
+                            logits_last_out && !emb_out && !l0_out && !fin_out;
+    if (graph_path && eng->dec.graph_ready){
+        cudaGraphLaunch(eng->dec.gexec, st);
+    } else if (graph_path){
+        // First decode: run once eagerly to warm up (cuBLAS workspace allocation and any
+        // lazy one-time init must NOT happen during capture, or BeginCapture aborts). The
+        // warmup writes KV at the same device n_past the replay will, so it is idempotent.
+        forward();
+        cudaStreamSynchronize(st);
+        cudaGraph_t g=nullptr;
+        cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+        forward();
+        cudaError_t cap = cudaStreamEndCapture(st,&g);
+        if (cap==cudaSuccess && cudaGraphInstantiate(&eng->dec.gexec,g,0)==cudaSuccess){
+            eng->dec.graph_ready=true;
+            cudaGraphDestroy(g);
+            cudaGraphLaunch(eng->dec.gexec, st);   // capture records but does not execute
+        } else {
+            eng->dec.graph_disabled=true; cudaGetLastError();
+            if(g) cudaGraphDestroy(g);
+            fprintf(stderr,"e4b: CUDA-graph capture failed (%s); decode falls back to eager\n",
+                    cudaGetErrorString(cap));
+            forward();                              // eager fallback (executes)
+        }
+    } else {
+        forward();                                  // prefill / debug: direct
     }
 
-    cudaError_t err=cudaDeviceSynchronize();
+    // Decode logits D2H — outside the captured region so the host buffer can change per call.
+    if (logits_last_out && persist)
+        cudaMemcpyAsync(logits_last_out, eng->dec.logits_f, (size_t)V*4, cudaMemcpyDeviceToHost, st);
+
+    cudaError_t err = persist ? cudaStreamSynchronize(st) : cudaDeviceSynchronize();
     if (!persist){   // prefill scratch is per-call; decode scratch is persistent (freed at destroy)
         cudaFree(d_ids);cudaFree(d_hidden);cudaFree(d_norm);cudaFree(d_tmpH);cudaFree(d_q);cudaFree(d_k);
         cudaFree(d_v);cudaFree(d_attn);cudaFree(d_gate);cudaFree(d_up);cudaFree(d_act);cudaFree(d_pleg);
