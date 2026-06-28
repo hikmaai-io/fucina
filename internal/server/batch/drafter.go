@@ -14,8 +14,22 @@ package batch
 // Params match the C call site: minNG=2, maxNG=draftK. occ is capped so a token that
 // recurs everywhere doesn't blow up the inner agreement scan.
 func promptLookupDraft(hist []int32, maxD, minNG, maxNG int) []int32 {
+	d, _ := promptLookupDraftConf(hist, maxD, minNG, maxNG)
+	return d
+}
+
+// promptLookupDraftConf is promptLookupDraft plus a per-position CONFIDENCE estimate for
+// every drafted token, consumed by the confidence-scheduled verifier (DSpark Algorithm 1).
+// conf[j] ∈ (0,1] is the consensus fraction at draft position j: of the earlier suffix
+// occurrences scanned, the fraction that agree on the proposed token. A unanimous (or
+// single-occurrence) match scores 1.0; a bare strict-majority scores ~0.5. It is the
+// training-free, model-agnostic stand-in for the drafter's accept probability c_{r,j} that
+// the paper's learned drafter would emit. len(conf) == len(draft). The scheduler turns these
+// into per-request survival a_{r,j}=∏_{i≤j} conf[i] and ranks draft positions across ALL
+// requests by survival to tailor each request's verify length to the current load.
+func promptLookupDraftConf(hist []int32, maxD, minNG, maxNG int) ([]int32, []float32) {
 	if maxD <= 0 {
-		return nil
+		return nil, nil
 	}
 	n := len(hist)
 	const maxOcc = 16
@@ -53,6 +67,7 @@ func promptLookupDraft(hist []int32, maxD, minNG, maxNG int) []int32 {
 			cap = ng
 		}
 		var draft []int32
+		var conf []float32
 		for dd := 0; dd < cap; dd++ {
 			p0 := occ[0] + dd // most-recent occurrence's continuation
 			if p0 >= n {
@@ -69,10 +84,11 @@ func promptLookupDraft(hist []int32, maxD, minNG, maxNG int) []int32 {
 				break // consensus broke → stop drafting here
 			}
 			draft = append(draft, cand)
+			conf = append(conf, float32(agree)/float32(nocc))
 		}
 		if len(draft) > 0 {
-			return draft
+			return draft, conf
 		}
 	}
-	return nil
+	return nil, nil
 }

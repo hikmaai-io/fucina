@@ -569,14 +569,22 @@ func (s *Scheduler) step(active map[int]*seq) bool {
 	return s.stepPlain(active)
 }
 
-// stepSpec is the speculative analogue of step: per active slot it drafts a few tokens
+// stepSpec is the speculative analogue of step: per active slot it drafts tokens
 // (prompt-lookup over that sequence's history) and verifies them all in ONE batched
 // forward via the engine's StepBatchSpec, then scatters the committed RUN (accepted
 // drafts + bonus token) back to each sequence. The accepted run is what makes spec pay
-// off — one weight pass commits multiple tokens. The verify flattens to Σ(1+drafts) rows
-// ≤ MaxVerifyRows: R anchors are mandatory, the rest is the draft budget, distributed
-// greedily, so speculation tapers as concurrency rises. It is LOSSLESS: the committed
-// run is what a plain greedy step would have emitted (the engine's verify enforces it).
+// off — one weight pass commits multiple tokens.
+//
+// How many of each slot's candidate drafts to actually verify is decided by the DSpark
+// Hardware-Aware Prefix Scheduler (scheduleConfidence): each draft token carries a
+// consensus confidence, the scheduler ranks all requests' draft positions by survival
+// probability and admits them greedily while expected throughput Θ=τ·SPS(B) rises,
+// stopping (non-anticipating) the instant it would drop. So speculation grows at low
+// concurrency (free verify rows) and tapers toward 0 as concurrency rises (anchors crowd
+// out drafts and the throughput bar climbs), the engine's Σ(1+drafts) ≤ MaxVerifyRows cap
+// being the hard ceiling. It is LOSSLESS: the scheduler only sets draft *lengths*; the
+// committed run is what a plain greedy step would have emitted (the engine's verify
+// enforces it), so any length — including zero — yields identical tokens.
 func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 	// Stable order: build parallel arrays so reqs[i] ↔ slots[i] ↔ out[i] by index.
 	slots := make([]int, 0, len(active))
@@ -584,35 +592,48 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 		slots = append(slots, slot)
 	}
 
-	budget := MaxVerifyRows - len(slots) // verify rows left for draft tokens
-	if budget < 0 {
-		budget = 0
+	// Draft a full candidate run per slot with per-position confidence, then fold each
+	// confidence sequence into cumulative survival a_{j}=∏_{i≤j} c_i for the scheduler.
+	drafts := make([][]int32, len(slots))
+	surv := make([][]float32, len(slots))
+	for i, slot := range slots {
+		sq := active[slot]
+		d, c := promptLookupDraftConf(sq.hist, s.draftK, 2, s.draftK)
+		drafts[i] = d
+		if len(c) > 0 {
+			a := make([]float32, len(c))
+			p := float32(1)
+			for j, cj := range c {
+				p *= cj
+				a[j] = p
+			}
+			surv[i] = a
+		}
 	}
+
+	// Hardware-aware prefix scheduler: choose the per-slot verify length under the global
+	// row budget and the decode throughput model (DSpark Alg.1, training-free half).
+	admit := scheduleConfidence(surv, MaxVerifyRows)
+
 	reqs := make([]SpecReq, len(slots))
 	anyDraft := false
 	for i, slot := range slots {
 		sq := active[slot]
-		var drafts []int32
-		if budget > 0 {
-			maxD := s.draftK
-			if maxD > budget {
-				maxD = budget
-			}
-			drafts = promptLookupDraft(sq.hist, maxD, 2, s.draftK)
-			if len(drafts) > budget {
-				drafts = drafts[:budget]
-			}
-			budget -= len(drafts)
-			if len(drafts) > 0 {
-				anyDraft = true
-			}
+		k := admit[i]
+		if k > len(drafts[i]) {
+			k = len(drafts[i])
 		}
-		reqs[i] = SpecReq{Slot: int32(slot), Anchor: sq.next, Drafts: drafts}
+		var d []int32
+		if k > 0 {
+			d = drafts[i][:k]
+			anyDraft = true
+		}
+		reqs[i] = SpecReq{Slot: int32(slot), Anchor: sq.next, Drafts: d}
 	}
 
-	// No slot produced a draft (e.g. all novel prose): the speculative verify would be
-	// pure overhead vs a plain one-token step. Fall back so we never pay to "spec" zero
-	// drafts.
+	// No slot was admitted a draft (all novel prose, or concurrency saturated the row
+	// budget): the speculative verify would be pure overhead vs a plain one-token step.
+	// Fall back so we never pay to "spec" zero drafts.
 	if !anyDraft {
 		return s.stepPlain(active)
 	}
