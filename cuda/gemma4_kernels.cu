@@ -1392,6 +1392,106 @@ static void mmvq_q4_k_batched_launch(
     #undef LQ4K
 }
 
+// ── PACKED Q4_K: de-interleaved superblock for coalesced uint4 loads ──────────────────────
+// The native mmvq_q4_k_kernel reads each sub-block's quants 2-byte-granular and re-reads the
+// sibling sub-block's 32 bytes (the pair shares 32 quant bytes, low/high nibble per j&1).
+// Repack each 256-elem superblock to the SAME 144 B: header [d,dmin,scales(12)] verbatim at
+// [0..15], then 8 sub-blocks of 16 DE-INTERLEAVED quant bytes at [16+j*16 .. +15], byte m =
+// nib(elem m) | (nib(elem m+16)<<4) — the GGML-Q4_0 nibble convention. The packed kernel then
+// reads one coalesced uint4 (16 B) per sub-block and reuses the Q4_0 unpack/dp4a; the integer
+// dot is identical → BIT-IDENTICAL to mmvq_q4_k_kernel. Repack is per-superblock same-size, so
+// it runs in place inside d_weights (no second full weight copy); aliasing within a superblock
+// is avoided by the caller giving src≠dst (a temp), since sub-blocks j and j^1 share src bytes.
+__global__ void repack_q4_k_kernel(const uint8_t *src, uint8_t *dst, size_t n_super) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_super) return;
+    const uint8_t *blk = src + i * 144;
+    uint8_t       *out = dst + i * 144;
+    #pragma unroll
+    for (int h = 0; h < 16; h++) out[h] = blk[h];           // header verbatim
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const uint8_t *qbase = blk + 16 + (size_t)(j >> 1) * 32;
+        int shift = (j & 1) ? 4 : 0;
+        uint8_t *p = out + 16 + (size_t)j * 16;
+        #pragma unroll
+        for (int m = 0; m < 16; m++) {
+            int lo = (qbase[m]      >> shift) & 0xF;        // element m
+            int hi = (qbase[m + 16] >> shift) & 0xF;        // element m+16
+            p[m] = (uint8_t)(lo | (hi << 4));
+        }
+    }
+}
+
+template<int NK>
+__global__ void mmvq_q4_k_packed_batched_kernel(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.x * nwarps + warp;
+    if (idx >= out_dim) return;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * 144;
+    float acc[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
+    for (int b = lane; b < nb32; b += 32) {
+        const uint8_t *blk = wrow + (size_t)(b >> 3) * 144;
+        int j = b & 7;
+        __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+        float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+        int s, m; q4k_scale_min(blk + 4, j, &s, &m);
+        uint4 q = *(const uint4 *)(blk + 16 + (size_t)j * 16);   // one coalesced load, 32 nibbles
+        int wv[8];
+        int w0=(int)q.x, w1=(int)q.y, w2=(int)q.z, w3=(int)q.w;
+        wv[0]=w0&0x0F0F0F0F; wv[1]=(w0>>4)&0x0F0F0F0F;
+        wv[2]=w1&0x0F0F0F0F; wv[3]=(w1>>4)&0x0F0F0F0F;
+        wv[4]=w2&0x0F0F0F0F; wv[5]=(w2>>4)&0x0F0F0F0F;
+        wv[6]=w3&0x0F0F0F0F; wv[7]=(w3>>4)&0x0F0F0F0F;
+        #pragma unroll
+        for (int n = 0; n < NK; n++) {
+            const int *xqs = (const int *)(qx + (size_t)n*in_dim + (size_t)b*32);
+            int sumi = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                sumi = __dp4a(wv[2*k],   xqs[k],     sumi);
+                sumi = __dp4a(wv[2*k+1], xqs[k + 4], sumi);
+            }
+            acc[n] += dx[(size_t)n*nb32 + b] *
+                      (d*(float)s*(float)sumi - dmin*(float)m*(float)sx[(size_t)n*nb32 + b]);
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) { float v = warp_reduce_sum_all(acc[n]); if (lane==0) out[(size_t)n*out_dim+idx] = v; }
+}
+
+static void mmvq_q4_k_packed_batched_launch(
+    float *out, const uint8_t *w, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K, cudaStream_t stream)
+{
+    const int NWARPS = 8; int b = NWARPS*32; dim3 g((out_dim + NWARPS - 1) / NWARPS);
+    #define LPP_Q4K(NK) mmvq_q4_k_packed_batched_kernel<NK><<<g,b,0,stream>>>(out,w,qx,dx,sx,in_dim,out_dim)
+    switch (K) {
+        case 1: LPP_Q4K(1); break; case 2: LPP_Q4K(2); break; case 3: LPP_Q4K(3); break; case 4: LPP_Q4K(4); break;
+        case 5: LPP_Q4K(5); break; case 6: LPP_Q4K(6); break; case 7: LPP_Q4K(7); break; case 8: LPP_Q4K(8); break;
+        default:
+            for (int o = 0; o < K; o += 8) {
+                int kk = (K - o < 8) ? (K - o) : 8;
+                mmvq_q4_k_packed_batched_launch(out + (size_t)o*out_dim, w,
+                                                qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
+                                                sx + (size_t)o*(in_dim>>5), in_dim, out_dim, kk, stream);
+            }
+    }
+    #undef LPP_Q4K
+}
+
+static inline void mmvq_q4_k_packed_launch(
+    float *out, const uint8_t *w, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim, cudaStream_t stream)
+{ mmvq_q4_k_packed_batched_launch(out, w, qx, dx, sx, in_dim, out_dim, 1, stream); }
+
 
 // =========================================================================
 // =========================================================================
@@ -2822,6 +2922,7 @@ struct gemma4_engine {
     // so a projection's packed base = d_weights_packed + (weight_ptr − d_weights).
     uint8_t       *d_weights_packed;    // repacked Q4_0 blob (same size as d_weights)
     int            packed_ready;        // 1 once d_weights_packed is built
+    int            q4k_packed;          // 1 once Q4_K bulk projections are repacked IN PLACE in d_weights
     cudaStream_t   dq_stream;           // weight-dequant stream (overlaps GEMMs)
     cudaEvent_t    ev_dq_done[2];       // dequant of buffer b complete
     cudaEvent_t    ev_gemm_done[2];     // last GEMM reading buffer b complete
@@ -3679,6 +3780,7 @@ static unsigned char* convert_q6k_to_q8_0(const unsigned char *src, int64_t n_el
 }
 
 static int build_packed_q4(gemma4_engine_t *eng);  // FUCINA_PACKED: lazy/eager repack (body below)
+static int build_packed_q4k(gemma4_engine_t *eng); // PACKED Q4_K: in-place superblock repack (body below)
 static void gemma4_engine_paged_selftest(gemma4_engine_t *eng);       // Phase 2 inc 3 (body below)
 static void gemma4_engine_paged_read_selftest(gemma4_engine_t *eng);  // Phase 2 inc 4 (body below)
 static void gemma4_engine_paged_e2e_selftest(gemma4_engine_t *eng);   // Phase 2 inc 4b (body below)
@@ -5072,6 +5174,12 @@ gemma4_engine_t* gemma4_engine_create(
     if (!is_nvfp4 && budget_packed) {
         build_packed_q4(eng);   // non-fatal: falls back if it fails
     }
+    // Packed Q4_K (Qwen3 / K-quant): in-place superblock repack → coalesced uint4 GEMV loads.
+    // Same 144 B per superblock → no extra weight VRAM, so it is NOT gated on budget_packed.
+    // Bit-identical to the native Q4_K dp4a; non-fatal (falls back to native on failure).
+    if (!is_nvfp4) {
+        build_packed_q4k(eng);
+    }
 
     // Paged KV mirror validation (opt-in): decode a fixed run and assert the
     // paged pool matches the contiguous cache byte-for-byte. Non-fatal.
@@ -5321,6 +5429,16 @@ static inline bool use_packed_q4(const gemma4_engine_t *eng, int fmt, const uint
            weight < eng->d_weights + (eng->gguf_size - eng->tdata_start);
 }
 
+// Q4_K analogue: the packed kernel reads the SAME 144-B superblock IN PLACE in d_weights (no
+// second copy), so the only gate is "this weight was repacked". build_packed_q4k repacks EVERY
+// Q4_K tensor that lives inside d_weights, so the d_weights pointer-range check is sound (every
+// in-blob Q4_K weight is packed; off-blob overrides and the converted Q8_0 head are excluded).
+static inline bool use_packed_q4k(const gemma4_engine_t *eng, int fmt, const uint8_t *weight) {
+    return eng->q4k_packed && fmt == FORMAT_Q4_K &&
+           eng->d_weights && weight >= eng->d_weights &&
+           weight < eng->d_weights + (eng->gguf_size - eng->tdata_start);
+}
+
 // Q4_0-aware single-token MMVQ over an ALREADY-quantized activation (qx/dx/sx, K=1 layout):
 // routes to the packed kernel when FUCINA_PACKED is active, else the native dp4a path. Used by
 // the call sites that pre-quantize once and call mmvq_launch directly (decode_layer q/k/v).
@@ -5330,7 +5448,13 @@ static inline void mmvq_q4aware(
     int in_dim, int out_dim, int fmt, cudaStream_t stream)
 {
     if (fmt == FORMAT_Q6_K) { mmvq_q6_k_launch(out, weight, qx, dx, in_dim, out_dim, stream); return; }
-    if (fmt == FORMAT_Q4_K) { mmvq_q4_k_launch(out, weight, qx, dx, sx, in_dim, out_dim, stream); return; }
+    if (fmt == FORMAT_Q4_K) {
+        if (use_packed_q4k(eng, fmt, weight))
+            mmvq_q4_k_packed_launch(out, weight, qx, dx, sx, in_dim, out_dim, stream);
+        else
+            mmvq_q4_k_launch(out, weight, qx, dx, sx, in_dim, out_dim, stream);
+        return;
+    }
     if (use_packed_q4(eng, fmt, weight)) {
         const uint8_t  *q = eng->d_weights_packed + (weight - eng->d_weights);
         const uint16_t *s = (const uint16_t *)(q + (size_t)out_dim * (in_dim >> 5) * 16);
@@ -5356,8 +5480,11 @@ static inline void gemv_w(
         x, eng->d_qx, eng->d_dx, eng->d_sx, in_dim);
     if (fmt == FORMAT_Q6_K) {
         mmvq_q6_k_launch(out, weight, eng->d_qx, eng->d_dx, in_dim, out_dim, stream);
-    } else if (fmt == FORMAT_Q4_K) {     // native Q4_K LM head (asymmetric → needs Σx = d_sx)
-        mmvq_q4_k_launch(out, weight, eng->d_qx, eng->d_dx, eng->d_sx, in_dim, out_dim, stream);
+    } else if (fmt == FORMAT_Q4_K) {     // Q4_K (asymmetric → needs Σx = d_sx); packed when in-place repacked
+        if (use_packed_q4k(eng, fmt, weight))
+            mmvq_q4_k_packed_launch(out, weight, eng->d_qx, eng->d_dx, eng->d_sx, in_dim, out_dim, stream);
+        else
+            mmvq_q4_k_launch(out, weight, eng->d_qx, eng->d_dx, eng->d_sx, in_dim, out_dim, stream);
     } else if (use_packed_q4(eng, fmt, weight)) {
         const uint8_t  *q = eng->d_weights_packed + (weight - eng->d_weights);
         const uint16_t *s = (const uint16_t *)(q + (size_t)out_dim * (in_dim >> 5) * 16);
@@ -5384,9 +5511,13 @@ static inline void gemv_batched_w(
                                  in_dim, out_dim, K, stream);
         return;
     }
-    if (fmt == FORMAT_Q4_K) {            // native Q4_K LM head, batched over K rows (needs Σx)
-        mmvq_q4_k_batched_launch(out, weight, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b,
-                                 in_dim, out_dim, K, stream);
+    if (fmt == FORMAT_Q4_K) {            // Q4_K, batched over K rows (needs Σx); packed when in-place repacked
+        if (use_packed_q4k(eng, fmt, weight))
+            mmvq_q4_k_packed_batched_launch(out, weight, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b,
+                                            in_dim, out_dim, K, stream);
+        else
+            mmvq_q4_k_batched_launch(out, weight, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b,
+                                     in_dim, out_dim, K, stream);
         return;
     }
     if (use_packed_q4(eng, fmt, weight)) {   // FUCINA_PACKED: coalesced uint4 weight loads
@@ -6227,6 +6358,81 @@ static int build_packed_q4(gemma4_engine_t *eng)
     fprintf(stderr, "fucina: packed-Q4_0 decode weights built (%.2f GB, 16-B-aligned quants "
             "‖ fp16 scales — coalesced uint4 GEMV loads)\n", tbytes / 1e9);
     eng->packed_ready = 1;
+    return 0;
+}
+
+// PACKED Q4_K (Qwen3 / K-quant): repack every Q4_K bulk projection IN PLACE inside d_weights
+// (same 144-B superblock → NO second weight copy). Repack is per-superblock but sub-blocks j and
+// j^1 share their 32 source quant bytes, so an in-place superblock kernel would corrupt itself;
+// we repack each tensor through ONE small reused temp (sized to the largest Q4_K tensor) and copy
+// back. Idempotent; non-fatal — on any failure q4k_packed stays 0 and callers use the native
+// Q4_K dp4a path. token_embd / output_weight are repacked too when Q4_K so use_packed_q4k's
+// pointer-range gate is sound (the converted-to-Q8_0 head reads d_token_embd, not these bytes).
+static int build_packed_q4k(gemma4_engine_t *eng)
+{
+    if (eng->q4k_packed) return 0;
+    if (!eng->d_weights) return -1;
+    const char *no_packed = getenv("FUCINA_NO_PACKED");
+    if (no_packed && no_packed[0] == '1') return -1;
+
+    // Enumerate EVERY weight tensor by its GGUF name and repack the Q4_K ones using the
+    // tensor's OWN element count from the GGUF header (NOT proj_desc dims — proj_desc uses
+    // GEMMA4_GLOBAL_HEAD_DIM for the attn projections, which is wrong for Qwen3's head_dim,
+    // so it would size the repack span incorrectly). off is absolute; n_el is the element
+    // count (Q4_K bytes = n_el/256 * 144). This also naturally covers token_embd / output.
+    auto tensor_q4k = [&](const char *nm, uint64_t *off, uint64_t *nsuper) -> bool {
+        uint64_t o, ne; uint32_t gt;
+        if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, nm, &o, &ne, &gt) != 0) return false;
+        if (gt != GGML_TYPE_Q4_K || (ne % 256) != 0) return false;
+        if (o < eng->tdata_start) return false;
+        if (o - eng->tdata_start >= (uint64_t)(eng->gguf_size - eng->tdata_start)) return false;
+        *off = o; *nsuper = ne / 256; return true;
+    };
+    // Pass 1: count + max byte size for the reusable temp.
+    size_t max_bytes = 0; int n_q4k = 0;
+    auto names_loop = [&](auto fn){
+        char nm[128];
+        const char *suf[] = {"attn_q","attn_k","attn_v","attn_output","ffn_gate","ffn_up","ffn_down"};
+        for (int l = 0; l < eng->cfg.n_layers; l++)
+            for (int s = 0; s < 7; s++) {
+                snprintf(nm, sizeof(nm), "blk.%d.%s.weight", l, suf[s]);
+                uint64_t off, ns; if (tensor_q4k(nm, &off, &ns)) fn(off, ns);
+            }
+        uint64_t off, ns;
+        if (tensor_q4k("token_embd.weight", &off, &ns)) fn(off, ns);
+        if (tensor_q4k("output.weight",     &off, &ns)) fn(off, ns);
+    };
+    names_loop([&](uint64_t, uint64_t ns){ size_t b = (size_t)ns * 144;
+                                           if (b > max_bytes) max_bytes = b; n_q4k++; });
+
+    if (n_q4k == 0) return -1;   // no Q4_K bulk weights (e.g. Gemma Q4_0) — nothing to do
+
+    uint8_t *tmp = NULL;
+    if (cudaMalloc(&tmp, max_bytes) != cudaSuccess) {
+        fprintf(stderr, "fucina: packed-Q4_K temp alloc failed (%.2f MB) — packed Q4_K off\n",
+                max_bytes / 1e6);
+        cudaGetLastError();
+        return -1;
+    }
+    // Pass 2: repack each Q4_K tensor through the reusable temp (src≠dst avoids the
+    // intra-superblock aliasing of an in-place kernel) then copy the packed bytes back.
+    names_loop([&](uint64_t off, uint64_t n_super){
+        size_t bytes = (size_t)n_super * 144;
+        uint8_t *dst = eng->d_weights + (off - eng->tdata_start);   // in-place region
+        repack_q4_k_kernel<<<(unsigned)((n_super + 255) / 256), 256>>>(dst, tmp, n_super);
+        cudaMemcpy(dst, tmp, bytes, cudaMemcpyDeviceToDevice);      // packed bytes back
+    });
+    cudaDeviceSynchronize();
+    cudaError_t e = cudaGetLastError();
+    cudaFree(tmp);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "fucina: packed-Q4_K repack error: %s — packed Q4_K path off\n",
+                cudaGetErrorString(e));
+        return -1;
+    }
+    fprintf(stderr, "fucina: packed-Q4_K decode weights built in place (%d tensors, "
+            "de-interleaved superblocks — coalesced uint4 GEMV loads)\n", n_q4k);
+    eng->q4k_packed = 1;
     return 0;
 }
 
