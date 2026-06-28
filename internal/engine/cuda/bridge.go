@@ -680,6 +680,73 @@ func (e *Engine) StepBatchSpec(slots []int32, inputs []int32) ([][]int32, error)
 	return runs, nil
 }
 
+// StepBatchSpecExt is the model-agnostic speculative step: it verifies the EXTERNAL
+// per-slot drafts supplied by the caller (the Go prompt-lookup drafter) in one batched
+// target forward, returning the accepted RUN per slot (accepted drafts + 1 bonus token).
+// No MTP head is required, so it works for any arch (Qwen3, Gemma). Output is byte-identical
+// to StepBatch / lossless w.r.t. greedy decode (the C verify re-derives every emitted token
+// from the target distribution). drafts[i] is the draft list for slots[i] (may be empty);
+// each is clamped to specMax-1 so an anchor+draft row fits the verify scratch. A run of {-1}
+// marks a KV-exhausted slot.
+func (e *Engine) StepBatchSpecExt(slots []int32, anchors []int32, drafts [][]int32) ([][]int32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(slots) != len(anchors) || len(slots) != len(drafts) {
+		return nil, fmt.Errorf("fucina: step_batch_spec_ext: %d slots vs %d anchors vs %d drafts",
+			len(slots), len(anchors), len(drafts))
+	}
+	b := len(slots)
+	if b == 0 {
+		return nil, nil
+	}
+	if b > maxBatchSeqs {
+		return nil, fmt.Errorf("fucina: step_batch_spec_ext: batch %d exceeds max %d", b, maxBatchSeqs)
+	}
+	cslots := make([]C.int, b)
+	// Flat draft buffer [b*specMax] + per-row lengths, matching the C ABI's stride.
+	dflat := make([]int32, b*specMax)
+	dlens := make([]C.int, b)
+	for i := 0; i < b; i++ {
+		cslots[i] = C.int(slots[i])
+		d := drafts[i]
+		if len(d) > specMax-1 {
+			d = d[:specMax-1]
+		}
+		copy(dflat[i*specMax:], d)
+		dlens[i] = C.int(len(d))
+	}
+	out := make([]int32, b*specMax)
+	lens := make([]C.int, b)
+	ret := C.gemma4_engine_step_batch_spec_ext(
+		e.ptr,
+		&cslots[0],
+		(*C.int32_t)(unsafe.Pointer(&anchors[0])),
+		C.int(b),
+		(*C.int32_t)(unsafe.Pointer(&out[0])),
+		&lens[0],
+		(*C.int32_t)(unsafe.Pointer(&dflat[0])),
+		&dlens[0],
+	)
+	if ret != 0 {
+		return nil, fmt.Errorf("fucina: step_batch_spec_ext failed")
+	}
+	runs := make([][]int32, b)
+	for i := 0; i < b; i++ {
+		n := int(lens[i])
+		if n < 0 { // KV-exhausted sentinel → scheduler stops just this row
+			runs[i] = []int32{-1}
+			continue
+		}
+		if n == 0 {
+			runs[i] = nil
+			continue
+		}
+		base := i * specMax
+		runs[i] = append([]int32(nil), out[base:base+n]...)
+	}
+	return runs, nil
+}
+
 // SeqRemove frees a slot's paged KV back to the pool and marks it reusable.
 func (e *Engine) SeqRemove(slot int) {
 	e.mu.Lock()
@@ -757,6 +824,36 @@ func (a *BatchAdapter) StepBatch(active []int32, inputs []int32) ([][]int32, err
 		out[i] = []int32{t}
 	}
 	return out, nil
+}
+
+// StepBatchSpec is the batch.SpecBatchEngine entry point: the scheduler drafts per slot
+// (model-agnostic prompt-lookup over each sequence's history) and asks the engine to verify
+// them all in ONE batched target forward, committing the accepted run per slot. Implementing
+// this is what makes the adapter a batch.SpecBatchEngine, so speculation is default-on.
+//
+// When the MTP assistant is loaded the engine self-drafts with the learned MTP head (its own
+// drafts beat prompt-lookup), so the externally-supplied drafts are ignored and the existing
+// MTP verify path is used. Otherwise (any arch, no assistant) the external prompt-lookup
+// drafts are verified via StepBatchSpecExt. Both paths are LOSSLESS: the committed run equals
+// a plain greedy step's output (the C verify enforces it).
+func (a *BatchAdapter) StepBatchSpec(reqs []batch.SpecReq) ([][]int32, error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+	slots := make([]int32, len(reqs))
+	anchors := make([]int32, len(reqs))
+	for i, r := range reqs {
+		slots[i] = r.Slot
+		anchors[i] = r.Anchor
+	}
+	if a.eng.hasMTP {
+		return a.eng.StepBatchSpec(slots, anchors)
+	}
+	drafts := make([][]int32, len(reqs))
+	for i, r := range reqs {
+		drafts[i] = r.Drafts
+	}
+	return a.eng.StepBatchSpecExt(slots, anchors, drafts)
 }
 
 // RemoveSeq frees a slot and updates the live-slot count.

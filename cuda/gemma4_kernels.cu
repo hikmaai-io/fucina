@@ -9880,9 +9880,15 @@ static void mtp_draft_paged_batched(
 //
 // out_tokens is [B * GEMMA4_SPEC_MAX] (each input row's run, contiguous); out_lens[B] is the
 // per-row run length (>=1), or -1 if that slot hit its KV limit (scheduler evicts it).
-extern "C" int gemma4_engine_step_batch_spec(
+// Shared verify+commit core. ext_drafts (when non-NULL) supplies EXTERNAL per-slot
+// drafts (flat [B*GEMMA4_SPEC_MAX], ext_dlens[B] the count per row) — the model-agnostic
+// prompt-lookup path driven from Go; otherwise the engine self-drafts with the MTP head.
+// Either way the SAME batched target verify re-derives every emitted token, so the output
+// is byte-identical to plain step_batch and lossless w.r.t. greedy decode.
+static int step_batch_spec_impl(
     gemma4_engine_t *eng, const int *slots, const int32_t *in_tokens, int B,
-    int32_t *out_tokens, int *out_lens)
+    int32_t *out_tokens, int *out_lens,
+    const int32_t *ext_drafts, const int *ext_dlens)
 {
     if (!eng || !eng->loaded || !eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
     if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
@@ -9906,6 +9912,36 @@ extern "C" int gemma4_engine_step_batch_spec(
     // minimum useful depth (FUCINA_BATCH_MIN_DRAFT, default 2) — at high concurrency the budget
     // (MAX_SEQS-A)/A collapses to depth 1, which ~doubles verify rows for a marginal τ, so those
     // batches fall back to plain decode. (A==1 single-stream keeps deep drafts.)
+    int32_t draft[GEMMA4_MAX_SEQS][GEMMA4_SPEC_MAX];
+    int D[GEMMA4_MAX_SEQS];
+    for (int i = 0; i < A; i++) D[i] = 0;
+
+    if (ext_drafts) {
+        // EXTERNAL drafts (Go prompt-lookup): copy per-slot, then greedily clamp the per-slot
+        // lengths so the flattened verify rows R = A + ΣD stay within the GEMMA4_MAX_SEQS
+        // scratch budget (the Go scheduler already budgets this, but clamp defensively so a
+        // wrong caller can never overrun the scratch). Greedy = earlier rows keep their full
+        // draft; later rows lose tail drafts first.
+        int rows_left = GEMMA4_MAX_SEQS - A;   // verify rows beyond the A mandatory anchors
+        for (int i = 0; i < A; i++) {
+            int d = ext_dlens ? ext_dlens[rowmap[i]] : 0;
+            if (d < 0) d = 0;
+            if (d > GEMMA4_SPEC_MAX - 1) d = GEMMA4_SPEC_MAX - 1;
+            if (d > rows_left) d = rows_left;
+            const int32_t *src = ext_drafts + (size_t)rowmap[i] * GEMMA4_SPEC_MAX;
+            for (int j = 0; j < d; j++) draft[i][j] = src[j];
+            D[i] = d;
+            rows_left -= d;
+        }
+    } else {
+    // Per-slot draft budget so B + Σ drafts <= GEMMA4_MAX_SEQS verify rows, capped at
+    // draft-k (FUCINA_BATCH_DRAFT_K). The whole round is drafted in ONE B-row forward per
+    // token (mtp_draft_paged_batched) with a single sync, so draft depth is cheap; the cost
+    // that matters is the verify ROW count R = A + Σdrafts, which is per-row compute-bound on
+    // GB10 (the tree-spec finding). Spark defaults: draft_cap 6, and AUTO-DISABLE spec below a
+    // minimum useful depth (FUCINA_BATCH_MIN_DRAFT, default 2) — at high concurrency the budget
+    // (MAX_SEQS-A)/A collapses to depth 1, which ~doubles verify rows for a marginal τ, so those
+    // batches fall back to plain decode. (A==1 single-stream keeps deep drafts.)
     static int draft_cap = -1, min_draft = -1;
     if (draft_cap < 0) { const char *e = getenv("FUCINA_BATCH_DRAFT_K");   draft_cap = e ? atoi(e) : 6; }
     if (min_draft < 0) { const char *e = getenv("FUCINA_BATCH_MIN_DRAFT"); min_draft = e ? atoi(e) : 2; }
@@ -9913,10 +9949,6 @@ extern "C" int gemma4_engine_step_batch_spec(
     if (per_slot > draft_cap) per_slot = draft_cap;
     if (per_slot > GEMMA4_SPEC_MAX - 1) per_slot = GEMMA4_SPEC_MAX - 1;
     if (per_slot < min_draft) per_slot = 0;   // plain batched decode for this round
-
-    int32_t draft[GEMMA4_MAX_SEQS][GEMMA4_SPEC_MAX];
-    int D[GEMMA4_MAX_SEQS];
-    for (int i = 0; i < A; i++) D[i] = 0;
 
     // Gather the rows whose recurrence is seeded (mtp_h_valid set by a prior step's
     // post-verify update) and greedy, then draft them ALL in one batched round.
@@ -9938,6 +9970,7 @@ extern "C" int gemma4_engine_step_batch_spec(
                 for (int j = 0; j < dr_D[k]; j++) draft[i][j] = dr_draft[k][j];
             }
         }
+    }
     }
 
     // Flatten (slot × [g, draft...]) into R verify rows; grow each slot's KV to cover them.
@@ -10011,6 +10044,25 @@ extern "C" int gemma4_engine_step_batch_spec(
                     steps, dbg_drafted, dbg_accepted, ta, td, td ? 100.0*ta/td : 0.0);
     }
     return 0;
+}
+
+// MTP speculative batched step (self-drafting). Byte-identical to the committed ABI.
+extern "C" int gemma4_engine_step_batch_spec(
+    gemma4_engine_t *eng, const int *slots, const int32_t *in_tokens, int B,
+    int32_t *out_tokens, int *out_lens)
+{
+    return step_batch_spec_impl(eng, slots, in_tokens, B, out_tokens, out_lens, NULL, NULL);
+}
+
+// Speculative batched step verifying EXTERNAL per-slot drafts (Go prompt-lookup): drafts is
+// flat [B*GEMMA4_SPEC_MAX], dlens[B] the count per row. Same lossless verify as the MTP path;
+// works for any arch (no MTP head required), which is what the model-agnostic drafter needs.
+extern "C" int gemma4_engine_step_batch_spec_ext(
+    gemma4_engine_t *eng, const int *slots, const int32_t *in_tokens, int B,
+    int32_t *out_tokens, int *out_lens,
+    const int32_t *drafts, const int *dlens)
+{
+    return step_batch_spec_impl(eng, slots, in_tokens, B, out_tokens, out_lens, drafts, dlens);
 }
 
 // Free a slot's block tables back to the pools and mark it free.

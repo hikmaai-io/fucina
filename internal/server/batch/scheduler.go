@@ -83,6 +83,35 @@ type SeqParams struct {
 	Seed          uint64
 }
 
+// SpecReq is one row of a speculative batched-decode step (see SpecBatchEngine):
+// feed Anchor to Slot and verify Drafts behind it. The engine commits the accepted
+// prefix of Drafts plus one bonus token, losslessly.
+type SpecReq struct {
+	Slot   int32
+	Anchor int32
+	Drafts []int32
+}
+
+// SpecBatchEngine is the optional speculative extension of BatchEngine. When the
+// concrete engine implements it, the scheduler drafts tokens per slot (prompt-lookup
+// over each sequence's history) and verifies them in ONE batched forward via
+// StepBatchSpec — committing the accepted run per slot (one weight pass, multiple
+// tokens) instead of one token per slot. out[i] is the committed run for reqs[i].Slot,
+// in request order; a run beginning with the -1 sentinel signals that slot must stop
+// (KV could not grow), exactly like StepBatch. The verify is LOSSLESS: the committed
+// run is byte-identical to what StepBatch would emit for that slot.
+type SpecBatchEngine interface {
+	BatchEngine
+	StepBatchSpec(reqs []SpecReq) (out [][]int32, err error)
+}
+
+// MaxVerifyRows is the engine's per-step verify-row budget (GEMMA4_MAX_SEQS in the CUDA
+// engine): the speculative step flattens to Σ(1+len(drafts)) forward rows, which must not
+// exceed it. With R active slots, R rows are anchors and the rest is the draft budget — so
+// speculation naturally tapers as concurrency rises (anchors crowd out drafts), which
+// matches where spec pays off (low concurrency / single-stream latency).
+const MaxVerifyRows = 16
+
 // ─── Public request type ───────────────────────────────────────────
 
 // Request is one unit of work submitted to the scheduler. It is the full
@@ -163,6 +192,10 @@ type seq struct {
 	remaining int   // generation budget left (counts down from MaxNew)
 	generated int   // tokens emitted so far
 	stops     map[int32]struct{}
+	// hist is the sequence's full token history (prompt + every committed token),
+	// the corpus the prompt-lookup drafter scans for repeated n-grams. Populated
+	// only on the speculative path (nil otherwise, so the plain path pays nothing).
+	hist []int32
 }
 
 // stopHit reports whether t is one of this sequence's stop tokens.
@@ -178,6 +211,14 @@ func (s *seq) stopHit(t int32) bool {
 // New, start it with Start, feed it with Submit, and stop it with Shutdown.
 type Scheduler struct {
 	engine BatchEngine
+
+	// spec is the speculative-decode fast path: non-nil when engine implements
+	// SpecBatchEngine. When set, step() drafts per-slot tokens (prompt-lookup over
+	// each sequence's history) and verifies them in one batched forward, committing
+	// the accepted run per slot — one weight pass commits multiple tokens. nil →
+	// the plain one-token-per-slot path. draftK bounds the per-slot draft length.
+	spec   SpecBatchEngine
+	draftK int
 
 	// submit carries new requests to the owner goroutine. It is bounded; a full
 	// channel is backpressure (Submit returns ErrQueueFull) rather than
@@ -205,12 +246,22 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	if queueDepth < 1 {
 		queueDepth = 1
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		engine: engine,
 		submit: make(chan Request, queueDepth),
 		quit:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
+	// Speculative decoding is a DEFAULT-on capability: if the engine can verify a
+	// batched draft step, use it. The drafter is model-agnostic (prompt-lookup), so
+	// it works for every arch (Qwen3, Gemma) with no extra weights. draftK is the
+	// max per-slot draft length, kept under the verify-row budget so a full draft plus
+	// its anchor fits.
+	if se, ok := engine.(SpecBatchEngine); ok {
+		s.spec = se
+		s.draftK = 6
+	}
+	return s
 }
 
 // Start launches the owner goroutine. It is safe to call once; subsequent calls
@@ -421,6 +472,10 @@ func (s *Scheduler) admit(active map[int]*seq, waiting *[]Request) bool {
 			remaining: req.MaxNew,
 			stops:     make(map[int32]struct{}, len(req.Stops)),
 		}
+		// Seed the drafter corpus with the prompt tokens (only when speculating).
+		if s.spec != nil {
+			sq.hist = append(make([]int32, 0, len(req.Tokens)+req.MaxNew), req.Tokens...)
+		}
 		for _, st := range req.Stops {
 			sq.stops[st] = struct{}{}
 		}
@@ -468,6 +523,11 @@ func (s *Scheduler) deliver(active map[int]*seq, sq *seq, token int32) bool {
 	sq.generated++
 	sq.remaining--
 
+	// Record the committed token in the drafter corpus (spec path only).
+	if s.spec != nil {
+		sq.hist = append(sq.hist, token)
+	}
+
 	// Stop token: deliver it (done above), then evict.
 	if sq.stopHit(token) {
 		s.evict(active, sq, Result{Reason: FinishStop, Generated: sq.generated})
@@ -495,13 +555,110 @@ func (s *Scheduler) evictCancelled(active map[int]*seq) {
 	}
 }
 
-// step builds the decode batch from all active slots, runs ONE StepBatch (which
-// advances every active slot together), and scatters the sampled tokens back to
-// each sequence. It returns false if a fatal engine error evicted everything.
+// step advances every active slot by one shared forward pass. When the engine is a
+// SpecBatchEngine it takes the speculative path (draft per slot + one batched verify,
+// committing the accepted run); otherwise it runs a plain one-token-per-slot decode.
+// It returns false if a fatal engine error evicted everything.
 func (s *Scheduler) step(active map[int]*seq) bool {
 	if len(active) == 0 {
 		return true
 	}
+	if s.spec != nil {
+		return s.stepSpec(active)
+	}
+	return s.stepPlain(active)
+}
+
+// stepSpec is the speculative analogue of step: per active slot it drafts a few tokens
+// (prompt-lookup over that sequence's history) and verifies them all in ONE batched
+// forward via the engine's StepBatchSpec, then scatters the committed RUN (accepted
+// drafts + bonus token) back to each sequence. The accepted run is what makes spec pay
+// off — one weight pass commits multiple tokens. The verify flattens to Σ(1+drafts) rows
+// ≤ MaxVerifyRows: R anchors are mandatory, the rest is the draft budget, distributed
+// greedily, so speculation tapers as concurrency rises. It is LOSSLESS: the committed
+// run is what a plain greedy step would have emitted (the engine's verify enforces it).
+func (s *Scheduler) stepSpec(active map[int]*seq) bool {
+	// Stable order: build parallel arrays so reqs[i] ↔ slots[i] ↔ out[i] by index.
+	slots := make([]int, 0, len(active))
+	for slot := range active {
+		slots = append(slots, slot)
+	}
+
+	budget := MaxVerifyRows - len(slots) // verify rows left for draft tokens
+	if budget < 0 {
+		budget = 0
+	}
+	reqs := make([]SpecReq, len(slots))
+	anyDraft := false
+	for i, slot := range slots {
+		sq := active[slot]
+		var drafts []int32
+		if budget > 0 {
+			maxD := s.draftK
+			if maxD > budget {
+				maxD = budget
+			}
+			drafts = promptLookupDraft(sq.hist, maxD, 2, s.draftK)
+			if len(drafts) > budget {
+				drafts = drafts[:budget]
+			}
+			budget -= len(drafts)
+			if len(drafts) > 0 {
+				anyDraft = true
+			}
+		}
+		reqs[i] = SpecReq{Slot: int32(slot), Anchor: sq.next, Drafts: drafts}
+	}
+
+	// No slot produced a draft (e.g. all novel prose): the speculative verify would be
+	// pure overhead vs a plain one-token step. Fall back so we never pay to "spec" zero
+	// drafts.
+	if !anyDraft {
+		return s.stepPlain(active)
+	}
+
+	out, err := s.spec.StepBatchSpec(reqs)
+	if err != nil {
+		log.Printf("batch: StepBatchSpec failed (%d active): %v", len(slots), err)
+		for _, slot := range slots {
+			if sq := active[slot]; sq != nil {
+				s.evict(active, sq, Result{Reason: FinishError, Generated: sq.generated, Err: err})
+			}
+		}
+		return false
+	}
+	if len(out) != len(slots) {
+		err := fmt.Errorf("StepBatchSpec returned %d runs for %d slots", len(out), len(slots))
+		log.Printf("batch: %v", err)
+		for _, slot := range slots {
+			if sq := active[slot]; sq != nil {
+				s.evict(active, sq, Result{Reason: FinishError, Generated: sq.generated, Err: err})
+			}
+		}
+		return false
+	}
+
+	// Scatter each committed run to its slot; deliver walks the run token-by-token and
+	// stops emitting the moment a token evicts the sequence (stop/budget/cancel or the
+	// -1 KV-exhausted sentinel) — the rest of that run is then dropped.
+	for i, slot := range slots {
+		sq := active[slot]
+		if sq == nil {
+			continue // evicted earlier this pass (defensive)
+		}
+		for _, tok := range out[i] {
+			if !s.deliver(active, sq, tok) {
+				break
+			}
+		}
+	}
+	return true
+}
+
+// stepPlain runs one NON-speculative batched decode over all active slots, scattering the
+// sampled run per slot back to each sequence (the original step body; stepSpec falls back
+// to it when no slot has a draft).
+func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 	// Build parallel (slot, input) arrays. Iteration order over the map is
 	// irrelevant: out[i] corresponds to slots[i] by index.
 	slots := make([]int32, 0, len(active))

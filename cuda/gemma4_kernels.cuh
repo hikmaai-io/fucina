@@ -306,6 +306,13 @@ int  gemma4_engine_step_batch(gemma4_engine_t *eng, const int *slots,
 int  gemma4_engine_step_batch_spec(gemma4_engine_t *eng, const int *slots,
                                    const int32_t *in_tokens, int B,
                                    int32_t *out_tokens, int *out_lens);
+// As above but verifies EXTERNAL per-slot drafts (model-agnostic prompt-lookup, driven
+// from Go): drafts is flat [B*GEMMA4_SPEC_MAX], dlens[B] the per-row draft count. No MTP
+// head required. Output is byte-identical to step_batch / lossless w.r.t. greedy decode.
+int  gemma4_engine_step_batch_spec_ext(gemma4_engine_t *eng, const int *slots,
+                                       const int32_t *in_tokens, int B,
+                                       int32_t *out_tokens, int *out_lens,
+                                       const int32_t *drafts, const int *dlens);
 void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot);
 int  gemma4_engine_seq_capacity(gemma4_engine_t *eng);
 
