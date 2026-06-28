@@ -1492,6 +1492,122 @@ static inline void mmvq_q4_k_packed_launch(
     int in_dim, int out_dim, cudaStream_t stream)
 { mmvq_q4_k_packed_batched_launch(out, w, qx, dx, sx, in_dim, out_dim, 1, stream); }
 
+// ─── Native Q4_K / Q6_K → BF16 dequant (fast Qwen3 prefill) ─────────────────────────
+// Dequantize a full K-quant weight row-set [out_dim][in_dim] (whose in_dim is a multiple
+// of 256) into the row-major BF16 buffer the cuBLAS prefill GEMM reads, element-for-element.
+// Each thread owns ONE 256-element superblock and writes its 256 dequantized values in the
+// SAME sequential element order the matching mmvq_q4_k / mmvq_q6_k decode kernels consume,
+// so the dequantized weights are numerically the K-quant values (greedy-token faithful).
+//
+// Q4_K superblock = 144 B: half d, half dmin, 12 B packed 6-bit (scale,min)×8, 128 B 4-bit
+// quants. Sub-block j: value = d·s_j·q − dmin·m_j (asymmetric). Mirrors mmvq_q4_k_kernel.
+__global__ void dequant_q4_k_to_bf16_kernel(
+    __nv_bfloat16 *dst, const uint8_t *src, uint64_t n_super)
+{
+    uint64_t sb = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb >= n_super) return;
+    const uint8_t *blk = src + sb * 144;
+    __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+    __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+    float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+    __nv_bfloat16 *out = dst + sb * 256;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int s, m; q4k_scale_min(blk + 4, j, &s, &m);
+        const uint8_t *qbase = blk + 16 + (size_t)(j >> 1) * 32;
+        int shift = (j & 1) ? 4 : 0;
+        float ds = d * (float)s, dm = dmin * (float)m;
+        for (int k = 0; k < 32; k++) {
+            int q = (qbase[k] >> shift) & 0x0F;
+            out[j * 32 + k] = __float2bfloat16(ds * (float)q - dm);
+        }
+    }
+}
+
+// PACKED Q4_K → BF16: build_packed_q4k de-interleaves each superblock IN PLACE (header
+// verbatim, then 8 sub-blocks of 16 bytes where byte m = nib(elem m) | nib(elem m+16)<<4).
+// When the engine has repacked (q4k_packed), the bulk Q4_K weights live in this layout, so
+// the dequant must read it. Element order matches mmvq_q4_k_packed_batched_kernel: within a
+// 32-elem sub-block, elems 0..15 are the low nibbles of bytes 0..15, elems 16..31 the highs.
+__global__ void dequant_q4_k_packed_to_bf16_kernel(
+    __nv_bfloat16 *dst, const uint8_t *src, uint64_t n_super)
+{
+    uint64_t sb = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb >= n_super) return;
+    const uint8_t *blk = src + sb * 144;
+    __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+    __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+    float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+    __nv_bfloat16 *out = dst + sb * 256;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int s, m; q4k_scale_min(blk + 4, j, &s, &m);
+        const uint8_t *p = blk + 16 + (size_t)j * 16;
+        float ds = d * (float)s, dm = dmin * (float)m;
+        for (int e = 0; e < 32; e++) {
+            int byte = p[e & 15];
+            int q = (e < 16) ? (byte & 0x0F) : (byte >> 4);
+            out[j * 32 + e] = __float2bfloat16(ds * (float)q - dm);
+        }
+    }
+}
+
+// Q6_K superblock = 210 B: 128 B low-4-bit (ql), 64 B high-2-bit (qh), 16 B int8 scales,
+// half d. value = d·scale·(q6 − 32). Mirrors the canonical ggml dequantize_row_q6_K element
+// order (the same order mmvq_q6_k_kernel reads its sequential 32-element activation blocks in).
+__global__ void dequant_q6_k_to_bf16_kernel(
+    __nv_bfloat16 *dst, const uint8_t *src, uint64_t n_super)
+{
+    uint64_t sb = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb >= n_super) return;
+    const uint8_t *blk = src + sb * 210;
+    const uint8_t *ql  = blk;
+    const uint8_t *qh  = blk + 128;
+    const int8_t  *sc  = (const int8_t *)(blk + 192);
+    __half_raw hd; hd.x = (uint16_t)(blk[208] | ((uint16_t)blk[209] << 8));
+    float d = __half2float(__half(hd));
+    __nv_bfloat16 *out = dst + sb * 256;
+    #pragma unroll
+    for (int nb = 0; nb < 2; nb++) {
+        const uint8_t *qln = ql + nb * 64;
+        const uint8_t *qhn = qh + nb * 32;
+        const int8_t  *scn = sc + nb * 8;
+        __nv_bfloat16 *yb  = out + nb * 128;
+        for (int l = 0; l < 32; l++) {
+            int is = l >> 4;
+            int q1 = (int)((qln[l]      & 0x0F) | (((qhn[l] >> 0) & 3) << 4)) - 32;
+            int q2 = (int)((qln[l + 32] & 0x0F) | (((qhn[l] >> 2) & 3) << 4)) - 32;
+            int q3 = (int)((qln[l]      >>   4) | (((qhn[l] >> 4) & 3) << 4)) - 32;
+            int q4 = (int)((qln[l + 32] >>   4) | (((qhn[l] >> 6) & 3) << 4)) - 32;
+            yb[l +  0] = __float2bfloat16(d * (float)scn[is + 0] * (float)q1);
+            yb[l + 32] = __float2bfloat16(d * (float)scn[is + 2] * (float)q2);
+            yb[l + 64] = __float2bfloat16(d * (float)scn[is + 4] * (float)q3);
+            yb[l + 96] = __float2bfloat16(d * (float)scn[is + 6] * (float)q4);
+        }
+    }
+}
+
+// Dispatch a single projection's dequant to BF16 by per-tensor format. Q4_K/Q6_K use the
+// superblock kernels above (one thread per 256-elem superblock); Q4_0/Q8_0/FP8 fall back to
+// the element-wise decode_weight path. n = in_dim*out_dim (multiple of 256 for K-quants).
+static inline void dequant_proj_to_bf16(
+    __nv_bfloat16 *dst, const uint8_t *src, uint64_t n, int fmt, bool q4k_packed,
+    cudaStream_t stream)
+{
+    if (fmt == FORMAT_Q4_K) {
+        uint64_t ns = n / 256;
+        if (q4k_packed)
+            dequant_q4_k_packed_to_bf16_kernel<<<(unsigned)((ns + 255) / 256), 256, 0, stream>>>(dst, src, ns);
+        else
+            dequant_q4_k_to_bf16_kernel<<<(unsigned)((ns + 255) / 256), 256, 0, stream>>>(dst, src, ns);
+    } else if (fmt == FORMAT_Q6_K) {
+        uint64_t ns = n / 256;
+        dequant_q6_k_to_bf16_kernel<<<(unsigned)((ns + 255) / 256), 256, 0, stream>>>(dst, src, ns);
+    } else {
+        dequant_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(dst, src, n, fmt);
+    }
+}
+
 
 // =========================================================================
 // =========================================================================
@@ -6289,6 +6405,14 @@ static int build_bf16_weights(gemma4_engine_t *eng)
             if (n > maxn[p]) maxn[p] = n;
         }
     }
+    // Qwen3 has a separate V projection on EVERY (full-attention) layer, which proj_desc
+    // reports as "no weight" for the global class (Gemma's global V = K). The fast Qwen3
+    // prefill needs a real BF16 buffer for it: size PJ_V to okv × H. (The attn buffers are
+    // over-sized by proj_desc's GEMMA4_GLOBAL_HEAD_DIM, which is harmless — only PJ_V is 0.)
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) {
+        uint64_t nv = (uint64_t)(eng->cfg.n_kv_global * eng->cfg.head_dim) * eng->cfg.hidden_size;
+        if (nv > maxn[PJ_V]) maxn[PJ_V] = nv;
+    }
 
     // Two ping/pong sets so the next layer's dequant can run concurrently with this
     // layer's GEMMs (see d_bf16_layer comment). ~2× the old 0.5 GB, still ≪ 21.8 GB.
@@ -7253,6 +7377,13 @@ __global__ void sample_logits_ms_kernel(
     const float *temps, const int *top_ks, const float *top_ps, const float *min_ps,
     const float *rnds, int *out_ids);
 
+// Fast single-pass Qwen3 prefill (per-tensor Q4_K/Q6_K → BF16 dequant + cuBLAS GEMM,
+// head_dim=128 full-causal attention). Defined after paged_prefill_batched; the Qwen3
+// arch branch in paged_prefill_batched routes here. Returns 0 / -1 / -2 (same contract).
+static int paged_prefill_qwen3(
+    gemma4_engine_t *eng, gemma4_seq *s, const int32_t *tokens, int N,
+    int32_t *first_tok_out);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Single-pass PAGED prefill (Phase 4 for the paged path).
 //
@@ -7285,11 +7416,11 @@ static int paged_prefill_batched(
 {
     if (!eng->loaded || N <= 0) return -1;
     if (!eng->paged_enabled) return -2;
-    // Qwen3 defers to the token-by-token prefill (decode_multiseq_body): the BF16 fast-prefill
-    // GEMM path dequants weights via decode_weight, which only knows Q4_0/Q8_0 — not the Q4_K/Q6_K
-    // bulk weights of a Qwen3 Q4_K_M checkpoint. The per-position decode path uses the per-tensor
-    // mmvq_q4_k/q6_k GEMVs and is the arch-correct route. (Prefill speed only; decode is unaffected.)
-    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) return -2;
+    // Qwen3 uses its own fast single-pass prefill (per-tensor Q4_K/Q6_K → BF16 dequant +
+    // cuBLAS GEMM, head_dim=128 full-causal attention) — the Gemma sliding/global/sandwich-norm
+    // body below does not apply. Same 0/-1/-2 contract; -2 falls back to token-by-token.
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3)
+        return paged_prefill_qwen3(eng, s, tokens, N, first_tok_out);
     if (s->n_tokens != 0) return -2;                       // fresh slot only
     if (N > eng->global_kv_capacity) return -2;            // would overflow pool
     if (N > 4096) return -2;                               // persistent scratch cap
@@ -7562,6 +7693,217 @@ static int paged_prefill_batched(
     }
     s->n_tokens = N;
     s->n_sampled = 1;                 // this seq produced one token (RNG index)
+    if (first_tok_out) *first_tok_out = last_tok;
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fast single-pass Qwen3 prefill.
+//
+// Replaces the token-by-token seq_add loop for a FRESH Qwen3 sequence: every prompt
+// token's projections run as ONE cuBLAS BF16 GEMM over all N rows (tensor-core bound)
+// instead of N bandwidth-bound GEMV passes. The per-tensor Q4_K/Q6_K weights are
+// dequantized to BF16 once per layer via dequant_proj_to_bf16 (numerically the K-quant
+// values → greedy-token faithful). Attention is the materialized [HEADS][N×N] tensor-core
+// path (head_dim=128, full causal, window=0), identical in math to the Gemma global path
+// but Qwen3-shaped. K/V are scattered into the SAME per-layer global pool slices as
+// decode_multiseq_body, position-for-position, so a later decode continues seamlessly.
+//
+// Determinism vs the token-by-token path: same pre-attn RMSNorm, q/k per-head RMS-norm,
+// the explicit 1/sqrt(head_dim) Q scale (Qwen3's q_norm is learned, no baked scale), RoPE
+// (theta 1e6, freq_factors), SiLU-GLU FFN, plain pre-norm residual adds (no sandwich norms),
+// untied Q6_K LM head and the SAME greedy-argmax / splitmix64 sampler at RNG index 0 — so the
+// first sampled token matches. Returns 0 on success, -2 to fall back, -1 on hard error.
+static int paged_prefill_qwen3(
+    gemma4_engine_t *eng, gemma4_seq *s, const int32_t *tokens, int N,
+    int32_t *first_tok_out)
+{
+    if (!eng->loaded || N <= 0) return -1;
+    if (s->n_tokens != 0) return -2;                       // fresh slot only
+    if (N > eng->global_kv_capacity) return -2;            // would overflow pool
+    if (N > 4096) return -2;                               // persistent scratch cap
+    if (!eng->pf_scratch_ready && alloc_prefill_scratch(eng) != 0) return -2;
+    if (build_bf16_weights(eng) != 0) return -1;
+
+    cudaStream_t stream = eng->stream;
+    const int H   = eng->cfg.hidden_size;
+    const int I   = eng->cfg.intermediate;
+    const int HD2 = 32 * sizeof(float);
+    const int HEADS = eng->cfg.n_heads;
+    const int hd  = eng->cfg.head_dim;                     // 128
+    const int nkv = eng->cfg.n_kv_global;                  // 8
+    const int oq  = HEADS * hd;
+    const int okv = nkv * hd;
+    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+
+    // Reserve N positions in the slot's paged tables ONCE (base stays 0). Mirror of the
+    // Gemma paged-prefill setup so the post-prefill slot state matches what step_batch
+    // expects. Qwen3 is all full-attention; only the global pool is written, but we ensure
+    // both tables (paged_slot_sync maintains both during the subsequent decode).
+    if (paged_table_ensure(&eng->slid_pool, &s->slid_bt, N) != 0) return -2;
+    if (paged_table_ensure(&eng->glob_pool, &s->glob_bt, N) != 0) return -2;
+    if (paged_upload_blocks(&s->slid_bt, &s->d_slid_blocks, &s->d_slid_cap, stream) != 0) return -1;
+    if (paged_upload_blocks(&s->glob_bt, &s->d_glob_blocks, &s->d_glob_cap, stream) != 0) return -1;
+    {
+        // N rows, each writing position r of THIS one sequence (replicated view).
+        PagedSeqView *hvg = (PagedSeqView*)malloc((size_t)N*sizeof(PagedSeqView));
+        if (!hvg) return -1;
+        PagedSeqView vg; vg.block_table = s->d_glob_blocks; vg.n_blocks = s->glob_bt.n;
+        vg.base = s->glob_bt.base; vg.n_tokens = N;
+        for (int r = 0; r < N; r++) hvg[r] = vg;
+        cudaMemcpyAsync(eng->d_pf_views_glob, hvg, (size_t)N*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream);   // hvg consumed by the async copy before free
+        free(hvg);
+    }
+    PagedWriteBatch wb_glob; wb_glob.seqs = eng->d_pf_views_glob; wb_glob.write_pos = eng->d_pf_wpos; wb_glob.n_rows = N;
+
+    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0, stream);
+
+    // Persistent prefill scratch (N<=4096).
+    float *d_x = eng->d_pf_x, *d_q = eng->d_pf_q;
+    float *d_k = eng->d_pf_k, *d_v = eng->d_pf_v, *d_attn = eng->d_pf_attn;
+    float *d_gate = eng->d_pf_gate, *d_up = eng->d_pf_up, *d_scores = eng->d_pf_scores;
+    __nv_bfloat16 *d_inb = eng->d_pf_inb, *d_qb = eng->d_pf_qb, *d_kb = eng->d_pf_kb;
+    __nv_bfloat16 *d_vb = eng->d_pf_vb, *d_kbx = eng->d_pf_kbx, *d_vbx = eng->d_pf_vbx;
+    __nv_bfloat16 *d_pb = eng->d_pf_pb;
+
+    // Per-tensor dequant of one projection into BF16 buffer 0, then cuBLAS GEMM.
+    auto dq_gemm = [&](uint64_t off, int in_dim, int out_dim, int fmt, int p, float *dst){
+        const uint8_t *w = weight_fp8(eng, off);
+        bool packed = (fmt == FORMAT_Q4_K) && use_packed_q4k(eng, fmt, w);
+        dequant_proj_to_bf16(eng->d_bf16_layer[0][p], w,
+                             (uint64_t)in_dim * out_dim, fmt, packed, stream);
+        gemm_bf16(eng, eng->d_bf16_layer[0][p], d_inb, dst, in_dim, out_dim, N);
+    };
+
+    // ── Embedding (Qwen3 does NOT scale embeddings by √H). ──
+    {
+        int32_t *d_tok = (int32_t*)d_kbx;   // reuse bf16 scratch as a byte area (>= N ints)
+        cudaMemcpyAsync(d_tok, tokens, (size_t)N*sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+        embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, N, H, stream);
+    }
+
+    for (int l = 0; l < eng->cfg.n_layers; l++) {
+        const __typeof__(eng->tensors.layers[0]) *L = &eng->tensors.layers[l];
+        const float *w_attn = eng->d_w_attn_norm + (size_t)l*H;
+        const float *w_ffn  = eng->d_w_ffn_norm  + (size_t)l*H;
+        const float *w_qn   = eng->d_w_q_norm    + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+        const float *w_kn   = eng->d_w_k_norm    + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
+
+        // pre-attn RMSNorm → bf16 input (feeds Q,K,V)
+        rms_norm_rows_bf16_kernel<<<N,256,HD2,stream>>>(d_inb, d_x, w_attn, H, N, GEMMA4_RMS_EPS);
+
+        dq_gemm(L->attn_q, H, oq, (int)L->fmt_q, PJ_Q, d_q);
+        per_head_rms_norm_rows_kernel<<<dim3(HEADS,N),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, N, GEMMA4_RMS_EPS);
+        // Qwen3 attention scale: q_norm is learned (no baked scale) → apply 1/sqrt(hd) to Q.
+        scale_kernel<<<grid1d((size_t)N*oq),256,0,stream>>>(d_q, N*oq, 1.0f/sqrtf((float)hd));
+        dq_gemm(L->attn_k, H, okv, (int)L->fmt_k, PJ_K, d_k);
+        dq_gemm(L->attn_v, H, okv, (int)L->fmt_v, PJ_V, d_v);   // separate V, NO V-norm
+        per_head_rms_norm_rows_kernel<<<dim3(nkv,N),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, N, GEMMA4_RMS_EPS);
+
+        rope_rows_kernel<<<dim3(HEADS,N),hd/2,0,stream>>>(
+            d_q, d_k, /*base=*/0, HEADS, nkv, hd, N, 1000000.0f, eng->d_rope_freqs);
+
+        // Materialized [HEADS][N×N] tensor-core attention (full causal, window=0). Q is
+        // pre-scaled, so the softmax uses scale 1 — same convention as the decode flash path.
+        f32_to_bf16_kernel<<<grid1d((size_t)N*oq),256,0,stream>>>(d_qb, d_q, (size_t)N*oq);
+        f32_to_bf16_kernel<<<grid1d((size_t)N*okv),256,0,stream>>>(d_kb, d_k, (size_t)N*okv);
+        f32_to_bf16_kernel<<<grid1d((size_t)N*okv),256,0,stream>>>(d_vb, d_v, (size_t)N*okv);
+        {
+            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),HEADS,N),256,0,stream>>>(d_kbx, d_kb, N, HEADS, nkv, hd);
+            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),HEADS,N),256,0,stream>>>(d_vbx, d_vb, N, HEADS, nkv, hd);
+            const float a1=1.0f, b0=0.0f;
+            long long sNN = (long long)N * N;
+            cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, N, hd,
+                &a1, d_qb,  CUDA_R_16BF, oq, (long long)hd,
+                     d_kbx, CUDA_R_16BF, oq, (long long)hd,
+                &b0, d_scores, CUDA_R_32F, N, sNN,
+                HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            attn_softmax_batched_kernel<<<dim3(N,HEADS),256,HD2,stream>>>(d_scores, d_pb, N, /*window=*/0);
+            cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_N, CUBLAS_OP_T, hd, N, N,
+                &a1, d_vbx, CUDA_R_16BF, oq, (long long)hd,
+                     d_pb,  CUDA_R_16BF, N,  sNN,
+                &b0, d_attn, CUDA_R_32F, oq, (long long)hd,
+                HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+
+        // Scatter ALL N tokens' K (post-norm/RoPE) and V (raw) into the global pool slice
+        // for this layer — same stride/slot as decode_multiseq_body.
+        {
+            int slot = eng->global_slot[l];
+            size_t pls = (size_t)eng->glob_pool.n_blocks * PAGED_KV_BLOCK_TOKENS * okv;
+            pkv_t *pk = eng->d_glob_pool_k + (size_t)slot * pls;
+            pkv_t *pv = eng->d_glob_pool_v + (size_t)slot * pls;
+            paged_kv_write<<<dim3(grid1d(okv),N),256,0,stream>>>(
+                pk, pv, d_k, d_v, wb_glob, PAGED_KV_BLOCK_TOKENS, okv);
+        }
+
+        // O projection → d_q ; plain residual add (Qwen3 has no post-attn sandwich norm).
+        f32_to_bf16_kernel<<<grid1d((size_t)N*oq),256,0,stream>>>(d_inb, d_attn, (size_t)N*oq);
+        dq_gemm(L->attn_output, oq, H, (int)L->fmt_o, PJ_O, d_q);
+        residual_add_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, d_q, N*H);
+
+        // FFN: pre-norm → SiLU-GLU → down → residual add.
+        rms_norm_rows_bf16_kernel<<<N,256,HD2,stream>>>(d_inb, d_x, w_ffn, H, N, GEMMA4_RMS_EPS);
+        dq_gemm(L->ffn_gate, H, I, (int)L->fmt_gate, PJ_GATE, d_gate);
+        dq_gemm(L->ffn_up,   H, I, (int)L->fmt_up,   PJ_UP,   d_up);
+        silu_glu_bf16_kernel<<<grid1d((size_t)N*I),256,0,stream>>>(d_inb, d_gate, d_up, N*I);
+        dq_gemm(L->ffn_down, I, H, (int)L->fmt_down, PJ_DOWN, d_q);
+        residual_add_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, d_q, N*H);
+    }
+
+    // ── Output norm + LM head on the LAST token only. ──
+    int vocab = eng->cfg.vocab_size;
+    float *x_last = d_x + (size_t)(N-1)*H;
+    rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
+    logits_head(eng, eng->d_logits, eng->d_norm, H, vocab, stream);
+    if (eng->cfg.softcap > 0.0f)
+        logit_softcap_kernel<<<grid1d((size_t)vocab),256,0,stream>>>(eng->d_logits, eng->cfg.softcap, vocab);
+    if (eng->n_suppress > 0)
+        suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
+            eng->d_logits, eng->d_suppress, eng->n_suppress, vocab);
+
+    // First token EXACTLY as seq_add: greedy argmax, or the per-row splitmix64 sampler at
+    // RNG index n_sampled==0. Routes through eng->d_ms_outtok.
+    if (s->samp_temp <= 0.0f) {
+        argmax_rows_kernel<<<1,32,0,stream>>>(eng->d_logits, eng->d_ms_outtok, 1, vocab);
+    } else {
+        float h_temp[1] = { s->samp_temp }, h_topp[1] = { s->samp_top_p };
+        float h_minp[1] = { s->samp_min_p }, h_rnd[1];
+        int   h_topk[1] = { s->samp_top_k };
+        uint64_t z = (s->samp_seed ? s->samp_seed : 0x9e3779b97f4a7c15ULL) + 0x9e3779b97f4a7c15ULL * (s->n_sampled + 1);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        z =  z ^ (z >> 31);
+        h_rnd[0] = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+        cudaMemcpyAsync(eng->d_ms_temp, h_temp, sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_ms_topk, h_topk, sizeof(int),   cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_ms_topp, h_topp, sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_ms_minp, h_minp, sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_ms_rnd,  h_rnd,  sizeof(float), cudaMemcpyHostToDevice, stream);
+        sample_logits_ms_kernel<<<1,1024,0,stream>>>(
+            eng->d_logits, vocab, eng->d_ms_temp, eng->d_ms_topk,
+            eng->d_ms_topp, eng->d_ms_minp, eng->d_ms_rnd, eng->d_ms_outtok);
+    }
+    int32_t last_tok = 0;
+    cudaMemcpyAsync(&last_tok, eng->d_ms_outtok, sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+
+    cudaEventRecord(t1, stream);
+    cudaEventSynchronize(t1);
+    float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
+    eng->prefill_time_ms += ms;
+    eng->n_prefill_tokens += N;
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fucina: qwen3-prefill CUDA error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    s->n_tokens = N;
+    s->n_sampled = 1;
+    s->mtp_h_valid = 0;
     if (first_tok_out) *first_tok_out = last_tok;
     return 0;
 }
