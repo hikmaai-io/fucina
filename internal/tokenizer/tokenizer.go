@@ -70,6 +70,22 @@ type Tokenizer struct {
 	bpe          bool
 	byteFallback bool
 	bpeMerges    map[mergePair]int32 // ordered merge → rank (lower rank applied first)
+
+	// GPT-2 byte-level BPE mode (tokenizer.ggml.model == "gpt2", e.g. Qwen3/Qwen2
+	// GGUFs). Unlike Gemma's SentencePiece/metaspace tokenizer, the vocab and merges
+	// are over a byte→unicode alphabet (space → "Ġ"), preceded by the GPT-2/Qwen2
+	// regex pre-tokenizer. Encode/Decode route to the byte-level path; the merge
+	// ranks reuse bpeMerges. See gpt2_bpe.go.
+	gpt2        bool
+	byteEncoder [256]rune     // GPT-2 bytes_to_unicode: raw byte → alphabet rune
+	byteDecoder map[rune]byte // inverse, for decode
+
+	// add_bos_token / add_eos_token from the GGUF (default true to preserve the
+	// pre-existing Gemma behaviour when the keys are absent). Encode honours the
+	// caller's addBos/addEos AND these flags, so a model that disables BOS (Qwen3:
+	// add_bos_token=0) never gets a spurious leading <|endoftext|>.
+	addBOS bool
+	addEOS bool
 }
 
 // mergePair keys the BPE merge table: the adjacent (left,right) symbol pair.
@@ -196,6 +212,21 @@ func (r *ggufReader) readScalarInt(valType uint32) (int32, bool) {
 	}
 }
 
+// readBool reads a GGUF bool (1 byte) scalar. Non-bool types are skipped and
+// report !ok so the caller keeps its default.
+func (r *ggufReader) readBool(valType uint32) (bool, bool) {
+	if valType != ggufTypeBool {
+		r.skipValue(valType)
+		return false, false
+	}
+	if r.pos+1 > r.size {
+		return false, false
+	}
+	v := r.data[r.pos]
+	r.pos++
+	return v != 0, true
+}
+
 // skipValue advances past a value of the given type. Returns false on overflow.
 func (r *ggufReader) skipValue(valType uint32) bool {
 	switch valType {
@@ -249,10 +280,18 @@ func (r *ggufReader) skipValue(valType uint32) bool {
 //	tokenizer.ggml.padding_token_id (u32/i32)
 func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 	t := &Tokenizer{
-		BOS: 2,
-		EOS: 1,
-		PAD: 0,
+		BOS:    2,
+		EOS:    1,
+		PAD:    0,
+		addBOS: true, // default-true preserves Gemma behaviour when the key is absent
+		addEOS: true,
 	}
+
+	// GGUF tokenizer model + merges captured during the metadata scan; the byte-level
+	// (GPT-2) setup runs after the vocab is loaded.
+	var ggmlModel string
+	var mergesRaw []string
+	var tokenTypes []int32
 
 	p := &ggufReader{data: ggufData, size: ggufSize, pos: 0}
 
@@ -326,6 +365,60 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 				t.PAD = v
 			}
 
+		case "tokenizer.ggml.model":
+			if valType == ggufTypeString {
+				if s, ok := p.readString(); ok {
+					ggmlModel = s
+				}
+			} else {
+				p.skipValue(valType)
+			}
+
+		case "tokenizer.ggml.merges":
+			if valType != ggufTypeArray {
+				p.skipValue(valType)
+				break
+			}
+			arrType, n, ok := p.readArrayHeader()
+			if !ok || arrType != ggufTypeString {
+				return nil, fmt.Errorf("tokenizer: merges array malformed")
+			}
+			mergesRaw = make([]string, 0, n)
+			for j := uint64(0); j < n; j++ {
+				s, ok := p.readString()
+				if !ok {
+					return nil, fmt.Errorf("tokenizer: truncated merge %d", j)
+				}
+				mergesRaw = append(mergesRaw, s)
+			}
+
+		case "tokenizer.ggml.token_type":
+			if valType != ggufTypeArray {
+				p.skipValue(valType)
+				break
+			}
+			arrType, n, ok := p.readArrayHeader()
+			if !ok || (arrType != ggufTypeInt32 && arrType != ggufTypeUint32) {
+				return nil, fmt.Errorf("tokenizer: token_type array malformed")
+			}
+			tokenTypes = make([]int32, n)
+			for j := uint64(0); j < n; j++ {
+				v, ok := p.readU32()
+				if !ok {
+					return nil, fmt.Errorf("tokenizer: truncated token_type %d", j)
+				}
+				tokenTypes[j] = int32(v)
+			}
+
+		case "tokenizer.ggml.add_bos_token":
+			if b, ok := p.readBool(valType); ok {
+				t.addBOS = b
+			}
+		case "tokenizer.ggml.add_eos_token":
+			if b, ok := p.readBool(valType); ok {
+				t.addEOS = b
+			}
+
 		default:
 			if !p.skipValue(valType) {
 				return nil, fmt.Errorf("tokenizer: failed to skip value for %q", key)
@@ -386,6 +479,14 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 			t.specials = append(t.specials, specialToken{str: s, id: id})
 		}
 	}
+	// GPT-2 byte-level BPE (Qwen3/Qwen2 GGUFs): the vocab + merges are over a
+	// byte→unicode alphabet preceded by the GPT-2/Qwen2 regex pre-tokenizer. Switch
+	// the encode/decode algorithm and load the merge ranks. Done last so the vocab
+	// and tokenToID map are already built. See gpt2_bpe.go.
+	if ggmlModel == "gpt2" {
+		t.setupGPT2(mergesRaw, tokenTypes)
+	}
+
 	sort.Slice(t.specials, func(i, j int) bool {
 		return len(t.specials[i].str) > len(t.specials[j].str)
 	})
@@ -404,6 +505,10 @@ func (t *Tokenizer) DecodeRaw(tokens []int32) string {
 		}
 		s := t.vocab[id]
 		if s == "" {
+			continue
+		}
+		if t.gpt2 {
+			buf = t.gpt2Decode(s, buf)
 			continue
 		}
 		if b, ok := parseByteToken(s); ok {
@@ -453,12 +558,15 @@ func (t *Tokenizer) isControl(id int32) bool {
 func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 	var tokens []int32
 
-	if addBos {
+	if addBos && t.addBOS {
 		tokens = append(tokens, t.BOS)
 	}
 
-	// SentencePiece space normalization: ' ' -> U+2581.
-	text = strings.ReplaceAll(text, " ", spaceMarker)
+	// SentencePiece space normalization: ' ' -> U+2581. NOT for GPT-2 byte-level
+	// (Qwen3) — there spaces are encoded as the "Ġ" alphabet rune by byteEncode.
+	if !t.gpt2 {
+		text = strings.ReplaceAll(text, " ", spaceMarker)
+	}
 
 	// Split at control-marker literals FIRST (see Tokenizer.specials): the
 	// greedy matcher below must never see a marker, or a piece straddling the
@@ -481,7 +589,7 @@ func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 	}
 	tokens = t.encodeSegment(text[start:], tokens)
 
-	if addEos {
+	if addEos && t.addEOS {
 		tokens = append(tokens, t.EOS)
 	}
 
@@ -492,6 +600,9 @@ func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 // whichever model this tokenizer carries: BPE merge-by-rank (HF tokenizer.json) or
 // the unigram longest-prefix match (GGUF).
 func (t *Tokenizer) encodeSegment(text string, tokens []int32) []int32 {
+	if t.gpt2 {
+		return t.gpt2Encode(text, tokens)
+	}
 	if t.bpe {
 		return t.bpeEncode(text, tokens)
 	}
@@ -553,6 +664,11 @@ func (t *Tokenizer) Decode(tokens []int32) string {
 		}
 		s := t.vocab[id]
 		if s == "" {
+			continue
+		}
+		// GPT-2 byte-level (Qwen3): map the alphabet runes back to raw bytes.
+		if t.gpt2 {
+			buf = t.gpt2Decode(s, buf)
 			continue
 		}
 		// Raw byte token <0xXX> → the single byte it names.

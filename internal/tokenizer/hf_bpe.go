@@ -52,7 +52,8 @@ func NewFromHFJSON(path string) (*Tokenizer, error) {
 		return nil, fmt.Errorf("tokenizer: %s has empty vocab", path)
 	}
 
-	t := &Tokenizer{BOS: 2, EOS: 1, PAD: 0, bpe: true, byteFallback: hf.Model.ByteFallback}
+	t := &Tokenizer{BOS: 2, EOS: 1, PAD: 0, bpe: true, byteFallback: hf.Model.ByteFallback,
+		addBOS: true, addEOS: true}
 
 	// vocab[id] = token string; ids are dense 0..N-1.
 	maxID := int32(-1)
