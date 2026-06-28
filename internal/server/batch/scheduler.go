@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -383,6 +384,18 @@ func (s *Scheduler) Shutdown() {
 // run is the single owner goroutine. It is the ONLY caller of the engine, so
 // the engine needs no internal locking for the step loop.
 func (s *Scheduler) run() {
+	// The CUDA context is bound to a single OS thread (the engine's creating
+	// thread calls runtime.LockOSThread in main). run() is the SOLE engine caller
+	// on the batch path — every AddSeq/StepBatch/RemoveSeq cgo call happens here —
+	// so this goroutine MUST stay pinned to one OS thread for the lifetime of the
+	// loop. Without this, the Go scheduler migrates the goroutine across OS threads
+	// between engine calls, and CUDA rejects the foreign thread with "invalid
+	// device context" (the batched-prefill / seq_add failures on Qwen3). Lock for
+	// the whole loop; do NOT Unlock on exit (a thread that has ever held the CUDA
+	// context is best left to die with the goroutine rather than returned to the
+	// runtime's reusable pool).
+	runtime.LockOSThread()
+
 	// active maps engine slot id → sequence. The scheduler holds at most
 	// Capacity() entries here at once.
 	active := make(map[int]*seq)

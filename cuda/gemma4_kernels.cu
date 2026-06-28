@@ -7023,6 +7023,13 @@ int gemma4_engine_prefill_batched(
                             // (the -2 fallthroughs to flash/chunked keep it live)
 
     if (!eng->loaded || n_tokens <= 0) return -1;
+    // Qwen3 has a different per-layer layout (full-causal all-layers, separate V,
+    // q/k norms, silu-glu, no softcap) and is supported ONLY by the paged
+    // multiseq path (paged_prefill_qwen3 / decode_multiseq_forward). This non-paged
+    // eng->cur prefill is gemma-layout-only: running it on Qwen3 weights corrupts
+    // the CUDA context (illegal launch → "invalid device context") and SIGSEGVs the
+    // single-flight HTTP path. Decline early so warmup and any caller stay safe.
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) return -2;
     if (eng->cur.n_tokens != 0) return -2;             // need fresh sequence
     if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
     // Batched attention materializes [HEADS][N×N] score buffers (fp32+bf16, ~6 B/elem).
@@ -7928,6 +7935,9 @@ int gemma4_engine_prefill_flash(
     eng->mtp_h_valid = 0;   // prefill invalidates the MTP drafter's recurrent h
 
     if (!eng->loaded || n_tokens <= 0) return -1;
+    // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
+    // flash prefill is gemma-layout-only. Decline so it never runs on Qwen3 weights.
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) return -2;
     // FORMAT_NVFP4: this path is BF16/MMQ-only (no FP4 GEMM) and would deref the NULL Q4_0
     // store. prefill_batched forces use_fp4=true for all N (so it never returns -2 here), but
     // guard anyway so a future change can't silently route NVFP4 through the Q4_0/BF16 path.
@@ -8289,6 +8299,10 @@ int gemma4_engine_prefill(
     eng->mtp_h_valid = 0;   // prefill invalidates the MTP drafter's recurrent h
 
     if (!eng->loaded) return -1;
+    // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
+    // token-by-token loop uses gemma-layout decode_layer. Decline cleanly rather than
+    // emit garbage / crash, so the single-flight HTTP fallthrough fails gracefully.
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) return -1;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
