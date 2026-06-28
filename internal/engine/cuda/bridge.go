@@ -592,6 +592,51 @@ func (e *Engine) SeqAdd(prompt []int32, p batch.SeqParams) (slot int, first int3
 	return int(id), int32(firstTok), nil
 }
 
+// SeqOpen reserves a fresh paged slot with empty KV and stores the per-sequence
+// sampling params, WITHOUT prefilling. Pair it with SeqPrefillChunk to fill the prompt
+// in bounded chunks (chunked prefill interleaved with decode). Returns the slot id, or
+// an error when no slot is free or the engine is not in paged mode.
+func (e *Engine) SeqOpen(p batch.SeqParams) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	id := C.gemma4_engine_seq_open(
+		e.ptr,
+		C.float(p.Temperature), C.int(p.TopK), C.float(p.TopP), C.float(p.MinP),
+		C.uint64_t(p.Seed),
+	)
+	if id < 0 {
+		return 0, fmt.Errorf("fucina: seq_open failed (no slot / not paged)")
+	}
+	return int(id), nil
+}
+
+// SeqPrefillChunk appends chunk to an open slot's paged KV at its current position.
+// When last is true it samples and returns the sequence's first generated token; the
+// paged KV and first token after the final chunk are byte-identical to a one-shot
+// SeqAdd of the whole prompt (the chunk boundary is invisible to the model).
+func (e *Engine) SeqPrefillChunk(slot int, chunk []int32, last bool) (int32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(chunk) == 0 {
+		return 0, fmt.Errorf("fucina: seq_prefill_chunk: empty chunk")
+	}
+	doSample := C.int(0)
+	if last {
+		doSample = 1
+	}
+	var first C.int32_t
+	ret := C.gemma4_engine_seq_prefill_chunk(
+		e.ptr,
+		C.int(slot),
+		(*C.int32_t)(unsafe.Pointer(&chunk[0])), C.int(len(chunk)),
+		doSample, &first,
+	)
+	if ret != 0 {
+		return 0, fmt.Errorf("fucina: seq_prefill_chunk failed (slot %d)", slot)
+	}
+	return int32(first), nil
+}
+
 // StepBatch advances each slot in slots by one token (feeding inputs[i] to
 // slots[i]) in a single batched forward, returning one freshly sampled token per
 // slot. len(inputs) must equal len(slots).
@@ -854,6 +899,25 @@ func (a *BatchAdapter) StepBatchSpec(reqs []batch.SpecReq) ([][]int32, error) {
 		drafts[i] = r.Drafts
 	}
 	return a.eng.StepBatchSpecExt(slots, anchors, drafts)
+}
+
+// OpenSeq reserves a slot for chunked prefill (batch.ChunkPrefillEngine) and records
+// it so Capacity() stays accurate — the slot is held from open, through the chunked
+// prefill, into the decode batch, until RemoveSeq.
+func (a *BatchAdapter) OpenSeq(params batch.SeqParams) (int, error) {
+	slot, err := a.eng.SeqOpen(params)
+	if err != nil {
+		return 0, err
+	}
+	a.active++
+	return slot, nil
+}
+
+// PrefillChunk appends the next prompt chunk to an open slot (see Engine.SeqPrefillChunk).
+// Implementing OpenSeq+PrefillChunk is what makes the adapter a batch.ChunkPrefillEngine,
+// so long prompts are prefilled interleaved with decode by default.
+func (a *BatchAdapter) PrefillChunk(slot int, chunk []int32, last bool) (int32, error) {
+	return a.eng.SeqPrefillChunk(slot, chunk, last)
 }
 
 // RemoveSeq frees a slot and updates the live-slot count.

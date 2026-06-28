@@ -9816,6 +9816,77 @@ extern "C" int gemma4_engine_seq_add(
     return slot;
 }
 
+// ─── Chunked prefill (interleaved with decode) ───────────────────────────────
+//
+// gemma4_engine_seq_open reserves a free slot with EMPTY KV and stores the
+// per-sequence sampling params, WITHOUT prefilling — the scheduler then feeds the
+// prompt in bounded chunks via gemma4_engine_seq_prefill_chunk, interleaving those
+// chunks with decode steps of the other slots so a long prompt never blocks the
+// batch. Mirrors the slot-allocation + state-init prologue of gemma4_engine_seq_add.
+extern "C" int gemma4_engine_seq_open(
+    gemma4_engine_t *eng, float temp, int top_k, float top_p, float min_p, uint64_t seed)
+{
+    if (!eng || !eng->loaded || !eng->paged_enabled) return -1;
+    int slot = -1;
+    for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (!eng->slots[i].used) { slot = i; break; }
+    if (slot < 0) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
+
+    gemma4_seq *s = &eng->slots[slot];
+    // Fresh tables (struct was zeroed at create / released on remove).
+    s->n_tokens = 0; s->slid_bt.base = 0; s->slid_bt.n = 0; s->glob_bt.base = 0; s->glob_bt.n = 0;
+    s->used = 1;
+    s->samp_temp = temp; s->samp_top_k = top_k; s->samp_top_p = top_p;
+    s->samp_min_p = min_p; s->samp_seed = seed; s->n_sampled = 0;
+    s->mtp_h_valid = 0;
+    return slot;
+}
+
+// gemma4_engine_seq_prefill_chunk appends `n` prompt tokens to an OPEN slot's paged
+// KV at the slot's CURRENT position (resumable suffix prefill). It is the token-by-token
+// fallback loop of gemma4_engine_seq_add, generalized to start at s->n_tokens and to
+// sample only when do_sample is set (the final chunk) — so splitting a prompt across
+// chunks is invisible to the model: each token is forwarded at the same absolute
+// position with the same per-token computation, and the paged KV after the final chunk
+// is position-for-position identical to a one-shot seq_add of the whole prompt (and so
+// is the first sampled token). Returns 0 on success, -1 on error (caller frees the slot).
+extern "C" int gemma4_engine_seq_prefill_chunk(
+    gemma4_engine_t *eng, int slot, const int32_t *tokens, int n,
+    int do_sample, int32_t *first_token_out)
+{
+    if (!eng || !eng->loaded || !eng->paged_enabled) return -1;
+    if (slot < 0 || slot >= GEMMA4_MAX_SEQS || !tokens || n <= 0) return -1;
+    gemma4_seq *s = &eng->slots[slot];
+    if (!s->used) return -1;
+
+    gemma4_seq *one[1] = { s };
+    int32_t last_tok = 0;
+    for (int i = 0; i < n; i++) {
+        int pos = s->n_tokens;
+        if (paged_slot_sync(eng, s, pos) != 0) return -1;     // out of KV blocks
+        int32_t tok = tokens[i];
+        int positions[1] = { pos };
+        int want_sample = (do_sample && i == n - 1);
+        if (decode_multiseq_forward(eng, one, &tok, positions, 1, want_sample) != 0) {
+            fprintf(stderr, "fucina: seq_prefill_chunk: forward failed at pos %d (%s)\n",
+                    pos, cudaGetErrorString(cudaGetLastError()));
+            return -1;
+        }
+        s->n_tokens = pos + 1;
+        if (want_sample) {
+            cudaMemcpyAsync(&last_tok, eng->d_ms_outtok, sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, eng->stream);
+            s->n_sampled++;   // this seq has now produced one token (RNG index)
+        }
+    }
+    cudaStreamSynchronize(eng->stream);
+    { cudaError_t e = cudaGetLastError();
+      if (e != cudaSuccess) { fprintf(stderr, "fucina: seq_prefill_chunk: CUDA error: %s\n", cudaGetErrorString(e));
+                              return -1; } }
+    if (do_sample && first_token_out) *first_token_out = last_tok;
+    return 0;
+}
+
 // One batched forward over the B given slots: feed in_tokens[i] at each slot's
 // current position, advance positions, sample one greedy token per slot into
 // out_tokens. Returns 0 on success, -1 on error.

@@ -315,6 +315,20 @@ int  gemma4_engine_step_batch_spec_ext(gemma4_engine_t *eng, const int *slots,
                                        const int32_t *drafts, const int *dlens);
 void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot);
 int  gemma4_engine_seq_capacity(gemma4_engine_t *eng);
+// Chunked prefill (interleave a long prompt's prefill with decode of other slots).
+// seq_open: reserve a free slot with EMPTY KV and store the sampling params, WITHOUT
+//   prefilling. Returns slot id (>=0) or -1 (no free slot / not paged / error).
+// seq_prefill_chunk: append `n` tokens to an open slot's paged KV at its current
+//   position (resumable suffix prefill), token-by-token — the SAME per-position forward
+//   as the seq_add fallback, so after the final chunk the KV is position-for-position
+//   identical to a one-shot seq_add of the whole prompt. When do_sample != 0 (final
+//   chunk) it samples the first generated token into *first_token_out with the slot's
+//   stored params. Returns 0 on success, -1 on error (caller frees the slot).
+int  gemma4_engine_seq_open(gemma4_engine_t *eng,
+                            float temp, int top_k, float top_p, float min_p, uint64_t seed);
+int  gemma4_engine_seq_prefill_chunk(gemma4_engine_t *eng, int slot,
+                                     const int32_t *tokens, int n,
+                                     int do_sample, int32_t *first_token_out);
 
 // ─── CUDA Graph support (experimental, off by default) ─────────────
 // Call gemma4_engine_set_graph_mode(eng, 1) to enable. This allocates

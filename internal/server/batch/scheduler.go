@@ -105,6 +105,52 @@ type SpecBatchEngine interface {
 	StepBatchSpec(reqs []SpecReq) (out [][]int32, err error)
 }
 
+// ChunkPrefillEngine is the optional CHUNKED-PREFILL extension of BatchEngine. When
+// the concrete engine implements it, the scheduler prefills LONG prompts in bounded
+// chunks INTERLEAVED with decode steps of the already-active sequences, instead of
+// running each prefill to completion (which blocks the whole batch and makes TTFT grow
+// ~linearly with concurrency). Short prompts keep the one-shot AddSeq fast path.
+//
+// The lifecycle is: OpenSeq reserves a slot with empty KV → PrefillChunk is called
+// repeatedly to append the prompt in pieces (the LAST call samples and returns the
+// sequence's first generated token) → the slot then joins the normal decode batch via
+// StepBatch. RemoveSeq frees it at any stage.
+//
+// LOSSLESSNESS (cardinal): OpenSeq + PrefillChunk over the whole prompt MUST produce a
+// KV cache and a first token byte-identical to AddSeq(prompt). The chunk boundary is
+// invisible to the model — each token is forwarded at the same absolute position with
+// the same per-token computation regardless of how the prompt is split — so chunking
+// changes only WHEN work happens, never WHAT is generated.
+type ChunkPrefillEngine interface {
+	BatchEngine
+	// OpenSeq reserves a fresh slot with empty KV and stores params for on-device
+	// sampling, WITHOUT prefilling any tokens. err means no slot was available (no
+	// slot is consumed in that case).
+	OpenSeq(params SeqParams) (slot int, err error)
+	// PrefillChunk appends chunk to slot's KV at the slot's current position. When
+	// last is true it additionally samples the sequence's FIRST generated token and
+	// returns it in first (the token the scheduler emits and feeds back as the next
+	// step's input); when last is false first is unused. A non-nil error means the
+	// prefill failed (e.g. KV could not grow) and the caller frees the slot.
+	PrefillChunk(slot int, chunk []int32, last bool) (first int32, err error)
+}
+
+// defaultPrefillChunk is the prompt-token budget committed per scheduler pass for a
+// chunked (interleaved) prefill. Each pass commits at most one chunk for ONE prefilling
+// sequence AND runs one decode step, so decode of the active sequences keeps flowing
+// while a long prompt prefills. The engine's chunked prefill is token-by-token (one
+// weight pass per token), so the chunk size trades the new sequence's prefill latency
+// against the active sequences' per-step decode latency; 64 keeps both responsive.
+const defaultPrefillChunk = 64
+
+// defaultPrefillChunkMin is the prompt length AT OR BELOW which prefill stays on the
+// one-shot AddSeq path (no chunking). It sits at the engine's one-shot fast-prefill cap
+// (4096 tokens for both the Gemma and Qwen3 paged-prefill paths): at/below it the fast
+// single-pass prefill is used, so chunking never regresses it; ABOVE it the engine
+// already falls back to a blocking token-by-token prefill — exactly the case chunking
+// turns into an interleaved, non-batch-blocking one.
+const defaultPrefillChunkMin = 4096
+
 // MaxVerifyRows is the engine's per-step verify-row budget (GEMMA4_MAX_SEQS in the CUDA
 // engine): the speculative step flattens to Σ(1+len(drafts)) forward rows, which must not
 // exceed it. With R active slots, R rows are anchors and the rest is the draft budget — so
@@ -192,6 +238,11 @@ type seq struct {
 	remaining int   // generation budget left (counts down from MaxNew)
 	generated int   // tokens emitted so far
 	stops     map[int32]struct{}
+	// prefillPos counts how many of req.Tokens have already been committed to the
+	// slot's KV during a chunked prefill. It is meaningful only while the sequence is
+	// in the prefill backlog (phasePrefill); once prefillPos == len(req.Tokens) the
+	// prompt is fully prefilled and the sequence joins the active decode set.
+	prefillPos int
 	// hist is the sequence's full token history (prompt + every committed token),
 	// the corpus the prompt-lookup drafter scans for repeated n-grams. Populated
 	// only on the speculative path (nil otherwise, so the plain path pays nothing).
@@ -219,6 +270,16 @@ type Scheduler struct {
 	// the plain one-token-per-slot path. draftK bounds the per-slot draft length.
 	spec   SpecBatchEngine
 	draftK int
+
+	// chunk is the chunked-prefill fast path: non-nil when engine implements
+	// ChunkPrefillEngine. When set, a prompt longer than chunkMin is prefilled in
+	// chunkSize-token chunks INTERLEAVED with decode steps (one chunk + one decode
+	// step per scheduler pass), so a long prefill no longer blocks the whole batch.
+	// Shorter prompts use the one-shot AddSeq fast path. nil → every prompt uses
+	// the one-shot path (the original behavior).
+	chunk     ChunkPrefillEngine
+	chunkSize int
+	chunkMin  int
 
 	// submit carries new requests to the owner goroutine. It is bounded; a full
 	// channel is backpressure (Submit returns ErrQueueFull) rather than
@@ -260,6 +321,14 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	if se, ok := engine.(SpecBatchEngine); ok {
 		s.spec = se
 		s.draftK = 6
+	}
+	// Chunked prefill is a DEFAULT-on capability: if the engine can prefill a slot
+	// in pieces, long prompts are prefilled interleaved with decode so they never
+	// block the batch. No effect on engines that don't implement it.
+	if ce, ok := engine.(ChunkPrefillEngine); ok {
+		s.chunk = ce
+		s.chunkSize = defaultPrefillChunk
+		s.chunkMin = defaultPrefillChunkMin
 	}
 	return s
 }
@@ -317,6 +386,11 @@ func (s *Scheduler) run() {
 	// active maps engine slot id → sequence. The scheduler holds at most
 	// Capacity() entries here at once.
 	active := make(map[int]*seq)
+	// prefill is the round-robin backlog of sequences whose (long) prompt is being
+	// prefilled in chunks, interleaved with decode. A sequence holds an engine slot
+	// the whole time it is here; when its prompt is fully prefilled it moves to
+	// active. Empty unless the engine supports chunked prefill (s.chunk != nil).
+	var prefill []*seq
 	// waiting is the queue of accepted-but-not-yet-admitted requests, drained
 	// from the submit channel and admitted as slots free up.
 	var waiting []Request
@@ -324,11 +398,17 @@ func (s *Scheduler) run() {
 	defer close(s.done)
 	defer func() {
 		// Drain everything on the way out so no client is left hanging and no
-		// slot is leaked: evict every active sequence and reply to every queued
-		// request with FinishShutdown.
+		// slot is leaked: evict every active and prefilling sequence and reply to
+		// every queued request with FinishShutdown.
 		for slot, sq := range active {
 			if err := s.engine.RemoveSeq(slot); err != nil {
 				log.Printf("batch: RemoveSeq(%d) on shutdown: %v", slot, err)
+			}
+			reply(sq.req, Result{Reason: FinishShutdown, Generated: sq.generated})
+		}
+		for _, sq := range prefill {
+			if err := s.engine.RemoveSeq(sq.slot); err != nil {
+				log.Printf("batch: RemoveSeq(%d) on shutdown: %v", sq.slot, err)
 			}
 			reply(sq.req, Result{Reason: FinishShutdown, Generated: sq.generated})
 		}
@@ -355,23 +435,33 @@ func (s *Scheduler) run() {
 		s.drainSubmit(&waiting)
 
 		// 2. Admit waiting requests while slots are free. Capacity is queried
-		//    each pass so a dynamic engine can grow/shrink. admitted reports
-		//    whether at least one sequence was slotted this pass.
-		admitted := s.admit(active, &waiting)
+		//    each pass so a dynamic engine can grow/shrink. A short prompt is
+		//    prefilled one-shot and joins active; a long prompt (chunked engine)
+		//    is opened and enters the prefill backlog. admitted reports whether
+		//    at least one sequence was slotted this pass.
+		admitted := s.admit(active, &prefill, &waiting)
 
-		// 3. Evict any active sequence whose context was cancelled BEFORE the
-		//    step, so a cancelled client's slot is freed promptly (and never
-		//    burns another forward pass).
+		// 3. Evict any active OR prefilling sequence whose context was cancelled
+		//    BEFORE the step, so a cancelled client's slot is freed promptly (and
+		//    never burns another forward pass / prefill chunk).
 		s.evictCancelled(active)
+		s.sweepCancelledPrefill(&prefill)
 
-		// If there is nothing to step, block instead of spinning. Two idle
-		// shapes:
+		// 4. Advance ONE chunk of one prefilling sequence (round-robin). Paired
+		//    with the decode step below, this interleaves prefill and decode so a
+		//    long prompt's prefill never blocks the active sequences. A sequence
+		//    whose prompt finished prefilling is promoted to active here.
+		s.advancePrefill(active, &prefill)
+
+		// If there is nothing to do, block instead of spinning. The scheduler is
+		// idle only when there is no active decode, no prefill in flight, and we
+		// admitted nothing this pass:
 		//   - nothing waiting: block until a new request or shutdown.
 		//   - waiting but un-admittable this pass (engine at capacity / AddSeq
 		//     stuck) AND we admitted nothing: block on a new request or a short
 		//     timer, so a capacity that frees externally is retried without a
 		//     100%-CPU spin.
-		if len(active) == 0 && !admitted {
+		if len(active) == 0 && len(prefill) == 0 && !admitted {
 			select {
 			case <-s.quit:
 				return
@@ -382,19 +472,21 @@ func (s *Scheduler) run() {
 			continue
 		}
 		if len(active) == 0 {
-			// admitted>0 a moment ago but everything was evicted in the same
-			// pass (e.g. one-token stop sequences); loop to admit more waiters.
+			// No active decode this pass: either everything self-evicted (e.g.
+			// one-token stop sequences) or work is still in the prefill backlog.
+			// Loop to advance the next prefill chunk / admit more waiters without
+			// parking (prefill in flight is real progress, not a spin).
 			continue
 		}
 
-		// 4. Build the decode batch from the active slots and run ONE step that
+		// 5. Build the decode batch from the active slots and run ONE step that
 		//    advances ALL of them together.
 		if !s.step(active) {
 			// Fatal engine error already handled inside step (all sequences
 			// evicted); fall through to re-check shutdown / new work.
 		}
 
-		// 5. Honor a shutdown request between steps.
+		// 6. Honor a shutdown request between steps.
 		select {
 		case <-s.quit:
 			return
@@ -444,10 +536,12 @@ func retryTimer(haveWaiters bool) <-chan time.Time {
 // slot. An AddSeq error fails just that request; others keep their place. It
 // returns true if at least one sequence was slotted (used by the run loop to
 // decide whether to retry or park).
-func (s *Scheduler) admit(active map[int]*seq, waiting *[]Request) bool {
+func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Request) bool {
 	admitted := false
 	w := *waiting
-	for len(w) > 0 && len(active) < s.engine.Capacity() {
+	// A prefilling sequence also holds a slot, so it counts against capacity.
+	held := func() int { return len(active) + len(*prefill) }
+	for len(w) > 0 && held() < s.engine.Capacity() {
 		req := w[0]
 
 		// Skip a request that gave up while queued — don't burn a prefill for a
@@ -455,6 +549,24 @@ func (s *Scheduler) admit(active map[int]*seq, waiting *[]Request) bool {
 		if req.Ctx != nil && req.Ctx.Err() != nil {
 			reply(req, Result{Reason: FinishCancelled})
 			w = w[1:]
+			continue
+		}
+
+		// Chunked path: a long prompt on a chunk-capable engine is opened now and
+		// prefilled in pieces (interleaved with decode) so it never blocks the
+		// batch. Short prompts fall through to the one-shot fast path below.
+		if s.chunk != nil && len(req.Tokens) > s.chunkMin {
+			slot, err := s.chunk.OpenSeq(req.Params)
+			if err != nil {
+				log.Printf("batch: OpenSeq failed: %v", err)
+				reply(req, Result{Reason: FinishError, Err: fmt.Errorf("prefill open: %w", err)})
+				w = w[1:]
+				continue
+			}
+			sq := s.newSeq(req, slot)
+			*prefill = append(*prefill, sq)
+			w = w[1:]
+			admitted = true
 			continue
 		}
 
@@ -466,19 +578,7 @@ func (s *Scheduler) admit(active map[int]*seq, waiting *[]Request) bool {
 			continue
 		}
 
-		sq := &seq{
-			req:       req,
-			slot:      slot,
-			remaining: req.MaxNew,
-			stops:     make(map[int32]struct{}, len(req.Stops)),
-		}
-		// Seed the drafter corpus with the prompt tokens (only when speculating).
-		if s.spec != nil {
-			sq.hist = append(make([]int32, 0, len(req.Tokens)+req.MaxNew), req.Tokens...)
-		}
-		for _, st := range req.Stops {
-			sq.stops[st] = struct{}{}
-		}
+		sq := s.newSeq(req, slot)
 		w = w[1:]
 		admitted = true // a slot was consumed (progress), even if it self-evicts below
 
@@ -492,6 +592,93 @@ func (s *Scheduler) admit(active map[int]*seq, waiting *[]Request) bool {
 	}
 	*waiting = w
 	return admitted
+}
+
+// newSeq builds the scheduler's per-sequence state for an admitted request bound to
+// slot, including the drafter corpus seed (prompt tokens) when speculating. Shared by
+// both admission paths (one-shot AddSeq and chunked OpenSeq) so they stay in lockstep.
+func (s *Scheduler) newSeq(req Request, slot int) *seq {
+	sq := &seq{
+		req:       req,
+		slot:      slot,
+		remaining: req.MaxNew,
+		stops:     make(map[int32]struct{}, len(req.Stops)),
+	}
+	if s.spec != nil {
+		sq.hist = append(make([]int32, 0, len(req.Tokens)+req.MaxNew), req.Tokens...)
+	}
+	for _, st := range req.Stops {
+		sq.stops[st] = struct{}{}
+	}
+	return sq
+}
+
+// advancePrefill commits ONE prefill chunk for the sequence at the front of the
+// prefill backlog and rotates it to the back (round-robin fairness across concurrent
+// prefills). Run once per scheduler pass alongside one decode step, this is what
+// interleaves prefill with decode. When a sequence's prompt is fully prefilled it is
+// removed from the backlog, its first token delivered, and (if it survives) promoted
+// to the active decode set. A prefill error or KV exhaustion evicts just that
+// sequence. It is a no-op when the backlog is empty.
+func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
+	p := *prefill
+	if len(p) == 0 {
+		return
+	}
+	sq := p[0]
+	toks := sq.req.Tokens
+	lo := sq.prefillPos
+	hi := lo + s.chunkSize
+	if hi > len(toks) {
+		hi = len(toks)
+	}
+	last := hi == len(toks)
+
+	first, err := s.chunk.PrefillChunk(sq.slot, toks[lo:hi], last)
+	if err != nil {
+		log.Printf("batch: PrefillChunk(slot %d) failed: %v", sq.slot, err)
+		*prefill = p[1:]
+		s.evict(active, sq, Result{Reason: FinishError, Generated: sq.generated, Err: err})
+		return
+	}
+	sq.prefillPos = hi
+
+	if !last {
+		// More prompt to go: rotate to the back so other prefills make progress too.
+		p = p[1:]
+		p = append(p, sq)
+		*prefill = p
+		return
+	}
+
+	// Prompt fully prefilled: leave the backlog and behave exactly like the one-shot
+	// admit path — deliver the first sampled token and join active if it survives.
+	*prefill = p[1:]
+	if s.deliver(active, sq, first) {
+		active[sq.slot] = sq
+	}
+}
+
+// sweepCancelledPrefill evicts every backlog sequence whose context has been
+// cancelled, so a client that gave up during a long prefill frees its slot promptly
+// instead of waiting to reach the front of the round-robin.
+func (s *Scheduler) sweepCancelledPrefill(prefill *[]*seq) {
+	p := *prefill
+	if len(p) == 0 {
+		return
+	}
+	kept := p[:0]
+	for _, sq := range p {
+		if sq.req.Ctx != nil && sq.req.Ctx.Err() != nil {
+			if err := s.engine.RemoveSeq(sq.slot); err != nil {
+				log.Printf("batch: RemoveSeq(%d) on cancel: %v", sq.slot, err)
+			}
+			reply(sq.req, Result{Reason: FinishCancelled, Generated: sq.generated})
+			continue
+		}
+		kept = append(kept, sq)
+	}
+	*prefill = kept
 }
 
 // deliver emits one sampled token to a sequence and advances its bookkeeping.
