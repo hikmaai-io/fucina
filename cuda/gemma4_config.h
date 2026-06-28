@@ -26,12 +26,24 @@
 #define GEMMA4_HEAD_DIM         256   // sliding-layer head dim (key_length_swa)
 #define GEMMA4_GLOBAL_HEAD_DIM  512   // global-layer head dim (key_length)
 
+// ── Model architecture family ───────────────────────────────────────────────────────────────────
+// fucina is one binary that runs several arch families off the SAME engine. The differences (embed
+// scale, sandwich norms, GLU activation, softcap, head_dim, V-sharing, attention scale) are gated on
+// cfg.arch so Gemma-4 stays byte-identical. Detected from general.architecture in the GGUF.
+enum {
+    GEMMA4_ARCH_GEMMA4 = 0,   // Gemma-4 (sliding+global, V=K on global, geglu, softcap, baked attn scale)
+    GEMMA4_ARCH_QWEN3  = 1,   // Qwen3 dense (full-causal all layers, separate V, silu-glu, no softcap)
+};
+
 // ── Per-model runtime configuration ─────────────────────────────────────────────────────────────
 // Populated at load time from GGUF kv (gemma4.block_count, embedding_length, feed_forward_length,
 // attention.head_count, attention.head_count_kv[], attention.sliding_window_pattern[],
 // final_logit_softcapping, rope.freq_base[_swa]) or safetensors config.json (already parsed in
 // nvfp4_loader.h). One struct per loaded model; the engine reads it instead of the old #defines.
 typedef struct gemma4_model_config_t {
+    int   arch;              // GEMMA4_ARCH_* (default GEMMA4_ARCH_GEMMA4)
+    int   head_dim;          // uniform head dim for single-head-dim archs (Qwen3=128); Gemma uses
+                             // the per-class GEMMA4_HEAD_DIM/GEMMA4_GLOBAL_HEAD_DIM constants instead.
     int   n_layers;          // 48 (12B) / 60 (31B)
     int   hidden_size;       // 3840 / 5376
     int   intermediate;      // 15360 / 21504  (FFN)

@@ -2292,6 +2292,16 @@ __global__ void geglu_bf16_kernel(
     out[i] = __float2bfloat16(gemma4_gelu_tanh(gate[i]) * up[i]);
 }
 
+// SiLU-GLU (Qwen3 FFN) writing BF16: out = silu(gate)*up, silu(x)=x*sigmoid(x).
+__global__ void silu_glu_bf16_kernel(
+    __nv_bfloat16 *out, const float *gate, const float *up, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    out[i] = __float2bfloat16((g / (1.0f + __expf(-g))) * up[i]);
+}
+
 // Broadcast K/V heads to all query heads for batched-attention GEMMs (GQA):
 // src [rows][n_kv_heads][head_dim] → dst [rows][n_heads][head_dim], dst head h
 // copies src kv head h/(n_heads/n_kv_heads). grid=(ceil(head_dim/256), n_heads, rows).
@@ -2462,6 +2472,16 @@ __global__ void geglu_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = gelu_tanh(gate[i]) * up[i];
+}
+
+// SiLU-GLU (Qwen3 FFN), f32: out = silu(gate)*up, silu(x)=x*sigmoid(x).
+__global__ void silu_glu_kernel(
+    float *out, const float *gate, const float *up, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    out[i] = (g / (1.0f + __expf(-g))) * up[i];
 }
 
 // ── Fused gate+up+GeGLU MMVQ (llama.cpp has_fusion analogue; audit #30 lever 2) ──────────
@@ -2868,10 +2888,15 @@ struct gemma4_engine {
             uint64_t ffn_norm;          // [hidden_size] pre-FFN RMSNorm
             uint64_t post_ffn_norm;     // [hidden_size] post-FFN sandwich norm
             uint64_t layer_out_scale;   // [1]  scalar output multiplier
+            // Per-tensor weight format (FORMAT_*). Qwen3 Q4_K_M mixes Q4_K/Q6_K per layer
+            // (attn_v + ffn_down vary), so the bulk dispatch must read the tensor's own format
+            // rather than the engine-wide eng->format. 0 = unset (e.g. global-layer attn_v).
+            uint8_t fmt_q, fmt_k, fmt_v, fmt_o, fmt_gate, fmt_up, fmt_down;
         } layers[GEMMA4_CAP_LAYERS];
 
         uint64_t output_norm;        // [hidden_size] (FP32)
         uint64_t output_weight;      // [hidden_size × vocab_size]
+        uint8_t  output_fmt;         // FORMAT_* of the (untied) LM head; 0 = tied/unset
     } tensors;
 
     // 1 if output_weight aliases token_embd (tied embeddings), 0 if a separate
@@ -3374,6 +3399,17 @@ static int gguf_find_tensor_offset(
     uint64_t      *n_bytes_out)
 {
     return gguf_find_tensor(data, size, name, offset_out, n_bytes_out, NULL);
+}
+
+// Map a GGML tensor type → fucina FORMAT_*; -1 for an unsupported bulk-weight type.
+static inline int ggml_to_fmt(uint32_t gt) {
+    switch (gt) {
+        case GGML_TYPE_Q4_0: return FORMAT_Q4_0;
+        case GGML_TYPE_Q8_0: return FORMAT_Q8_0;
+        case GGML_TYPE_Q4_K: return FORMAT_Q4_K;
+        case GGML_TYPE_Q6_K: return FORMAT_Q6_K;
+        default: return -1;
+    }
 }
 
 // ─── Engine Construction ──────────────────────────────────────────────
@@ -4020,13 +4056,14 @@ gemma4_engine_t* gemma4_engine_create(
         int got_fmt = 0;
         for (int t = 0; t < 2 && !got_fmt; t++) {
             if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, names[t], &_off, &_n, &gtype) == 0) {
-                if (gtype != GGML_TYPE_Q4_0 && gtype != GGML_TYPE_Q8_0) {
+                int bfmt = ggml_to_fmt(gtype);
+                if (bfmt < 0) {
                     fprintf(stderr, "fucina: unsupported GGUF bulk tensor type %u — "
-                            "only Q4_0 (QAT) and Q8_0 models are supported\n", gtype);
+                            "only Q4_0 (QAT), Q8_0, Q4_K and Q6_K models are supported\n", gtype);
                     gemma4_engine_destroy(eng);
                     return NULL;
                 }
-                eng->format = (gtype == GGML_TYPE_Q4_0) ? FORMAT_Q4_0 : FORMAT_Q8_0;
+                eng->format = (tensor_format_t)bfmt;
                 got_fmt = 1;
             }
         }
@@ -4065,6 +4102,12 @@ gemma4_engine_t* gemma4_engine_create(
             fprintf(stderr, "fucina: GGUF arch auto-detect failed: %s "
                             "(falling back to 12B defaults)\n", derr);
             // eng->cfg already holds the 12B defaults seeded at create top.
+        } else if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) {
+            fprintf(stderr, "fucina: detected Qwen3 dense arch: %d layers, hidden %d, FFN %d, "
+                    "%d heads, %d KV heads, head_dim %d, vocab %d, rope_theta %.0f (full-causal)\n",
+                    eng->cfg.n_layers, eng->cfg.hidden_size, eng->cfg.intermediate,
+                    eng->cfg.n_heads, eng->cfg.n_kv_global, eng->cfg.head_dim,
+                    eng->cfg.vocab_size, eng->cfg.rope_theta_global);
         } else {
             fprintf(stderr, "fucina: detected Gemma-4 arch: %d layers, hidden %d, FFN %d, "
                     "%d heads, KV %d sliding/%d global, %d global layers, softcap %.1f\n",
@@ -4104,6 +4147,16 @@ gemma4_engine_t* gemma4_engine_create(
             missing_required = true; \
         } \
     } while(0)
+    // Record a weight tensor's own GGML format (Qwen3 Q4_K_M mixes Q4_K/Q6_K per layer).
+    #define LOAD_WT_FMT(nm, fld) do { \
+        uint64_t _o2 = 0, _n2 = 0; uint32_t _t2 = 0; \
+        if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, nm, &_o2, &_n2, &_t2) == 0) { \
+            int _f2 = ggml_to_fmt(_t2); \
+            if (_f2 < 0) { fprintf(stderr, "fucina: unsupported weight type %u for %s\n", _t2, nm); \
+                           missing_required = true; } \
+            eng->tensors.fld = (uint8_t)_f2; \
+        } \
+    } while(0)
 
     // Load embedding (required — also the tied LM head)
     LOAD_TENSOR_REQUIRED("token_embd.weight", token_embd);
@@ -4113,20 +4166,26 @@ gemma4_engine_t* gemma4_engine_create(
     for (int l = 0; l < eng->cfg.n_layers; l++) {
         snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].attn_q);
+        LOAD_WT_FMT(tname, layers[l].fmt_q);
 
         snprintf(tname, sizeof(tname), "blk.%d.attn_k.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].attn_k);
+        LOAD_WT_FMT(tname, layers[l].fmt_k);
 
-        // Global layers use a unified K=V cache and ship no attn_v.weight.
-        if (eng->layer_types[l] == LAYER_SLIDING) {
+        // Gemma global layers use a unified K=V cache and ship no attn_v.weight. Qwen3 is
+        // standard GQA: EVERY layer has a separate attn_v projection (even though all its layers
+        // run through the engine's full-causal "global" class).
+        if (eng->layer_types[l] == LAYER_SLIDING || eng->cfg.arch == GEMMA4_ARCH_QWEN3) {
             snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", l);
             LOAD_TENSOR_OFFSET(tname, layers[l].attn_v);
+            LOAD_WT_FMT(tname, layers[l].fmt_v);
         } else {
             eng->tensors.layers[l].attn_v = 0;
         }
 
         snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].attn_output);
+        LOAD_WT_FMT(tname, layers[l].fmt_o);
 
         snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].attn_norm);
@@ -4142,12 +4201,15 @@ gemma4_engine_t* gemma4_engine_create(
 
         snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].ffn_gate);
+        LOAD_WT_FMT(tname, layers[l].fmt_gate);
 
         snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].ffn_up);
+        LOAD_WT_FMT(tname, layers[l].fmt_up);
 
         snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].ffn_down);
+        LOAD_WT_FMT(tname, layers[l].fmt_down);
 
         snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].ffn_norm);
@@ -4166,11 +4228,17 @@ gemma4_engine_t* gemma4_engine_create(
     // "output.weight" tensor. Probe for an explicit head first; if absent,
     // alias it to token_embd.weight (tied embeddings).
     {
-        uint64_t _off = 0, _n = 0;
-        if (gguf_find_tensor_offset(eng->gguf_data, eng->gguf_size,
-                "output.weight", &_off, &_n) == 0) {
+        uint64_t _off = 0, _n = 0; uint32_t _ot = 0;
+        if (gguf_find_tensor(eng->gguf_data, eng->gguf_size,
+                "output.weight", &_off, &_n, &_ot) == 0) {
             eng->tensors.output_weight = _off;
             eng->output_tied = 0;
+            int ofmt = ggml_to_fmt(_ot);
+            if (ofmt < 0) {
+                fprintf(stderr, "fucina: unsupported output.weight type %u\n", _ot);
+                missing_required = true;
+            }
+            eng->tensors.output_fmt = (uint8_t)ofmt;
         } else {
             eng->tensors.output_weight = eng->tensors.token_embd;
             eng->output_tied = 1;
@@ -4181,6 +4249,7 @@ gemma4_engine_t* gemma4_engine_create(
 
     #undef LOAD_TENSOR_OFFSET
     #undef LOAD_TENSOR_REQUIRED
+    #undef LOAD_WT_FMT
 
     // A model-defining tensor was missing: the GGUF is corrupt or not a gemma-4
     // model. Fail the load rather than run inference against offset-0 garbage.
@@ -4337,8 +4406,9 @@ gemma4_engine_t* gemma4_engine_create(
         } while (0)
 
         for (int l = 0; l < nL; l++) {
-            int head_dim = (eng->layer_types[l] == LAYER_SLIDING)
-                               ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+            int head_dim = (eng->cfg.arch == GEMMA4_ARCH_QWEN3) ? eng->cfg.head_dim
+                         : ((eng->layer_types[l] == LAYER_SLIDING)
+                               ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM);
             UPLOAD_NORM(eng->d_w_attn_norm      + l * hs, eng->tensors.layers[l].attn_norm,      hs);
             UPLOAD_NORM(eng->d_w_post_attn_norm + l * hs, eng->tensors.layers[l].post_attn_norm, hs);
             UPLOAD_NORM(eng->d_w_ffn_norm       + l * hs, eng->tensors.layers[l].ffn_norm,       hs);
@@ -4582,8 +4652,7 @@ gemma4_engine_t* gemma4_engine_create(
 
     // QAT Q4_0 model: convert the Q6_K (or Unsloth UD Q4_K) token_embd (= tied LM head) to a
     // Q8_0 device buffer so the existing Q8_0 embed/LM-head kernels handle it (layers stay Q4_0).
-    if (eng->format == FORMAT_Q4_0 &&
-        (embd_src_type == GGML_TYPE_Q6_K || embd_src_type == GGML_TYPE_Q4_K)) {
+    if (embd_src_type == GGML_TYPE_Q6_K || embd_src_type == GGML_TYPE_Q4_K) {
         int64_t n_elem = (int64_t)eng->cfg.vocab_size * eng->cfg.hidden_size;
         const unsigned char *src = (const unsigned char*)(eng->gguf_data + eng->tensors.token_embd);
         unsigned char *q8 = (embd_src_type == GGML_TYPE_Q6_K)
@@ -4916,8 +4985,12 @@ gemma4_engine_t* gemma4_engine_create(
 
     if (getenv("FUCINA_PAGED_KV")) {
         const int BT = PAGED_KV_BLOCK_TOKENS;
-        const int slid_elems = eng->cfg.n_kv_sliding * GEMMA4_HEAD_DIM;          // 8×256 (12B) / 16×256 (31B)
-        const int glob_elems = eng->cfg.n_kv_global  * GEMMA4_GLOBAL_HEAD_DIM;   // 1×512 (12B) / 4×512 (31B)
+        // Per-token element count per KV-class. Qwen3 is single-head-dim (128) and routes every
+        // layer through the global class, so glob_elems uses cfg.head_dim (NOT the 512 Gemma const)
+        // — this MUST match the runtime okv = n_kv*head_dim used at write/read time in the pools.
+        const int q3 = (eng->cfg.arch == GEMMA4_ARCH_QWEN3);
+        const int slid_elems = eng->cfg.n_kv_sliding * (q3 ? eng->cfg.head_dim : GEMMA4_HEAD_DIM);
+        const int glob_elems = eng->cfg.n_kv_global  * (q3 ? eng->cfg.head_dim : GEMMA4_GLOBAL_HEAD_DIM);
         // Per-block bytes for K (== V) across all layers of the class.
         size_t slid_block_k = (size_t)eng->cfg.n_layers    * BT * slid_elems * sizeof(kv_t);
         size_t glob_block_k = (size_t)eng->n_layers_global * BT * glob_elems * sizeof(kv_t);
@@ -5256,6 +5329,8 @@ static inline void mmvq_q4aware(
     const int8_t *qx, const float *dx, const int *sx,
     int in_dim, int out_dim, int fmt, cudaStream_t stream)
 {
+    if (fmt == FORMAT_Q6_K) { mmvq_q6_k_launch(out, weight, qx, dx, in_dim, out_dim, stream); return; }
+    if (fmt == FORMAT_Q4_K) { mmvq_q4_k_launch(out, weight, qx, dx, sx, in_dim, out_dim, stream); return; }
     if (use_packed_q4(eng, fmt, weight)) {
         const uint8_t  *q = eng->d_weights_packed + (weight - eng->d_weights);
         const uint16_t *s = (const uint16_t *)(q + (size_t)out_dim * (in_dim >> 5) * 16);
@@ -5380,6 +5455,9 @@ static inline const unsigned char* lmhead_w(const gemma4_engine_t *eng) {
 static inline int embd_fmt(const gemma4_engine_t *eng) {
     if (lmhead_native_q6k(eng)) return (int)FORMAT_Q6_K;
     if (lmhead_native_q4k(eng)) return (int)FORMAT_Q4_K;
+    // Untied head (e.g. Qwen3): use the head's own recorded format (Q6_K for Qwen3 Q4_K_M),
+    // NOT the bulk engine format (Q4_K) which would mis-decode the Q6_K head bytes.
+    if (!eng->output_tied) return (int)eng->tensors.output_fmt;
     return (eng->format == FORMAT_Q4_0 && eng->d_token_embd) ? (int)FORMAT_Q8_0 : FMT(eng);
 }
 
@@ -5698,18 +5776,18 @@ static int decode_layer(
     quantize_q8_1_kernel<<<HS/32, 32, 0, stream>>>(
         eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, HS);
     mmvq_q4aware(eng, eng->d_attn_q, weight_fp8(eng, eng->tensors.layers[layer].attn_q),
-        eng->d_qx, eng->d_dx, eng->d_sx, HS, out_dim_q, (int)eng->format, stream);
+        eng->d_qx, eng->d_dx, eng->d_sx, HS, out_dim_q, (int)eng->tensors.layers[layer].fmt_q, stream);
     PER_HEAD_NORM(eng->d_attn_q, HEAD_NORM_W(d_w_q_norm), n_heads, head_dim);
 
     // ── 3. K projection → per-head RMSNorm ───────────────────────────────
     mmvq_q4aware(eng, eng->d_attn_k, weight_fp8(eng, eng->tensors.layers[layer].attn_k),
-        eng->d_qx, eng->d_dx, eng->d_sx, HS, out_dim_kv, (int)eng->format, stream);
+        eng->d_qx, eng->d_dx, eng->d_sx, HS, out_dim_kv, (int)eng->tensors.layers[layer].fmt_k, stream);
     // ── 4. V projection → plain RMSNorm (no weight) ──────────────────────
     // For global layers V = K BEFORE any norm/RoPE is applied.
     // For sliding layers V comes from a separate projection.
     if (ltype == LAYER_SLIDING) {
         mmvq_q4aware(eng, eng->d_attn_v, weight_fp8(eng, eng->tensors.layers[layer].attn_v),
-            eng->d_qx, eng->d_dx, eng->d_sx, HS, out_dim_kv, (int)eng->format, stream);
+            eng->d_qx, eng->d_dx, eng->d_sx, HS, out_dim_kv, (int)eng->tensors.layers[layer].fmt_v, stream);
         PER_HEAD_NORM(eng->d_attn_v, NULL, n_kv_heads, head_dim);
     } else {
         // Global: V = raw K projection (before K-norm)
@@ -5951,7 +6029,7 @@ static int decode_layer(
     } else
     gemv_w(eng, eng->d_x,
         weight_fp8(eng, eng->tensors.layers[layer].attn_output),
-        eng->d_attn_out, out_dim_q, HS, stream);
+        eng->d_attn_out, out_dim_q, HS, stream, (int)eng->tensors.layers[layer].fmt_o);
     // Post-attention sandwich norm
     rms_norm_kernel<<<1, block, smem32, stream>>>(
         eng->d_norm, eng->d_x, NORM_W(d_w_post_attn_norm),
@@ -5983,13 +6061,26 @@ static int decode_layer(
         geglu_kernel<<<(IM+255)/256, 256, 0, stream>>>(
             eng->d_ffn_out, eng->d_ffn_gate, eng->d_ffn_up, IM);
     } else {
-    quantize_q8_1_kernel<<<HS/32, 32, 0, stream>>>(
-        eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, HS);
-    mmvq_glu_launch(eng->d_ffn_out,
-        weight_fp8(eng, eng->tensors.layers[layer].ffn_gate),
-        weight_fp8(eng, eng->tensors.layers[layer].ffn_up),
-        eng->d_qx, eng->d_dx, eng->d_sx, HS, IM,
-        (int)eng->format, stream);
+    int fmt_gate = (int)eng->tensors.layers[layer].fmt_gate;
+    int fmt_up   = (int)eng->tensors.layers[layer].fmt_up;
+    if (fmt_gate == FORMAT_Q4_0 || fmt_gate == FORMAT_Q8_0) {
+        // Fused gate·up·GeGLU (Q4_0/Q8_0 only) — gate/up intermediates never touch DRAM.
+        quantize_q8_1_kernel<<<HS/32, 32, 0, stream>>>(
+            eng->d_norm, eng->d_qx, eng->d_dx, eng->d_sx, HS);
+        mmvq_glu_launch(eng->d_ffn_out,
+            weight_fp8(eng, eng->tensors.layers[layer].ffn_gate),
+            weight_fp8(eng, eng->tensors.layers[layer].ffn_up),
+            eng->d_qx, eng->d_dx, eng->d_sx, HS, IM,
+            fmt_gate, stream);
+    } else {
+        // Q4_K/Q6_K gate/up have no fused GLU: two GEMVs into gate/up scratch, then geglu.
+        gemv_w(eng, eng->d_ffn_gate,
+            weight_fp8(eng, eng->tensors.layers[layer].ffn_gate), eng->d_norm, HS, IM, stream, fmt_gate);
+        gemv_w(eng, eng->d_ffn_up,
+            weight_fp8(eng, eng->tensors.layers[layer].ffn_up),   eng->d_norm, HS, IM, stream, fmt_up);
+        geglu_kernel<<<(IM+255)/256, 256, 0, stream>>>(
+            eng->d_ffn_out, eng->d_ffn_gate, eng->d_ffn_up, IM);
+    }
     }
 
     // ── 12. FFN down projection ───────────────────────────────────────────
@@ -5998,7 +6089,7 @@ static int decode_layer(
     } else
     gemv_w(eng, eng->d_x,
         weight_fp8(eng, eng->tensors.layers[layer].ffn_down),
-        eng->d_ffn_out, IM, HS, stream);
+        eng->d_ffn_out, IM, HS, stream, (int)eng->tensors.layers[layer].fmt_down);
 
     // ── 13. Post-FFN sandwich norm → residual add ─────────────────────────
     rms_norm_kernel<<<1, block, smem32, stream>>>(
@@ -6988,6 +7079,11 @@ static int paged_prefill_batched(
 {
     if (!eng->loaded || N <= 0) return -1;
     if (!eng->paged_enabled) return -2;
+    // Qwen3 defers to the token-by-token prefill (decode_multiseq_body): the BF16 fast-prefill
+    // GEMM path dequants weights via decode_weight, which only knows Q4_0/Q8_0 — not the Q4_K/Q6_K
+    // bulk weights of a Qwen3 Q4_K_M checkpoint. The per-position decode path uses the per-tensor
+    // mmvq_q4_k/q6_k GEMVs and is the arch-correct route. (Prefill speed only; decode is unaffected.)
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) return -2;
     if (s->n_tokens != 0) return -2;                       // fresh slot only
     if (N > eng->global_kv_capacity) return -2;            // would overflow pool
     if (N > 4096) return -2;                               // persistent scratch cap
@@ -8269,11 +8365,11 @@ static void decode_batched_forward(
             }
             per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, K, GEMMA4_RMS_EPS);
         } else {
-        gemv_batched_w(eng, d_q, weight_fp8(eng, L->attn_q), d_inf, H, oq, K, stream);
+        gemv_batched_w(eng, d_q, weight_fp8(eng, L->attn_q), d_inf, H, oq, K, stream, (int)L->fmt_q);
         per_head_rms_norm_rows_kernel<<<dim3(HEADS,K),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, K, GEMMA4_RMS_EPS);
-        gemv_batched_w(eng, d_k, weight_fp8(eng, L->attn_k), d_inf, H, okv, K, stream);
+        gemv_batched_w(eng, d_k, weight_fp8(eng, L->attn_k), d_inf, H, okv, K, stream, (int)L->fmt_k);
         if (lt == LAYER_SLIDING) {
-            gemv_batched_w(eng, d_v, weight_fp8(eng, L->attn_v), d_inf, H, okv, K, stream);
+            gemv_batched_w(eng, d_v, weight_fp8(eng, L->attn_v), d_inf, H, okv, K, stream, (int)L->fmt_v);
             per_head_rms_norm_rows_kernel<<<dim3(nkv,K),hd,HD2,stream>>>(d_v, NULL, nkv, hd, K, GEMMA4_RMS_EPS);
         } else {
             cudaMemcpyAsync(d_v, d_k, (size_t)K*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
@@ -8365,7 +8461,7 @@ static void decode_batched_forward(
 
         // O projection (input d_attn is already fp32) → d_o; post-attn norm; residual.
         if (nvfp4) nvb_proj(PJ_O, d_attn, d_o, oq, H);
-        else gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, K, stream);
+        else gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, K, stream, (int)L->fmt_o);
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_a, H, K, GEMMA4_RMS_EPS);
         residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
 
@@ -8375,12 +8471,12 @@ static void decode_batched_forward(
             nvb_proj(PJ_GATE, d_inf, d_gate, H, I);
             nvb_proj(PJ_UP,   d_inf, d_up,   H, I);
         } else {
-            gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, K, stream);
-            gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, K, stream);
+            gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, K, stream, (int)L->fmt_gate);
+            gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, K, stream, (int)L->fmt_up);
         }
         geglu_kernel<<<grid1d((size_t)K*I),256,0,stream>>>(d_inf, d_gate, d_up, K*I);
         if (nvfp4) nvb_proj(PJ_DOWN, d_inf, d_o, I, H);
-        else gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, K, stream);
+        else gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, K, stream, (int)L->fmt_down);
         rms_norm_rows_kernel<<<K,256,HD2,stream>>>(d_norm, d_o, w_post_f, H, K, GEMMA4_RMS_EPS);
         residual_add_kernel<<<grid1d((size_t)K*H),256,0,stream>>>(d_x, d_norm, K*H);
         if (eng->h_out_scale[l] != 1.0f)
@@ -8757,13 +8853,16 @@ static void decode_multiseq_body(
     float *d_attn = eng->d_sb[7], *d_o   = eng->d_sb[8], *d_gate= eng->d_sb[9];
     float *d_up = eng->d_sb[10], *d_logitsK = eng->d_sb[11];
 
-    // Embed (per-row token, device d_tok) + Gemma √H scale.
+    const int qwen3 = (eng->cfg.arch == GEMMA4_ARCH_QWEN3);
+    // Embed (per-row token, device d_tok) + Gemma √H scale. Qwen3 does NOT scale embeddings.
     embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, B, H, stream);
-    scale_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, B*H, sqrtf((float)H));
+    if (!qwen3)
+        scale_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, B*H, sqrtf((float)H));
 
     for (int l = 0; l < eng->cfg.n_layers; l++) {
         layer_type_t lt = eng->layer_types[l];
-        int hd  = (lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM;
+        int hd  = qwen3 ? eng->cfg.head_dim
+                        : ((lt==LAYER_SLIDING)? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM);
         int nkv = (lt==LAYER_SLIDING)? eng->cfg.n_kv_sliding : eng->cfg.n_kv_global;
         int oq  = HEADS*hd, okv = nkv*hd;
         const float *w_attn   = eng->d_w_attn_norm      + (size_t)l*H;
@@ -8775,11 +8874,18 @@ static void decode_multiseq_body(
         const __typeof__(eng->tensors.layers[0]) *L = &eng->tensors.layers[l];
 
         rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_inf, d_x, w_attn, H, B, GEMMA4_RMS_EPS);
-        gemv_batched_w(eng, d_q, weight_fp8(eng, L->attn_q), d_inf, H, oq, B, stream);
+        gemv_batched_w(eng, d_q, weight_fp8(eng, L->attn_q), d_inf, H, oq, B, stream, (int)L->fmt_q);
         per_head_rms_norm_rows_kernel<<<dim3(HEADS,B),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, B, GEMMA4_RMS_EPS);
-        gemv_batched_w(eng, d_k, weight_fp8(eng, L->attn_k), d_inf, H, okv, B, stream);
-        if (lt == LAYER_SLIDING) {
-            gemv_batched_w(eng, d_v, weight_fp8(eng, L->attn_v), d_inf, H, okv, B, stream);
+        // Attention scale: Gemma bakes it into the constant q_norm/k_norm weights (kernel scale=1).
+        // Qwen3's q_norm/k_norm are LEARNED (no baked scale) → apply 1/sqrt(head_dim) to Q here.
+        if (qwen3)
+            scale_kernel<<<grid1d((size_t)B*oq),256,0,stream>>>(d_q, B*oq, 1.0f/sqrtf((float)hd));
+        gemv_batched_w(eng, d_k, weight_fp8(eng, L->attn_k), d_inf, H, okv, B, stream, (int)L->fmt_k);
+        if (qwen3) {
+            // Qwen3: separate V projection on EVERY layer, NO V norm.
+            gemv_batched_w(eng, d_v, weight_fp8(eng, L->attn_v), d_inf, H, okv, B, stream, (int)L->fmt_v);
+        } else if (lt == LAYER_SLIDING) {
+            gemv_batched_w(eng, d_v, weight_fp8(eng, L->attn_v), d_inf, H, okv, B, stream, (int)L->fmt_v);
             per_head_rms_norm_rows_kernel<<<dim3(nkv,B),hd,HD2,stream>>>(d_v, NULL, nkv, hd, B, GEMMA4_RMS_EPS);
         } else {
             cudaMemcpyAsync(d_v, d_k, (size_t)B*okv*sizeof(float), cudaMemcpyDeviceToDevice, stream);
@@ -8849,7 +8955,17 @@ static void decode_multiseq_body(
                         hd, window, GEMMA4_SLIDING_SPLIT_CHUNK);
             }
         } else {
-            if (HEADS == 32 && nkv == 4) {
+            if (qwen3 && HEADS == 32 && nkv == 8) {
+                // Qwen3 full-causal GQA: 32 query / 8 KV heads, head_dim 128.
+                paged_global_attn_splitk_batched<32, 8, 128, GEMMA4_GLOBAL_MAX_SPLITS>
+                    <<<dim3(g_splits, B), 32*32, 0, stream>>>(
+                        eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, pk, pv, views,
+                        GEMMA4_GLOBAL_SPLIT_CHUNK, PAGED_KV_BLOCK_TOKENS, okv);
+                paged_flash_decode_combine_batched<32, GEMMA4_GLOBAL_MAX_SPLITS>
+                    <<<dim3(HEADS, B), hd, 0, stream>>>(
+                        d_attn, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, views,
+                        hd, /*window=*/0, GEMMA4_GLOBAL_SPLIT_CHUNK);
+            } else if (HEADS == 32 && nkv == 4) {
                 paged_global_attn_splitk_batched<32, 4, GEMMA4_GLOBAL_HEAD_DIM, GEMMA4_GLOBAL_MAX_SPLITS>
                     <<<dim3(g_splits, B), 32*32, 0, stream>>>(
                         eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, d_q, pk, pv, views,
@@ -8871,27 +8987,39 @@ static void decode_multiseq_body(
             }
         }
 
-        // O proj → post-attn norm → residual; FFN; post-FFN norm → residual; out scale.
-        gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, B, stream);
-        rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_norm, d_o, w_post_a, H, B, GEMMA4_RMS_EPS);
-        residual_add_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, d_norm, B*H);
+        // O proj → (post-attn sandwich norm) → residual; FFN; (post-FFN norm) → residual; out scale.
+        // Qwen3 is standard pre-norm: NO sandwich norms — the attn/ffn outputs add to the residual
+        // directly. Gemma applies a post_attn_norm / post_ffn_norm before each residual add.
+        gemv_batched_w(eng, d_o, weight_fp8(eng, L->attn_output), d_attn, oq, H, B, stream, (int)L->fmt_o);
+        if (qwen3) {
+            residual_add_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, d_o, B*H);
+        } else {
+            rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_norm, d_o, w_post_a, H, B, GEMMA4_RMS_EPS);
+            residual_add_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, d_norm, B*H);
+        }
 
         rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_inf, d_x, w_ffn, H, B, GEMMA4_RMS_EPS);
-        gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, B, stream);
-        gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, B, stream);
-        geglu_kernel<<<grid1d((size_t)B*I),256,0,stream>>>(d_inf, d_gate, d_up, B*I);
-        gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, B, stream);
-        rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_norm, d_o, w_post_f, H, B, GEMMA4_RMS_EPS);
-        residual_add_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, d_norm, B*H);
+        gemv_batched_w(eng, d_gate, weight_fp8(eng, L->ffn_gate), d_inf, H, I, B, stream, (int)L->fmt_gate);
+        gemv_batched_w(eng, d_up,   weight_fp8(eng, L->ffn_up),   d_inf, H, I, B, stream, (int)L->fmt_up);
+        if (qwen3) silu_glu_kernel<<<grid1d((size_t)B*I),256,0,stream>>>(d_inf, d_gate, d_up, B*I);
+        else       geglu_kernel  <<<grid1d((size_t)B*I),256,0,stream>>>(d_inf, d_gate, d_up, B*I);
+        gemv_batched_w(eng, d_o, weight_fp8(eng, L->ffn_down), d_inf, I, H, B, stream, (int)L->fmt_down);
+        if (qwen3) {
+            residual_add_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, d_o, B*H);
+        } else {
+            rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_norm, d_o, w_post_f, H, B, GEMMA4_RMS_EPS);
+            residual_add_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, d_norm, B*H);
+        }
         if (eng->h_out_scale[l] != 1.0f)
             scale_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, B*H, eng->h_out_scale[l]);
     }
 
     // Output norm + LM head (batched) + softcap (+suppress) → d_logitsK [B][VOCAB].
-    int vocab = GEMMA4_VOCAB_SIZE;
+    int vocab = eng->cfg.vocab_size;
     rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_norm, d_x, eng->d_w_out_norm, H, B, GEMMA4_RMS_EPS);
     gemv_batched_w(eng, d_logitsK, lmhead_w(eng), d_norm, H, vocab, B, stream, embd_fmt(eng));
-    logit_softcap_kernel<<<grid1d((size_t)B*vocab),256,0,stream>>>(d_logitsK, GEMMA4_SOFTCAP, B*vocab);
+    if (eng->cfg.softcap > 0.0f)
+        logit_softcap_kernel<<<grid1d((size_t)B*vocab),256,0,stream>>>(d_logitsK, eng->cfg.softcap, B*vocab);
     if (eng->n_suppress > 0)
         for (int i = 0; i < B; i++)
             suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
@@ -8990,7 +9118,7 @@ static int decode_multiseq_forward(
     if (!eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
     if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
     cudaStream_t stream = eng->stream;
-    const int vocab = GEMMA4_VOCAB_SIZE;
+    const int vocab = eng->cfg.vocab_size;
 
     int any_sample = 0;
     for (int r = 0; r < B; r++) if (slv[r]->samp_temp > 0.0f) { any_sample = 1; break; }

@@ -142,6 +142,91 @@ static inline int g4d_f32(const uint8_t *d, uint64_t s, const char *k, float *ou
     return g4d_meta(d, s, k, G4D_T_FLOAT32, out);
 }
 
+// Copy the value of a STRING metadata key into out (NUL-terminated, truncated to outlen).
+// Returns 0 on found, -1 otherwise. Mirrors g4d_meta's kv-walk (STRING isn't a fixed scalar).
+static inline int g4d_str(const uint8_t *data, uint64_t size, const char *key,
+                          char *out, size_t outlen) {
+    const g4d_gguf_header_t *hdr = (const g4d_gguf_header_t *)data;
+    if (size < sizeof(*hdr) || hdr->magic != 0x46554747u) return -1;
+    const uint8_t *end = data + size;
+    const uint8_t *p = data + sizeof(*hdr);
+    for (uint64_t i = 0; i < hdr->metadata_kv_count; i++) {
+        uint64_t klen = 0;
+        const char *k = g4d_read_str(&p, end, &klen);
+        if (!k) return -1;
+        if (p + 4 > end) return -1;
+        uint32_t vtype; memcpy(&vtype, p, 4); p += 4;
+        if (g4d_str_eq(k, klen, key)) {
+            if (vtype != G4D_T_STRING) return -1;
+            uint64_t vlen = 0;
+            const char *v = g4d_read_str(&p, end, &vlen);
+            if (!v) return -1;
+            size_t n = (vlen < outlen - 1) ? (size_t)vlen : (outlen - 1);
+            memcpy(out, v, n); out[n] = '\0';
+            return 0;
+        }
+        if (g4d_skip_value(&p, end, vtype) != 0) return -1;
+    }
+    return -1;
+}
+
+// Qwen3 dense → gemma4_model_config_t. Qwen3 is single-head-dim, FULL-causal on every layer
+// (no sliding/global split), separate V projection, no softcap. Marked arch=GEMMA4_ARCH_QWEN3;
+// all layers are treated as the engine's "global" (full-attention) class. See gemma4_detect.h
+// docs and the qwen3.* metadata keys.
+static inline int gemma4_detect_qwen3(const uint8_t *data, uint64_t size,
+                                      gemma4_model_config_t *cfg,
+                                      char *err, size_t errlen) {
+    #define G4D_FAIL(...) do { if (err) snprintf(err, errlen, __VA_ARGS__); return -1; } while (0)
+    uint32_t bc = 0, embd = 0, ffn = 0, hc = 0, hckv = 0, kl = 0;
+    if (g4d_u32(data, size, "qwen3.block_count", &bc) != 0)            G4D_FAIL("missing qwen3.block_count");
+    if (g4d_u32(data, size, "qwen3.embedding_length", &embd) != 0)     G4D_FAIL("missing qwen3.embedding_length");
+    if (g4d_u32(data, size, "qwen3.feed_forward_length", &ffn) != 0)   G4D_FAIL("missing qwen3.feed_forward_length");
+    if (g4d_u32(data, size, "qwen3.attention.head_count", &hc) != 0)   G4D_FAIL("missing qwen3.attention.head_count");
+    if (g4d_u32(data, size, "qwen3.attention.head_count_kv", &hckv) != 0) G4D_FAIL("missing qwen3.attention.head_count_kv");
+    if (g4d_u32(data, size, "qwen3.attention.key_length", &kl) != 0)   G4D_FAIL("missing qwen3.attention.key_length");
+
+    if ((int)bc > GEMMA4_CAP_LAYERS) G4D_FAIL("block_count %u exceeds GEMMA4_CAP_LAYERS %d", bc, GEMMA4_CAP_LAYERS);
+    if ((int)hc > GEMMA4_CAP_HEADS)  G4D_FAIL("head_count %u exceeds GEMMA4_CAP_HEADS %d", hc, GEMMA4_CAP_HEADS);
+    if ((int)hckv > GEMMA4_CAP_KV_HEADS) G4D_FAIL("head_count_kv %u exceeds GEMMA4_CAP_KV_HEADS %d", hckv, GEMMA4_CAP_KV_HEADS);
+    if ((int)kl > GEMMA4_GLOBAL_HEAD_DIM) G4D_FAIL("key_length %u exceeds GEMMA4_GLOBAL_HEAD_DIM %d", kl, GEMMA4_GLOBAL_HEAD_DIM);
+
+    cfg->arch         = GEMMA4_ARCH_QWEN3;
+    cfg->head_dim     = (int)kl;          // 128
+    cfg->n_layers     = (int)bc;
+    cfg->hidden_size  = (int)embd;
+    cfg->intermediate = (int)ffn;
+    cfg->n_heads      = (int)hc;
+    // Qwen3 has the SAME KV head count on every layer (GQA). The engine routes all layers
+    // through its "global" full-attention class, so n_kv_global carries the real per-layer KV
+    // count; n_kv_sliding is set equal so the sliding-pool sizing/guards stay valid (unused).
+    cfg->n_kv_global  = (int)hckv;
+    cfg->n_kv_sliding = (int)hckv;
+
+    uint32_t vocab = 0;
+    if (g4d_u32(data, size, "qwen3.vocab_size", &vocab) == 0 && vocab > 0) {
+        cfg->vocab_size = (int)vocab;
+    } else {
+        g4d_array_t toks;
+        if (g4d_meta(data, size, "tokenizer.ggml.tokens", G4D_T_ARRAY, &toks) == 0)
+            cfg->vocab_size = (int)toks.count;
+    }
+    if (cfg->vocab_size <= 0) G4D_FAIL("qwen3: could not determine vocab size");
+
+    cfg->softcap = 0.0f;   // Qwen3 has no logit softcap
+
+    float fb = 1000000.0f;
+    g4d_f32(data, size, "qwen3.rope.freq_base", &fb);
+    cfg->rope_theta_global  = fb;
+    cfg->rope_theta_sliding = fb;   // single theta; sliding unused
+
+    // Every layer is full-causal (the engine's "global" class).
+    cfg->n_global = (int)bc;
+    for (int i = 0; i < cfg->n_layers && i < GEMMA4_CAP_LAYERS; i++) cfg->is_global[i] = 1;
+    return 0;
+    #undef G4D_FAIL
+}
+
 // ── Detection: GGUF → gemma4_model_config_t ─────────────────────────────────────────────────────
 // `data`/`size` is the mmap'd (or fully read) GGUF file. Returns 0 on success, -1 on a fatal
 // inconsistency (missing required kv, or counts exceeding the compiled capacity maxima). On
@@ -151,6 +236,17 @@ static inline int gemma4_detect_from_gguf(const uint8_t *data, uint64_t size,
                                           char *err, size_t errlen) {
     #define G4D_FAIL(...) do { if (err) snprintf(err, errlen, __VA_ARGS__); return -1; } while (0)
     memset(cfg, 0, sizeof(*cfg));
+
+    // Branch on the checkpoint's declared architecture. Non-Gemma families parse their own
+    // namespaced keys; Gemma-4 falls through to the original path below (arch stays GEMMA4).
+    {
+        char arch[32] = {0};
+        if (g4d_str(data, size, "general.architecture", arch, sizeof(arch)) == 0 &&
+            strcmp(arch, "qwen3") == 0) {
+            return gemma4_detect_qwen3(data, size, cfg, err, errlen);
+        }
+    }
+    cfg->arch = GEMMA4_ARCH_GEMMA4;
 
     uint32_t block_count = 0, embd = 0, ffn = 0, head_count = 0;
     if (g4d_u32(data, size, "gemma4.block_count", &block_count) != 0)

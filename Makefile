@@ -115,6 +115,23 @@ packed-kv-test:
 		cuda/packed_kv_test.cu -diag-suppress 550
 	/tmp/fucina_packed_kv_test
 
+# ─── Qwen3 dense numeric parity vs llama.cpp (GPU) ──────────────────────
+# Feeds llama.cpp's input ids for "The capital of France is" through fucina's
+# arch-driven multiseq path and asserts the greedy continuation matches
+# llama.cpp's [12095,13,576,6722,315,15344,374,21718] (Qwen3-8B Q4_K_M).
+qwen3-parity-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_parity.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_parity \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	/tmp/fucina_qwen3_parity
+
+# ─── Qwen3 decode throughput (GPU) ──────────────────────────────────────
+qwen3-bench: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_bench.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_bench \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	/tmp/fucina_qwen3_bench $(MODEL)
+
 # ─── KV-quant exploration (host, Phase 6) ───────────────────────────────
 # Offline comparison of KV-cache quant codecs (FP8 / per-token FP8 / NVFP4 /
 # TurboQuant-MSE). Decides whether to move KV off flat FP8. Host-only, no engine
@@ -205,7 +222,9 @@ check: vet lint go-test-race
 DG_GGUF ?= ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
 DG_NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo -Xcompiler -O3 -Xcompiler -pthread --threads 8
 # CUTLASS (vendored under flashinfer) for the grouped NVFP4 expert GEMM (cuda/dg_fp4_moe.cu).
-CUTLASS_DIR ?= /path/to/cutlass
+CUTLASS_DIR ?= $(shell \
+	python3 -c "import flashinfer,os;print(os.path.join(os.path.dirname(flashinfer.__file__),'data','cutlass'))" 2>/dev/null \
+	|| ls -d $(HOME)/.venv/lib/python*/site-packages/flashinfer/data/cutlass 2>/dev/null | head -1)
 DG_FP4_NVCCFLAGS := -arch=$(CUDA_ARCH) -std=c++17 -O3 -lineinfo --expt-relaxed-constexpr \
 	--expt-extended-lambda -DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 \
 	-I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include -Xcompiler -O3 -Xcompiler -pthread
