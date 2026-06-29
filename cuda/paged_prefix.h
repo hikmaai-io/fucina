@@ -200,9 +200,14 @@ static inline int prefix_alloc(PrefixTree *c, PagedBlockPool *pool) {
 // Find the longest cached prefix of `tokens` at FULL-block granularity. Adopts
 // each matched block (refcount++, unlinks from LRU if it was evictable), writes
 // the adopted physical block ids into out_block_ids[0..ret), and returns the
-// number of shared blocks. `max_blocks` bounds out_block_ids. The matched chain
-// is verified by exact token memcmp at every block, so a hash collision can never
-// adopt a wrong block.
+// number of shared blocks. `max_blocks` bounds out_block_ids.
+//
+// Adoption is ANCESTRY-EXACT, not hash-trusting: block i is adopted only if its
+// node's parent is the node adopted at block i-1 (and block 0's node is a tree
+// root). Combined with the per-block token memcmp in prefix_map_find, this binds
+// the whole adopted chain to the prompt's actual tokens [0,(i+1)*BT) by node
+// identity — so even a (2^-64) chained-hash collision cannot adopt a block whose
+// KV was computed under a different prefix.
 static inline int prefix_lookup(PrefixTree *c, const int32_t *tokens, int n_tokens,
                                 int *out_block_ids, int max_blocks) {
     c->lookups++;
@@ -210,15 +215,17 @@ static inline int prefix_lookup(PrefixTree *c, const int32_t *tokens, int n_toke
     int full_blocks = n_tokens / BT;            // complete blocks available in prompt
     uint64_t h = PREFIX_HASH_SEED;
     int shared = 0;
+    PrefixNode *prev = NULL;                     // node adopted at the previous block (NULL at block 0)
     for (int i = 0; i < full_blocks && shared < max_blocks; i++) {
         h = prefix_block_hash(h, tokens + (size_t)i * BT, BT);
         PrefixNode *node = prefix_map_find(c, h, tokens + (size_t)i * BT, BT);
-        if (!node) break;                       // first miss ends the shared chain
+        if (!node || node->parent != prev) break;   // miss OR ancestry break ends the shared chain
         // adopt
         if (node->on_lru) prefix_lru_unlink(c, node);
         c->refcount[node->block_id]++;
         out_block_ids[shared++] = node->block_id;
         c->hit_blocks++;
+        prev = node;
     }
     return shared;
 }

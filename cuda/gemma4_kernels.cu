@@ -5270,7 +5270,7 @@ gemma4_engine_t* gemma4_engine_create(
                 // Cross-request prefix cache: only on the full-attention single-pool
                 // geometry (no sliding layers => global blocks are never recycled, so
                 // a shared prefix block stays valid for its whole cached lifetime).
-                if (eng->n_layers_sliding == 0) {
+                if (eng->n_layers_sliding == 0 && getenv("FUCINA_NO_PREFIX_CACHE") == NULL) {
                     prefix_tree_init(&eng->glob_prefix, &eng->glob_pool, 2 * glob_blocks + 16);
                     eng->prefix_cache_enabled = 1;   // default-on for the full-attention single-pool geometry
                 }
