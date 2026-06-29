@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -322,11 +323,11 @@ type Scheduler struct {
 	// the engine implements PrefixCacheStatsEngine. The run loop (the sole engine
 	// caller) snapshots the engine counters into the atomics below each pass so
 	// /metrics can read them lock-free without touching the engine mutex.
-	prefixStats  PrefixCacheStatsEngine
-	pcLookups    atomic.Int64
-	pcHitBlocks  atomic.Int64
-	pcCached     atomic.Int64
-	pcEvictions  atomic.Int64
+	prefixStats PrefixCacheStatsEngine
+	pcLookups   atomic.Int64
+	pcHitBlocks atomic.Int64
+	pcCached    atomic.Int64
+	pcEvictions atomic.Int64
 
 	// prefixCommit, when non-nil, registers generated text for cross-request reuse:
 	// the scheduler tracks each sequence's committed history and calls it as the
@@ -370,7 +371,7 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	// it works for every arch (Qwen3, Gemma) with no extra weights. draftK is the
 	// max per-slot draft length, kept under the verify-row budget so a full draft plus
 	// its anchor fits.
-	if se, ok := engine.(SpecBatchEngine); ok {
+	if se, ok := engine.(SpecBatchEngine); ok && os.Getenv("FUCINA_NO_BATCH_SPEC") == "" {
 		s.spec = se
 		s.draftK = 6
 	}
