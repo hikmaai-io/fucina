@@ -1158,6 +1158,131 @@ static void mmq_q4_0_launch(
     mmq_q4_0_tiled_kernel<<<g, 256, 0, stream>>>(out, weight, qx, dx, sx, in_dim, out_dim, N);
 }
 
+// ─── Tiled MMQ GEMM for PACKED Q4_K (prefill projections, dp4a) ──────────────────────────
+// Y[out_dim × N] = W_q4_k[out_dim × in_dim] · X_int8[in_dim × N], token-major output. The
+// Q4_K analogue of mmq_q4_0_tiled_kernel: identical shared-memory tiled structure (BM×BN
+// tile, K looped in 32-elem blocks, 4×4 micro-tile per thread, dp4a integer dot), so it
+// reads the native (de-interleaved/PACKED) Q4_K weight ONCE — no BF16 materialize, no
+// per-projection full-model dequant (the un-pipelined ~1244 ms/512-tok floor of the Qwen3
+// prefill). REQUIRES the PACKED layout (build_packed_q4k): each 256-elem superblock is 144 B
+// = header[d,dmin,scales(12)] at [0..15] then 8 sub-blocks of 16 de-interleaved bytes at
+// [16+j*16 .. +15] (GGML-Q4_0 nibble convention, byte m = nib(elem m)|nib(elem m+16)<<4) —
+// so one int word's low/high nibbles map to natural elem order exactly like Q4_0.
+//
+// (q4k_scale_min — the ggml get_scale_min_k4 6-bit (scale,min) unpack — is defined with the
+// Q4_K mmvq kernels further below; forward-declared here.)
+__device__ __forceinline__ void q4k_scale_min(const uint8_t *sc, int j, int *s, int *m);
+//
+// Q4_K is ASYMMETRIC: value = d·s_j·q − dmin·m_j (per 32-elem sub-block j). Per block the
+// contribution is dx·[ d·s_j·Σ(q·xq) − dmin·m_j·Σ(xq) ] = Xd·(Wd·sumi − Wm·Σxq), with the
+// raw nibble q (NOT the Q4_0 −8 fold) dp4a'd against the int8 activation. Wd = d·s_j and
+// Wm = dmin·m_j are per-block; Σxq is the activation's per-block sum (sx, same as Q4_0).
+// Math is bit-faithful to mmvq_q4_k_packed; only the K-reduction order differs (float).
+__global__ void mmq_q4_k_tiled_kernel(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim, int N)
+{
+    __shared__ int   Ws[MMQ_BM][8];   // decoded weight nibbles (raw 0..15), 4 per int
+    __shared__ int   Xs[MMQ_BN][8];   // activation int8, 4 per int
+    __shared__ float Wd[MMQ_BM];      // per-row d·s_j  (block weight scale)
+    __shared__ float Wm[MMQ_BM];      // per-row dmin·m_j (block weight min)
+    __shared__ float Xd[MMQ_BN];      // per-col activation block scale
+    __shared__ int   Xq[MMQ_BN];      // per-col Σ activation int8
+
+    const int nb = in_dim >> 5;           // 32-elem blocks (== Q4_K sub-blocks)
+    const int n_super = in_dim >> 8;      // 256-elem superblocks
+    const int rowbase = blockIdx.x * MMQ_BM;
+    const int colbase = blockIdx.y * MMQ_BN;
+    const int t = threadIdx.x;
+    const int tx = t & 15, ty = t >> 4;
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    for (int b = 0; b < nb; b++) {
+        const int sb = b >> 3, jsub = b & 7;
+        // Stage W tile: 256 threads = 64 rows × 4 words; each decodes one packed int → 2 ints.
+        {
+            int r = t >> 2, wk = t & 3, row = rowbase + r;
+            if (row < out_dim) {
+                const uint8_t *blk = weight + ((size_t)row*n_super + sb)*144;
+                int w = ((const int *)(blk + 16 + jsub*16))[wk];   // 16-B aligned
+                Ws[r][wk]     =  w        & 0x0F0F0F0F;
+                Ws[r][wk + 4] = (w >> 4)  & 0x0F0F0F0F;
+                if (wk == 0) {
+                    __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+                    __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+                    float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+                    int s, m; q4k_scale_min(blk + 4, jsub, &s, &m);
+                    Wd[r] = d * (float)s; Wm[r] = dmin * (float)m;
+                }
+            } else { Ws[r][wk] = 0; Ws[r][wk + 4] = 0; if (wk == 0) { Wd[r] = 0.0f; Wm[r] = 0.0f; } }
+        }
+        // Stage X tile: 256 threads = 64 cols × 4; each loads 2 of the 8 ints. (== Q4_0)
+        {
+            int c = t >> 2, xk = t & 3, col = colbase + c;
+            if (col < N) {
+                const int *xqs = (const int *)(qx + (size_t)col*in_dim + (size_t)b*32);
+                Xs[c][xk*2]     = xqs[xk*2];
+                Xs[c][xk*2 + 1] = xqs[xk*2 + 1];
+                if (xk == 0) { Xd[c] = dx[(size_t)col*nb + b]; Xq[c] = sx[(size_t)col*nb + b]; }
+            } else { Xs[c][xk*2] = 0; Xs[c][xk*2 + 1] = 0; if (xk == 0) { Xd[c] = 0.0f; Xq[c] = 0; } }
+        }
+        __syncthreads();
+
+        int sumi[4][4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) sumi[i][j] = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int wv[4], xv[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) wv[i] = Ws[ty*4 + i][k];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) xv[j] = Xs[tx*4 + j][k];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) sumi[i][j] = __dp4a(wv[i], xv[j], sumi[i][j]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float wd = Wd[ty*4 + i], wm = Wm[ty*4 + i];
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                acc[i][j] += Xd[tx*4 + j] * (wd * (float)sumi[i][j] - wm * (float)Xq[tx*4 + j]);
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int row = rowbase + ty*4 + i;
+        if (row >= out_dim) continue;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int col = colbase + tx*4 + j;
+            if (col < N) out[(size_t)col*out_dim + row] = acc[i][j];
+        }
+    }
+}
+
+// Launch the tiled PACKED-Q4_K MMQ. Same grid/tiling as Q4_0; caller guarantees the weight
+// is repacked (use_packed_q4k) and in_dim is a multiple of 256.
+static void mmq_q4_k_launch(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim, int N, cudaStream_t stream)
+{
+    dim3 g((unsigned)((out_dim + MMQ_BM - 1) / MMQ_BM),
+           (unsigned)((N + MMQ_BN - 1) / MMQ_BN));
+    mmq_q4_k_tiled_kernel<<<g, 256, 0, stream>>>(out, weight, qx, dx, sx, in_dim, out_dim, N);
+}
+
 // Single-token warp-per-row MMVQ launch (Step 5). NWARPS output rows per block, no smem.
 static inline void mmvq_launch(
     float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
@@ -7231,7 +7356,17 @@ static int ensure_mmq_scratch(gemma4_engine_t *eng)
 {
     if (eng->mmq_ready) return 0;
     const size_t Nmax = GEMMA4_MMQ_MAX_N;
-    const size_t I    = eng->cfg.intermediate;
+    // Size the int8 activation scratch by the LARGEST projection in_dim, not just the FFN
+    // intermediate: Qwen3's o-projection reads in_dim = n_heads·head_dim (= oq), and Qwen3-MoE
+    // has a small cfg.intermediate (the dense FFN is unused — experts are separate), so oq can
+    // exceed it. Under-sizing here would overflow d_pf_qx on the o-proj quantize. Cover both
+    // the Qwen3 head_dim and the Gemma global head dim.
+    size_t I = eng->cfg.intermediate;
+    if ((size_t)eng->cfg.hidden_size > I) I = eng->cfg.hidden_size;
+    size_t oq  = (size_t)eng->cfg.n_heads * (size_t)eng->cfg.head_dim;
+    size_t oqg = (size_t)eng->cfg.n_heads * (size_t)GEMMA4_GLOBAL_HEAD_DIM;
+    if (oq  > I) I = oq;
+    if (oqg > I) I = oqg;
     int ok = 1;
     if (cudaMalloc(&eng->d_pf_qx, Nmax * I * sizeof(int8_t))     != cudaSuccess) ok = 0;
     if (cudaMalloc(&eng->d_pf_dx, Nmax * (I/32) * sizeof(float)) != cudaSuccess) ok = 0;
@@ -7266,6 +7401,45 @@ static void mmq_proj(
         xb, eng->d_pf_qx, eng->d_pf_dx, eng->d_pf_sx, N*in_dim);
     mmq_q4_0_launch(dst, wq, eng->d_pf_qx, eng->d_pf_dx, eng->d_pf_sx,
                     in_dim, out_dim, N, stream);
+}
+
+// Tiled-MMQ projection for PACKED Q4_K (Qwen3/MoE prefill): same drop-in contract as mmq_proj
+// but reads native de-interleaved Q4_K weights — no per-projection BF16 dequant. Quantizes the
+// BF16 activation to int8 (+ per-block Σ for the asymmetric min term), then the one-weight-pass
+// Q4_K MMQ kernel. Caller guarantees the weight is repacked (use_packed_q4k) and N ≤ MMQ_MAX_N.
+static void mmq_q4k_proj(
+    gemma4_engine_t *eng, const uint8_t *wq, const __nv_bfloat16 *xb,
+    float *dst, int in_dim, int out_dim, int N, cudaStream_t stream)
+{
+    quantize_q8_1_bf16_kernel<<<(unsigned)((size_t)N*in_dim/32), 32, 0, stream>>>(
+        xb, eng->d_pf_qx, eng->d_pf_dx, eng->d_pf_sx, N*in_dim);
+    mmq_q4_k_launch(dst, wq, eng->d_pf_qx, eng->d_pf_dx, eng->d_pf_sx,
+                    in_dim, out_dim, N, stream);
+}
+
+// Whether a PACKED Q4_K projection should take the native tiled-MMQ prefill path for N tokens.
+//
+// The Qwen3 BF16 prefill dequant is UN-pipelined (per-projection synchronous Q4_K→BF16 — the
+// measured small-N floor), so reading the native weight ONCE via MMQ is a real SMALL-N win:
+// MEASURED (GB10, Qwen3-8B dense) prefill TTFT — N=128: 693 vs 980 ms (1.41×); N=512: 1140 vs
+// 1159 ms (~tied); N=1024: 1306 vs 1321 ms (~tied). The win is entirely the removed dequant
+// floor, which dp4a recovers at small N; at larger N GEMM compute dominates and dp4a ≈ BF16.
+//
+// BUT the dp4a path quantizes the activation to int8 (the weight is the SAME Q4_K), so it is
+// LOWER precision than the BF16 dequant+GEMM. That extra rounding, combined with the pre-existing
+// fresh-vs-suffix attention-path float gap, FLIPS a borderline greedy token on the dense model
+// (qwen3-suffix-test: one-shot 5766 vs suffix 1467 at position 20) — i.e. it is NOT lossless
+// enough to keep the Stage-9 suffix self-consistency gate green. So, exactly like the Q4_0 MMQ
+// (mmq_enabled, also off by default), it ships OFF: opt in with FUCINA_Q4K_MMQ=1 for the small-N
+// TTFT win / A-B. The default prefill stays on the lossless BF16 path (suffix/prefix gates green).
+// A lossless default win needs either the BF16-faithful PIPELINED Q4_K dequant or an int-precise
+// path; tracked as the next step.
+static inline bool q4k_mmq_enabled(gemma4_engine_t *eng, int N)
+{
+    static int opt = -1;
+    if (opt < 0) { const char *e = getenv("FUCINA_Q4K_MMQ"); opt = (e && e[0] == '1') ? 1 : 0; }
+    if (!opt) return false;
+    return (N <= GEMMA4_MMQ_MAX_N) && ensure_mmq_scratch(eng) == 0;
 }
 
 // Whether the prefill should take the native Q4_0 tiled-MMQ path for a batch of N tokens.
@@ -8249,6 +8423,13 @@ static int paged_prefill_qwen3(
     auto dq_gemm = [&](uint64_t off, int in_dim, int out_dim, int fmt, int p, float *dst){
         const uint8_t *w = weight_fp8(eng, off);
         bool packed = (fmt == FORMAT_Q4_K) && use_packed_q4k(eng, fmt, w);
+        // PACKED Q4_K projections take the native tiled-MMQ path (no per-projection BF16
+        // dequant) when enabled; Q6_K/Q8_0 (and unpacked Q4_K) keep the BF16 dequant+GEMM.
+        // The dispatch is per-tensor on `fmt`, so the mixed Q4_K+Q6_K(+Q8_0) model is correct.
+        if (packed && q4k_mmq_enabled(eng, N)) {
+            mmq_q4k_proj(eng, w, d_inb, dst, in_dim, out_dim, N, stream);
+            return;
+        }
         dequant_proj_to_bf16(eng->d_bf16_layer[0][p], w,
                              (uint64_t)in_dim * out_dim, fmt, packed, stream);
         gemm_bf16(eng, eng->d_bf16_layer[0][p], d_inb, dst, in_dim, out_dim, N);
