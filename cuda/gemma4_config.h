@@ -31,9 +31,17 @@
 // scale, sandwich norms, GLU activation, softcap, head_dim, V-sharing, attention scale) are gated on
 // cfg.arch so Gemma-4 stays byte-identical. Detected from general.architecture in the GGUF.
 enum {
-    GEMMA4_ARCH_GEMMA4 = 0,   // Gemma-4 (sliding+global, V=K on global, geglu, softcap, baked attn scale)
-    GEMMA4_ARCH_QWEN3  = 1,   // Qwen3 dense (full-causal all layers, separate V, silu-glu, no softcap)
+    GEMMA4_ARCH_GEMMA4   = 0,   // Gemma-4 (sliding+global, V=K on global, geglu, softcap, baked attn scale)
+    GEMMA4_ARCH_QWEN3    = 1,   // Qwen3 dense (full-causal all layers, separate V, silu-glu, no softcap)
+    GEMMA4_ARCH_QWEN3MOE = 2,   // Qwen3 MoE (qwen3moe): IDENTICAL attention/norm/rope/KV to Qwen3 dense,
+                                // but the dense FFN becomes a 128-expert top-8 SiLU-GLU mixture.
 };
+
+// Qwen3 dense and Qwen3-MoE share an IDENTICAL attention/norm/rope/KV/head_dim layout — only the FFN
+// block differs (dense SiLU-GLU vs router→top-8 expert mixture). Every attention/norm/rope/head_dim
+// site that tested `arch == GEMMA4_ARCH_QWEN3` must accept BOTH so the MoE forward isn't silently a
+// no-op; FFN-specific sites branch on QWEN3MOE for the mixture block.
+#define GEMMA4_IS_QWEN3_FAMILY(a) ((a) == GEMMA4_ARCH_QWEN3 || (a) == GEMMA4_ARCH_QWEN3MOE)
 
 // ── Per-model runtime configuration ─────────────────────────────────────────────────────────────
 // Populated at load time from GGUF kv (gemma4.block_count, embedding_length, feed_forward_length,
@@ -58,6 +66,14 @@ typedef struct gemma4_model_config_t {
     // is_global[i]=1 → global layer. Index into a CAP_LAYERS-sized array.
     uint8_t is_global[GEMMA4_CAP_LAYERS];
     int   n_global;          // count of global layers (8 / 10)
+
+    // ── Sparse-MoE (GEMMA4_ARCH_QWEN3MOE) ───────────────────────────────────────────────────────
+    // Zero for dense archs. n_experts = total expert count (128), n_experts_used = top-k routed
+    // per token (8), expert_ffn = per-expert FFN intermediate (768). The router is a plain
+    // hidden→n_experts GEMV (softmax over all experts, top-k, renormalize the k weights to sum 1).
+    int   n_experts;         // 0 (dense) / 128 (qwen3moe)
+    int   n_experts_used;    // 0 (dense) / 8   (qwen3moe top-k)
+    int   expert_ffn;        // 0 (dense) / 768 (qwen3moe per-expert FFN intermediate)
 } gemma4_model_config_t;
 
 #endif // GEMMA4_CONFIG_H

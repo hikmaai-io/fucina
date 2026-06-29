@@ -4333,6 +4333,14 @@ gemma4_engine_t* gemma4_engine_create(
                     eng->cfg.n_layers, eng->cfg.hidden_size, eng->cfg.intermediate,
                     eng->cfg.n_heads, eng->cfg.n_kv_global, eng->cfg.head_dim,
                     eng->cfg.vocab_size, eng->cfg.rope_theta_global);
+        } else if (eng->cfg.arch == GEMMA4_ARCH_QWEN3MOE) {
+            fprintf(stderr, "fucina: detected Qwen3-MoE arch: %d layers, hidden %d, %d heads, "
+                    "%d KV heads, head_dim %d, %d experts (top-%d, expert_ffn %d), vocab %d, "
+                    "rope_theta %.0f (full-causal)\n",
+                    eng->cfg.n_layers, eng->cfg.hidden_size, eng->cfg.n_heads,
+                    eng->cfg.n_kv_global, eng->cfg.head_dim, eng->cfg.n_experts,
+                    eng->cfg.n_experts_used, eng->cfg.expert_ffn, eng->cfg.vocab_size,
+                    eng->cfg.rope_theta_global);
         } else {
             fprintf(stderr, "fucina: detected Gemma-4 arch: %d layers, hidden %d, FFN %d, "
                     "%d heads, KV %d sliding/%d global, %d global layers, softcap %.1f\n",
@@ -4400,7 +4408,7 @@ gemma4_engine_t* gemma4_engine_create(
         // Gemma global layers use a unified K=V cache and ship no attn_v.weight. Qwen3 is
         // standard GQA: EVERY layer has a separate attn_v projection (even though all its layers
         // run through the engine's full-causal "global" class).
-        if (eng->layer_types[l] == LAYER_SLIDING || eng->cfg.arch == GEMMA4_ARCH_QWEN3) {
+        if (eng->layer_types[l] == LAYER_SLIDING || GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
             snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", l);
             LOAD_TENSOR_OFFSET(tname, layers[l].attn_v);
             LOAD_WT_FMT(tname, layers[l].fmt_v);
@@ -4631,7 +4639,7 @@ gemma4_engine_t* gemma4_engine_create(
         } while (0)
 
         for (int l = 0; l < nL; l++) {
-            int head_dim = (eng->cfg.arch == GEMMA4_ARCH_QWEN3) ? eng->cfg.head_dim
+            int head_dim = GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) ? eng->cfg.head_dim
                          : ((eng->layer_types[l] == LAYER_SLIDING)
                                ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM);
             UPLOAD_NORM(eng->d_w_attn_norm      + l * hs, eng->tensors.layers[l].attn_norm,      hs);
@@ -5213,7 +5221,7 @@ gemma4_engine_t* gemma4_engine_create(
         // Per-token element count per KV-class. Qwen3 is single-head-dim (128) and routes every
         // layer through the global class, so glob_elems uses cfg.head_dim (NOT the 512 Gemma const)
         // — this MUST match the runtime okv = n_kv*head_dim used at write/read time in the pools.
-        const int q3 = (eng->cfg.arch == GEMMA4_ARCH_QWEN3);
+        const int q3 = GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch);
         const int slid_elems = eng->cfg.n_kv_sliding * (q3 ? eng->cfg.head_dim : GEMMA4_HEAD_DIM);
         const int glob_elems = eng->cfg.n_kv_global  * (q3 ? eng->cfg.head_dim : GEMMA4_GLOBAL_HEAD_DIM);
         // Per-block bytes for K (== V) across all layers of the class.
@@ -6427,7 +6435,7 @@ static int build_bf16_weights(gemma4_engine_t *eng)
     // reports as "no weight" for the global class (Gemma's global V = K). The fast Qwen3
     // prefill needs a real BF16 buffer for it: size PJ_V to okv × H. (The attn buffers are
     // over-sized by proj_desc's GEMMA4_GLOBAL_HEAD_DIM, which is harmless — only PJ_V is 0.)
-    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) {
+    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
         uint64_t nv = (uint64_t)(eng->cfg.n_kv_global * eng->cfg.head_dim) * eng->cfg.hidden_size;
         if (nv > maxn[PJ_V]) maxn[PJ_V] = nv;
     }
@@ -7047,7 +7055,7 @@ int gemma4_engine_prefill_batched(
     // eng->cur prefill is gemma-layout-only: running it on Qwen3 weights corrupts
     // the CUDA context (illegal launch → "invalid device context") and SIGSEGVs the
     // single-flight HTTP path. Decline early so warmup and any caller stay safe.
-    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) return -2;
+    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) return -2;
     if (eng->cur.n_tokens != 0) return -2;             // need fresh sequence
     if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
     // Batched attention materializes [HEADS][N×N] score buffers (fp32+bf16, ~6 B/elem).
@@ -7456,7 +7464,8 @@ static int paged_prefill_batched(
     // Qwen3 uses its own fast single-pass prefill (per-tensor Q4_K/Q6_K → BF16 dequant +
     // cuBLAS GEMM, head_dim=128 full-causal attention) — the Gemma sliding/global/sandwich-norm
     // body below does not apply. Same 0/-1/-2 contract; -2 falls back to token-by-token.
-    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3)
+    // Qwen3-MoE shares this exact prefill path; only its FFN block differs (gated inside).
+    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch))
         return paged_prefill_qwen3(eng, s, tokens, N, first_tok_out);
     if (s->n_tokens != 0) return -2;                       // fresh slot only
     if (N > eng->global_kv_capacity) return -2;            // would overflow pool
@@ -7967,7 +7976,7 @@ int gemma4_engine_prefill_flash(
     if (!eng->loaded || n_tokens <= 0) return -1;
     // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
     // flash prefill is gemma-layout-only. Decline so it never runs on Qwen3 weights.
-    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) return -2;
+    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) return -2;
     // FORMAT_NVFP4: this path is BF16/MMQ-only (no FP4 GEMM) and would deref the NULL Q4_0
     // store. prefill_batched forces use_fp4=true for all N (so it never returns -2 here), but
     // guard anyway so a future change can't silently route NVFP4 through the Q4_0/BF16 path.
@@ -8332,7 +8341,7 @@ int gemma4_engine_prefill(
     // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
     // token-by-token loop uses gemma-layout decode_layer. Decline cleanly rather than
     // emit garbage / crash, so the single-flight HTTP fallthrough fails gracefully.
-    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) return -1;
+    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) return -1;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -9445,7 +9454,7 @@ static void decode_multiseq_body(
     float *d_attn = eng->d_sb[7], *d_o   = eng->d_sb[8], *d_gate= eng->d_sb[9];
     float *d_up = eng->d_sb[10], *d_logitsK = eng->d_sb[11];
 
-    const int qwen3 = (eng->cfg.arch == GEMMA4_ARCH_QWEN3);
+    const int qwen3 = GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch);
     // Embed (per-row token, device d_tok) + Gemma √H scale. Qwen3 does NOT scale embeddings.
     embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, B, H, stream);
     if (!qwen3)

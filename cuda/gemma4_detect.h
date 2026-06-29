@@ -227,6 +227,70 @@ static inline int gemma4_detect_qwen3(const uint8_t *data, uint64_t size,
     #undef G4D_FAIL
 }
 
+// Qwen3 MoE (qwen3moe) → gemma4_model_config_t. The attention/norm/rope/KV/head_dim layout is
+// IDENTICAL to Qwen3 dense (full-causal every layer, separate V, learned q/k norms, no softcap);
+// the only architectural difference is the FFN, which is a sparse 128-expert top-8 SiLU-GLU
+// mixture instead of one dense SiLU-GLU. We read the qwen3moe.* namespaced keys (mirroring
+// detect_qwen3) plus the expert geometry (expert_count / expert_used_count /
+// expert_feed_forward_length). cfg.intermediate carries the DENSE feed_forward_length (present in
+// the GGUF but unused by the MoE FFN) so all existing dense scratch sizing stays valid and ample.
+static inline int gemma4_detect_qwen3moe(const uint8_t *data, uint64_t size,
+                                         gemma4_model_config_t *cfg,
+                                         char *err, size_t errlen) {
+    #define G4D_FAIL(...) do { if (err) snprintf(err, errlen, __VA_ARGS__); return -1; } while (0)
+    uint32_t bc = 0, embd = 0, ffn = 0, hc = 0, hckv = 0, kl = 0;
+    uint32_t nexp = 0, nused = 0, effn = 0;
+    if (g4d_u32(data, size, "qwen3moe.block_count", &bc) != 0)              G4D_FAIL("missing qwen3moe.block_count");
+    if (g4d_u32(data, size, "qwen3moe.embedding_length", &embd) != 0)       G4D_FAIL("missing qwen3moe.embedding_length");
+    if (g4d_u32(data, size, "qwen3moe.feed_forward_length", &ffn) != 0)     ffn = 0;  // dense value, unused by MoE
+    if (g4d_u32(data, size, "qwen3moe.attention.head_count", &hc) != 0)     G4D_FAIL("missing qwen3moe.attention.head_count");
+    if (g4d_u32(data, size, "qwen3moe.attention.head_count_kv", &hckv) != 0) G4D_FAIL("missing qwen3moe.attention.head_count_kv");
+    if (g4d_u32(data, size, "qwen3moe.attention.key_length", &kl) != 0)     G4D_FAIL("missing qwen3moe.attention.key_length");
+    if (g4d_u32(data, size, "qwen3moe.expert_count", &nexp) != 0)           G4D_FAIL("missing qwen3moe.expert_count");
+    if (g4d_u32(data, size, "qwen3moe.expert_used_count", &nused) != 0)     G4D_FAIL("missing qwen3moe.expert_used_count");
+    if (g4d_u32(data, size, "qwen3moe.expert_feed_forward_length", &effn) != 0) G4D_FAIL("missing qwen3moe.expert_feed_forward_length");
+
+    if ((int)bc > GEMMA4_CAP_LAYERS) G4D_FAIL("block_count %u exceeds GEMMA4_CAP_LAYERS %d", bc, GEMMA4_CAP_LAYERS);
+    if ((int)hc > GEMMA4_CAP_HEADS)  G4D_FAIL("head_count %u exceeds GEMMA4_CAP_HEADS %d", hc, GEMMA4_CAP_HEADS);
+    if ((int)hckv > GEMMA4_CAP_KV_HEADS) G4D_FAIL("head_count_kv %u exceeds GEMMA4_CAP_KV_HEADS %d", hckv, GEMMA4_CAP_KV_HEADS);
+    if ((int)kl > GEMMA4_GLOBAL_HEAD_DIM) G4D_FAIL("key_length %u exceeds GEMMA4_GLOBAL_HEAD_DIM %d", kl, GEMMA4_GLOBAL_HEAD_DIM);
+
+    cfg->arch         = GEMMA4_ARCH_QWEN3MOE;
+    cfg->head_dim     = (int)kl;            // 128
+    cfg->n_layers     = (int)bc;
+    cfg->hidden_size  = (int)embd;
+    cfg->intermediate = (ffn > 0) ? (int)ffn : (int)effn; // dense FFN length (scratch sizing only)
+    cfg->n_heads      = (int)hc;
+    cfg->n_kv_global  = (int)hckv;
+    cfg->n_kv_sliding = (int)hckv;
+    cfg->n_experts      = (int)nexp;
+    cfg->n_experts_used = (int)nused;
+    cfg->expert_ffn     = (int)effn;
+
+    uint32_t vocab = 0;
+    if (g4d_u32(data, size, "qwen3moe.vocab_size", &vocab) == 0 && vocab > 0) {
+        cfg->vocab_size = (int)vocab;
+    } else {
+        g4d_array_t toks;
+        if (g4d_meta(data, size, "tokenizer.ggml.tokens", G4D_T_ARRAY, &toks) == 0)
+            cfg->vocab_size = (int)toks.count;
+    }
+    if (cfg->vocab_size <= 0) G4D_FAIL("qwen3moe: could not determine vocab size");
+
+    cfg->softcap = 0.0f;    // Qwen3 has no logit softcap
+
+    float fb = 1000000.0f;
+    g4d_f32(data, size, "qwen3moe.rope.freq_base", &fb);
+    cfg->rope_theta_global  = fb;
+    cfg->rope_theta_sliding = fb;
+
+    // Every layer is full-causal (the engine's "global" class).
+    cfg->n_global = (int)bc;
+    for (int i = 0; i < cfg->n_layers && i < GEMMA4_CAP_LAYERS; i++) cfg->is_global[i] = 1;
+    return 0;
+    #undef G4D_FAIL
+}
+
 // ── Detection: GGUF → gemma4_model_config_t ─────────────────────────────────────────────────────
 // `data`/`size` is the mmap'd (or fully read) GGUF file. Returns 0 on success, -1 on a fatal
 // inconsistency (missing required kv, or counts exceeding the compiled capacity maxima). On
@@ -241,9 +305,11 @@ static inline int gemma4_detect_from_gguf(const uint8_t *data, uint64_t size,
     // namespaced keys; Gemma-4 falls through to the original path below (arch stays GEMMA4).
     {
         char arch[32] = {0};
-        if (g4d_str(data, size, "general.architecture", arch, sizeof(arch)) == 0 &&
-            strcmp(arch, "qwen3") == 0) {
-            return gemma4_detect_qwen3(data, size, cfg, err, errlen);
+        if (g4d_str(data, size, "general.architecture", arch, sizeof(arch)) == 0) {
+            if (strcmp(arch, "qwen3") == 0)
+                return gemma4_detect_qwen3(data, size, cfg, err, errlen);
+            if (strcmp(arch, "qwen3moe") == 0)
+                return gemma4_detect_qwen3moe(data, size, cfg, err, errlen);
         }
     }
     cfg->arch = GEMMA4_ARCH_GEMMA4;
