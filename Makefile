@@ -28,7 +28,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
-        qwen3moe-parity-test qwen3moe-spec-test \
+        qwen3moe-parity-test qwen3moe-spec-test qwen3-suffix-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -162,6 +162,17 @@ qwen3-prefix-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_prefix \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	/tmp/fucina_qwen3_prefix $(MODEL)
+
+# ─── Stage 9: base-offset compute-bound suffix prefill losslessness (GPU) ─
+# Proves the GEMM suffix prefill (paged_prefill_qwen3 base>0) is lossless: a sequence built
+# prefix-then-suffix (cross-request prefix-cache adoption) yields a greedy stream bit-identical
+# to a one-shot prefill, on BOTH Qwen3-8B dense and Qwen3-30B-A3B MoE. Args: <dense> [<moe>].
+QWEN3_DENSE_MODEL ?= /opt/spark/models/Qwen3-8B-abliterated.Q4_K_M.gguf
+qwen3-suffix-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_suffix_prefill.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_suffix \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	/tmp/fucina_qwen3_suffix $(if $(MODEL),$(MODEL),$(QWEN3_DENSE_MODEL)) $(QWEN3MOE_MODEL)
 
 # ─── Qwen3 decode throughput (GPU) ──────────────────────────────────────
 qwen3-bench: lib libdg
