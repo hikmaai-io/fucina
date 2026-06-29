@@ -449,6 +449,21 @@ func (e *Engine) PrefixCacheStats() (lookups, hitBlocks, cachedBlocks, evictions
 	return int64(lk), int64(hb), int64(cb), int64(ev)
 }
 
+// PrefixCommit registers the slot's completed full blocks (prompt + generated text)
+// from its authoritative committed token history, so a later request whose prompt
+// extends this sequence (e.g. the next turn of a chat) reuses the generated KV too.
+// Idempotent on the engine side; the scheduler calls it as a sequence crosses block
+// boundaries. history must be the slot's full committed tokens.
+func (e *Engine) PrefixCommit(slot int, history []int32) {
+	if len(history) == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	C.gemma4_engine_prefix_commit(e.ptr, C.int(slot),
+		(*C.int32_t)(unsafe.Pointer(&history[0])), C.int(len(history)))
+}
+
 // Reset rewinds the KV cache to empty so the next Prefill starts a fresh
 // sequence at position 0. It does not free device memory.
 func (e *Engine) Reset() {
@@ -949,6 +964,12 @@ func (a *BatchAdapter) Capacity() int { return a.eng.SeqFreeCapacity() + a.activ
 // scheduler can publish them lock-free for /metrics.
 func (a *BatchAdapter) PrefixCacheStats() (lookups, hitBlocks, cachedBlocks, evictions int64) {
 	return a.eng.PrefixCacheStats()
+}
+
+// PrefixCommit forwards decode-time block registration so generated text becomes
+// reusable by later requests.
+func (a *BatchAdapter) PrefixCommit(slot int, history []int32) {
+	a.eng.PrefixCommit(slot, history)
 }
 
 // ensure CGO runs on the main thread for CUDA compatibility

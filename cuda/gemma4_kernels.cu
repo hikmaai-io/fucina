@@ -10297,6 +10297,22 @@ extern "C" void gemma4_engine_set_prefix_cache(gemma4_engine_t *eng, int enable)
                                  eng->glob_prefix.refcount != NULL) ? 1 : 0;
 }
 
+// Register any full GLOBAL blocks of a slot's sequence that have completed (prompt
+// AND generated text) using the caller's authoritative committed token history
+// [0,n). Lets a later request reuse this sequence's GENERATED continuation, not just
+// its prompt (e.g. a multi-turn chat whose next prompt = prior prompt+response).
+// Idempotent: prefix_register skips blocks already in the tree, so the scheduler can
+// call it whenever a sequence crosses a 256-token boundary. No-op when disabled.
+extern "C" void gemma4_engine_prefix_commit(gemma4_engine_t *eng, int slot,
+                                            const int32_t *history, int n) {
+    if (!eng || !eng->prefix_cache_enabled || slot < 0 || slot >= GEMMA4_MAX_SEQS) return;
+    gemma4_seq *s = &eng->slots[slot];
+    if (!s->used || n <= 0) return;
+    int full = n / PAGED_KV_BLOCK_TOKENS;
+    if (full > s->glob_bt.n) full = s->glob_bt.n;   // only blocks actually backed by KV
+    prefix_register(&eng->glob_prefix, history, full, s->glob_bt.blocks);
+}
+
 // Observability counters (all zero when the cache is disabled/uninitialized).
 extern "C" void gemma4_engine_prefix_cache_stats(const gemma4_engine_t *eng,
         uint64_t *lookups, uint64_t *hit_blocks, uint64_t *cached_blocks, uint64_t *evictions) {

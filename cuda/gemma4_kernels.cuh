@@ -322,6 +322,10 @@ void gemma4_engine_set_prefix_cache(gemma4_engine_t *eng, int enable);
 void gemma4_engine_prefix_cache_stats(const gemma4_engine_t *eng, uint64_t *lookups,
                                       uint64_t *hit_blocks, uint64_t *cached_blocks,
                                       uint64_t *evictions);
+// Register full blocks (prompt + generated) from a slot's committed token history so
+// later requests can reuse generated text. Idempotent; call on 256-token boundaries.
+void gemma4_engine_prefix_commit(gemma4_engine_t *eng, int slot,
+                                 const int32_t *history, int n);
 // Chunked prefill (interleave a long prompt's prefill with decode of other slots).
 // seq_open: reserve a free slot with EMPTY KV and store the sampling params, WITHOUT
 //   prefilling. Returns slot id (>=0) or -1 (no free slot / not paged / error).

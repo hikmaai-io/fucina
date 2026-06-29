@@ -147,6 +147,15 @@ type PrefixCacheStatsEngine interface {
 	PrefixCacheStats() (lookups, hitBlocks, cachedBlocks, evictions int64)
 }
 
+// PrefixCommitEngine is the optional decode-time registration hook: an engine that
+// can register a slot's completed full blocks (prompt + generated text) from its
+// committed token history, so a later request extending this sequence reuses the
+// generated KV. Idempotent; the scheduler calls it as a sequence crosses 256-token
+// boundaries.
+type PrefixCommitEngine interface {
+	PrefixCommit(slot int, history []int32)
+}
+
 // defaultPrefillChunk is the prompt-token budget committed per scheduler pass for a
 // chunked (interleaved) prefill. Each pass commits at most one chunk for ONE prefilling
 // sequence AND runs one decode step, so decode of the active sequences keeps flowing
@@ -256,9 +265,14 @@ type seq struct {
 	// prompt is fully prefilled and the sequence joins the active decode set.
 	prefillPos int
 	// hist is the sequence's full token history (prompt + every committed token),
-	// the corpus the prompt-lookup drafter scans for repeated n-grams. Populated
-	// only on the speculative path (nil otherwise, so the plain path pays nothing).
+	// the corpus the prompt-lookup drafter scans for repeated n-grams. Populated on
+	// the speculative path AND when the engine has a prefix cache (so generated text
+	// can be registered for cross-request reuse); nil otherwise so the plain path
+	// pays nothing.
 	hist []int32
+	// regBlocks is how many full 256-token blocks of hist have been registered with
+	// the prefix cache; used to call PrefixCommit only when a new block completes.
+	regBlocks int
 }
 
 // stopHit reports whether t is one of this sequence's stop tokens.
@@ -302,6 +316,11 @@ type Scheduler struct {
 	pcHitBlocks  atomic.Int64
 	pcCached     atomic.Int64
 	pcEvictions  atomic.Int64
+
+	// prefixCommit, when non-nil, registers generated text for cross-request reuse:
+	// the scheduler tracks each sequence's committed history and calls it as the
+	// sequence crosses 256-token block boundaries.
+	prefixCommit PrefixCommitEngine
 
 	// submit carries new requests to the owner goroutine. It is bounded; a full
 	// channel is backpressure (Submit returns ErrQueueFull) rather than
@@ -354,6 +373,9 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	}
 	if ps, ok := engine.(PrefixCacheStatsEngine); ok {
 		s.prefixStats = ps
+	}
+	if pc, ok := engine.(PrefixCommitEngine); ok {
+		s.prefixCommit = pc
 	}
 	return s
 }
@@ -478,17 +500,6 @@ func (s *Scheduler) run() {
 		//    at least one sequence was slotted this pass.
 		admitted := s.admit(active, &prefill, &waiting)
 
-		// Publish prefix-cache counters lock-free for /metrics. Adoption happens at
-		// admit (AddSeq), so refresh after a pass that admitted; the engine read is a
-		// cheap counter fetch on the goroutine that already owns the engine.
-		if s.prefixStats != nil && admitted {
-			lk, hb, cb, ev := s.prefixStats.PrefixCacheStats()
-			s.pcLookups.Store(lk)
-			s.pcHitBlocks.Store(hb)
-			s.pcCached.Store(cb)
-			s.pcEvictions.Store(ev)
-		}
-
 		// 3. Evict any active OR prefilling sequence whose context was cancelled
 		//    BEFORE the step, so a cancelled client's slot is freed promptly (and
 		//    never burns another forward pass / prefill chunk).
@@ -534,7 +545,19 @@ func (s *Scheduler) run() {
 			// evicted); fall through to re-check shutdown / new work.
 		}
 
-		// 6. Honor a shutdown request between steps.
+		// 6. Publish prefix-cache counters lock-free for /metrics. Done once per pass
+		//    (not just on admit) so decode-time changes — generated-block registration
+		//    via PrefixCommit and LRU evictions — are reflected. The engine read is a
+		//    cheap uncontended counter fetch on the goroutine that owns the engine.
+		if s.prefixStats != nil {
+			lk, hb, cb, ev := s.prefixStats.PrefixCacheStats()
+			s.pcLookups.Store(lk)
+			s.pcHitBlocks.Store(hb)
+			s.pcCached.Store(cb)
+			s.pcEvictions.Store(ev)
+		}
+
+		// 7. Honor a shutdown request between steps.
 		select {
 		case <-s.quit:
 			return
@@ -662,8 +685,12 @@ func (s *Scheduler) newSeq(req Request, slot int) *seq {
 		remaining: req.MaxNew,
 		stops:     make(map[int32]struct{}, len(req.Stops)),
 	}
-	if s.spec != nil {
+	// Track full history for the drafter (spec) and/or decode-time prefix-cache
+	// registration. The prompt's full blocks are already registered by AddSeq, so
+	// start regBlocks past them — PrefixCommit only fires for generated blocks.
+	if s.spec != nil || s.prefixCommit != nil {
 		sq.hist = append(make([]int32, 0, len(req.Tokens)+req.MaxNew), req.Tokens...)
+		sq.regBlocks = len(req.Tokens) / 256
 	}
 	for _, st := range req.Stops {
 		sq.stops[st] = struct{}{}
@@ -768,9 +795,16 @@ func (s *Scheduler) deliver(active map[int]*seq, sq *seq, token int32) bool {
 	sq.generated++
 	sq.remaining--
 
-	// Record the committed token in the drafter corpus (spec path only).
-	if s.spec != nil {
+	// Record the committed token in the history corpus (drafter and/or prefix cache).
+	if sq.hist != nil {
 		sq.hist = append(sq.hist, token)
+		// Register a generated block as soon as it completes, so a concurrent/later
+		// request whose prompt extends this sequence reuses the generated KV. One
+		// cgo call per 256 generated tokens (idempotent on the engine side).
+		if s.prefixCommit != nil && len(sq.hist)/256 > sq.regBlocks {
+			s.prefixCommit.PrefixCommit(sq.slot, sq.hist)
+			sq.regBlocks = len(sq.hist) / 256
+		}
 	}
 
 	// Stop token: deliver it (done above), then evict.

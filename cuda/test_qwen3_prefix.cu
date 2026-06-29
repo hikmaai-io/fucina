@@ -67,6 +67,52 @@ int main(int argc, char **argv) {
     int rc = 0;
     int32_t cold[1 + STEPS], warm1[1 + STEPS], warm2[1 + STEPS];
 
+    // (0) GENERATED-TEXT reuse (Stage 5): a sequence's decoded continuation, once
+    //     registered via gemma4_engine_prefix_commit, is reusable by a later request
+    //     whose prompt extends into the generated region — bit-identical to cold.
+    //     Run first, while the pool is fresh (the cold-ref toggles the cache off, and
+    //     the plain allocator can't reclaim cached blocks once the pool fills).
+    {
+        const int PP = 300, GEN = 260;          // 300-tok prompt + 260 decoded => >2 full blocks
+        int32_t pr[PP];
+        for (int i = 0; i < PP; i++) pr[i] = (int32_t)((i * 2654435761u >> 9) % 30000u + 100u);
+        int32_t hist[PP + GEN];
+        for (int i = 0; i < PP; i++) hist[i] = pr[i];
+
+        gemma4_engine_set_prefix_cache(eng, 1);
+        int32_t fA = 0;
+        int sA = gemma4_engine_seq_add(eng, pr, PP, &fA, 0.0f, 0, 0.0f, 0.0f, 0);
+        if (sA < 0) { fprintf(stderr, "stage5 seq_add failed\n"); return 2; }
+        hist[PP] = fA; int32_t cur = fA;
+        for (int k = 0; k < GEN - 1; k++) {
+            int32_t nb = 0; int sl = sA;
+            if (gemma4_engine_step_batch(eng, &sl, &cur, 1, &nb) != 0) { fprintf(stderr, "stage5 decode failed\n"); return 2; }
+            hist[PP + 1 + k] = nb; cur = nb;
+        }
+        gemma4_engine_prefix_commit(eng, sA, hist, PP + GEN);   // register A's generated full blocks
+        gemma4_engine_seq_remove(eng, sA);
+
+        // New request B whose prompt reaches into A's GENERATED blocks (block 1 holds
+        // A's decoded tokens). qlen leaves a small suffix past 2 full blocks.
+        int qlen = 512 + 5;
+        uint64_t hbB0, tmp;
+        gemma4_engine_prefix_cache_stats(eng, &tmp, &hbB0, &tmp, &tmp);
+        int32_t coldB[1 + STEPS], warmB[1 + STEPS];
+        gemma4_engine_set_prefix_cache(eng, 0);
+        if (run_seq(eng, hist, qlen, coldB) < 0) { fprintf(stderr, "stage5 cold B failed\n"); return 2; }
+        gemma4_engine_set_prefix_cache(eng, 1);
+        if (run_seq(eng, hist, qlen, warmB) < 0) { fprintf(stderr, "stage5 warm B failed\n"); return 2; }
+        uint64_t hbB1;
+        gemma4_engine_prefix_cache_stats(eng, &tmp, &hbB1, &tmp, &tmp);
+        rc |= cmp_stream("gen-text reuse B", coldB, warmB);
+        if ((long)(hbB1 - hbB0) <= 0) {
+            fprintf(stderr, "FAIL: request B reused no GENERATED blocks (hit delta=%ld)\n", (long)(hbB1 - hbB0));
+            rc |= 1;
+        } else {
+            printf("  OK  request B reused %ld blocks of A's prompt+generated text\n", (long)(hbB1 - hbB0));
+        }
+    }
+
     // (1) COLD reference — cache forced OFF.
     gemma4_engine_set_prefix_cache(eng, 0);
     if (run_seq(eng, prompt, NP, cold) < 0) { fprintf(stderr, "cold run failed\n"); return 2; }
@@ -155,7 +201,7 @@ int main(int argc, char **argv) {
     }
 
     gemma4_engine_destroy(eng);
-    if (rc == 0) printf("PASS — prefix cache is lossless (cold == cache-served, concurrent shared, post-eviction)\n");
+    if (rc == 0) printf("PASS — prefix cache is lossless (cold == cache-served, concurrent shared, post-eviction, gen-text)\n");
     else         printf("FAIL — prefix cache diverged from cold reference\n");
     return rc ? 1 : 0;
 }
