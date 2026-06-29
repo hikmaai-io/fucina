@@ -27,7 +27,7 @@ CGO_CFLAGS   := -I$(CUDA_HOME)/include
 CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
-        go-test go-test-race go-test-cgo vet lint check paged-kv-test \
+        go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -87,7 +87,7 @@ cuda/test_engine: cuda/test_engine.cu cuda/libfucina.a
 # ─── Testing ────────────────────────────────────────────────────────────
 # Full test suite: pure-Go unit tests, cgo-dependent tests (needs the CUDA
 # archive), then the binary's built-in self-tests on the GPU.
-test: fucina go-test go-test-cgo paged-kv-test
+test: fucina go-test go-test-cgo paged-kv-test paged-prefix-test
 	./fucina --test-parser
 	CUDA_VISIBLE_DEVICES=0 ./fucina --test-cuda
 
@@ -97,6 +97,12 @@ test: fucina go-test go-test-cgo paged-kv-test
 paged-kv-test:
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/paged_kv_test.cc -o /tmp/fucina_paged_kv_test
 	/tmp/fucina_paged_kv_test
+
+# Cross-request prefix cache (RadixAttention): radix tree + refcount + LRU over
+# the paged-KV pool. Pure host integer logic; see docs/continuous-batching.md.
+paged-prefix-test:
+	g++ -std=c++17 -O2 -Wall -Wextra cuda/paged_prefix_test.cc -o /tmp/fucina_paged_prefix_test
+	/tmp/fucina_paged_prefix_test
 
 # ─── Paged-KV device-kernel test (GPU) ──────────────────────────────────
 # Proves block-table indirection (paged_kv_device.cuh) is bit-identical to the
