@@ -28,7 +28,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
-        qwen3moe-parity-test \
+        qwen3moe-parity-test qwen3moe-spec-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -142,6 +142,17 @@ qwen3moe-parity-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3moe_parity \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	/tmp/fucina_qwen3moe_parity $(QWEN3MOE_MODEL)
+
+# ─── Qwen3-MoE DSpark spec losslessness on the MoE FFN (GPU) ────────────
+# Drives Qwen3-30B-A3B through the spec-decode verify path and asserts: (A) depth-0 spec is
+# byte-identical to plain step_batch (lossless), (B) a correct draft is accepted and grows the
+# run, (C) a wrong draft is rejected and corrected. Guards the deterministic per-token MoE
+# expert reduce (no atomicAdd scatter) that makes the batched MoE FFN bit-reproducible.
+qwen3moe-spec-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3moe_spec.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3moe_spec \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	/tmp/fucina_qwen3moe_spec $(QWEN3MOE_MODEL)
 
 # ─── Qwen3 cross-request prefix cache losslessness (GPU) ────────────────
 # Proves cache-served requests (shared-prefix reuse) produce a greedy token stream

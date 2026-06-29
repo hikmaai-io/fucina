@@ -199,6 +199,15 @@ void dg_mmq_q4_K(float *out, const void *weight, const int8_t *qx, const float *
 void dg_moe_route(const int *tki, const float *tkw, const float *pes, int n_tokens, int n_used,
                   int n_expert, int *count, int *coloff, int *cursor, int *src, float *csc,
                   cudaStream_t s);
+// Variant of dg_moe_route that also records invpos[i] = grouped column of assignment i; pairs with
+// dg_moe_reduce for a deterministic (atomic-free) per-token expert combine.
+void dg_moe_route_inv(const int *tki, const float *tkw, const float *pes, int n_tokens, int n_used,
+                      int n_expert, int *count, int *coloff, int *cursor, int *src, float *csc,
+                      int *invpos, cudaStream_t s);
+// Deterministic per-token expert reduce: out[t] = Σ_k oe[invpos[t*n_used+k]]·csc[...] in fixed k
+// order. Replaces the nondeterministic atomicAdd dg_scatteradd_cols. out is fully written.
+void dg_moe_reduce(float *out, const float *oe, const int *invpos, const float *csc,
+                   int feat, int n_tokens, int n_used, cudaStream_t s);
 
 // Grouped expert matmul — grid=(row-tiles, n_expert); blockIdx.y is the expert, reading its
 // coloff[e]/count[e] (empty experts return early). qx/dx/sx/out are the flattened gathered

@@ -783,6 +783,46 @@ extern "C" void dg_moe_route(const int* tki, const float* tkw, const float* pes,
     dg_moe_scatter_kernel<<<(n_assign+255)/256,256,0,s>>>(tki,tkw,pes,n_assign,n_used,cursor,src,csc);
 }
 
+// Same counting-sort route, but also records invpos[i]=pos — the grouped column assigned to
+// assignment i (= token·n_used + k). The cursor atomicAdd makes the column ORDER nondeterministic,
+// but invpos captures the exact (token,k)→column map so a later per-token reduce can sum each
+// token's contributions in FIXED k order (no atomics) and stay bit-identical run-to-run.
+__global__ void dg_moe_scatter_inv_kernel(const int* tki, const float* tkw, const float* pes,
+        int n_assign, int n_used, int* cursor, int* src, float* csc, int* invpos){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n_assign) return;
+    int ex=tki[i]; int pos=atomicAdd(&cursor[ex],1);
+    src[pos]=i/n_used; csc[pos]=tkw[i]*pes[ex]; invpos[i]=pos;
+}
+extern "C" void dg_moe_route_inv(const int* tki, const float* tkw, const float* pes,
+        int n_tokens, int n_used, int n_expert, int* count, int* coloff, int* cursor,
+        int* src, float* csc, int* invpos, cudaStream_t s){
+    int n_assign=n_tokens*n_used;
+    cudaMemsetAsync(count,0,(size_t)n_expert*4,s);
+    dg_moe_count_kernel<<<(n_assign+255)/256,256,0,s>>>(tki,n_assign,count);
+    dg_moe_scan_kernel<<<1,32,0,s>>>(count,coloff,cursor,n_expert);
+    dg_moe_scatter_inv_kernel<<<(n_assign+255)/256,256,0,s>>>(tki,tkw,pes,n_assign,n_used,cursor,src,csc,invpos);
+}
+
+// Deterministic per-token expert reduce. out[t] = Σ_k oe[invpos[t·n_used+k]]·csc[invpos[...]],
+// summed in fixed k order. For a fixed (t,k), both oe[pos] (that token's k-th expert output) and
+// csc[pos] (its router weight) are value-deterministic regardless of the nondeterministic column
+// order, so this fully replaces the atomicAdd scatter-add and removes all MoE float nondeterminism.
+// One block per token; out is fully written (no pre-memset needed).
+__global__ void dg_moe_reduce_kernel(float* out, const float* oe, const int* invpos,
+        const float* csc, int feat, int n_used){
+    int t=blockIdx.x;
+    for(int h=threadIdx.x; h<feat; h+=blockDim.x){
+        float acc=0.f;
+        for(int k=0;k<n_used;k++){ int pos=invpos[t*n_used+k]; acc += oe[(size_t)pos*feat+h]*csc[pos]; }
+        out[(size_t)t*feat+h]=acc;
+    }
+}
+extern "C" void dg_moe_reduce(float* out, const float* oe, const int* invpos, const float* csc,
+        int feat, int n_tokens, int n_used, cudaStream_t s){
+    if(n_tokens<=0) return;
+    dg_moe_reduce_kernel<<<n_tokens,256,0,s>>>(out,oe,invpos,csc,feat,n_used);
+}
+
 // Grouped expert Q4_K — narrow-column tiled MMQ (BM=64 × BN=16). Keeps the tiled kernel's smem
 // activation reuse (one staged column tile feeds all 64 rows → ~out_dim/64 L2 re-reads, vs
 // out_dim× for a warp-per-row scheme) AND removes the BN=64 padding waste: BN=16 ≈ the average

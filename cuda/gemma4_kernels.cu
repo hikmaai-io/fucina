@@ -39,6 +39,11 @@ extern "C" {
     void dg_moe_route(const int *tki, const float *tkw, const float *pes, int n_tokens, int n_used,
                       int n_expert, int *count, int *coloff, int *cursor, int *src, float *csc,
                       cudaStream_t s);
+    void dg_moe_route_inv(const int *tki, const float *tkw, const float *pes, int n_tokens, int n_used,
+                          int n_expert, int *count, int *coloff, int *cursor, int *src, float *csc,
+                          int *invpos, cudaStream_t s);
+    void dg_moe_reduce(float *out, const float *oe, const int *invpos, const float *csc,
+                       int feat, int n_tokens, int n_used, cudaStream_t s);
     void dg_gather_cols(float *dst, const float *src, const int *idx, int feat, int ncols, cudaStream_t s);
     void dg_scatteradd_cols(float *dst, const float *src, const int *idx, const float *colscale,
                             int feat, int ncols, cudaStream_t s);
@@ -3532,6 +3537,7 @@ struct gemma4_engine {
     int            *d_moe_tki;       // [TMAX·n_used] top-k expert ids
     float          *d_moe_tkw;       // [TMAX·n_used] renormalized router weights
     int            *d_moe_eidx;      // [TMAX·n_used] route src token (gather/scatter idx)
+    int            *d_moe_invpos;    // [TMAX·n_used] assignment i → grouped column (deterministic reduce)
     float          *d_moe_ecs;       // [TMAX·n_used] route colscale (router weight)
     int            *d_moe_count;     // [n_experts] per-expert assignment count
     int            *d_moe_coloff;    // [n_experts] exclusive prefix (column base)
@@ -7702,6 +7708,7 @@ static int moe_alloc_scratch(gemma4_engine_t *eng) {
     MOE_A(eng->d_moe_tki,     (size_t)A * sizeof(int));
     MOE_A(eng->d_moe_tkw,     (size_t)A * sizeof(float));
     MOE_A(eng->d_moe_eidx,    (size_t)A * sizeof(int));
+    MOE_A(eng->d_moe_invpos,  (size_t)A * sizeof(int));
     MOE_A(eng->d_moe_ecs,     (size_t)A * sizeof(float));
     MOE_A(eng->d_moe_count,   (size_t)E * sizeof(int));
     MOE_A(eng->d_moe_coloff,  (size_t)E * sizeof(int));
@@ -7744,9 +7751,9 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         // Router → softmax-128 → top-8 → renorm-to-sum-1 → counting-sort route (pes = ones[E]).
         moe_router_gemv_kernel<<<dim3(E, cn), 256, 0, stream>>>(router_w, h, eng->d_moe_rlogits, H, E);
         dg_softmax_topk(eng->d_moe_rlogits, E, cn, U, eng->d_moe_tki, eng->d_moe_tkw, stream);
-        dg_moe_route(eng->d_moe_tki, eng->d_moe_tkw, eng->d_moe_ones, cn, U, E,
-                     eng->d_moe_count, eng->d_moe_coloff, eng->d_moe_cursor,
-                     eng->d_moe_eidx, eng->d_moe_ecs, stream);
+        dg_moe_route_inv(eng->d_moe_tki, eng->d_moe_tkw, eng->d_moe_ones, cn, U, E,
+                         eng->d_moe_count, eng->d_moe_coloff, eng->d_moe_cursor,
+                         eng->d_moe_eidx, eng->d_moe_ecs, eng->d_moe_invpos, stream);
         // Gather expert inputs → quantize → grouped gate + up (Q4_K, SAME quantized acts).
         dg_gather_cols(eng->d_moe_xe, h, eng->d_moe_eidx, H, total, stream);
         dg_quantize_q8_1(eng->d_moe_xe, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, H, total, stream);
@@ -7769,9 +7776,10 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                 eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
         }
-        // Scatter-add expert outputs back to tokens, weighted by router prob (d_moe_ecs).
-        cudaMemsetAsync(out, 0, (size_t)H * cn * sizeof(float), stream);
-        dg_scatteradd_cols(out, eng->d_moe_oe, eng->d_moe_eidx, eng->d_moe_ecs, H, total, stream);
+        // Combine expert outputs back to tokens, weighted by router prob (d_moe_ecs). Deterministic
+        // per-token reduce (fixed k order via d_moe_invpos) — no atomicAdd, so bit-identical
+        // run-to-run (was nondeterministic atomic scatter-add). out is fully written (no memset).
+        dg_moe_reduce(out, eng->d_moe_oe, eng->d_moe_invpos, eng->d_moe_ecs, H, cn, U, stream);
     }
 }
 
