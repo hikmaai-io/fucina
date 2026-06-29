@@ -49,7 +49,7 @@ lib: cuda/libfucina.a
 # a stale cubin built with the old flags into libfucina.a.
 
 cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh \
-                       cuda/paged_kv.h cuda/paged_kv_device.cuh Makefile
+                       cuda/paged_kv.h cuda/paged_kv_device.cuh cuda/paged_prefix.h Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
 
 cuda/gemma4_kernels_link.o: cuda/gemma4_kernels.o Makefile

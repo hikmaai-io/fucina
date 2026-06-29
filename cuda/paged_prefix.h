@@ -281,6 +281,29 @@ static inline void prefix_release(PrefixTree *c, PagedBlockPool *pool,
     }
 }
 
+// Grow a sequence's block table to cover `n_tokens`, pulling fresh blocks from
+// the cache-aware allocator (free_stack first, then LRU reclaim) so EVERY block a
+// sequence holds is reference-counted and reclaimable. Drop-in replacement for
+// paged_table_ensure on the cached path. Returns 0, or -1 if the pool is truly
+// exhausted (no free block and nothing evictable). Already-mapped leading blocks
+// (e.g. an adopted shared prefix) are left untouched.
+static inline int prefix_table_ensure(PrefixTree *c, PagedBlockPool *pool,
+                                      PagedBlockTable *t, int n_tokens) {
+    if (!c || !pool || !t || n_tokens < 0) return -1;
+    int BT = c->block_tokens;
+    int need_end_block = (n_tokens + BT - 1) / BT;
+    int base_block = t->base / BT;
+    int need = need_end_block - base_block;
+    if (need <= t->n) return 0;
+    if (paged_table_reserve(t, need) != 0) return -1;
+    while (t->n < need) {
+        int b = prefix_alloc(c, pool);
+        if (b < 0) return -1;
+        t->blocks[t->n++] = b;
+    }
+    return 0;
+}
+
 // ── stats ────────────────────────────────────────────────────────────────────
 static inline void prefix_tree_stats(const PrefixTree *c, uint64_t *lookups,
                                      uint64_t *hit_blocks, uint64_t *cached_blocks,

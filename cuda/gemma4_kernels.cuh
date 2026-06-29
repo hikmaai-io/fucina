@@ -315,6 +315,13 @@ int  gemma4_engine_step_batch_spec_ext(gemma4_engine_t *eng, const int *slots,
                                        const int32_t *drafts, const int *dlens);
 void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot);
 int  gemma4_engine_seq_capacity(gemma4_engine_t *eng);
+// Cross-request prefix cache (RadixAttention). set: enable/disable (effective only
+// on the full-attention single-pool geometry, n_layers_sliding==0; no-op for Gemma).
+// stats: observability counters (all zero when disabled).
+void gemma4_engine_set_prefix_cache(gemma4_engine_t *eng, int enable);
+void gemma4_engine_prefix_cache_stats(const gemma4_engine_t *eng, uint64_t *lookups,
+                                      uint64_t *hit_blocks, uint64_t *cached_blocks,
+                                      uint64_t *evictions);
 // Chunked prefill (interleave a long prompt's prefill with decode of other slots).
 // seq_open: reserve a free slot with EMPTY KV and store the sampling params, WITHOUT
 //   prefilling. Returns slot id (>=0) or -1 (no free slot / not paged / error).

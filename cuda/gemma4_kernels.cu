@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>         // __nv_fp8_storage_t, conversion functions
 #include "paged_kv_device.cuh" // paged KV: host block-table bookkeeping + device access kernels
+#include "paged_prefix.h"      // cross-request prefix cache (RadixAttention): radix tree + refcount + LRU
                               // (Phase 2 continuous batching). Pulls paged_kv.h. Kernels are
                               // compiled into the engine TU but stay dormant until wired.
 #include <cuda_fp4.h>         // __nv_fp4_storage_t, NVFP4 E2M1 conversion (FUCINA_FP4)
@@ -3394,6 +3395,12 @@ struct gemma4_engine {
                                         // the read path and validate it drives generation.
     PagedBlockPool slid_pool;           // sliding-class block free-list (host)
     PagedBlockPool glob_pool;           // global-class  block free-list (host)
+    // Cross-request prefix cache (RadixAttention) over the GLOBAL pool. Only ever
+    // allocated/active on the full-attention single-pool geometry (n_layers_sliding
+    // == 0, i.e. Qwen3); a hard no-op for Gemma's sliding+global geometry, which
+    // keeps its KV bookkeeping byte-identical. See cuda/paged_prefix.h.
+    PrefixTree     glob_prefix;         // radix tree + refcount + LRU (glob_prefix.refcount==NULL when off)
+    int            prefix_cache_enabled;// 1 iff active for this engine
     kv_t          *d_slid_pool_k;       // [n_blocks × 40 sliding-layers × 256 × 2048] fp8
     kv_t          *d_slid_pool_v;
     kv_t          *d_glob_pool_k;       // [n_blocks × n_global-layers × 256 × 512] fp8
@@ -5260,6 +5267,12 @@ gemma4_engine_t* gemma4_engine_create(
                 // is what seq_capacity() admits against, so the block pool is never
                 // over-subscribed (each admitted seq is guaranteed its maxctx blocks).
                 eng->paged_cap = (max_seqs + 1 < GEMMA4_MAX_SEQS) ? (max_seqs + 1) : GEMMA4_MAX_SEQS;
+                // Cross-request prefix cache: only on the full-attention single-pool
+                // geometry (no sliding layers => global blocks are never recycled, so
+                // a shared prefix block stays valid for its whole cached lifetime).
+                if (eng->n_layers_sliding == 0) {
+                    prefix_tree_init(&eng->glob_prefix, &eng->glob_pool, 2 * glob_blocks + 16);
+                }
                 fprintf(stderr,
                     "fucina: paged KV ENABLED — ~%d concurrent seqs @ maxctx %d "
                     "(block=%d tok): sliding %d blk %.1f GB, global %d blk %.1f GB\n",
@@ -5352,6 +5365,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_slid_pool_v);
     CUDA_FREE(eng->d_glob_pool_k);
     CUDA_FREE(eng->d_glob_pool_v);
+    prefix_tree_destroy(&eng->glob_prefix);   // safe no-op when never initialized
     paged_pool_destroy(&eng->slid_pool);
     paged_pool_destroy(&eng->glob_pool);
     CUDA_FREE(eng->cur.d_slid_blocks);
@@ -10171,6 +10185,23 @@ extern "C" int gemma4_engine_seq_capacity(gemma4_engine_t *eng) {
     for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (eng->slots[i].used) used++;
     int free_eff = eng->paged_cap - used;
     return free_eff > 0 ? free_eff : 0;
+}
+
+// Enable/disable the cross-request prefix cache. Effective ONLY on the full-
+// attention single-pool geometry (n_layers_sliding==0, the tree allocated at
+// create); a no-op for Gemma. Also the A/B override the lossless test uses to
+// force a cold reference run.
+extern "C" void gemma4_engine_set_prefix_cache(gemma4_engine_t *eng, int enable) {
+    if (!eng) return;
+    eng->prefix_cache_enabled = (enable && eng->n_layers_sliding == 0 &&
+                                 eng->glob_prefix.refcount != NULL) ? 1 : 0;
+}
+
+// Observability counters (all zero when the cache is disabled/uninitialized).
+extern "C" void gemma4_engine_prefix_cache_stats(const gemma4_engine_t *eng,
+        uint64_t *lookups, uint64_t *hit_blocks, uint64_t *cached_blocks, uint64_t *evictions) {
+    const PrefixTree *c = (eng && eng->prefix_cache_enabled) ? &eng->glob_prefix : NULL;
+    prefix_tree_stats(c, lookups, hit_blocks, cached_blocks, evictions);
 }
 
 // Self-test (FUCINA_BATCH_SELFTEST): 3 distinct short token sequences, each run
