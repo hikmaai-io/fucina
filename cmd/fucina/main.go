@@ -229,9 +229,25 @@ func main() {
 		// the per-request kv lock. Requires the engine to be in paged mode (--paged-kv /
 		// FUCINA_PAGED_KV=1); SetBatchEngine is a no-op otherwise, so the single-flight
 		// path stays intact.
-		if args.Batch || os.Getenv("FUCINA_BATCH") != "" {
+		// The Qwen3 family is served ONLY through the paged multiseq + scheduler path
+		// (the single-flight prefill entry points decline for Qwen3, so a bare launch
+		// would 500 on every request). The engine already auto-enables paged KV for
+		// those archs; mirror that here by auto-enabling the batch scheduler so a plain
+		// `fucina -m Qwen3...gguf` Just Works. Gemma/dense single-flight is untouched.
+		wantBatch := args.Batch || os.Getenv("FUCINA_BATCH") != ""
+		qwen3 := eng.IsQwen3Family()
+		if qwen3 && !wantBatch {
+			wantBatch = true
+			log.Printf("fucina: Qwen3 family detected — continuous batching auto-enabled (required; single-flight prefill is Gemma-only)")
+		}
+		if wantBatch {
 			if srv.SetBatchEngine(cuda.NewBatchAdapter(eng)) {
 				log.Printf("fucina: continuous batching ENABLED (paged KV multi-sequence)")
+			} else if qwen3 {
+				// Qwen3 has no working non-paged path — fail fast at startup with a clear
+				// remedy instead of returning HTTP 500 on every completion.
+				log.Fatalf("fucina: Qwen3 requires paged KV but the pools are not active " +
+					"(allocation failed — lower --ctx or raise --gpu-mem-util)")
 			} else {
 				log.Printf("fucina: WARNING — FUCINA_BATCH set but engine not in paged mode (FUCINA_PAGED_KV); batching disabled")
 			}

@@ -5597,7 +5597,15 @@ gemma4_engine_t* gemma4_engine_create(
                    "[Phase 6 bench; ~4.5-bit precision, storage still FP8]\n");
     }
 
-    if (getenv("FUCINA_PAGED_KV")) {
+    // Paged pools are opt-in (FUCINA_PAGED_KV) for Gemma, but MANDATORY for the Qwen3
+    // family: every Qwen3/Qwen3-MoE prefill+decode entry point routes exclusively
+    // through the paged multiseq path (the non-paged gemma4_engine_prefill* decline
+    // with -1/-2 for GEMMA4_IS_QWEN3_FAMILY), so without these pools a bare Qwen3
+    // launch would 500 on every request. Auto-enable from the detected arch — runtime
+    // model detection, no env flag required (Gemma stays opt-in / byte-identical).
+    if (getenv("FUCINA_PAGED_KV") || GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
+        if (!getenv("FUCINA_PAGED_KV") && GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch))
+            printf("fucina: Qwen3 family — paged KV auto-enabled (required for Qwen3 serving)\n");
         const int BT = PAGED_KV_BLOCK_TOKENS;
         // Per-token element count per KV-class. Qwen3 is single-head-dim (128) and routes every
         // layer through the global class, so glob_elems uses cfg.head_dim (NOT the 512 Gemma const)
@@ -13419,6 +13427,13 @@ void gemma4_engine_print_timing(const gemma4_engine_t *eng) {
 
 int gemma4_engine_get_n_layers(const gemma4_engine_t *eng) {
     return eng ? eng->cfg.n_layers : 0;
+}
+
+// Detected architecture family. The Qwen3/Qwen3-MoE forward is served ONLY through
+// the paged multiseq + continuous-batching path (single-flight prefill declines),
+// so the Go server uses this to auto-enable the batch scheduler for those models.
+int gemma4_engine_is_qwen3_family(const gemma4_engine_t *eng) {
+    return (eng && GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) ? 1 : 0;
 }
 
 // ─── Timing accessors (for Go-side speed logging) ─────────────────────

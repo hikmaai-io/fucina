@@ -157,6 +157,16 @@ func (e *Engine) Info() string {
 	return fmt.Sprintf("%s (%d ctx, device=%d)", e.path, e.ctx, 0)
 }
 
+// IsQwen3Family reports whether the loaded model is Qwen3 / Qwen3-MoE. Those archs
+// are served only through the paged multiseq + continuous-batching path (the
+// single-flight prefill entry points decline), so the server auto-enables the batch
+// scheduler for them.
+func (e *Engine) IsQwen3Family() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return C.gemma4_engine_is_qwen3_family(e.ptr) == 1
+}
+
 // PrintInfo prints engine configuration to stderr.
 func (e *Engine) PrintInfo() {
 	e.mu.Lock()
