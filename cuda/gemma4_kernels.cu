@@ -9780,6 +9780,44 @@ static int decode_multiseq_forward(
 // Allocate a free slot, prefill `prompt` into THAT slot's paged KV (correctness
 // first: loop single-token multi-seq forwards over the slot alone), sample the
 // first token greedily, write it to *first_token_out. Returns slot id (>=0) or -1.
+// Fast suffix prefill for the cross-request prefix cache. After adopting a shared
+// prefix (s->n_tokens == base), prefill the divergent suffix [base, base+M) in
+// BATCHED chunks of up to GEMMA4_MAX_SEQS rows — one weight pass per chunk —
+// instead of token-by-token. Each chunk is a decode_multiseq_forward over the SAME
+// seq at consecutive positions: row j writes its K/V then attends [0, base+j+1) via
+// its per-row PagedSeqView.n_tokens bound, so it sees the adopted prefix (pool) plus
+// the earlier suffix rows written THIS pass — exactly the ragged spec-verify
+// causality, hence bit-identical to the token-by-token path. Samples the first
+// generated token on the final row. Returns 0 / -1.
+static int prefill_suffix_batched(gemma4_engine_t *eng, gemma4_seq *s,
+                                  const int32_t *suffix, int M, int32_t *first_tok_out)
+{
+    const int CH = GEMMA4_MAX_SEQS;
+    gemma4_seq *rows[GEMMA4_MAX_SEQS];
+    int positions[GEMMA4_MAX_SEQS];
+    int32_t last_tok = 0;
+    int done = 0;
+    while (done < M) {
+        int C = M - done; if (C > CH) C = CH;
+        int base = s->n_tokens;
+        if (paged_slot_sync(eng, s, base + C - 1) != 0) return -1;   // grow block tables for this chunk
+        for (int j = 0; j < C; j++) { rows[j] = s; positions[j] = base + j; }
+        int want_sample = (done + C >= M);                          // sample only the final suffix row
+        if (decode_multiseq_forward(eng, rows, suffix + done, positions, C, want_sample) != 0)
+            return -1;
+        if (want_sample)
+            cudaMemcpyAsync(&last_tok, eng->d_ms_outtok + (C - 1), sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, eng->stream);
+        s->n_tokens = base + C;
+        done += C;
+    }
+    cudaStreamSynchronize(eng->stream);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    s->n_sampled++;   // one token produced (RNG index advances once), matching token-by-token
+    if (first_tok_out) *first_tok_out = last_tok;
+    return 0;
+}
+
 extern "C" int gemma4_engine_seq_add(
     gemma4_engine_t *eng, const int32_t *prompt, int n_prompt, int32_t *first_token_out,
     float temp, int top_k, float top_p, float min_p, uint64_t seed)
@@ -9823,9 +9861,11 @@ extern "C" int gemma4_engine_seq_add(
         // The sliding table is never read on this geometry; start it past the
         // shared region so it never allocates blocks for the reused prefix.
         s->slid_bt.base = shared_tok; s->slid_bt.n = 0;
-        if (gemma4_engine_seq_prefill_chunk(eng, slot, prompt + shared_tok,
-                                            n_prompt - shared_tok, /*do_sample=*/1,
-                                            first_token_out) != 0) {
+        // Prefill the suffix in batched chunks (one weight pass per chunk) rather than
+        // token-by-token — otherwise a long suffix at decode speed would erase the
+        // prefill saved by reusing the shared prefix.
+        if (prefill_suffix_batched(eng, s, prompt + shared_tok,
+                                   n_prompt - shared_tok, first_token_out) != 0) {
             gemma4_engine_seq_remove(eng, slot); return -1;
         }
         // Register this seq's full prompt blocks (shared ones skipped inside) so
