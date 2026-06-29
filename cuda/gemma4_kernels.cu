@@ -10384,7 +10384,7 @@ static int multiseq_upload_inputs(
 // falls back to the per-kernel body (which also runs the per-row temperature sampler).
 static int decode_multiseq_forward(
     gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *in_tok,
-    const int *positions, int B, int want_sample)
+    const int *positions, int B, int want_sample, const int *rng_off)
 {
     if (!eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
     if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
@@ -10432,10 +10432,16 @@ static int decode_multiseq_forward(
             h_topk[r] = s->samp_top_k;
             h_topp[r] = s->samp_top_p;
             h_minp[r] = s->samp_min_p;
-            // splitmix64(seed, index): reproducible per (seed, token index),
+            // splitmix64(seed, index): reproducible per (seed, token ordinal),
             // independent of batch position so two runs match regardless of
-            // how rows are grouped into steps.
-            uint64_t z = (s->samp_seed ? s->samp_seed : 0x9e3779b97f4a7c15ULL) + 0x9e3779b97f4a7c15ULL * (s->n_sampled + 1);
+            // how rows are grouped into steps. rng_off[r] is the row's sampled-
+            // ordinal offset within this seq's burst (0 for a plain decode row or
+            // the spec anchor; 1+j for the j-th draft/verify row), so every verify
+            // position of a slot draws an INDEPENDENT uniform — making sampled spec
+            // distributionally identical to (and bit-reproducible with) plain
+            // per-token sampling. NULL ⇒ all-zero ⇒ unchanged for non-spec callers.
+            int roff = rng_off ? rng_off[r] : 0;
+            uint64_t z = (s->samp_seed ? s->samp_seed : 0x9e3779b97f4a7c15ULL) + 0x9e3779b97f4a7c15ULL * (s->n_sampled + 1 + roff);
             z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
             z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
             z =  z ^ (z >> 31);
@@ -10482,7 +10488,7 @@ static int prefill_suffix_batched(gemma4_engine_t *eng, gemma4_seq *s,
         if (paged_slot_sync(eng, s, base + C - 1) != 0) return -1;   // grow block tables for this chunk
         for (int j = 0; j < C; j++) { rows[j] = s; positions[j] = base + j; }
         int want_sample = (do_sample && done + C >= M);             // sample only the final row, only if asked
-        if (decode_multiseq_forward(eng, rows, suffix + done, positions, C, want_sample) != 0)
+        if (decode_multiseq_forward(eng, rows, suffix + done, positions, C, want_sample, NULL) != 0)
             return -1;
         if (want_sample)
             cudaMemcpyAsync(&last_tok, eng->d_ms_outtok + (C - 1), sizeof(int32_t),
@@ -10616,7 +10622,7 @@ extern "C" int gemma4_engine_seq_add(
         int32_t tok = prompt[i];
         int positions[1] = { pos };
         int want_sample = (i == n_prompt - 1);
-        if (decode_multiseq_forward(eng, one, &tok, positions, 1, want_sample) != 0) {
+        if (decode_multiseq_forward(eng, one, &tok, positions, 1, want_sample, NULL) != 0) {
             fprintf(stderr, "fucina: seq_add: decode_multiseq_forward failed at pos %d (%s)\n",
                     pos, cudaGetErrorString(cudaGetLastError()));
             gemma4_engine_seq_remove(eng, slot); return -1;
@@ -10727,7 +10733,7 @@ extern "C" int gemma4_engine_seq_prefill_chunk(
         int32_t tok = tokens[i];
         int positions[1] = { pos };
         int want_sample = (do_sample && i == n - 1);
-        if (decode_multiseq_forward(eng, one, &tok, positions, 1, want_sample) != 0) {
+        if (decode_multiseq_forward(eng, one, &tok, positions, 1, want_sample, NULL) != 0) {
             fprintf(stderr, "fucina: seq_prefill_chunk: forward failed at pos %d (%s)\n",
                     pos, cudaGetErrorString(cudaGetLastError()));
             return -1;
@@ -10777,7 +10783,7 @@ extern "C" int gemma4_engine_step_batch(
         slv[Bv] = s; positions[Bv] = s->n_tokens; in2[Bv] = in_tokens[r]; rowmap[Bv] = r; Bv++;
     }
     if (Bv == 0) return 0;   // every row hit its limit; caller evicts the -1 rows
-    if (decode_multiseq_forward(eng, slv, in2, positions, Bv, /*want_sample=*/1) != 0)
+    if (decode_multiseq_forward(eng, slv, in2, positions, Bv, /*want_sample=*/1, NULL) != 0)
         return -1;
     int32_t outs[GEMMA4_MAX_SEQS];
     cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)Bv*sizeof(int32_t),
@@ -10906,6 +10912,7 @@ static int step_batch_spec_impl(
 
     // Flatten (slot × [g, draft...]) into R verify rows; grow each slot's KV to cover them.
     gemma4_seq *vslv[GEMMA4_MAX_SEQS]; int32_t vtok[GEMMA4_MAX_SEQS]; int vpos[GEMMA4_MAX_SEQS];
+    int vrng[GEMMA4_MAX_SEQS];   // per-row sampled-ordinal offset (anchor 0, draft j → 1+j)
     int off[GEMMA4_MAX_SEQS]; int R = 0;
     for (int i = 0; i < A; i++) {
         gemma4_seq *s = act[i];
@@ -10925,13 +10932,18 @@ static int step_batch_spec_impl(
             continue;
         }
         off[i] = R;
-        vslv[R] = s; vtok[R] = g[i];        vpos[R] = pos;     R++;        // row 0: pending token
-        for (int j = 0; j < D[i]; j++) { vslv[R] = s; vtok[R] = draft[i][j]; vpos[R] = pos + 1 + j; R++; }
+        vslv[R] = s; vtok[R] = g[i];        vpos[R] = pos;     vrng[R] = 0;     R++;   // row 0: pending token
+        for (int j = 0; j < D[i]; j++) { vslv[R] = s; vtok[R] = draft[i][j]; vpos[R] = pos + 1 + j; vrng[R] = 1 + j; R++; }
     }
     if (R == 0) return 0;
 
     // ONE batched verify forward (greedy rows argmaxed, temp>0 rows sampled). No state mutation.
-    if (decode_multiseq_forward(eng, vslv, vtok, vpos, R, /*want_sample=*/1) != 0) return -1;
+    // vrng gives each verify row an INDEPENDENT per-position uniform (anchor draws the
+    // n_sampled-th token's stream, draft j the (n_sampled+1+j)-th), so a committed run of a
+    // accepted draft tokens consumes the exact RNG indices a plain per-token sampled decode
+    // would — making sampled spec lossless (distributionally identical AND reproducible),
+    // not just argmax-greedy-safe.
+    if (decode_multiseq_forward(eng, vslv, vtok, vpos, R, /*want_sample=*/1, vrng) != 0) return -1;
     int32_t outs[GEMMA4_MAX_SEQS];
     cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)R*sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
     if (cudaStreamSynchronize(stream) != cudaSuccess) return -1;
