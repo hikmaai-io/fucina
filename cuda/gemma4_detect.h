@@ -254,6 +254,11 @@ static inline int gemma4_detect_qwen3moe(const uint8_t *data, uint64_t size,
     if ((int)hc > GEMMA4_CAP_HEADS)  G4D_FAIL("head_count %u exceeds GEMMA4_CAP_HEADS %d", hc, GEMMA4_CAP_HEADS);
     if ((int)hckv > GEMMA4_CAP_KV_HEADS) G4D_FAIL("head_count_kv %u exceeds GEMMA4_CAP_KV_HEADS %d", hckv, GEMMA4_CAP_KV_HEADS);
     if ((int)kl > GEMMA4_GLOBAL_HEAD_DIM) G4D_FAIL("key_length %u exceeds GEMMA4_GLOBAL_HEAD_DIM %d", kl, GEMMA4_GLOBAL_HEAD_DIM);
+    // Cap the expert counts: the MoE top-k router kernel indexes a fixed-size stack array
+    // (`bool used[128]`) by the runtime expert_count, so a >128-expert checkpoint would
+    // corrupt the stack. Fail cleanly here instead. (Mirrors the dim caps above.)
+    if ((int)nexp > GEMMA4_CAP_EXPERTS)       G4D_FAIL("expert_count %u exceeds GEMMA4_CAP_EXPERTS %d", nexp, GEMMA4_CAP_EXPERTS);
+    if ((int)nused > GEMMA4_CAP_EXPERTS_USED) G4D_FAIL("expert_used_count %u exceeds GEMMA4_CAP_EXPERTS_USED %d", nused, GEMMA4_CAP_EXPERTS_USED);
 
     cfg->arch         = GEMMA4_ARCH_QWEN3MOE;
     cfg->head_dim     = (int)kl;            // 128

@@ -21,6 +21,14 @@
 #define GEMMA4_CAP_LAYERS   64    // ≥ 60 (31B); 12B uses 48
 #define GEMMA4_CAP_HEADS    32    // ≥ 32 (31B); 12B uses 16
 #define GEMMA4_CAP_KV_HEADS 16    // ≥ 16 (31B sliding); 12B uses 8
+// Sparse-MoE (qwen3moe) caps. These MUST stay <= the hardcoded stack-array bound in the
+// MoE top-k router kernel (dg_softmax_topk's `bool used[DG_N_EXPERTS]`, DG_N_EXPERTS=128,
+// DG_N_EXPERTS_USED=8): the kernel indexes that array by the RUNTIME expert_count, so a
+// checkpoint with more experts than this would walk off thread 0's stack. Detection caps
+// expert_count/expert_used_count against these so an oversized MoE fails cleanly at load
+// instead of silently corrupting the stack. The whole Qwen3-MoE family is 128/top-8.
+#define GEMMA4_CAP_EXPERTS       128
+#define GEMMA4_CAP_EXPERTS_USED  8
 
 // Geometry shared by every Gemma-4 size (constant — safe to keep as template params).
 #define GEMMA4_HEAD_DIM         256   // sliding-layer head dim (key_length_swa)
