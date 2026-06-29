@@ -28,6 +28,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
+        qwen3moe-parity-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -130,6 +131,17 @@ qwen3-parity-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_parity \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	/tmp/fucina_qwen3_parity
+
+# ─── Qwen3-MoE (qwen3moe) numeric parity vs llama.cpp (GPU) ─────────────
+# Loads Qwen3-30B-A3B (sparse MoE: 128 experts, top-8) and asserts fucina's greedy
+# continuation of "The capital of France is" matches llama.cpp's raw-completion reference
+# [12095,13,576,6722,315,279,3639,4180] token-for-token (8/8). Override the model with MODEL=.
+QWEN3MOE_MODEL ?= /opt/spark/models/Qwen3-30B-A3B-Instruct-2507-UD-Q4_K_XL.gguf
+qwen3moe-parity-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3moe_parity.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3moe_parity \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	/tmp/fucina_qwen3moe_parity $(QWEN3MOE_MODEL)
 
 # ─── Qwen3 cross-request prefix cache losslessness (GPU) ────────────────
 # Proves cache-served requests (shared-prefix reuse) produce a greedy token stream
