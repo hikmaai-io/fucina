@@ -712,6 +712,26 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"in_flight":     len(s.inflight),
 		"max_in_flight": cap(s.inflight),
 	}
+	// Cross-request prefix cache (RadixAttention) reuse counters, published lock-free
+	// by the batch scheduler. Present only when serving via continuous batching on an
+	// engine that has the cache (Qwen3 single-pool geometry).
+	if s.scheduler != nil {
+		lk, hb, cb, ev := s.scheduler.PrefixCacheStats()
+		if lk > 0 || cb > 0 {
+			rate := 0.0
+			if lk > 0 {
+				rate = float64(hb) / float64(lk)
+			}
+			snap["prefix_cache"] = map[string]interface{}{
+				"lookups":               lk,
+				"reused_blocks":         hb,
+				"reused_blocks_per_req": rate,
+				"tokens_saved":          hb * 256,
+				"cached_blocks":         cb,
+				"evictions":             ev,
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, snap)
 }
 

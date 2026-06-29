@@ -437,6 +437,18 @@ func (e *Engine) SpecStats() (steps, drafted, accepted, emitted int64) {
 		int64(C.gemma4_engine_spec_emitted(e.ptr))
 }
 
+// PrefixCacheStats returns cumulative cross-request prefix-cache counters for /metrics:
+// lookups (AddSeq prefix probes), hitBlocks (KV blocks reused from cache instead of
+// re-prefilled), cachedBlocks (live tree size), evictions. All zero when the cache is
+// disabled (e.g. the Gemma sliding geometry). hitBlocks/lookups is the reuse rate.
+func (e *Engine) PrefixCacheStats() (lookups, hitBlocks, cachedBlocks, evictions int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var lk, hb, cb, ev C.uint64_t
+	C.gemma4_engine_prefix_cache_stats(e.ptr, &lk, &hb, &cb, &ev)
+	return int64(lk), int64(hb), int64(cb), int64(ev)
+}
+
 // Reset rewinds the KV cache to empty so the next Prefill starts a fresh
 // sequence at position 0. It does not free device memory.
 func (e *Engine) Reset() {
@@ -932,6 +944,12 @@ func (a *BatchAdapter) RemoveSeq(slot int) error {
 // Capacity reports the engine's total concurrent-slot budget (free + currently
 // held), so the scheduler's admission test len(active) < Capacity() is correct.
 func (a *BatchAdapter) Capacity() int { return a.eng.SeqFreeCapacity() + a.active }
+
+// PrefixCacheStats forwards the engine's cross-request prefix-cache counters so the
+// scheduler can publish them lock-free for /metrics.
+func (a *BatchAdapter) PrefixCacheStats() (lookups, hitBlocks, cachedBlocks, evictions int64) {
+	return a.eng.PrefixCacheStats()
+}
 
 // ensure CGO runs on the main thread for CUDA compatibility
 func init() {

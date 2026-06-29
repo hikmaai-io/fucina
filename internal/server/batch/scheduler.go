@@ -7,6 +7,7 @@ import (
 	"log"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -134,6 +135,16 @@ type ChunkPrefillEngine interface {
 	// step's input); when last is false first is unused. A non-nil error means the
 	// prefill failed (e.g. KV could not grow) and the caller frees the slot.
 	PrefillChunk(slot int, chunk []int32, last bool) (first int32, err error)
+}
+
+// PrefixCacheStatsEngine is the optional observability hook for the cross-request
+// prefix cache: an engine that can report cumulative reuse counters. The scheduler
+// snapshots them lock-free for /metrics.
+type PrefixCacheStatsEngine interface {
+	// PrefixCacheStats returns cumulative counters: lookups (prefix probes at admit),
+	// hitBlocks (KV blocks reused instead of re-prefilled), cachedBlocks (live tree
+	// size), evictions. hitBlocks*blockTokens is the prefill work saved.
+	PrefixCacheStats() (lookups, hitBlocks, cachedBlocks, evictions int64)
 }
 
 // defaultPrefillChunk is the prompt-token budget committed per scheduler pass for a
@@ -282,6 +293,16 @@ type Scheduler struct {
 	chunkSize int
 	chunkMin  int
 
+	// prefixStats is the cross-request prefix-cache observability hook: non-nil when
+	// the engine implements PrefixCacheStatsEngine. The run loop (the sole engine
+	// caller) snapshots the engine counters into the atomics below each pass so
+	// /metrics can read them lock-free without touching the engine mutex.
+	prefixStats  PrefixCacheStatsEngine
+	pcLookups    atomic.Int64
+	pcHitBlocks  atomic.Int64
+	pcCached     atomic.Int64
+	pcEvictions  atomic.Int64
+
 	// submit carries new requests to the owner goroutine. It is bounded; a full
 	// channel is backpressure (Submit returns ErrQueueFull) rather than
 	// unbounded goroutine/memory growth.
@@ -330,6 +351,9 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 		s.chunk = ce
 		s.chunkSize = defaultPrefillChunk
 		s.chunkMin = defaultPrefillChunkMin
+	}
+	if ps, ok := engine.(PrefixCacheStatsEngine); ok {
+		s.prefixStats = ps
 	}
 	return s
 }
@@ -454,6 +478,17 @@ func (s *Scheduler) run() {
 		//    at least one sequence was slotted this pass.
 		admitted := s.admit(active, &prefill, &waiting)
 
+		// Publish prefix-cache counters lock-free for /metrics. Adoption happens at
+		// admit (AddSeq), so refresh after a pass that admitted; the engine read is a
+		// cheap counter fetch on the goroutine that already owns the engine.
+		if s.prefixStats != nil && admitted {
+			lk, hb, cb, ev := s.prefixStats.PrefixCacheStats()
+			s.pcLookups.Store(lk)
+			s.pcHitBlocks.Store(hb)
+			s.pcCached.Store(cb)
+			s.pcEvictions.Store(ev)
+		}
+
 		// 3. Evict any active OR prefilling sequence whose context was cancelled
 		//    BEFORE the step, so a cancelled client's slot is freed promptly (and
 		//    never burns another forward pass / prefill chunk).
@@ -513,6 +548,16 @@ func (s *Scheduler) run() {
 // channel, where Submit observes it as ErrQueueFull. It is sized off the channel
 // capacity so the total accepted-but-unadmitted budget tracks New's queueDepth.
 func (s *Scheduler) maxBacklog() int { return cap(s.submit) }
+
+// PrefixCacheStats returns the last-published cross-request prefix-cache counters
+// (lock-free). Zero when the engine has no prefix cache (e.g. Gemma). The reuse rate
+// is hitBlocks/lookups; hitBlocks*256 tokens of prefill were skipped.
+func (s *Scheduler) PrefixCacheStats() (lookups, hitBlocks, cachedBlocks, evictions int64) {
+	if s.prefixStats == nil {
+		return 0, 0, 0, 0
+	}
+	return s.pcLookups.Load(), s.pcHitBlocks.Load(), s.pcCached.Load(), s.pcEvictions.Load()
+}
 
 // drainSubmit moves currently-queued submissions into waiting without blocking,
 // up to the backlog bound. Leaving the rest in the channel is what surfaces

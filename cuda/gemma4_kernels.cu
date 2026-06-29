@@ -5273,6 +5273,9 @@ gemma4_engine_t* gemma4_engine_create(
                 if (eng->n_layers_sliding == 0 && getenv("FUCINA_NO_PREFIX_CACHE") == NULL) {
                     prefix_tree_init(&eng->glob_prefix, &eng->glob_pool, 2 * glob_blocks + 16);
                     eng->prefix_cache_enabled = 1;   // default-on for the full-attention single-pool geometry
+                    fprintf(stderr, "fucina: cross-request prefix cache ENABLED "
+                            "(RadixAttention; %d global blocks, %d-token granularity)\n",
+                            glob_blocks, BT);
                 }
                 fprintf(stderr,
                     "fucina: paged KV ENABLED — ~%d concurrent seqs @ maxctx %d "
