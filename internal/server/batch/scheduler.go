@@ -162,9 +162,9 @@ type PrefixCommitEngine interface {
 // chunked (interleaved) prefill. Each pass commits at most one chunk for ONE prefilling
 // sequence AND runs one decode step, so decode of the active sequences keeps flowing
 // while a long prompt prefills. The engine's chunked prefill is token-by-token (one
-// weight pass per ≤GEMMA4_MAX_SEQS=16 tokens via the batched suffix-prefill), so the
+// weight pass per ≤GEMMA4_MAX_SEQS=32 tokens via the batched suffix-prefill), so the
 // chunk size trades the new sequence's prefill latency against the active sequences'
-// per-step decode latency; 256 = ~16 batched weight passes per chunk, still interleaving
+// per-step decode latency; 256 = ~8 batched weight passes per chunk, still interleaving
 // a decode step between chunks while keeping per-chunk overhead amortized.
 const defaultPrefillChunk = 256
 
@@ -188,7 +188,7 @@ const maxOneShotAdmitsPerPass = 1
 // exceed it. With R active slots, R rows are anchors and the rest is the draft budget — so
 // speculation naturally tapers as concurrency rises (anchors crowd out drafts), which
 // matches where spec pays off (low concurrency / single-stream latency).
-const MaxVerifyRows = 16
+const MaxVerifyRows = 32
 
 // ─── Public request type ───────────────────────────────────────────
 

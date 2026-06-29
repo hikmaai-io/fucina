@@ -588,11 +588,11 @@ func (e *Engine) GraphStats() (hits, misses, captures, launches int) {
 // fixed number of concurrent paged slots. seq_capacity() reports only the FREE
 // slots, so the adapter reconstructs the *total* (free+used) for the scheduler's
 // Capacity() contract by tracking how many slots it currently holds.
-const maxBatchSeqs = 16
+const maxBatchSeqs = 32
 
 // specMax mirrors GEMMA4_SPEC_MAX: the max length of a per-slot speculative run, and
 // the stride of the flattened out_tokens buffer that step_batch_spec writes.
-const specMax = 16
+const specMax = 32
 
 // SeqAdd prefills prompt into a fresh paged slot and returns the slot id and the
 // first sampled token. The per-sequence sampling params are stored on the slot

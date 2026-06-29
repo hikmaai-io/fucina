@@ -47,7 +47,7 @@
 #define GEMMA4_MAX_CTX           262144
 #define GEMMA4_SOFTCAP           30.0f
 #define GEMMA4_RMS_EPS           1e-6f
-#define GEMMA4_SPEC_MAX          16      // max draft length per batched-decode pass
+#define GEMMA4_SPEC_MAX          32      // max draft length per batched-decode pass / max concurrent decode rows
 // GQA-broadcast global flash-decode split-K (DECODE-30-35 Step 1): the global context is
 // split into ≤MAX_SPLITS blocks of ~SPLIT_CHUNK timesteps so the single global KV head still
 // saturates bandwidth across SMs while being read only ONCE per token (not n_heads× = 16×).
