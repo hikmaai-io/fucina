@@ -133,6 +133,7 @@ void dg_head_rmsnorm(float *x, const float *weight, int head_dim, int n_head, in
 void dg_rope(float *x, const int *pos, int head_dim, int n_head, int tokens,
              float theta_base, const float *freq_factors, cudaStream_t s);
 void dg_gelu_mul(float *out, const float *gate, const float *up, int64_t n, cudaStream_t s); // gelu_tanh(gate)*up
+void dg_silu_mul(float *out, const float *gate, const float *up, int64_t n, cudaStream_t s); // silu(gate)*up (Qwen3-MoE)
 void dg_add(float *out, const float *a, const float *b, int64_t n, cudaStream_t s);          // out=a+b
 void dg_scale(float *x, int64_t n, float s_scalar, cudaStream_t s);                          // x *= s
 void dg_mul_vec_cols(float *x, const float *vec, int feat, int tokens, cudaStream_t s);      // x[:,t]*=vec (per feature)

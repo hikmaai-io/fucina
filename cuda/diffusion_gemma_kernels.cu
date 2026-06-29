@@ -216,6 +216,17 @@ extern "C" void dg_gelu_mul(float *out, const float *g, const float *u, int64_t 
     dg_gelu_mul_kernel<<<(n + 255) / 256, 256, 0, s>>>(out, g, u, n);
 }
 
+// SiLU-GLU over SEPARATE gate/up buffers: out = silu(g)*u, silu(x)=x*sigmoid(x). Qwen3-MoE keeps
+// gate and up as distinct expert slabs (ffn_gate_exps / ffn_up_exps), so the fused split variant
+// above is not usable — this consumes the two grouped-GEMM outputs directly.
+__global__ void dg_silu_mul_kernel(float *out, const float *g, const float *u, int64_t n) {
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i < n) { float x = g[i]; out[i] = (x / (1.0f + __expf(-x))) * u[i]; }
+}
+extern "C" void dg_silu_mul(float *out, const float *g, const float *u, int64_t n, cudaStream_t s) {
+    dg_silu_mul_kernel<<<(n + 255) / 256, 256, 0, s>>>(out, g, u, n);
+}
+
 // gateup is [2*half, ncols] column-major; out[half,ncols] = gelu(gateup[0:half]) * gateup[half:2half]
 __global__ void dg_split_gelu_mul_kernel(float *out, const float *gu, int half, int ncols) {
     int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
