@@ -79,6 +79,9 @@ typedef enum {
                        // both the cuBLASLt block-scaled prefill and the fused decode GEMV.
     FORMAT_Q4_K  = 5,  // GGML Q4_K super-blocks — wfmt override for the native Unsloth-UD tied LM
                        // head (reads raw 4.5-bit head vs the Q8_0 upconvert); not a whole-model format.
+    FORMAT_Q5_K  = 6,  // GGML Q5_K super-blocks — appears on a few Qwen3 UD bulk weights (mixed
+                       // attention). No native Q5_K kernel: each Q5_K bulk tensor is requantized to
+                       // Q8_0 at load (wt_override) and thereafter read as FORMAT_Q8_0.
 } tensor_format_t;
 
 // ─── GGML Q8_0 block ──────────────────────────────────────────────────

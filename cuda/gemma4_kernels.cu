@@ -28,6 +28,33 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+// ── Qwen3-MoE grouped-expert kernels (libdg) ────────────────────────────────────────────────────
+// The sparse FFN reuses the DiffusionGemma MoE primitives (declared in diffusion_gemma_kernels.cuh,
+// compiled into libdg.a which fucina already links). These are extern-C HOST launchers — no device
+// symbol crosses the archive boundary, so no -dlink change is needed. Declared here (not via the
+// header include, which would pull DG model #defines) to keep the gemma4 TU self-contained.
+extern "C" {
+    void dg_softmax_topk(const float *logits, int n_expert, int tokens, int topk,
+                         int *out_idx, float *out_w, cudaStream_t s);
+    void dg_moe_route(const int *tki, const float *tkw, const float *pes, int n_tokens, int n_used,
+                      int n_expert, int *count, int *coloff, int *cursor, int *src, float *csc,
+                      cudaStream_t s);
+    void dg_gather_cols(float *dst, const float *src, const int *idx, int feat, int ncols, cudaStream_t s);
+    void dg_scatteradd_cols(float *dst, const float *src, const int *idx, const float *colscale,
+                            int feat, int ncols, cudaStream_t s);
+    void dg_quantize_q8_1(const float *x, int8_t *qx, float *dx, int *sx, int in_dim, int tokens,
+                          cudaStream_t s);
+    void dg_mmq_q4_K_grouped(float *out, const void *wbase, int64_t slab_stride, const int8_t *qx,
+                             const float *dx, const int *sx, const int *coloff, const int *count,
+                             int n_expert, int in_dim, int out_dim, cudaStream_t s);
+    void dg_mmq_q8_0_grouped(float *out, const void *wbase, int64_t slab_stride, const int8_t *qx,
+                             const float *dx, const int *sx, const int *coloff, const int *count,
+                             int n_expert, int in_dim, int out_dim, cudaStream_t s);
+    void dg_silu_mul(float *out, const float *gate, const float *up, int64_t n, cudaStream_t s);
+}
+
+#define GEMMA4_MOE_TMAX 512   // max tokens per MoE chunk (decode B≤16, prefill loops in chunks)
+
 // NVFP4 safetensors loading (FORMAT_NVFP4): container parser, dequant math, name mapping, and
 // the fused decode GEMV. All header-only; the decode kernel lives in nvfp4_gemv.cuh.
 //
@@ -127,6 +154,7 @@ typedef enum {
     GGML_TYPE_Q4_1 = 3,   // 32-block: fp16 d, fp16 m, 16 nibble bytes (v = d*q + m)
     GGML_TYPE_Q8_0 = 8,
     GGML_TYPE_Q4_K = 12,  // 256-superblock k-quant (Unsloth UD dynamic-quant token_embd)
+    GGML_TYPE_Q5_K = 13,  // 256-superblock k-quant (some qwen3moe ffn_down_exps slabs)
     GGML_TYPE_Q6_K = 14,
 } ggml_type_t;
 
@@ -3009,8 +3037,8 @@ struct gemma4_engine {
     // requested tensor_offset matches an override entry, so every GEMV/MMQ/BF16-dequant site
     // reads valid Q4_0 with the engine format unchanged. 12B has zero overrides → no effect.
     int            n_wt_override;                       // 0 for 12B / non-dynamic GGUF
-    uint64_t       wt_override_off[16];                 // ABS file offset of the overridden tensor
-    unsigned char *wt_override_ptr[16];                 // device buffer with requantized Q4_0 bytes
+    uint64_t       wt_override_off[96];                 // ABS file offset of the overridden tensor
+    unsigned char *wt_override_ptr[96];                 // device buffer with requantized bytes (Q4_0/Q8_0)
 
     // ROTATING per-layer BF16 dequant scratch for batched cuBLAS prefill (Step 2).
     // The 7 projection weights of the CURRENT layer only are dequantized Q8_0/FP8 →
@@ -3483,6 +3511,41 @@ struct gemma4_engine {
     // give the live counts. See docs/dense-31b-89tok-plan.md (M0).
     gemma4_model_config_t cfg;
 
+    // ─── Sparse-MoE (GEMMA4_ARCH_QWEN3MOE) ──────────────────────────────
+    // Per-layer expert/router tensor offsets (into d_weights, read via weight_fp8) + the per-layer
+    // ffn_down_exps type. gate/up are uniformly Q4_K (grouped Q4_K GEMM); down is Q4_K on most
+    // layers and Q5_K on a few — the Q5_K slabs are requantized to Q8_0 into moe_down_q8[l] at
+    // load (the grouped down GEMM has no Q5_K path) and dispatched via dg_mmq_q8_0_grouped.
+    uint64_t        moe_gate_exps[GEMMA4_CAP_LAYERS];   // blk.l.ffn_gate_exps.weight (Q4_K)
+    uint64_t        moe_up_exps[GEMMA4_CAP_LAYERS];     // blk.l.ffn_up_exps.weight   (Q4_K)
+    uint64_t        moe_down_exps[GEMMA4_CAP_LAYERS];   // blk.l.ffn_down_exps.weight (Q4_K layers)
+    uint64_t        moe_router[GEMMA4_CAP_LAYERS];      // blk.l.ffn_gate_inp.weight  (F32)
+    unsigned char  *moe_down_q8[GEMMA4_CAP_LAYERS];     // requantized Q8_0 down slab (Q5_K layers) or NULL
+    int64_t         moe_gate_slab, moe_up_slab;         // bytes per expert (Q4_K)
+    int64_t         moe_down_slab_q4k, moe_down_slab_q8;// bytes per expert (down)
+    int             moe_loaded;                         // 1 once expert tensors are resolved
+    // MoE forward scratch (lazy, QWEN3MOE only). Processes ≤ GEMMA4_MOE_TMAX tokens per chunk;
+    // total assignments = tokens·n_experts_used. FP32 column-major [feat, tokens] throughout.
+    int             moe_scratch_ready;
+    float          *d_moe_rlogits;   // [TMAX·n_experts] router logits (per-token softmax input)
+    int            *d_moe_tki;       // [TMAX·n_used] top-k expert ids
+    float          *d_moe_tkw;       // [TMAX·n_used] renormalized router weights
+    int            *d_moe_eidx;      // [TMAX·n_used] route src token (gather/scatter idx)
+    float          *d_moe_ecs;       // [TMAX·n_used] route colscale (router weight)
+    int            *d_moe_count;     // [n_experts] per-expert assignment count
+    int            *d_moe_coloff;    // [n_experts] exclusive prefix (column base)
+    int            *d_moe_cursor;    // [n_experts] route scratch
+    float          *d_moe_ones;      // [n_experts] all-ones pes (Qwen3 has no per-expert scale)
+    float          *d_moe_xe;        // [H·assign] gathered expert input
+    float          *d_moe_gate;      // [expert_ffn·assign] grouped gate
+    float          *d_moe_up;        // [expert_ffn·assign] grouped up
+    float          *d_moe_act;       // [expert_ffn·assign] silu(gate)*up
+    float          *d_moe_oe;        // [H·assign] grouped down output
+    float          *d_moe_out;       // [H·TMAX] scatter-add accumulator
+    int8_t         *d_moe_q8;        // [H·assign] int8 quantized activations
+    float          *d_moe_q8d;       // [(H/32)·assign] per-block scale
+    int            *d_moe_q8s;       // [(H/32)·assign] per-block Σ
+
     // ─── LoRA adapter support ───────────────────────────────────────────
 };
 
@@ -3631,6 +3694,7 @@ static inline int ggml_to_fmt(uint32_t gt) {
         case GGML_TYPE_Q4_0: return FORMAT_Q4_0;
         case GGML_TYPE_Q8_0: return FORMAT_Q8_0;
         case GGML_TYPE_Q4_K: return FORMAT_Q4_K;
+        case GGML_TYPE_Q5_K: return FORMAT_Q5_K;  // requantized to Q8_0 at load (no native kernel)
         case GGML_TYPE_Q6_K: return FORMAT_Q6_K;
         default: return -1;
     }
@@ -3834,6 +3898,65 @@ static unsigned char* convert_q4k_to_q8_0(const unsigned char *src, int64_t n_el
     float f[256];
     for (int64_t s = 0; s < n_super; s++) {
         dequant_q4_k_superblock(src + (size_t)s * 144, f);
+        for (int sb = 0; sb < 8; sb++) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(f[sb * 32 + j]));
+            float scale = amax / 127.0f, iscale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+            unsigned char *ob = dst + (size_t)(s * 8 + sb) * 34;
+            uint16_t hb = f2h_host(scale);
+            ob[0] = (unsigned char)(hb & 0xFF); ob[1] = (unsigned char)(hb >> 8);
+            for (int j = 0; j < 32; j++) {
+                int q = (int)lrintf(f[sb * 32 + j] * iscale);
+                q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                ob[2 + j] = (unsigned char)(int8_t)q;
+            }
+        }
+    }
+    return dst;
+}
+
+// Q5_K super-block = 256 elems (176 B): fp16 d, fp16 dmin, 12 B of 6-bit packed scales/mins
+// (same get_scale_min_k4 packing as Q4_K), 32 B of high bits (qh), 128 B of low nibbles (qs).
+// Sub-block j (0..7) value = d*sc_j*(nib + 16*high_bit) - dmin*m_j, where nib is qs[(j/2)*32+i]'s
+// low/high nibble (j even/odd) and high_bit = (qh[i] >> j) & 1. Verified against ggml-quants.git
+// dequantize_row_q5_K (u1/u2 = 1<<sb / 2<<sb ⇒ qh bit == sub-block index). Output natural order.
+static inline void dequant_q5_k_superblock(const unsigned char *blk, float out[256]) {
+    uint16_t dr, mr; memcpy(&dr, blk, 2); memcpy(&mr, blk + 2, 2);
+    float d = h2f_host(dr), dmin = h2f_host(mr);
+    const unsigned char *sc = blk + 4;       // 12 bytes packed 6-bit scales+mins
+    const unsigned char *qh = blk + 16;      // 32 bytes high bits (1 per element)
+    const unsigned char *qs = blk + 48;      // 128 bytes low nibbles
+    auto get_sm = [&](int j, uint8_t *s, uint8_t *m) {
+        if (j < 4) { *s = sc[j] & 63; *m = sc[j + 4] & 63; }
+        else { *s = (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4);
+               *m = (sc[j + 4] >> 4)   | ((sc[j    ] >> 6) << 4); }
+    };
+    for (int j = 0; j < 8; j++) {
+        uint8_t s, m; get_sm(j, &s, &m);
+        float dl = d * (float)s, ml = dmin * (float)m;
+        const unsigned char *q = qs + (j / 2) * 32;
+        int shift = (j & 1) ? 4 : 0;
+        float *o = out + j * 32;
+        for (int i = 0; i < 32; i++) {
+            int lo = (q[i] >> shift) & 0x0F;
+            int hi = (qh[i] >> j) & 1;
+            o[i] = dl * (float)(lo + (hi << 4)) - ml;
+        }
+    }
+}
+
+// Requantize a Q5_K tensor → Q8_0 (host, once at load). Used for the qwen3moe ffn_down_exps slabs
+// that ship Q5_K (the grouped down GEMM supports Q4_K/Q8_0/Q5_0 but not Q5_K). Mirrors
+// convert_q4k_to_q8_0; preserves element order so the per-expert row-major [out_dim×in_dim] layout
+// is unchanged (in_dim=expert_ffn=768 = 24·32 ⇒ Q8_0 blocks never straddle a row boundary).
+static unsigned char* convert_q5k_to_q8_0(const unsigned char *src, int64_t n_elem) {
+    const int64_t n_super = n_elem / 256;
+    const int64_t n_q8blk = n_elem / 32;
+    unsigned char *dst = (unsigned char *)malloc((size_t)n_q8blk * 34);
+    if (!dst) return NULL;
+    float f[256];
+    for (int64_t s = 0; s < n_super; s++) {
+        dequant_q5_k_superblock(src + (size_t)s * 176, f);
         for (int sb = 0; sb < 8; sb++) {
             float amax = 0.0f;
             for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(f[sb * 32 + j]));
@@ -4432,17 +4555,21 @@ gemma4_engine_t* gemma4_engine_create(
         snprintf(tname, sizeof(tname), "blk.%d.post_attention_norm.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].post_attn_norm);
 
-        snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
-        LOAD_TENSOR_OFFSET(tname, layers[l].ffn_gate);
-        LOAD_WT_FMT(tname, layers[l].fmt_gate);
+        // Qwen3-MoE has NO dense FFN tensors (gate/up/down are 3D expert slabs loaded separately
+        // below as moe_*); skip the dense names so they don't warn-spam "tensor not found".
+        if (eng->cfg.arch != GEMMA4_ARCH_QWEN3MOE) {
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
+            LOAD_TENSOR_OFFSET(tname, layers[l].ffn_gate);
+            LOAD_WT_FMT(tname, layers[l].fmt_gate);
 
-        snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", l);
-        LOAD_TENSOR_OFFSET(tname, layers[l].ffn_up);
-        LOAD_WT_FMT(tname, layers[l].fmt_up);
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", l);
+            LOAD_TENSOR_OFFSET(tname, layers[l].ffn_up);
+            LOAD_WT_FMT(tname, layers[l].fmt_up);
 
-        snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
-        LOAD_TENSOR_OFFSET(tname, layers[l].ffn_down);
-        LOAD_WT_FMT(tname, layers[l].fmt_down);
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
+            LOAD_TENSOR_OFFSET(tname, layers[l].ffn_down);
+            LOAD_WT_FMT(tname, layers[l].fmt_down);
+        }
 
         snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].ffn_norm);
@@ -4881,6 +5008,121 @@ gemma4_engine_t* gemma4_engine_create(
         if (eng->n_wt_override)
             fprintf(stderr, "fucina: requantized %d off-format ffn_down tensor(s) Q4_1->Q4_0\n",
                     eng->n_wt_override);
+    }
+
+    // ── Q5_K bulk-weight requant → Q8_0 (Qwen3 UD mixed-precision attention) ──────────────
+    // A few attention projections (attn_q/k/v/output) ship Q5_K, which has no native GEMV/dequant
+    // kernel. Requantize each to Q8_0 into its own device buffer + register a pointer override, then
+    // rewrite the per-tensor fmt to FORMAT_Q8_0 so every read site (gemv_w/dq_gemm/gemv_batched_w)
+    // handles it unchanged. Fires only when a bulk weight is FORMAT_Q5_K → Gemma/Q4_K_M models are
+    // byte-unchanged (no Q5_K tensors). Source bytes come from the mmap'd GGUF.
+    if (eng->gguf_data) {
+        int n_q5k_bulk = 0;
+        char tn[128];
+        const char *suf[] = {"attn_q","attn_k","attn_v","attn_output"};
+        uint8_t *fmtfields[4];
+        for (int l = 0; l < eng->cfg.n_layers; l++) {
+            fmtfields[0] = &eng->tensors.layers[l].fmt_q;
+            fmtfields[1] = &eng->tensors.layers[l].fmt_k;
+            fmtfields[2] = &eng->tensors.layers[l].fmt_v;
+            fmtfields[3] = &eng->tensors.layers[l].fmt_o;
+            for (int s = 0; s < 4; s++) {
+                if (*fmtfields[s] != (uint8_t)FORMAT_Q5_K) continue;
+                snprintf(tn, sizeof(tn), "blk.%d.%s.weight", l, suf[s]);
+                uint64_t off = 0, nel = 0; uint32_t gt = 0;
+                if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, tn, &off, &nel, &gt) != 0) continue;
+                if (gt != GGML_TYPE_Q5_K) continue;
+                unsigned char *q8 = convert_q5k_to_q8_0((const unsigned char*)(eng->gguf_data + off), (int64_t)nel);
+                if (!q8) { fprintf(stderr, "fucina: %s Q5_K->Q8_0 alloc failed\n", tn); continue; }
+                size_t q8bytes = (size_t)(nel / 32) * 34;
+                unsigned char *d_buf = NULL;
+                if (cudaMalloc(&d_buf, q8bytes) != cudaSuccess) {
+                    cudaGetLastError(); free(q8);
+                    fprintf(stderr, "fucina: %s Q8_0 cudaMalloc(%zu) failed\n", tn, q8bytes); continue;
+                }
+                cudaMemcpy(d_buf, q8, q8bytes, cudaMemcpyHostToDevice); free(q8);
+                if (eng->n_wt_override < (int)(sizeof(eng->wt_override_off)/sizeof(eng->wt_override_off[0]))) {
+                    eng->wt_override_off[eng->n_wt_override] = off;
+                    eng->wt_override_ptr[eng->n_wt_override] = d_buf;
+                    eng->n_wt_override++;
+                    *fmtfields[s] = (uint8_t)FORMAT_Q8_0;   // read as Q8_0 thereafter
+                    n_q5k_bulk++;
+                } else {
+                    fprintf(stderr, "fucina: weight override table full — %s NOT overridden\n", tn);
+                    cudaFree(d_buf);
+                }
+            }
+        }
+        if (n_q5k_bulk)
+            fprintf(stderr, "fucina: requantized %d Q5_K bulk attention tensor(s) -> Q8_0\n", n_q5k_bulk);
+    }
+
+    // ── Qwen3-MoE expert/router tensors ──────────────────────────────────
+    // Resolve the three 3D expert slabs (ffn_gate_exps / ffn_up_exps / ffn_down_exps) + the F32
+    // router (ffn_gate_inp) per layer. gate/up are uniformly Q4_K (grouped Q4_K GEMM). down is
+    // Q4_K on most layers and Q5_K on a few; the grouped down GEMM has no Q5_K path, so each Q5_K
+    // down slab is requantized to Q8_0 into its own device buffer (dispatched via the Q8_0 grouped
+    // GEMM). Offsets feed weight_fp8() (→ d_weights); requant reads the mmap'd GGUF bytes.
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3MOE) {
+        const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn, E = eng->cfg.n_experts;
+        eng->moe_gate_slab     = (int64_t)(H * EFFN / 256) * 144;   // Q4_K bytes/expert (gate/up)
+        eng->moe_up_slab       = eng->moe_gate_slab;
+        eng->moe_down_slab_q4k = (int64_t)(EFFN * H / 256) * 144;   // Q4_K bytes/expert (down)
+        eng->moe_down_slab_q8  = (int64_t)(EFFN * H / 32) * 34;     // Q8_0 bytes/expert (requant)
+        int ok = 1, n_q5k = 0;
+        char tn[128];
+        for (int l = 0; l < eng->cfg.n_layers; l++) {
+            uint64_t off = 0, nel = 0; uint32_t gt = 0;
+            #define MOE_FIND(suffix, dstoff, want_type, label) do { \
+                snprintf(tn, sizeof(tn), "blk.%d." suffix, l); \
+                if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, tn, &off, &nel, &gt) != 0) { \
+                    fprintf(stderr, "fucina: qwen3moe missing %s\n", tn); ok = 0; break; } \
+                if ((want_type) >= 0 && gt != (uint32_t)(want_type)) { \
+                    fprintf(stderr, "fucina: qwen3moe %s unexpected type %u (want %s)\n", tn, gt, label); ok = 0; break; } \
+                (dstoff) = off; \
+            } while (0)
+            MOE_FIND("ffn_gate_exps.weight", eng->moe_gate_exps[l], GGML_TYPE_Q4_K, "Q4_K");
+            MOE_FIND("ffn_up_exps.weight",   eng->moe_up_exps[l],   GGML_TYPE_Q4_K, "Q4_K");
+            MOE_FIND("ffn_gate_inp.weight",  eng->moe_router[l],    GGML_TYPE_F32,  "F32");
+            // ffn_down_exps: Q4_K (read native) or Q5_K (requant → Q8_0 device buffer).
+            snprintf(tn, sizeof(tn), "blk.%d.ffn_down_exps.weight", l);
+            if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, tn, &off, &nel, &gt) != 0) {
+                fprintf(stderr, "fucina: qwen3moe missing %s\n", tn); ok = 0; break;
+            }
+            eng->moe_down_exps[l] = off;
+            eng->moe_down_q8[l] = NULL;
+            if (gt == GGML_TYPE_Q4_K) {
+                // native — read from d_weights via weight_fp8.
+            } else if (gt == GGML_TYPE_Q5_K) {
+                int64_t n_elem = (int64_t)EFFN * H * E;
+                unsigned char *q8 = convert_q5k_to_q8_0((const unsigned char*)(eng->gguf_data + off), n_elem);
+                if (!q8) { fprintf(stderr, "fucina: qwen3moe %s Q5_K->Q8_0 alloc failed\n", tn); ok = 0; break; }
+                size_t q8bytes = (size_t)(n_elem / 32) * 34;
+                unsigned char *d_buf = NULL;
+                if (cudaMalloc(&d_buf, q8bytes) != cudaSuccess) {
+                    cudaGetLastError(); free(q8);
+                    fprintf(stderr, "fucina: qwen3moe %s Q8_0 cudaMalloc(%zu) failed\n", tn, q8bytes); ok = 0; break;
+                }
+                cudaMemcpy(d_buf, q8, q8bytes, cudaMemcpyHostToDevice);
+                free(q8);
+                eng->moe_down_q8[l] = d_buf;
+                n_q5k++;
+            } else {
+                fprintf(stderr, "fucina: qwen3moe %s unsupported down type %u (want Q4_K/Q5_K)\n", tn, gt);
+                ok = 0; break;
+            }
+            #undef MOE_FIND
+        }
+        if (ok) {
+            eng->moe_loaded = 1;
+            fprintf(stderr, "fucina: qwen3moe experts loaded — %d layers, %d experts, top-%d, "
+                    "expert_ffn %d; %d Q5_K down slab(s) requantized -> Q8_0\n",
+                    eng->cfg.n_layers, E, eng->cfg.n_experts_used, EFFN, n_q5k);
+        } else {
+            fprintf(stderr, "fucina: qwen3moe expert load FAILED — aborting\n");
+            gemma4_engine_destroy(eng);
+            return NULL;
+        }
     }
 
     // QAT Q4_0 model: convert the Q6_K (or Unsloth UD Q4_K) token_embd (= tied LM head) to a
@@ -5363,6 +5605,14 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_ffn_out);
     CUDA_FREE(eng->d_ffn_gate);
     CUDA_FREE(eng->d_ffn_up);
+    // Qwen3-MoE: per-layer requantized Q8_0 down slabs + forward scratch.
+    for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) CUDA_FREE(eng->moe_down_q8[l]);
+    CUDA_FREE(eng->d_moe_rlogits); CUDA_FREE(eng->d_moe_tki);  CUDA_FREE(eng->d_moe_tkw);
+    CUDA_FREE(eng->d_moe_eidx);    CUDA_FREE(eng->d_moe_ecs);  CUDA_FREE(eng->d_moe_count);
+    CUDA_FREE(eng->d_moe_coloff);  CUDA_FREE(eng->d_moe_cursor); CUDA_FREE(eng->d_moe_ones);
+    CUDA_FREE(eng->d_moe_xe);      CUDA_FREE(eng->d_moe_gate);  CUDA_FREE(eng->d_moe_up);
+    CUDA_FREE(eng->d_moe_act);     CUDA_FREE(eng->d_moe_oe);    CUDA_FREE(eng->d_moe_out);
+    CUDA_FREE(eng->d_moe_q8);      CUDA_FREE(eng->d_moe_q8d);   CUDA_FREE(eng->d_moe_q8s);
     CUDA_FREE(eng->d_norm);
     CUDA_FREE(eng->d_norm_w);
     CUDA_FREE(eng->d_residual);
