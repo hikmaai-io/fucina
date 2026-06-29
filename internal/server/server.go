@@ -531,8 +531,12 @@ func (s *Server) SetBatchEngine(eng BatchEngine) bool {
 	if slots < 1 {
 		slots = 1
 	}
-	// Queue depth: room for a backlog of waiting requests beyond the live slots.
-	depth := slots
+	// Queue depth: room for a backlog of waiting requests beyond the live slots. Sized
+	// generously (3× the live-slot budget) so a concurrency BURST queues and is served
+	// in admission order rather than being shed with 503 — matching vLLM's behavior
+	// (the engine still processes Capacity() at a time; this only bounds the wait queue,
+	// not concurrency). The scheduler's ErrQueueFull still sheds load past this.
+	depth := 3 * slots
 	s.scheduler = batch.New(eng, depth)
 	s.scheduler.Start()
 	// The single-flight inflight bound (default 4) would cap concurrency below
