@@ -5272,6 +5272,7 @@ gemma4_engine_t* gemma4_engine_create(
                 // a shared prefix block stays valid for its whole cached lifetime).
                 if (eng->n_layers_sliding == 0) {
                     prefix_tree_init(&eng->glob_prefix, &eng->glob_pool, 2 * glob_blocks + 16);
+                    eng->prefix_cache_enabled = 1;   // default-on for the full-attention single-pool geometry
                 }
                 fprintf(stderr,
                     "fucina: paged KV ENABLED — ~%d concurrent seqs @ maxctx %d "
@@ -7431,6 +7432,18 @@ static int paged_prefill_qwen3(
 // first sampled token matches the token-by-token path. Returns 0 on success (and
 // writes *first_tok_out + sets s->n_tokens / s->n_sampled), -2 to fall back, -1 on
 // hard error.
+// Cache-aware GLOBAL block-table growth for a BATCH slot. When the cross-request
+// prefix cache is active, pull blocks via the refcounted allocator (free_stack
+// first, then LRU reclaim) so every block a slot holds is reference-counted,
+// registrable, and reclaimable; otherwise the plain pool allocator. The SLIDING
+// table always uses the plain allocator (the cache is global-pool only and gated
+// to the no-sliding geometry). NOT used by the single-flight eng->cur path.
+static inline int glob_table_ensure(gemma4_engine_t *eng, gemma4_seq *s, int n_tokens) {
+    if (eng->prefix_cache_enabled)
+        return prefix_table_ensure(&eng->glob_prefix, &eng->glob_pool, &s->glob_bt, n_tokens);
+    return paged_table_ensure(&eng->glob_pool, &s->glob_bt, n_tokens);
+}
+
 static int paged_prefill_batched(
     gemma4_engine_t *eng, gemma4_seq *s, const int32_t *tokens, int N,
     int32_t *first_tok_out)
@@ -7479,7 +7492,7 @@ static int paged_prefill_batched(
     // ── Reserve ALL N positions in the slot's paged tables ONCE (base stays 0;
     //    N<=window ⇒ no sliding recycle). Mirror of paged_slot_sync(pos=N-1).
     if (paged_table_ensure(&eng->slid_pool, &s->slid_bt, N) != 0) return -2;
-    if (paged_table_ensure(&eng->glob_pool, &s->glob_bt, N) != 0) return -2;
+    if (glob_table_ensure(eng, s, N) != 0) return -2;
     if (paged_upload_blocks(&s->slid_bt, &s->d_slid_blocks, &s->d_slid_cap, stream) != 0) return -1;
     if (paged_upload_blocks(&s->glob_bt, &s->d_glob_blocks, &s->d_glob_cap, stream) != 0) return -1;
 
@@ -7762,7 +7775,7 @@ static int paged_prefill_qwen3(
     // expects. Qwen3 is all full-attention; only the global pool is written, but we ensure
     // both tables (paged_slot_sync maintains both during the subsequent decode).
     if (paged_table_ensure(&eng->slid_pool, &s->slid_bt, N) != 0) return -2;
-    if (paged_table_ensure(&eng->glob_pool, &s->glob_bt, N) != 0) return -2;
+    if (glob_table_ensure(eng, s, N) != 0) return -2;
     if (paged_upload_blocks(&s->slid_bt, &s->d_slid_blocks, &s->d_slid_cap, stream) != 0) return -1;
     if (paged_upload_blocks(&s->glob_bt, &s->d_glob_blocks, &s->d_glob_cap, stream) != 0) return -1;
     {
@@ -9364,7 +9377,7 @@ static int paged_slot_sync(gemma4_engine_t *eng, gemma4_seq *s, int pos) {
     if (!eng->paged_enabled) return -1;
     if (paged_table_ensure(&eng->slid_pool, &s->slid_bt, pos + 1) != 0) return -1;
     paged_table_advance_sliding(&eng->slid_pool, &s->slid_bt, pos + 1, GEMMA4_SLIDING_WINDOW);
-    if (paged_table_ensure(&eng->glob_pool, &s->glob_bt, pos + 1) != 0) return -1;
+    if (glob_table_ensure(eng, s, pos + 1) != 0) return -1;
     if (paged_upload_blocks(&s->slid_bt, &s->d_slid_blocks, &s->d_slid_cap, eng->stream) != 0) return -1;
     if (paged_upload_blocks(&s->glob_bt, &s->d_glob_blocks, &s->d_glob_cap, eng->stream) != 0) return -1;
     return 0;
@@ -9786,6 +9799,38 @@ extern "C" int gemma4_engine_seq_add(
     gemma4_seq *one[1] = { s };
     int32_t last_tok = 0;
 
+    // ── Cross-request prefix cache (RadixAttention): adopt the longest cached
+    //    FULL-block prefix of this prompt (read-only, refcounted) and prefill only
+    //    the divergent suffix. Gated to the full-attention single-pool geometry. A
+    //    miss (nshared==0) falls through to the normal fast/slow prefill below,
+    //    byte-for-byte unchanged. Shared blocks are immutable (full + already
+    //    written) so reuse is lossless and needs no copy-on-write.
+    int pc_nshared = 0;
+    if (eng->prefix_cache_enabled) {
+        int max_share = (n_prompt - 1) / PAGED_KV_BLOCK_TOKENS;   // always leave >=1 suffix token to forward
+        if (max_share > 0 && paged_table_reserve(&s->glob_bt, max_share) == 0) {
+            pc_nshared = prefix_lookup(&eng->glob_prefix, prompt, n_prompt,
+                                       s->glob_bt.blocks, max_share);
+            s->glob_bt.n = pc_nshared; s->glob_bt.base = 0;
+        }
+    }
+    if (pc_nshared > 0) {
+        int shared_tok = pc_nshared * PAGED_KV_BLOCK_TOKENS;
+        s->n_tokens = shared_tok;
+        // The sliding table is never read on this geometry; start it past the
+        // shared region so it never allocates blocks for the reused prefix.
+        s->slid_bt.base = shared_tok; s->slid_bt.n = 0;
+        if (gemma4_engine_seq_prefill_chunk(eng, slot, prompt + shared_tok,
+                                            n_prompt - shared_tok, /*do_sample=*/1,
+                                            first_token_out) != 0) {
+            gemma4_engine_seq_remove(eng, slot); return -1;
+        }
+        // Register this seq's full prompt blocks (shared ones skipped inside) so
+        // concurrent/later requests reuse them.
+        prefix_register(&eng->glob_prefix, prompt, n_prompt / PAGED_KV_BLOCK_TOKENS, s->glob_bt.blocks);
+        return slot;
+    }
+
     // ── Phase 4: SINGLE-PASS paged prefill (default ON). Processes the whole prompt
     //    in ONE weight pass via paged_prefill_batched instead of token-by-token. It
     //    is gated (fresh slot, N<=window, supported format) and returns -2 to fall
@@ -9807,6 +9852,9 @@ extern "C" int gemma4_engine_seq_add(
                 fprintf(stderr, "fucina: seq_add: fast-prefill CUDA error: %s\n", cudaGetErrorString(e));
                 gemma4_engine_seq_remove(eng, slot); return -1;
             }
+            // Register the cold-prefilled full prompt blocks so later requests reuse them.
+            if (eng->prefix_cache_enabled)
+                prefix_register(&eng->glob_prefix, prompt, n_prompt / PAGED_KV_BLOCK_TOKENS, s->glob_bt.blocks);
             if (first_token_out) *first_token_out = ft;
             return slot;
         }
@@ -9840,6 +9888,8 @@ extern "C" int gemma4_engine_seq_add(
     { cudaError_t e = cudaGetLastError();
       if (e != cudaSuccess) { fprintf(stderr, "fucina: seq_add: post-prefill CUDA error: %s\n", cudaGetErrorString(e));
                               gemma4_engine_seq_remove(eng, slot); return -1; } }
+    if (eng->prefix_cache_enabled)
+        prefix_register(&eng->glob_prefix, prompt, n_prompt / PAGED_KV_BLOCK_TOKENS, s->glob_bt.blocks);
     if (first_token_out) *first_token_out = last_tok;
     return slot;
 }
@@ -10079,7 +10129,7 @@ static int step_batch_spec_impl(
         gemma4_seq *s = act[i];
         int pos = s->n_tokens, K = D[i] + 1;
         int okp = (paged_table_ensure(&eng->slid_pool, &s->slid_bt, pos + K) == 0 &&
-                   paged_table_ensure(&eng->glob_pool, &s->glob_bt, pos + K) == 0) ? 0 : -1;
+                   glob_table_ensure(eng, s, pos + K) == 0) ? 0 : -1;
         if (okp == 0) {
             // Recycle sliding by the COMMITTED pos only, so every draft row's window stays
             // mapped (draft positions are within their own window of pos..pos+K-1).
@@ -10169,7 +10219,14 @@ extern "C" void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot) {
     if (!eng || slot < 0 || slot >= GEMMA4_MAX_SEQS) return;
     gemma4_seq *s = &eng->slots[slot];
     paged_table_release(&eng->slid_pool, &s->slid_bt);
-    paged_table_release(&eng->glob_pool, &s->glob_bt);
+    if (eng->prefix_cache_enabled) {
+        // Decrement refcounts: a registered block at refcount 0 stays cached
+        // (EVICTABLE, re-hittable); a private/tail block returns to the pool.
+        prefix_release(&eng->glob_prefix, &eng->glob_pool, s->glob_bt.blocks, s->glob_bt.n);
+        s->glob_bt.n = 0; s->glob_bt.base = 0;
+    } else {
+        paged_table_release(&eng->glob_pool, &s->glob_bt);
+    }
     s->n_tokens = 0; s->used = 0;
     s->mtp_h_valid = 0;   // recurrence does not survive slot reuse
     // d_slid_blocks/d_glob_blocks and d_mtp_h device buffers are retained for slot reuse.
