@@ -28,7 +28,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
-        qwen3moe-parity-test qwen3moe-spec-test qwen3-suffix-test \
+        qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -50,6 +50,7 @@ lib: cuda/libfucina.a
 # a stale cubin built with the old flags into libfucina.a.
 
 cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh \
+                       cuda/gemma4_config.h cuda/gemma4_detect.h \
                        cuda/paged_kv.h cuda/paged_kv_device.cuh cuda/paged_prefix.h Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
 
@@ -87,10 +88,21 @@ cuda/test_engine: cuda/test_engine.cu cuda/libfucina.a
 
 # ─── Testing ────────────────────────────────────────────────────────────
 # Full test suite: pure-Go unit tests, cgo-dependent tests (needs the CUDA
-# archive), then the binary's built-in self-tests on the GPU.
-test: fucina go-test go-test-cgo paged-kv-test paged-prefix-test
+# archive), the binary's built-in self-tests, then the session's CUDA
+# parity/determinism/lossless regression gates (gpu-gates) — all on the GPU.
+test: fucina go-test go-test-cgo paged-kv-test paged-prefix-test gpu-gates
 	./fucina --test-parser
 	CUDA_VISIBLE_DEVICES=0 ./fucina --test-cuda
+
+# ─── Aggregate GPU regression gates ─────────────────────────────────────
+# The Qwen3-dense / Qwen3-MoE / spec / prefix / suffix / B=2-row-independence
+# correctness gates introduced this session. Each is a standalone target, but
+# none was a prerequisite of `test`, so all could be silently forgotten. This
+# umbrella chains them so a regression in any cannot pass unnoticed. Requires
+# the Qwen3 dense + MoE GGUFs (override with MODEL= / QWEN3MOE_MODEL=) and a
+# GPU; run each invocation under the shared GPU flock.
+gpu-gates: qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-prefix-test qwen3-suffix-test
+	@echo "gpu-gates: all Qwen3-dense/MoE/spec/prefix/suffix/B=2 regression gates passed"
 
 # ─── Paged-KV allocator unit test (host-only, no GPU) ───────────────────
 # Pure integer bookkeeping for the continuous-batching paged KV cache; runs on
@@ -153,6 +165,18 @@ qwen3moe-spec-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3moe_spec \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	/tmp/fucina_qwen3moe_spec $(QWEN3MOE_MODEL)
+
+# ─── Qwen3-MoE B=2 cross-sequence row-independence (GPU) ────────────────
+# The atomicAdd-scatter nondeterminism bug only surfaced at B>=2 with DIVERGENT rows;
+# single-seq parity missed it entirely. This batches two sequences at different
+# trajectory positions in ONE step_batch(B=2) and asserts each row continues
+# independently (row0==single-seq next, row1==trajectory[3], rows differ) — the
+# direct gate for the deterministic dg_moe_route_inv/dg_moe_reduce combine.
+qwen3moe-one-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3moe_one.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3moe_one \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	/tmp/fucina_qwen3moe_one $(QWEN3MOE_MODEL)
 
 # ─── Qwen3 cross-request prefix cache losslessness (GPU) ────────────────
 # Proves cache-served requests (shared-prefix reuse) produce a greedy token stream
