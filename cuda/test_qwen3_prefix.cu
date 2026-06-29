@@ -51,6 +51,9 @@ int main(int argc, char **argv) {
     const char *path = (argc > 1) ? argv[1]
         : "/opt/spark/models/Qwen3-8B-abliterated.Q4_K_M.gguf";
     setenv("FUCINA_PAGED_KV", "1", 1);
+    // Shrink the global pool so the eviction section below actually forces LRU
+    // reclaim with a handful of distinct prompts (48 glob blocks at maxseqs=2).
+    setenv("FUCINA_PAGED_MAXSEQS", "2", 1);
 
     // A deterministic >=512-token prompt (>= 2 full 256-token blocks, so >=1 block is
     // shareable while a non-trivial suffix is recomputed). Values are arbitrary valid ids.
@@ -118,8 +121,41 @@ int main(int argc, char **argv) {
         rc |= cmp_stream("concurrent B", cold, cb_);
     }
 
+    // (4) EVICTION — fill the (shrunk) pool with distinct cached prompts until LRU
+    //     reclaim recycles physical blocks, then re-run the first (now-evicted) prompt
+    //     and assert it recomputes bit-identically. Catches device-side corruption from
+    //     reusing a recycled block id.
+    {
+        const int ND = 30;             // distinct 2-block prompts; > pool/2 forces eviction
+        auto mkd = [&](int d, int32_t *p) {
+            for (int i = 0; i < NP; i++)
+                p[i] = (int32_t)(((((uint32_t)d * 2654435761u) ^ (i * 1103515245u + 12345u)) >> 8) % 30000u + 100u);
+        };
+        int32_t d0[NP];   mkd(0, d0);
+        int32_t cold_d0[1 + STEPS];
+        gemma4_engine_set_prefix_cache(eng, 0);
+        if (run_seq(eng, d0, NP, cold_d0) < 0) { fprintf(stderr, "evict cold d0 failed\n"); return 2; }
+        gemma4_engine_set_prefix_cache(eng, 1);
+
+        uint64_t lkA, hbA, cbA, evA; gemma4_engine_prefix_cache_stats(eng, &lkA, &hbA, &cbA, &evA);
+        int32_t tmp[1 + STEPS], buf[NP];
+        for (int d = 0; d < ND; d++) { mkd(d, buf); if (run_seq(eng, buf, NP, tmp) < 0) { fprintf(stderr, "evict run %d failed\n", d); return 2; } }
+        uint64_t lkB, hbB, cbB, evB; gemma4_engine_prefix_cache_stats(eng, &lkB, &hbB, &cbB, &evB);
+        long evicted = (long)(evB - evA);
+        if (evicted <= 0) {
+            fprintf(stderr, "FAIL: eviction never triggered (evictions delta=%ld) — pool too large for the stress\n", evicted);
+            rc |= 1;
+        } else {
+            printf("  OK  forced %ld LRU evictions across %d distinct prompts\n", evicted, ND);
+        }
+        // d0 is the oldest released entry → evicted; re-running it must recompute losslessly.
+        int32_t warm_d0[1 + STEPS];
+        if (run_seq(eng, d0, NP, warm_d0) < 0) { fprintf(stderr, "evict re-run d0 failed\n"); return 2; }
+        rc |= cmp_stream("post-evict d0", cold_d0, warm_d0);
+    }
+
     gemma4_engine_destroy(eng);
-    if (rc == 0) printf("PASS — prefix cache is lossless (cold == cache-served, concurrent shared)\n");
+    if (rc == 0) printf("PASS — prefix cache is lossless (cold == cache-served, concurrent shared, post-eviction)\n");
     else         printf("FAIL — prefix cache diverged from cold reference\n");
     return rc ? 1 : 0;
 }
