@@ -8211,17 +8211,28 @@ static int paged_prefill_qwen3(
         free(h_wpos);
     }
     {
-        // N rows, each writing position base+r of THIS one sequence (replicated view).
-        PagedSeqView *hvg = (PagedSeqView*)malloc((size_t)N*sizeof(PagedSeqView));
-        if (!hvg) return -1;
-        PagedSeqView vg; vg.block_table = s->d_glob_blocks; vg.n_blocks = s->glob_bt.n;
-        vg.base = s->glob_bt.base; vg.n_tokens = base + N;
-        for (int r = 0; r < N; r++) hvg[r] = vg;
-        cudaMemcpyAsync(eng->d_pf_views_glob, hvg, (size_t)N*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
-        cudaStreamSynchronize(stream);   // hvg consumed by the async copy before free
-        free(hvg);
+        // Two N-row view arrays, built + uploaded ONCE (they do NOT vary by layer):
+        //  - d_pf_views_glob: the WRITE view, n_tokens = base+N (the write ignores n_tokens;
+        //    every row writes its own position base+r via d_wpos).
+        //  - d_pf_views_slid (unused by Qwen3 — no sliding): the per-row ATTENTION view with
+        //    the CAUSAL bound n_tokens = base+r+1, so suffix query r attends [0..base+r].
+        // Hoisting these out of the per-layer chunk loop avoids 36*ceil(N/16) synchronous
+        // pageable view memcpys (the dominant cost of the naive per-chunk upload).
+        PagedSeqView *hvw = (PagedSeqView*)malloc((size_t)N*sizeof(PagedSeqView));
+        PagedSeqView *hva = (PagedSeqView*)malloc((size_t)N*sizeof(PagedSeqView));
+        if (!hvw || !hva) { free(hvw); free(hva); return -1; }
+        for (int r = 0; r < N; r++) {
+            hvw[r].block_table = s->d_glob_blocks; hvw[r].n_blocks = s->glob_bt.n;
+            hvw[r].base = s->glob_bt.base; hvw[r].n_tokens = base + N;
+            hva[r] = hvw[r]; hva[r].n_tokens = base + r + 1;
+        }
+        cudaMemcpyAsync(eng->d_pf_views_glob, hvw, (size_t)N*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(eng->d_pf_views_slid, hva, (size_t)N*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream);   // hvw/hva consumed by the async copies before free
+        free(hvw); free(hva);
     }
     PagedWriteBatch wb_glob; wb_glob.seqs = eng->d_pf_views_glob; wb_glob.write_pos = d_wpos; wb_glob.n_rows = N;
+    PagedSeqView *d_att_views = eng->d_pf_views_slid;   // per-row causal attention views (base>0)
 
     cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0, stream);
@@ -8312,13 +8323,7 @@ static int paged_prefill_qwen3(
                 pk, pv, d_k, d_v, wb_glob, PAGED_KV_BLOCK_TOKENS, okv);
             for (int c0 = 0; c0 < N; c0 += GEMMA4_MAX_SEQS) {
                 int cn = (N - c0 < GEMMA4_MAX_SEQS) ? (N - c0) : GEMMA4_MAX_SEQS;
-                PagedSeqView hv[GEMMA4_MAX_SEQS];
-                for (int j = 0; j < cn; j++) {
-                    hv[j].block_table = s->d_glob_blocks; hv[j].n_blocks = s->glob_bt.n;
-                    hv[j].base = s->glob_bt.base; hv[j].n_tokens = base + c0 + j + 1;
-                }
-                cudaMemcpyAsync(eng->d_ms_views_glob, hv, (size_t)cn*sizeof(PagedSeqView),
-                                cudaMemcpyHostToDevice, stream);
+                PagedSeqView *views_c = d_att_views + c0;   // prebuilt causal views for this chunk
                 int longest = base + c0 + cn;     // longest row's context (exclusive bound)
                 int g_splits = (longest + GEMMA4_GLOBAL_SPLIT_CHUNK - 1) / GEMMA4_GLOBAL_SPLIT_CHUNK;
                 if (g_splits < 1) g_splits = 1;
@@ -8328,17 +8333,17 @@ static int paged_prefill_qwen3(
                 if (nkv == 8) {
                     paged_global_attn_splitk_batched<32, 8, 128, GEMMA4_GLOBAL_MAX_SPLITS>
                         <<<dim3(g_splits, cn), 32*32, 0, stream>>>(
-                            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q_c, pk, pv, eng->d_ms_views_glob,
+                            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q_c, pk, pv, views_c,
                             GEMMA4_GLOBAL_SPLIT_CHUNK, PAGED_KV_BLOCK_TOKENS, okv);
                 } else {   // nkv == 4 (Qwen3-MoE)
                     paged_global_attn_splitk_batched<32, 4, 128, GEMMA4_GLOBAL_MAX_SPLITS>
                         <<<dim3(g_splits, cn), 32*32, 0, stream>>>(
-                            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q_c, pk, pv, eng->d_ms_views_glob,
+                            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q_c, pk, pv, views_c,
                             GEMMA4_GLOBAL_SPLIT_CHUNK, PAGED_KV_BLOCK_TOKENS, okv);
                 }
                 paged_flash_decode_combine_batched<32, GEMMA4_GLOBAL_MAX_SPLITS>
                     <<<dim3(HEADS, cn), hd, 0, stream>>>(
-                        att_c, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, eng->d_ms_views_glob,
+                        att_c, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, views_c,
                         hd, /*window=*/0, GEMMA4_GLOBAL_SPLIT_CHUNK);
             }
         }
