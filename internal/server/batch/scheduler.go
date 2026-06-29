@@ -140,6 +140,31 @@ type ChunkPrefillEngine interface {
 	PrefillChunk(slot int, chunk []int32, last bool) (first int32, err error)
 }
 
+// FusedPrefillEngine is the optional FUSED prefill+decode extension (Stage 18). When the
+// concrete engine implements it, the scheduler combines a decode step over ALL active slots
+// with the ingestion of ONE prefilling sequence's next chunk into a SINGLE engine call, so an
+// arriving prompt's prefill never stalls the active sequences' decode (true vLLM-style chunked
+// prefill + continuous batching: the prefill rows ride along in the same forward as the decode
+// rows). It is a refinement of ChunkPrefillEngine: OpenSeq still reserves the slot, but instead
+// of the separate PrefillChunk + StepBatch of a normal pass, StepBatchFused does both at once.
+//
+// LOSSLESSNESS (cardinal): the decode half MUST be byte-identical to a plain StepBatch of the
+// same rows WITHOUT the co-batched prefill, and the prefill half byte-identical to PrefillChunk —
+// the two are independent given each row's (token, position, block table), so neither perturbs
+// the other. MaxFusedRows() == 0 means fused is unavailable (wrong arch / disabled), and the
+// scheduler keeps the engine on the plain ChunkPrefillEngine interleave path.
+type FusedPrefillEngine interface {
+	ChunkPrefillEngine
+	// StepBatchFused decodes every slot in decSlots (feeding decInputs[i] to decSlots[i], one
+	// token per slot — decOut[i] is that token, or -1 if the slot hit its KV limit and must stop)
+	// AND appends pfChunk to pfSlot's KV at its current position. When last is true it additionally
+	// samples pfSlot's FIRST generated token and returns it in pfFirst. Both halves are lossless.
+	StepBatchFused(decSlots []int32, decInputs []int32, pfSlot int, pfChunk []int32, last bool) (decOut []int32, pfFirst int32, err error)
+	// MaxFusedRows is the hard per-pass row budget (decode rows + prefill rows). The scheduler
+	// sizes each prefill chunk so len(active)+len(chunk) <= MaxFusedRows. 0 disables fusion.
+	MaxFusedRows() int
+}
+
 // PrefixCacheStatsEngine is the optional observability hook for the cross-request
 // prefix cache: an engine that can report cumulative reuse counters. The scheduler
 // snapshots them lock-free for /metrics.
@@ -319,6 +344,14 @@ type Scheduler struct {
 	chunkSize int
 	chunkMin  int
 
+	// fused is the FUSED prefill+decode fast path (Stage 18): non-nil when the engine
+	// implements FusedPrefillEngine with a positive row budget. When set AND a prefill is in
+	// flight alongside active decode, the scheduler fuses one prefill chunk INTO the same forward
+	// as the decode step (stepFused), so the active sequences' decode never stalls while a new
+	// prompt is ingested. fusedRows is the hard per-pass row budget (decode rows + prefill rows).
+	fused     FusedPrefillEngine
+	fusedRows int
+
 	// prefixStats is the cross-request prefix-cache observability hook: non-nil when
 	// the engine implements PrefixCacheStatsEngine. The run loop (the sole engine
 	// caller) snapshots the engine counters into the atomics below each pass so
@@ -382,6 +415,17 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 		s.chunk = ce
 		s.chunkSize = defaultPrefillChunk
 		s.chunkMin = defaultPrefillChunkMin
+	}
+	// Fused prefill+decode is a DEFAULT-on refinement of chunked prefill: if the engine can run
+	// a decode step and a prefill chunk in ONE forward, a new prompt's prefill rides along with
+	// the active decode instead of taking its own (decode-stalling) pass. MaxFusedRows()==0
+	// means the engine opted out (wrong arch / FUCINA_NO_FUSED_PREFILL), so we stay on the plain
+	// chunked interleave path. Requires the chunked path (OpenSeq/PrefillChunk lifecycle).
+	if fe, ok := engine.(FusedPrefillEngine); ok && s.chunk != nil {
+		if rows := fe.MaxFusedRows(); rows > 0 {
+			s.fused = fe
+			s.fusedRows = rows
+		}
 	}
 	if ps, ok := engine.(PrefixCacheStatsEngine); ok {
 		s.prefixStats = ps
@@ -518,11 +562,19 @@ func (s *Scheduler) run() {
 		s.evictCancelled(active)
 		s.sweepCancelledPrefill(&prefill)
 
-		// 4. Advance ONE chunk of one prefilling sequence (round-robin). Paired
-		//    with the decode step below, this interleaves prefill and decode so a
-		//    long prompt's prefill never blocks the active sequences. A sequence
-		//    whose prompt finished prefilling is promoted to active here.
-		s.advancePrefill(active, &prefill)
+		// 4. Advance the prefill backlog. With the FUSED path (Stage 18) and BOTH a prefill in
+		//    flight AND active decode, stepFused ingests one prefill chunk INTO the same forward
+		//    as the decode step (so decode never stalls) — it does both steps 4 and 5 at once,
+		//    recorded in fusedThisPass so step 5 below is skipped. Otherwise advancePrefill commits
+		//    one chunk (round-robin) and the separate decode step 5 runs as before. A sequence whose
+		//    prompt finished prefilling is promoted to active in either path.
+		fusedThisPass := false
+		if s.fused != nil && len(prefill) > 0 && len(active) > 0 {
+			s.stepFused(active, &prefill)
+			fusedThisPass = true
+		} else {
+			s.advancePrefill(active, &prefill)
+		}
 
 		// If there is nothing to do, block instead of spinning. The scheduler is
 		// idle only when there is no active decode, no prefill in flight, and we
@@ -551,10 +603,13 @@ func (s *Scheduler) run() {
 		}
 
 		// 5. Build the decode batch from the active slots and run ONE step that
-		//    advances ALL of them together.
-		if !s.step(active) {
-			// Fatal engine error already handled inside step (all sequences
-			// evicted); fall through to re-check shutdown / new work.
+		//    advances ALL of them together — UNLESS stepFused already decoded them
+		//    this pass (fused prefill+decode), in which case decode is done.
+		if !fusedThisPass {
+			if !s.step(active) {
+				// Fatal engine error already handled inside step (all sequences
+				// evicted); fall through to re-check shutdown / new work.
+			}
 		}
 
 		// 6. Publish prefix-cache counters lock-free for /metrics. Done once per pass
@@ -771,6 +826,93 @@ func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
 	}
 	if s.deliver(active, sq, first) {
 		active[sq.slot] = sq
+	}
+}
+
+// stepFused runs ONE engine call (Stage 18) that decodes ALL active slots AND ingests the next
+// chunk of the prefilling sequence at the front of the backlog — the FUSED prefill+decode path.
+// It replaces the separate advancePrefill + step of a normal pass, so the active sequences' decode
+// never stalls while a new prompt is prefilled: the prefill rows ride along in the same forward as
+// the decode rows. The decode half is byte-identical to stepPlain; the prefill half is byte-identical
+// to advancePrefill's PrefillChunk. SPEC IS DISABLED on fused passes (the decode rows commit exactly
+// one token each, like stepPlain): the ≤MaxFusedRows row budget is already shared between decode rows
+// and prefill rows, leaving no room for the extra draft/verify rows speculation needs — and prefill is
+// a transient state, so decode returns to the spec path automatically once the prompt is fully
+// prefilled. Both paths are lossless w.r.t. greedy decode, so this changes only throughput, never tokens.
+func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) {
+	p := *prefill
+	pfSq := p[0]
+	toks := pfSq.req.Tokens
+	lo := pfSq.prefillPos
+
+	// Prefill-row budget: M = len(active) + L <= fusedRows. There is always room for L>=1 because
+	// the prefilling sequence holds a slot but contributes 0 decode rows, so len(active) <=
+	// slots-1 <= fusedRows-1 — except when an unusual concurrency mix saturates the row budget, in
+	// which case decode this pass alone and let the prefill resume when a decode slot frees.
+	room := s.fusedRows - len(active)
+	if room < 1 {
+		s.step(active)
+		return
+	}
+	hi := lo + room
+	if hi > len(toks) {
+		hi = len(toks)
+	}
+	last := hi == len(toks)
+
+	// Decode arrays (stable index order: out[i] ↔ slots[i]).
+	slots := make([]int32, 0, len(active))
+	inputs := make([]int32, 0, len(active))
+	for slot, sq := range active {
+		slots = append(slots, int32(slot))
+		inputs = append(inputs, sq.next)
+	}
+
+	decOut, pfFirst, err := s.fused.StepBatchFused(slots, inputs, pfSq.slot, toks[lo:hi], last)
+	if err != nil {
+		// A fused step failed. The engine ensures the prefill blocks FIRST and returns before
+		// committing ANY decode row on error, so the decode rows are uncommitted: evict just the
+		// prefilling sequence (the common cause is its KV exhausting) and run a plain decode this
+		// pass so the active sequences still progress. A genuine decode-forward failure then surfaces
+		// in s.step (which evicts the whole batch), matching stepPlain's behavior.
+		log.Printf("batch: StepBatchFused failed (slot %d, %d active): %v", pfSq.slot, len(active), err)
+		*prefill = p[1:]
+		s.evict(active, pfSq, Result{Reason: FinishError, Generated: pfSq.generated, Err: err})
+		s.step(active)
+		return
+	}
+
+	// Decode commit: scatter one token per slot (deliver handles stop/budget/cancel and the
+	// -1 KV-exhausted sentinel). Mirrors stepPlain.
+	if len(decOut) == len(slots) {
+		for i, slot := range slots {
+			sq := active[int(slot)]
+			if sq == nil {
+				continue // already evicted this pass (defensive)
+			}
+			s.deliver(active, sq, decOut[i])
+		}
+	} else {
+		log.Printf("batch: StepBatchFused returned %d decode tokens for %d slots", len(decOut), len(slots))
+	}
+
+	// Prefill advance/commit (mirrors advancePrefill's tail).
+	pfSq.prefillPos = hi
+	if !last {
+		// More prompt to go: rotate to the back so other prefills make progress too.
+		p = p[1:]
+		p = append(p, pfSq)
+		*prefill = p
+		return
+	}
+	// Prompt fully prefilled: leave the backlog, register its blocks, deliver the first token,
+	// and join active if it survives — exactly the one-shot/advancePrefill completion path.
+	*prefill = p[1:]
+	if s.prefixCommit != nil {
+		s.prefixCommit.PrefixCommit(pfSq.slot, pfSq.req.Tokens)
+	}
+	if s.deliver(active, pfSq, pfFirst) {
+		active[pfSq.slot] = pfSq
 	}
 }
 

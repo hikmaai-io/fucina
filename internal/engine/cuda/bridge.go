@@ -37,6 +37,7 @@ import "C"
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"runtime/cgo"
 	"sync"
@@ -697,6 +698,69 @@ func (e *Engine) SeqPrefillChunk(slot int, chunk []int32, last bool) (int32, err
 	return int32(first), nil
 }
 
+// StepBatchFused (Stage 18) runs ONE batched forward that DECODES every slot in decSlots
+// (feeding decInputs[i] to decSlots[i], one token per slot) AND ingests the next prefill
+// chunk (pfChunk) of the prefilling slot pfSlot, so the prompt's prefill never stalls the
+// active sequences' decode. The returned decOut is one token per decode slot (-1 = that slot
+// hit its KV limit, scheduler stops it). When last is true the prompt's first generated token
+// is returned in pfFirst. The decode half is byte-identical to StepBatch of the same rows; the
+// prefill half is byte-identical to SeqPrefillChunk. Qwen3 family only (the C ABI returns -2 for
+// other archs). decSlots may be empty (pure prefill chunk), though the scheduler always passes >=1.
+func (e *Engine) StepBatchFused(decSlots []int32, decInputs []int32, pfSlot int, pfChunk []int32, last bool) ([]int32, int32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(decSlots) != len(decInputs) {
+		return nil, 0, fmt.Errorf("fucina: step_batch_fused: %d slots vs %d inputs", len(decSlots), len(decInputs))
+	}
+	if len(pfChunk) == 0 {
+		return nil, 0, fmt.Errorf("fucina: step_batch_fused: empty prefill chunk")
+	}
+	bDec := len(decSlots)
+	if bDec+len(pfChunk) > maxBatchSeqs {
+		return nil, 0, fmt.Errorf("fucina: step_batch_fused: %d decode + %d prefill rows exceed max %d",
+			bDec, len(pfChunk), maxBatchSeqs)
+	}
+	out := make([]int32, bDec)
+	lens := make([]C.int, bDec)
+	cslots := make([]C.int, bDec)
+	var (
+		slotsPtr *C.int
+		toksPtr  *C.int32_t
+		outPtr   *C.int32_t
+		lensPtr  *C.int
+	)
+	if bDec > 0 {
+		for i, s := range decSlots {
+			cslots[i] = C.int(s)
+		}
+		slotsPtr = &cslots[0]
+		toksPtr = (*C.int32_t)(unsafe.Pointer(&decInputs[0]))
+		outPtr = (*C.int32_t)(unsafe.Pointer(&out[0]))
+		lensPtr = &lens[0]
+	}
+	doFinal := C.int(0)
+	if last {
+		doFinal = 1
+	}
+	var pfFirst C.int32_t
+	ret := C.gemma4_engine_step_batch_fused(
+		e.ptr,
+		slotsPtr, toksPtr, C.int(bDec),
+		C.int(pfSlot), (*C.int32_t)(unsafe.Pointer(&pfChunk[0])), C.int(len(pfChunk)), doFinal,
+		outPtr, lensPtr, &pfFirst,
+	)
+	if ret != 0 {
+		return nil, 0, fmt.Errorf("fucina: step_batch_fused failed (ret %d)", int(ret))
+	}
+	// Surface the per-row KV-exhausted sentinel: a row with len -1 stops gracefully.
+	for i := 0; i < bDec; i++ {
+		if int(lens[i]) < 0 {
+			out[i] = -1
+		}
+	}
+	return out, int32(pfFirst), nil
+}
+
 // StepBatch advances each slot in slots by one token (feeding inputs[i] to
 // slots[i]) in a single batched forward, returning one freshly sampled token per
 // slot. len(inputs) must equal len(slots).
@@ -978,6 +1042,23 @@ func (a *BatchAdapter) OpenSeq(prompt []int32, params batch.SeqParams) (slot int
 // so long prompts are prefilled interleaved with decode by default.
 func (a *BatchAdapter) PrefillChunk(slot int, chunk []int32, last bool) (int32, error) {
 	return a.eng.SeqPrefillChunk(slot, chunk, last)
+}
+
+// StepBatchFused (batch.FusedPrefillEngine) decodes every active slot AND ingests one
+// prefilling slot's next chunk in a SINGLE engine call — see Engine.StepBatchFused. Making the
+// adapter satisfy this interface is what turns on the Stage 18 fused prefill+decode scheduler path.
+func (a *BatchAdapter) StepBatchFused(decSlots []int32, decInputs []int32, pfSlot int, pfChunk []int32, last bool) ([]int32, int32, error) {
+	return a.eng.StepBatchFused(decSlots, decInputs, pfSlot, pfChunk, last)
+}
+
+// MaxFusedRows is the hard per-pass row budget (decode rows + prefill rows) for a fused step.
+// It returns 0 for non-Qwen3 archs (Gemma) so the scheduler keeps Gemma on its byte-identical
+// non-fused chunked path, and 0 when FUCINA_NO_FUSED_PREFILL is set (the pre-fusion baseline).
+func (a *BatchAdapter) MaxFusedRows() int {
+	if !a.eng.IsQwen3Family() || os.Getenv("FUCINA_NO_FUSED_PREFILL") != "" {
+		return 0
+	}
+	return maxBatchSeqs
 }
 
 // RemoveSeq frees a slot and updates the live-slot count.
