@@ -85,14 +85,14 @@ func (m *chunkMock) AddSeq(prompt []int32, _ SeqParams) (int, int32, error) {
 	return slot, m.acc[slot] + 1, nil
 }
 
-func (m *chunkMock) OpenSeq(_ SeqParams) (int, error) {
+func (m *chunkMock) OpenSeq(_ []int32, _ SeqParams) (int, int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.openCalls++
 	slot := m.allocSlot()
 	m.live[slot] = true
 	m.acc[slot] = 0
-	return slot, nil
+	return slot, 0, nil // mock has no prefix cache → nShared 0
 }
 
 func (m *chunkMock) PrefillChunk(slot int, chunk []int32, last bool) (int32, error) {

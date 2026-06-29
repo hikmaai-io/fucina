@@ -9790,7 +9790,7 @@ static int decode_multiseq_forward(
 // causality, hence bit-identical to the token-by-token path. Samples the first
 // generated token on the final row. Returns 0 / -1.
 static int prefill_suffix_batched(gemma4_engine_t *eng, gemma4_seq *s,
-                                  const int32_t *suffix, int M, int32_t *first_tok_out)
+                                  const int32_t *suffix, int M, int do_sample, int32_t *first_tok_out)
 {
     const int CH = GEMMA4_MAX_SEQS;
     gemma4_seq *rows[GEMMA4_MAX_SEQS];
@@ -9802,7 +9802,7 @@ static int prefill_suffix_batched(gemma4_engine_t *eng, gemma4_seq *s,
         int base = s->n_tokens;
         if (paged_slot_sync(eng, s, base + C - 1) != 0) return -1;   // grow block tables for this chunk
         for (int j = 0; j < C; j++) { rows[j] = s; positions[j] = base + j; }
-        int want_sample = (done + C >= M);                          // sample only the final suffix row
+        int want_sample = (do_sample && done + C >= M);             // sample only the final row, only if asked
         if (decode_multiseq_forward(eng, rows, suffix + done, positions, C, want_sample) != 0)
             return -1;
         if (want_sample)
@@ -9813,8 +9813,10 @@ static int prefill_suffix_batched(gemma4_engine_t *eng, gemma4_seq *s,
     }
     cudaStreamSynchronize(eng->stream);
     if (cudaGetLastError() != cudaSuccess) return -1;
-    s->n_sampled++;   // one token produced (RNG index advances once), matching token-by-token
-    if (first_tok_out) *first_tok_out = last_tok;
+    if (do_sample) {
+        s->n_sampled++;   // one token produced (RNG index advances once), matching token-by-token
+        if (first_tok_out) *first_tok_out = last_tok;
+    }
     return 0;
 }
 
@@ -9865,7 +9867,7 @@ extern "C" int gemma4_engine_seq_add(
         // token-by-token — otherwise a long suffix at decode speed would erase the
         // prefill saved by reusing the shared prefix.
         if (prefill_suffix_batched(eng, s, prompt + shared_tok,
-                                   n_prompt - shared_tok, first_token_out) != 0) {
+                                   n_prompt - shared_tok, /*do_sample=*/1, first_token_out) != 0) {
             gemma4_engine_seq_remove(eng, slot); return -1;
         }
         // Register this seq's full prompt blocks (shared ones skipped inside) so
@@ -9944,6 +9946,33 @@ extern "C" int gemma4_engine_seq_add(
 // prompt in bounded chunks via gemma4_engine_seq_prefill_chunk, interleaving those
 // chunks with decode steps of the other slots so a long prompt never blocks the
 // batch. Mirrors the slot-allocation + state-init prologue of gemma4_engine_seq_add.
+// Chunked-prefill open WITH cross-request prefix-cache adoption. Reserves a slot, adopts
+// the longest cached FULL-block prefix of `prompt` (read-only, refcounted) into the slot's
+// KV, and reports how many prompt tokens are already satisfied (*shared_out) so the
+// scheduler chunk-prefills ONLY the divergent suffix prompt[*shared_out:]. Without this,
+// routing short prompts to the chunked interleave path would re-prefill cached prefixes
+// and forfeit the prefix-cache win. Returns slot or -1.
+extern "C" int gemma4_engine_seq_open_prefix(
+    gemma4_engine_t *eng, const int32_t *prompt, int n_prompt, int *shared_out,
+    float temp, int top_k, float top_p, float min_p, uint64_t seed)
+{
+    if (shared_out) *shared_out = 0;
+    int slot = gemma4_engine_seq_open(eng, temp, top_k, top_p, min_p, seed);
+    if (slot < 0) return -1;
+    if (!eng->prefix_cache_enabled || !prompt || n_prompt <= 0) return slot;
+    gemma4_seq *s = &eng->slots[slot];
+    int max_share = (n_prompt - 1) / PAGED_KV_BLOCK_TOKENS;   // leave >=1 suffix token to prefill
+    if (max_share <= 0 || paged_table_reserve(&s->glob_bt, max_share) != 0) return slot;
+    int nshared = prefix_lookup(&eng->glob_prefix, prompt, n_prompt, s->glob_bt.blocks, max_share);
+    if (nshared <= 0) return slot;
+    int shared_tok = nshared * PAGED_KV_BLOCK_TOKENS;
+    s->glob_bt.n = nshared; s->glob_bt.base = 0;
+    s->n_tokens = shared_tok;
+    s->slid_bt.base = shared_tok; s->slid_bt.n = 0;   // slid never read on this geometry
+    if (shared_out) *shared_out = shared_tok;
+    return slot;
+}
+
 extern "C" int gemma4_engine_seq_open(
     gemma4_engine_t *eng, float temp, int top_k, float top_p, float min_p, uint64_t seed)
 {
@@ -9979,6 +10008,17 @@ extern "C" int gemma4_engine_seq_prefill_chunk(
     if (slot < 0 || slot >= GEMMA4_MAX_SEQS || !tokens || n <= 0) return -1;
     gemma4_seq *s = &eng->slots[slot];
     if (!s->used) return -1;
+
+    // FAST path (default): prefill the chunk in batched ≤GEMMA4_MAX_SEQS-row passes (one
+    // weight pass per ≤16 tokens) instead of token-by-token — bit-identical (the same
+    // ragged-causality the prefix cache uses). This is what makes short-prompt chunked
+    // prefill cheap enough to interleave with decode. FUCINA_NO_FAST_PREFILL /
+    // g_fucina_force_slow_prefill force the token-by-token path for the determinism self-test.
+    extern int g_fucina_force_slow_prefill;
+    static int no_fast_chunk = -1;
+    if (no_fast_chunk < 0) no_fast_chunk = (getenv("FUCINA_NO_FAST_PREFILL") != NULL);
+    if (!no_fast_chunk && !g_fucina_force_slow_prefill)
+        return prefill_suffix_batched(eng, s, tokens, n, do_sample, first_token_out);
 
     gemma4_seq *one[1] = { s };
     int32_t last_tok = 0;

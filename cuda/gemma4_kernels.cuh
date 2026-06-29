@@ -337,6 +337,12 @@ void gemma4_engine_prefix_commit(gemma4_engine_t *eng, int slot,
 //   stored params. Returns 0 on success, -1 on error (caller frees the slot).
 int  gemma4_engine_seq_open(gemma4_engine_t *eng,
                             float temp, int top_k, float top_p, float min_p, uint64_t seed);
+// As seq_open but adopts the longest cached prefix of `prompt` into the slot's KV and
+// reports the number of already-satisfied prompt tokens in *shared_out, so the chunked
+// path prefills only the divergent suffix (keeps the prefix-cache win on the interleave path).
+int  gemma4_engine_seq_open_prefix(gemma4_engine_t *eng, const int32_t *prompt, int n_prompt,
+                                   int *shared_out,
+                                   float temp, int top_k, float top_p, float min_p, uint64_t seed);
 int  gemma4_engine_seq_prefill_chunk(gemma4_engine_t *eng, int slot,
                                      const int32_t *tokens, int n,
                                      int do_sample, int32_t *first_token_out);

@@ -125,10 +125,12 @@ type SpecBatchEngine interface {
 // changes only WHEN work happens, never WHAT is generated.
 type ChunkPrefillEngine interface {
 	BatchEngine
-	// OpenSeq reserves a fresh slot with empty KV and stores params for on-device
-	// sampling, WITHOUT prefilling any tokens. err means no slot was available (no
-	// slot is consumed in that case).
-	OpenSeq(params SeqParams) (slot int, err error)
+	// OpenSeq reserves a fresh slot, adopts the longest cached prefix of prompt into
+	// its KV (cross-request prefix cache), and reports nShared = the number of prompt
+	// tokens already satisfied by that adopted prefix, so the caller chunk-prefills
+	// only prompt[nShared:]. It does NOT prefill the suffix. err means no slot was
+	// available (no slot is consumed in that case). nShared is 0 on a cache miss.
+	OpenSeq(prompt []int32, params SeqParams) (slot int, nShared int, err error)
 	// PrefillChunk appends chunk to slot's KV at the slot's current position. When
 	// last is true it additionally samples the sequence's FIRST generated token and
 	// returns it in first (the token the scheduler emits and feeds back as the next
@@ -160,9 +162,11 @@ type PrefixCommitEngine interface {
 // chunked (interleaved) prefill. Each pass commits at most one chunk for ONE prefilling
 // sequence AND runs one decode step, so decode of the active sequences keeps flowing
 // while a long prompt prefills. The engine's chunked prefill is token-by-token (one
-// weight pass per token), so the chunk size trades the new sequence's prefill latency
-// against the active sequences' per-step decode latency; 64 keeps both responsive.
-const defaultPrefillChunk = 64
+// weight pass per ≤GEMMA4_MAX_SEQS=16 tokens via the batched suffix-prefill), so the
+// chunk size trades the new sequence's prefill latency against the active sequences'
+// per-step decode latency; 256 = ~16 batched weight passes per chunk, still interleaving
+// a decode step between chunks while keeping per-chunk overhead amortized.
+const defaultPrefillChunk = 256
 
 // defaultPrefillChunkMin is the prompt length AT OR BELOW which prefill stays on the
 // one-shot AddSeq path (no chunking). It sits at the engine's one-shot fast-prefill cap
@@ -170,7 +174,14 @@ const defaultPrefillChunk = 64
 // single-pass prefill is used, so chunking never regresses it; ABOVE it the engine
 // already falls back to a blocking token-by-token prefill — exactly the case chunking
 // turns into an interleaved, non-batch-blocking one.
-const defaultPrefillChunkMin = 4096
+const defaultPrefillChunkMin = 256
+
+// maxOneShotAdmitsPerPass caps blocking one-shot AddSeq admissions per scheduler pass.
+// A one-shot AddSeq prefills synchronously before any decode step, so admitting a whole
+// burst in one pass serializes all their prefills ahead of decode (head-of-line TTFT
+// blowup at concurrency). Capping to 1 forces a decode step between admissions; longer
+// prompts use the chunked interleave path which is not capped (opening is cheap).
+const maxOneShotAdmitsPerPass = 1
 
 // MaxVerifyRows is the engine's per-step verify-row budget (GEMMA4_MAX_SEQS in the CUDA
 // engine): the speculative step flattens to Σ(1+len(drafts)) forward rows, which must not
@@ -619,6 +630,7 @@ func retryTimer(haveWaiters bool) <-chan time.Time {
 // decide whether to retry or park).
 func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Request) bool {
 	admitted := false
+	oneShotAdmits := 0 // blocking AddSeq admissions this pass (capped to interleave decode)
 	w := *waiting
 	// A prefilling sequence also holds a slot, so it counts against capacity.
 	held := func() int { return len(active) + len(*prefill) }
@@ -633,11 +645,12 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			continue
 		}
 
-		// Chunked path: a long prompt on a chunk-capable engine is opened now and
-		// prefilled in pieces (interleaved with decode) so it never blocks the
-		// batch. Short prompts fall through to the one-shot fast path below.
+		// Chunked path: a prompt on a chunk-capable engine is opened now (adopting any
+		// cached prefix) and prefilled in pieces interleaved with decode, so it never
+		// blocks the batch. Opening is cheap (no prefill), so it is NOT subject to the
+		// one-shot admit cap below. Very short prompts fall through to the one-shot path.
 		if s.chunk != nil && len(req.Tokens) > s.chunkMin {
-			slot, err := s.chunk.OpenSeq(req.Params)
+			slot, nShared, err := s.chunk.OpenSeq(req.Tokens, req.Params)
 			if err != nil {
 				log.Printf("batch: OpenSeq failed: %v", err)
 				reply(req, Result{Reason: FinishError, Err: fmt.Errorf("prefill open: %w", err)})
@@ -645,10 +658,19 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 				continue
 			}
 			sq := s.newSeq(req, slot)
+			sq.prefillPos = nShared // adopted prefix already in KV; chunk-prefill only the suffix
 			*prefill = append(*prefill, sq)
 			w = w[1:]
 			admitted = true
 			continue
+		}
+
+		// One-shot AddSeq runs a BLOCKING suffix-prefill to completion before any decode
+		// step. Cap it to maxOneShotAdmitsPerPass so a long burst of admissions cannot
+		// starve decode (head-of-line TTFT blowup): the rest wait for the next pass,
+		// which runs a decode step in between.
+		if oneShotAdmits >= maxOneShotAdmitsPerPass {
+			break
 		}
 
 		slot, first, err := s.engine.AddSeq(req.Tokens, req.Params)
@@ -662,6 +684,7 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		sq := s.newSeq(req, slot)
 		w = w[1:]
 		admitted = true // a slot was consumed (progress), even if it self-evicts below
+		oneShotAdmits++
 
 		// Deliver the first (prefill-sampled) token immediately and apply the
 		// same stop/budget bookkeeping a decode step would, so a one-token
@@ -739,6 +762,12 @@ func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
 	// Prompt fully prefilled: leave the backlog and behave exactly like the one-shot
 	// admit path — deliver the first sampled token and join active if it survives.
 	*prefill = p[1:]
+	// Register the prompt's full blocks so concurrent/later requests reuse them (the
+	// one-shot AddSeq path registers inside the engine; the chunked path does it here
+	// from the committed prompt). Idempotent; adopted blocks are skipped.
+	if s.prefixCommit != nil {
+		s.prefixCommit.PrefixCommit(sq.slot, sq.req.Tokens)
+	}
 	if s.deliver(active, sq, first) {
 		active[sq.slot] = sq
 	}

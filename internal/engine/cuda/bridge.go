@@ -637,6 +637,29 @@ func (e *Engine) SeqOpen(p batch.SeqParams) (int, error) {
 	return int(id), nil
 }
 
+// SeqOpenPrefix opens a chunked-prefill slot AND adopts the longest cached prefix of
+// prompt into its KV, returning the slot and the number of prompt tokens already
+// satisfied by the adopted prefix (so the scheduler chunk-prefills only the divergent
+// suffix). Keeps the prefix-cache win on the interleaved (short-prompt) path.
+func (e *Engine) SeqOpenPrefix(prompt []int32, p batch.SeqParams) (slot int, nShared int, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var pp *C.int32_t
+	if len(prompt) > 0 {
+		pp = (*C.int32_t)(unsafe.Pointer(&prompt[0]))
+	}
+	var shared C.int
+	id := C.gemma4_engine_seq_open_prefix(
+		e.ptr, pp, C.int(len(prompt)), &shared,
+		C.float(p.Temperature), C.int(p.TopK), C.float(p.TopP), C.float(p.MinP),
+		C.uint64_t(p.Seed),
+	)
+	if id < 0 {
+		return 0, 0, fmt.Errorf("fucina: seq_open_prefix failed (no slot / not paged)")
+	}
+	return int(id), int(shared), nil
+}
+
 // SeqPrefillChunk appends chunk to an open slot's paged KV at its current position.
 // When last is true it samples and returns the sequence's first generated token; the
 // paged KV and first token after the final chunk are byte-identical to a one-shot
@@ -931,13 +954,13 @@ func (a *BatchAdapter) StepBatchSpec(reqs []batch.SpecReq) ([][]int32, error) {
 // OpenSeq reserves a slot for chunked prefill (batch.ChunkPrefillEngine) and records
 // it so Capacity() stays accurate — the slot is held from open, through the chunked
 // prefill, into the decode batch, until RemoveSeq.
-func (a *BatchAdapter) OpenSeq(params batch.SeqParams) (int, error) {
-	slot, err := a.eng.SeqOpen(params)
+func (a *BatchAdapter) OpenSeq(prompt []int32, params batch.SeqParams) (slot int, nShared int, err error) {
+	slot, nShared, err = a.eng.SeqOpenPrefix(prompt, params)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	a.active++
-	return slot, nil
+	return slot, nShared, nil
 }
 
 // PrefillChunk appends the next prompt chunk to an open slot (see Engine.SeqPrefillChunk).
