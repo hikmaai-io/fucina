@@ -3606,6 +3606,11 @@ struct gemma4_engine {
     __nv_bfloat16 *d_q35_pb;                         // BF16 softmax probs [NQ*N*N]
     float         *d_q35_scores;                     // FP32 QKᵀ scores [NQ*N*N]
     int            d_q35_attn_cap;                   // N this attn scratch is sized for (0=off)
+    // Resident BF16 prefill-weight cache: dequant each projection ONCE, reuse across prefills
+    // (kills the per-prefill ~45% dequant cost). Auto-enabled when device memory allows; on OOM
+    // it self-disables and the per-tile dequant fallback runs. [layer][WC_* slot].
+    __nv_bfloat16 *d_q35_wc[GEMMA4_CAP_LAYERS][10];
+    int            q35_wcache_on;                    // 1 = cache prefill weights in BF16
     cudaGraphExec_t q35_graph[GEMMA4_MAX_SEQS + 1];
     int      q35_graph_failed;                // global disable (env or capture failure)
     uint64_t q35_graph_logged;
@@ -4647,7 +4652,9 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_q35_wbf16[0] = NULL; eng->d_q35_wbf16[1] = NULL; eng->d_q35_xbf16 = NULL;
     eng->d_q35_qb = NULL; eng->d_q35_kb = NULL; eng->d_q35_vb = NULL;
     eng->d_q35_kbx = NULL; eng->d_q35_vbx = NULL; eng->d_q35_pb = NULL;
-    eng->d_q35_scores = NULL; eng->d_q35_attn_cap = 0;
+    eng->d_q35_scores = NULL; eng->d_q35_attn_cap = 0; eng->q35_wcache_on = 0;
+    for (int l = 0; l < GEMMA4_CAP_LAYERS; l++)
+        for (int p = 0; p < 10; p++) eng->d_q35_wc[l][p] = NULL;
     eng->q35_graph_failed = 0; eng->q35_graph_logged = 0;
     for (int b = 0; b <= GEMMA4_MAX_SEQS; b++) eng->q35_graph[b] = NULL;
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
@@ -6185,6 +6192,8 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_q35_qb); CUDA_FREE(eng->d_q35_kb); CUDA_FREE(eng->d_q35_vb);
     CUDA_FREE(eng->d_q35_kbx); CUDA_FREE(eng->d_q35_vbx); CUDA_FREE(eng->d_q35_pb);
     CUDA_FREE(eng->d_q35_scores);
+    for (int l = 0; l < GEMMA4_CAP_LAYERS; l++)
+        for (int p = 0; p < 10; p++) CUDA_FREE(eng->d_q35_wc[l][p]);
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -15674,6 +15683,17 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
             cudaFuncAttributeMaxDynamicSharedMemorySize, maxctx * (int)sizeof(float)) == cudaSuccess;
     if (!ok) { fprintf(stderr, "fucina: qwen35 M4 scratch alloc/opt-in failed\n"); return -1; }
     if (getenv("FUCINA_NO_BATCHED_GRAPH")) eng->q35_graph_enabled = 0;
+    // Resident BF16 prefill-weight cache: kills the per-prefill ~45% dequant cost at the price of
+    // ~2x(weight bytes) BF16 (≈18 GB for 9B). Default-on ONLY when device memory comfortably
+    // allows (memory-constrained clients keep the per-tile dequant). Env force: 1=on, 0=off.
+    {
+        size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb);
+        const size_t need = (size_t)2 * eng->cfg.n_layers * 350ull * 1024 * 1024;  // ~rough BF16 wts
+        eng->q35_wcache_on = (freeb > need + (size_t)20ull * 1024 * 1024 * 1024) ? 1 : 0;
+        if (const char *e = getenv("FUCINA_QWEN35_WCACHE")) eng->q35_wcache_on = (atoi(e) != 0);
+        fprintf(stderr, "fucina: qwen35 prefill weight-cache %s (free %.1f GiB)\n",
+                eng->q35_wcache_on ? "ON" : "off", freeb / (1024.0*1024*1024));
+    }
     eng->q35_ready = 1;
     fprintf(stderr, "fucina: qwen35 M4 batched arenas ready (maxctx=%d, MAX_SEQS=%d)\n", maxctx, MS);
     return 0;
@@ -15868,19 +15888,41 @@ static void q35_full_attn_tc(gemma4_engine_t *eng, float *attn, const float *qb,
         NQ, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-// Tensor-core BF16 GEMM for ONE qwen35 prefill projection: dequant the quantized weight to BF16,
-// cast the FP32 activation tile to BF16, then a cuBLAS tensor-core GEMM → FP32 dst[T×out_dim].
-// Prefill is COMPUTE-bound, so this replaces the decode-oriented dp4a gemv_batched_w (warp-per-
-// output-row, ~3 effective TFLOPS) which is built for 1–few rows, not a wide prompt tile.
-// dst/x are token-major; weight is row-major [out_dim][in_dim] (= BF16 col-major [in_dim×out_dim]).
+// qwen35 prefill weight-cache slots (one per distinct projection a layer can hold).
+enum { WC_QKV=0, WC_Z, WC_OUT, WC_Q, WC_K, WC_V, WC_O, WC_GATE, WC_UP, WC_DOWN };
+
+// Tensor-core BF16 GEMM for ONE qwen35 prefill projection: get the BF16 weight (from the resident
+// cache, or dequant on the fly), cast the FP32 activation tile to BF16, then a cuBLAS tensor-core
+// GEMM → FP32 dst[T×out_dim]. Prefill is COMPUTE-bound, so this replaces the decode-oriented dp4a
+// gemv_batched_w (warp-per-output-row, ~3 effective TFLOPS) built for 1–few rows, not a wide tile.
+// dst/x token-major; weight row-major [out_dim][in_dim] (= BF16 col-major [in_dim×out_dim]).
+// wcslot: address of this weight's cache entry (NULL = never cache).
 static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fmt,
-                          const float *x_f32, int in_dim, int out_dim, int T, cudaStream_t st) {
+                          const float *x_f32, int in_dim, int out_dim, int T, cudaStream_t st,
+                          __nv_bfloat16 **wcslot) {
     const uint8_t *w = weight_fp8(eng, off);
     bool packed = use_packed_q4k(eng, fmt, w);
-    dequant_proj_to_bf16(eng->d_q35_wbf16[0], w, (uint64_t)in_dim * out_dim, fmt, packed, st);
+    const uint64_t n = (uint64_t)in_dim * out_dim;
+    const __nv_bfloat16 *wbf;
+    if (wcslot && *wcslot) {
+        wbf = *wcslot;                                   // resident BF16 — no dequant
+    } else if (wcslot && eng->q35_wcache_on) {
+        __nv_bfloat16 *buf = NULL;                       // first touch: dequant once, keep resident
+        if (cudaMalloc(&buf, n * sizeof(__nv_bfloat16)) == cudaSuccess) {
+            dequant_proj_to_bf16(buf, w, n, fmt, packed, st);
+            *wcslot = buf; wbf = buf;
+        } else {
+            eng->q35_wcache_on = 0;                       // OOM → stop caching, fall back
+            dequant_proj_to_bf16(eng->d_q35_wbf16[0], w, n, fmt, packed, st);
+            wbf = eng->d_q35_wbf16[0];
+        }
+    } else {
+        dequant_proj_to_bf16(eng->d_q35_wbf16[0], w, n, fmt, packed, st);
+        wbf = eng->d_q35_wbf16[0];
+    }
     f32_to_bf16_kernel<<<(unsigned)(((size_t)T * in_dim + 255) / 256), 256, 0, st>>>(
         eng->d_q35_xbf16, x_f32, (uint64_t)T * in_dim);
-    gemm_bf16(eng, eng->d_q35_wbf16[0], eng->d_q35_xbf16, dst, in_dim, out_dim, T);
+    gemm_bf16(eng, wbf, eng->d_q35_xbf16, dst, in_dim, out_dim, T);
 }
 
 // Zero a slot's GDN recurrent state + conv ring (the FULL-layer K/V cache needs no zeroing —
@@ -15951,9 +15993,9 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
         const auto &Tn = eng->tensors.layers[l];
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.attn_norm), H, T, eps);
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
-            q35_proj_gemm(eng, qg, Tn.attn_q, Tn.fmt_q, xn, H, 2*NQ*HD, T, st);
-            q35_proj_gemm(eng, kb, Tn.attn_k, Tn.fmt_k, xn, H, NKV*HD,  T, st);
-            q35_proj_gemm(eng, vb, Tn.attn_v, Tn.fmt_v, xn, H, NKV*HD,  T, st);
+            q35_proj_gemm(eng, qg, Tn.attn_q, Tn.fmt_q, xn, H, 2*NQ*HD, T, st, &eng->d_q35_wc[l][WC_Q]);
+            q35_proj_gemm(eng, kb, Tn.attn_k, Tn.fmt_k, xn, H, NKV*HD,  T, st, &eng->d_q35_wc[l][WC_K]);
+            q35_proj_gemm(eng, vb, Tn.attn_v, Tn.fmt_v, xn, H, NKV*HD,  T, st, &eng->d_q35_wc[l][WC_V]);
             m2_split_query_gate_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(qb, gate, qg, T);
             per_head_rms_norm_rows_kernel<<<dim3(NQ,T),256,32*sizeof(float),st>>>(qb, Wf(Tn.attn_q_norm), NQ, HD, T, eps);
             per_head_rms_norm_rows_kernel<<<dim3(NKV,T),256,32*sizeof(float),st>>>(kb, Wf(Tn.attn_k_norm), NKV, HD, T, eps);
@@ -15969,12 +16011,12 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
                     attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T);
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
-            q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st);
+            q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st, &eng->d_q35_wc[l][WC_O]);
         } else {
             // Weight-heavy projections via tensor-core BF16 GEMM (prefill is compute-bound). The
             // tiny alpha/beta projections (out_dim=TSR=32) stay on the dp4a GEMV — GEMM not worth it.
-            q35_proj_gemm(eng, qkv, Tn.ssm.in_qkv, Tn.ssm.fmt_in_qkv, xn, H, CONVD, T, st);
-            q35_proj_gemm(eng, zc,  Tn.ssm.in_z,   Tn.ssm.fmt_in_z,   xn, H, INNER, T, st);
+            q35_proj_gemm(eng, qkv, Tn.ssm.in_qkv, Tn.ssm.fmt_in_qkv, xn, H, CONVD, T, st, &eng->d_q35_wc[l][WC_QKV]);
+            q35_proj_gemm(eng, zc,  Tn.ssm.in_z,   Tn.ssm.fmt_in_z,   xn, H, INNER, T, st, &eng->d_q35_wc[l][WC_Z]);
             gemv_batched_w(eng, ac, Wq(Tn.ssm.in_a), xn, H, TSR,   T, st, Tn.ssm.fmt_in_a);   // alpha
             gemv_batched_w(eng, bc, Wq(Tn.ssm.in_b), xn, H, TSR,   T, st, Tn.ssm.fmt_in_b);   // beta
             // RECURRENT: causal conv1d ring — ONE batched launch over the whole T-row tile,
@@ -15993,14 +16035,14 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             qwen35_b_gdn_chunk_kernel<<<NVH,256,smGDNchunk,st>>>(
                 core, qh, kh, vh, gg, bb, eng->d_q35_S[l], eng->d_q35_chunk_scr, slot, T, NPAD);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T);
-            q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st);
+            q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, &eng->d_q35_wc[l][WC_OUT]);
         }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.ffn_norm), H, T, eps);
-        q35_proj_gemm(eng, fg, Tn.ffn_gate, Tn.fmt_gate, xn, H, I, T, st);
-        q35_proj_gemm(eng, fu, Tn.ffn_up,   Tn.fmt_up,   xn, H, I, T, st);
+        q35_proj_gemm(eng, fg, Tn.ffn_gate, Tn.fmt_gate, xn, H, I, T, st, &eng->d_q35_wc[l][WC_GATE]);
+        q35_proj_gemm(eng, fu, Tn.ffn_up,   Tn.fmt_up,   xn, H, I, T, st, &eng->d_q35_wc[l][WC_UP]);
         silu_glu_kernel<<<grid1d((size_t)T*I),256,0,st>>>(fa, fg, fu, T*I);
-        q35_proj_gemm(eng, mix, Tn.ffn_down, Tn.fmt_down, fa, I, H, T, st);
+        q35_proj_gemm(eng, mix, Tn.ffn_down, Tn.fmt_down, fa, I, H, T, st, &eng->d_q35_wc[l][WC_DOWN]);
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
     }
 
