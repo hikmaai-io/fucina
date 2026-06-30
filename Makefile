@@ -29,7 +29,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
-        qwen35-detect-test qwen35-load-test \
+        qwen35-detect-test qwen35-load-test qwen35-layer-parity-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -154,6 +154,19 @@ qwen35-load-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_load \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_load $(QWEN35_MODEL)"
+
+# ─── Qwen3.5 hybrid (qwen35) M2 per-layer kernel parity gate (GPU) ──────
+# Dumps a torch reference (one FULL softmax-attn layer + one GDN gated-deltanet layer from
+# the GGUF, dequant Q4_K) with cuda/qwen35_layer_ref.py — CPU-only, no flock — then runs the
+# fucina M2 mixer kernels and asserts <1e-2 max-abs-rel error vs torch for BOTH kinds and that
+# the GDN chunked-scan output equals the single-step recurrence. GPU run wrapped in the flock.
+QWEN35_M2_REF ?= /tmp/qwen35_m2_ref.bin
+qwen35-layer-parity-test: lib libdg
+	python3 cuda/qwen35_layer_ref.py $(QWEN35_MODEL) $(QWEN35_M2_REF)
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_layer_parity.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_layer_parity \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_layer_parity $(QWEN35_M2_REF)"
 
 # ─── Qwen3 dense numeric parity vs llama.cpp (GPU) ──────────────────────
 # Feeds llama.cpp's input ids for "The capital of France is" through fucina's

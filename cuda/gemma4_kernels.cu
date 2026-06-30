@@ -14118,3 +14118,577 @@ void gemma4_engine_abort_prefill(gemma4_engine_t *eng) {
     if (eng) eng->abort_req = 1;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// ─── Qwen3.5 hybrid (qwen35) M2: GDN + gated-full-attn mixer kernels + parity self-test ─────
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Net-new math for the qwen35 hybrid, gated behind the qwen35 arch when wired into the forward
+// (M3). Implemented here as standalone fp32 device kernels + a self-test that loads the torch
+// reference (cuda/qwen35_layer_ref.py) and compares. All conventions are taken VERBATIM from
+// llama.cpp src/models/qwen35.cpp + delta-net-base.cpp and HF modeling_qwen3_next.py:
+//   * RMSNorm gain applied directly (x_norm*w); the GGUF bakes the +1.
+//   * ssm_a already stores -exp(A_log); decay g = ssm_a * softplus(alpha + dt_bias).
+//   * delta-rule q scaled by 1/sqrt(head_dim) AFTER l2-norm; q,k l2-normed over head_dim.
+//   * conv1d depthwise causal k=4 then SiLU on concat[q;k;v]; split q,k(16 heads) v(32 heads);
+//     q,k repeat_interleave 16→32 (v-head h uses k-head h/2).
+//   * RMSNormGated = RMSNorm(o)*SiLU(z) (gate NOT in variance).
+//   * partial NEOX RoPE on the first rotary_dim dims (mrope collapses to this for text).
+
+// qwen35 fixed geometry (9B Q4_K_M). Used only by the M2 self-test kernels below.
+#define M2_H        4096
+#define M2_HEAD     256
+#define M2_NQ       16
+#define M2_NKV      4
+#define M2_ROT      64
+#define M2_THETA    10000000.0f
+#define M2_CONVDIM  8192
+#define M2_KEYD     2048
+#define M2_VALD     4096
+#define M2_NKH      16
+#define M2_NVH      32
+#define M2_SD       128
+#define M2_TSR      32
+#define M2_CK       4
+#define M2_CHUNK    64
+#define M2_EPS      1e-6f
+
+// out[n,o] = sum_i in[n,i]*W[o,i]   (W row-major [OUT,IN]; one block per (o,n), reduces IN).
+__global__ void m2_gemm_kernel(float *out, const float *in, const float *W,
+                               int N, int INN, int OUT) {
+    int o = blockIdx.x, n = blockIdx.y;
+    if (o >= OUT || n >= N) return;
+    __shared__ float red[32];
+    const float *xr = in + (size_t)n * INN;
+    const float *wr = W  + (size_t)o * INN;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < INN; i += blockDim.x) acc += xr[i] * wr[i];
+    acc = block_reduce_sum(acc, red);
+    if (threadIdx.x == 0) out[(size_t)n * OUT + o] = acc;
+}
+
+// Split the 2×-wide q projection qg[N,16,512] (per head [query(256)|gate(256)]) into a
+// contiguous query q[N,16,256] and a head-major gate[N,4096].
+__global__ void m2_split_query_gate_kernel(float *q, float *gate, const float *qg, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;     // over N*NQ*HEAD
+    if (idx >= N * M2_NQ * M2_HEAD) return;
+    int d = idx % M2_HEAD;
+    int h = (idx / M2_HEAD) % M2_NQ;
+    int n = idx / (M2_HEAD * M2_NQ);
+    q[idx]    = qg[((size_t)n * M2_NQ + h) * (M2_HEAD * 2) + d];
+    gate[(size_t)n * (M2_NQ * M2_HEAD) + h * M2_HEAD + d] =
+        qg[((size_t)n * M2_NQ + h) * (M2_HEAD * 2) + M2_HEAD + d];
+}
+
+// Partial NEOX RoPE on the first ROT dims of each head, positions = row index. In-place.
+__global__ void m2_partial_rope_kernel(float *x, int n_heads, int rows) {
+    int i   = blockIdx.x * blockDim.x + threadIdx.x;     // 0..ROT/2-1
+    int h   = blockIdx.y;
+    int row = blockIdx.z;
+    if (i >= M2_ROT / 2 || h >= n_heads || row >= rows) return;
+    float *hd = x + ((size_t)row * n_heads + h) * M2_HEAD;
+    float inv = powf(M2_THETA, -(float)(2 * i) / (float)M2_ROT);
+    float ang = (float)row * inv;
+    float c = cosf(ang), s = sinf(ang);
+    float a = hd[i], b = hd[i + M2_ROT / 2];
+    hd[i]             = a * c - b * s;
+    hd[i + M2_ROT / 2] = b * c + a * s;
+}
+
+// Causal GQA softmax: out[N,NQ,HEAD] from q[N,NQ,HEAD], k/v[N,NKV,HEAD]. One block per
+// (query-head, query-row); scores cached in dynamic shared (size = rows floats).
+__global__ void m2_gqa_attn_kernel(float *out, const float *q, const float *k, const float *v,
+                                   int N) {
+    int hd  = blockIdx.x;        // query head 0..NQ-1
+    int qi  = blockIdx.y;        // query row
+    if (hd >= M2_NQ || qi >= N) return;
+    int kv  = hd / (M2_NQ / M2_NKV);
+    int tid = threadIdx.x;
+    extern __shared__ float sc[];     // [N] scores
+    const float *qr = q + ((size_t)qi * M2_NQ + hd) * M2_HEAD;
+    float scale = rsqrtf((float)M2_HEAD);
+    // scores for keys 0..qi
+    for (int j = tid; j <= qi; j += blockDim.x) {
+        const float *kr = k + ((size_t)j * M2_NKV + kv) * M2_HEAD;
+        float acc = 0.f;
+        for (int d = 0; d < M2_HEAD; d++) acc += qr[d] * kr[d];
+        sc[j] = acc * scale;
+    }
+    __syncthreads();
+    __shared__ float red[32];
+    // max
+    float m = -1e30f;
+    for (int j = tid; j <= qi; j += blockDim.x) m = fmaxf(m, sc[j]);
+    m = block_reduce_max(m, red);
+    __shared__ float msh;
+    if (tid == 0) msh = m;
+    __syncthreads();
+    m = msh;
+    // exp + sum
+    float ssum = 0.f;
+    for (int j = tid; j <= qi; j += blockDim.x) { float e = __expf(sc[j] - m); sc[j] = e; ssum += e; }
+    ssum = block_reduce_sum(ssum, red);
+    __shared__ float ssh;
+    if (tid == 0) ssh = ssum;
+    __syncthreads();
+    float inv = 1.f / ssh;
+    // weighted sum of v over head_dim (thread per dim)
+    for (int d = tid; d < M2_HEAD; d += blockDim.x) {
+        float acc = 0.f;
+        for (int j = 0; j <= qi; j++)
+            acc += sc[j] * v[((size_t)j * M2_NKV + kv) * M2_HEAD + d];
+        out[((size_t)qi * M2_NQ + hd) * M2_HEAD + d] = acc * inv;
+    }
+}
+
+// attn[i] *= sigmoid(gate[i])
+__global__ void m2_sigmoid_gate_mul_kernel(float *attn, const float *gate, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    attn[i] *= 1.f / (1.f + __expf(-g));
+}
+
+// Causal depthwise conv1d (k=4) over CONVDIM channels + SiLU. out[t,c] =
+// silu( sum_j cw[c*4+j] * in[t-3+j, c] ), zero left-pad. in/out [N, CONVDIM].
+__global__ void m2_conv_silu_kernel(float *out, const float *in, const float *cw, int N) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (c >= M2_CONVDIM || t >= N) return;
+    float acc = 0.f;
+    #pragma unroll
+    for (int j = 0; j < M2_CK; j++) {
+        int tt = t - (M2_CK - 1) + j;
+        if (tt >= 0) acc += cw[c * M2_CK + j] * in[(size_t)tt * M2_CONVDIM + c];
+    }
+    out[(size_t)t * M2_CONVDIM + c] = acc / (1.f + __expf(-acc));   // SiLU
+}
+
+// L2-norm per head over head_dim: x[rows,n_heads,sd] /= sqrt(sum(x^2)+eps). In-place.
+__global__ void m2_l2norm_heads_kernel(float *x, int n_heads, int sd, int rows) {
+    int head = blockIdx.x, row = blockIdx.y;
+    if (head >= n_heads || row >= rows) return;
+    __shared__ float red[32];
+    float *h = x + ((size_t)row * n_heads + head) * sd;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < sd; i += blockDim.x) ss += h[i] * h[i];
+    ss = block_reduce_sum(ss, red);
+    float invn = rsqrtf(ss + M2_EPS);
+    for (int i = threadIdx.x; i < sd; i += blockDim.x) h[i] *= invn;
+}
+
+// Per-(token,v-head) decay g = ssm_a*softplus(a+dt_bias) and beta = sigmoid(b).
+__global__ void m2_decay_beta_kernel(float *g_out, float *beta_out, const float *a,
+                                     const float *b, const float *ssm_a, const float *dt_bias,
+                                     int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;     // N*TSR
+    if (idx >= N * M2_TSR) return;
+    int h = idx % M2_TSR;
+    float x = a[idx] + dt_bias[h];
+    float sp = (x > 0.f) ? (x + log1pf(__expf(-x))) : log1pf(__expf(x));   // softplus
+    g_out[idx]    = ssm_a[h] * sp;
+    beta_out[idx] = 1.f / (1.f + __expf(-b[idx]));
+}
+
+// Gated RMSNorm + SiLU(z): out[N,VALD] = RMSNorm(core, ssm_norm) * silu(z), per v-head.
+__global__ void m2_gated_norm_kernel(float *out, const float *core, const float *z,
+                                     const float *ssm_norm, int N) {
+    int vh = blockIdx.x, row = blockIdx.y;
+    if (vh >= M2_NVH || row >= N) return;
+    __shared__ float red[32];
+    const float *c = core + ((size_t)row * M2_NVH + vh) * M2_SD;
+    const float *zz = z   + ((size_t)row * M2_NVH + vh) * M2_SD;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < M2_SD; i += blockDim.x) ss += c[i] * c[i];
+    ss = block_reduce_sum(ss, red);
+    float rms = rsqrtf(ss / M2_SD + M2_EPS);
+    for (int i = threadIdx.x; i < M2_SD; i += blockDim.x) {
+        float zv = zz[i];
+        float silu = zv / (1.f + __expf(-zv));
+        // RMSNorm(o)*ssm_norm gain, then * SiLU(z) gate (gate NOT in the variance).
+        out[(size_t)row * M2_VALD + vh * M2_SD + i] = c[i] * rms * ssm_norm[i] * silu;
+    }
+}
+
+// GDN single-step delta-rule recurrence. core[N,NVH,SD] from q,k[NPAD,NKH,SD], v[NPAD,NVH,SD],
+// g,beta[NPAD,NVH]. One block per v-head; fp32 state S[SD(k)×SD(v)] in shared. q scaled 1/sqrt(SD).
+__global__ void m2_gdn_recurrent_kernel(float *core, const float *q, const float *k,
+                                        const float *v, const float *g, const float *beta, int N) {
+    int vh  = blockIdx.x;
+    int kh  = vh / (M2_NVH / M2_NKH);
+    int tid = threadIdx.x;
+    extern __shared__ float sm[];
+    float *S   = sm;                 // [SD*SD] k-major: S[kd*SD+vd]
+    float *kt  = S + M2_SD * M2_SD;  // [SD]
+    float *qt  = kt + M2_SD;         // [SD]
+    float *dlt = qt + M2_SD;         // [SD]
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] = 0.f;
+    __syncthreads();
+    float scale = rsqrtf((float)M2_SD);
+    for (int t = 0; t < N; t++) {
+        if (tid < M2_SD) {
+            kt[tid] = k[((size_t)t * M2_NKH + kh) * M2_SD + tid];
+            qt[tid] = q[((size_t)t * M2_NKH + kh) * M2_SD + tid] * scale;
+        }
+        __syncthreads();
+        float gt = __expf(g[(size_t)t * M2_NVH + vh]);
+        float bt = beta[(size_t)t * M2_NVH + vh];
+        for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] *= gt;
+        __syncthreads();
+        if (tid < M2_SD) {                            // kv_mem + delta, thread per v-dim
+            float acc = 0.f;
+            for (int kd = 0; kd < M2_SD; kd++) acc += S[kd * M2_SD + tid] * kt[kd];
+            float vv = v[((size_t)t * M2_NVH + vh) * M2_SD + tid];
+            dlt[tid] = (vv - acc) * bt;
+        }
+        __syncthreads();
+        for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) {   // S += k ⊗ delta
+            int kd = idx / M2_SD, vd = idx % M2_SD;
+            S[idx] += kt[kd] * dlt[vd];
+        }
+        __syncthreads();
+        if (tid < M2_SD) {                            // o = S^T q
+            float acc = 0.f;
+            for (int kd = 0; kd < M2_SD; kd++) acc += S[kd * M2_SD + tid] * qt[kd];
+            core[((size_t)t * M2_NVH + vh) * M2_SD + tid] = acc;
+        }
+        __syncthreads();
+    }
+}
+
+// GDN chunked-scan (prefill form): one block per v-head; chunk size CHUNK, head_dim SD. fp32
+// inter-chunk state S in shared, k-chunk cached in shared. Per-chunk WY/UT matrices live in
+// per-v-head global scratch (Tm,u,kcd,vnew,aintra). Mathematically identical to the recurrence.
+// scratch layout per v-head: [Tm(CS*CS) | u(CS*SD) | kcd(CS*SD) | vnew(CS*SD) | aintra(CS*CS)].
+#define M2_SCR_PER ( M2_CHUNK*M2_CHUNK + M2_CHUNK*M2_SD*3 + M2_CHUNK*M2_CHUNK )
+__global__ void m2_gdn_chunk_kernel(float *core, const float *q, const float *k, const float *v,
+                                    const float *g, const float *beta, float *scratch,
+                                    int N, int NPAD) {
+    int vh  = blockIdx.x;
+    int kh  = vh / (M2_NVH / M2_NKH);
+    int tid = threadIdx.x;
+    const int CS = M2_CHUNK, SD = M2_SD;
+    extern __shared__ float sm[];
+    float *S    = sm;                 // [SD*SD]
+    float *kch  = S + SD * SD;        // [CS*SD] cached k-chunk
+    float *gc   = kch + CS * SD;      // [CS] cumulative decay
+    float *bet  = gc + CS;            // [CS] beta per chunk row
+    float *rowb = bet + CS;           // [CS] scratch row for fwd-subst
+    float *Tm    = scratch + (size_t)vh * M2_SCR_PER;
+    float *u     = Tm + CS * CS;
+    float *kcd   = u + CS * SD;
+    float *vnew  = kcd + CS * SD;
+    float *aintra= vnew + CS * SD;
+    float scale = rsqrtf((float)SD);
+    for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = 0.f;
+    __syncthreads();
+
+    int n_chunks = NPAD / CS;
+    for (int c = 0; c < n_chunks; c++) {
+        // load chunk k into shared, beta, and (serial) cumulative decay gc
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+            int r = idx / SD, d = idx % SD;
+            int gt = c * CS + r;
+            kch[idx] = (gt < N) ? k[((size_t)gt * M2_NKH + kh) * SD + d] : 0.f;
+        }
+        for (int r = tid; r < CS; r += blockDim.x) {
+            int gt = c * CS + r;
+            bet[r] = (gt < N) ? beta[(size_t)gt * M2_NVH + vh] : 0.f;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float acc = 0.f;
+            for (int r = 0; r < CS; r++) {
+                int gt = c * CS + r;
+                acc += (gt < N) ? g[(size_t)gt * M2_NVH + vh] : 0.f;
+                gc[r] = acc;
+            }
+        }
+        __syncthreads();
+        // A[i,j] = -<k_beta[i],k[j]>*exp(gc[i]-gc[j]) for i>j else 0   (k_beta = k*beta)
+        for (int idx = tid; idx < CS * CS; idx += blockDim.x) {
+            int i = idx / CS, j = idx % CS;
+            float val = 0.f;
+            if (i > j) {
+                float dot = 0.f;
+                for (int d = 0; d < SD; d++) dot += kch[i * SD + d] * bet[i] * kch[j * SD + d];
+                val = -dot * __expf(gc[i] - gc[j]);
+            }
+            Tm[idx] = val;
+        }
+        __syncthreads();
+        // forward substitution: Tm = (I - A)^{-1} - I  (then +I below). Sequential over rows.
+        for (int i = 1; i < CS; i++) {
+            for (int m = tid; m < i; m += blockDim.x) rowb[m] = Tm[i * CS + m];
+            __syncthreads();
+            for (int m = tid; m < i; m += blockDim.x) {
+                float acc = rowb[m];
+                for (int nn = 0; nn < i; nn++) acc += rowb[nn] * Tm[nn * CS + m];
+                Tm[i * CS + m] = acc;
+            }
+            __syncthreads();
+        }
+        for (int i = tid; i < CS; i += blockDim.x) Tm[i * CS + i] += 1.f;   // +I
+        __syncthreads();
+        // u = T @ v_beta ; kcd = T @ (k_beta*exp(gc))
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+            int i = idx / SD, d = idx % SD;
+            float su = 0.f, sk = 0.f;
+            for (int s = 0; s < CS; s++) {
+                float t = Tm[i * CS + s];
+                int gt = c * CS + s;
+                float vv = (gt < N) ? v[((size_t)gt * M2_NVH + vh) * SD + d] : 0.f;
+                su += t * (vv * bet[s]);
+                sk += t * (kch[s * SD + d] * bet[s] * __expf(gc[s]));
+            }
+            u[idx] = su; kcd[idx] = sk;
+        }
+        __syncthreads();
+        // v_new = u - kcd @ S
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+            int i = idx / SD, d = idx % SD;
+            float vp = 0.f;
+            for (int kd = 0; kd < SD; kd++) vp += kcd[i * SD + kd] * S[kd * SD + d];
+            vnew[idx] = u[idx] - vp;
+        }
+        __syncthreads();
+        // a_intra[i,j] = <q[i],k[j]>*exp(gc[i]-gc[j]) for i>=j else 0  (q scaled)
+        for (int idx = tid; idx < CS * CS; idx += blockDim.x) {
+            int i = idx / CS, j = idx % CS;
+            float val = 0.f;
+            if (i >= j) {
+                int gti = c * CS + i;
+                float dot = 0.f;
+                for (int d = 0; d < SD; d++) {
+                    float qv = (gti < N) ? q[((size_t)gti * M2_NKH + kh) * SD + d] * scale : 0.f;
+                    dot += qv * kch[j * SD + d];
+                }
+                val = dot * __expf(gc[i] - gc[j]);
+            }
+            aintra[idx] = val;
+        }
+        __syncthreads();
+        // core[i,d] = (q[i]*exp(gc[i])) @ S  +  a_intra @ v_new
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+            int i = idx / SD, d = idx % SD;
+            int gti = c * CS + i;
+            if (gti >= N) continue;
+            float inter = 0.f;
+            float egi = __expf(gc[i]);
+            for (int kd = 0; kd < SD; kd++)
+                inter += q[((size_t)gti * M2_NKH + kh) * SD + kd] * scale * egi * S[kd * SD + d];
+            float intra = 0.f;
+            for (int j = 0; j <= i; j++) intra += aintra[i * CS + j] * vnew[j * SD + d];
+            core[((size_t)gti * M2_NVH + vh) * SD + d] = inter + intra;
+        }
+        __syncthreads();
+        // S = S*exp(gc[last]) + sum_r k[r]*exp(gc[last]-gc[r]) ⊗ v_new[r]
+        float glast = gc[CS - 1];
+        for (int idx = tid; idx < SD * SD; idx += blockDim.x) {
+            int kd = idx / SD, d = idx % SD;
+            float acc = S[idx] * __expf(glast);
+            for (int r = 0; r < CS; r++)
+                acc += kch[r * SD + kd] * __expf(glast - gc[r]) * vnew[r * SD + d];
+            S[idx] = acc;
+        }
+        __syncthreads();
+    }
+}
+
+// ─── host helpers for the self-test ───────────────────────────────────────────
+static float *m2_dev(const float *host, size_t n) {
+    float *d = nullptr;
+    if (cudaMalloc(&d, n * sizeof(float)) != cudaSuccess) return nullptr;
+    cudaMemcpy(d, host, n * sizeof(float), cudaMemcpyHostToDevice);
+    return d;
+}
+static void m2_gemm(float *out, const float *in, const float *W, int N, int INN, int OUT) {
+    dim3 grid((unsigned)OUT, (unsigned)N);
+    m2_gemm_kernel<<<grid, 128>>>(out, in, W, N, INN, OUT);
+}
+// max-abs-rel error of dev[n] vs reference dev_ref[n]: max|a-b| / max|ref|.
+static double m2_relerr(const float *d_a, const float *d_ref, size_t n, double *out_maxabs) {
+    float *a = (float*)malloc(n * sizeof(float)), *b = (float*)malloc(n * sizeof(float));
+    cudaMemcpy(a, d_a, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(b, d_ref, n * sizeof(float), cudaMemcpyDeviceToHost);
+    double mad = 0, mref = 0;
+    for (size_t i = 0; i < n; i++) { double dd = fabs((double)a[i]-b[i]); if (dd>mad) mad=dd;
+        double rr = fabs((double)b[i]); if (rr>mref) mref=rr; }
+    free(a); free(b);
+    if (out_maxabs) *out_maxabs = mad;
+    return mad / (mref > 1e-9 ? mref : 1e-9);
+}
+
+int qwen35_m2_layer_selftest(const char *ref_bin_path) {
+    FILE *f = fopen(ref_bin_path, "rb");
+    if (!f) { fprintf(stderr, "M2: cannot open %s (run cuda/qwen35_layer_ref.py first)\n", ref_bin_path); return 1; }
+    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *blob = (char*)malloc(fsz);
+    if (fread(blob, 1, fsz, f) != (size_t)fsz) { fprintf(stderr, "M2: short read\n"); fclose(f); return 1; }
+    fclose(f);
+    int *hdr = (int*)blob;
+    if (hdr[0] != 0x51573532) { fprintf(stderr, "M2: bad magic\n"); return 1; }
+    int N = hdr[1], H = hdr[2];
+    if (H != M2_H) { fprintf(stderr, "M2: H mismatch %d\n", H); return 1; }
+    float *cur = (float*)(blob + 12);
+    auto take = [&](size_t n) -> float* { float *p = cur; cur += n; return p; };
+
+    // FULL block
+    float *h_attn_norm = take(M2_H);
+    float *h_Wq = take((size_t)M2_NQ*M2_HEAD*2*M2_H);
+    float *h_Wk = take((size_t)M2_NKV*M2_HEAD*M2_H);
+    float *h_Wv = take((size_t)M2_NKV*M2_HEAD*M2_H);
+    float *h_Wo = take((size_t)M2_H*(M2_NQ*M2_HEAD));
+    float *h_qn = take(M2_HEAD);
+    float *h_kn = take(M2_HEAD);
+    float *h_in_full = take((size_t)N*M2_H);
+    float *h_ref_full = take((size_t)N*M2_H);
+    // GDN block
+    float *h_gn = take(M2_H);
+    float *h_Wqkv = take((size_t)M2_CONVDIM*M2_H);
+    float *h_Wgate = take((size_t)M2_VALD*M2_H);
+    float *h_Wbeta = take((size_t)M2_TSR*M2_H);
+    float *h_Walpha = take((size_t)M2_TSR*M2_H);
+    float *h_conv = take((size_t)M2_CONVDIM*M2_CK);
+    float *h_ssma = take(M2_TSR);
+    float *h_dtb = take(M2_TSR);
+    float *h_ssmn = take(M2_SD);
+    float *h_Wout = take((size_t)M2_H*M2_VALD);
+    float *h_in_gdn = take((size_t)N*M2_H);
+    float *h_ref_recur = take((size_t)N*M2_H);
+    float *h_ref_chunk = take((size_t)N*M2_H);
+    if ((char*)cur != blob + fsz) { fprintf(stderr, "M2: layout mismatch (cur off %ld, fsz %ld)\n",
+        (long)((char*)cur - blob), fsz); return 1; }
+
+    int rc = 0;
+    // Opt-in to >48KB dynamic shared for the GDN state kernels. The attribute MUST be <= the
+    // device's MaxSharedMemoryPerBlockOptin or cudaFuncSetAttribute fails and the launch (which
+    // requests the larger size) silently aborts, leaving the output zeroed.
+    size_t smR_bytes = ((size_t)M2_SD*M2_SD + 3*M2_SD)*sizeof(float);
+    size_t smC_bytes = ((size_t)M2_SD*M2_SD + M2_CHUNK*M2_SD + 3*M2_CHUNK)*sizeof(float);
+    cudaError_t aR = cudaFuncSetAttribute(m2_gdn_recurrent_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smR_bytes);
+    cudaError_t aC = cudaFuncSetAttribute(m2_gdn_chunk_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smC_bytes);
+    if (aR != cudaSuccess || aC != cudaSuccess) {
+        fprintf(stderr, "M2: cudaFuncSetAttribute failed (recur %zuB:%s, chunk %zuB:%s) — "
+            "exceeds device MaxSharedMemoryPerBlockOptin\n",
+            smR_bytes, cudaGetErrorString(aR), smC_bytes, cudaGetErrorString(aC));
+        free(blob); return 1;
+    }
+
+    // ───────── FULL layer ─────────
+    {
+        float *Wq=m2_dev(h_Wq,(size_t)M2_NQ*M2_HEAD*2*M2_H), *Wk=m2_dev(h_Wk,(size_t)M2_NKV*M2_HEAD*M2_H),
+              *Wv=m2_dev(h_Wv,(size_t)M2_NKV*M2_HEAD*M2_H), *Wo=m2_dev(h_Wo,(size_t)M2_H*M2_NQ*M2_HEAD),
+              *an=m2_dev(h_attn_norm,M2_H), *qn=m2_dev(h_qn,M2_HEAD), *kn=m2_dev(h_kn,M2_HEAD),
+              *hin=m2_dev(h_in_full,(size_t)N*M2_H), *ref=m2_dev(h_ref_full,(size_t)N*M2_H);
+        float *x,*qg,*q,*gate,*k,*v,*attn,*out;
+        cudaMalloc(&x,(size_t)N*M2_H*sizeof(float));
+        cudaMalloc(&qg,(size_t)N*M2_NQ*M2_HEAD*2*sizeof(float));
+        cudaMalloc(&q,(size_t)N*M2_NQ*M2_HEAD*sizeof(float));
+        cudaMalloc(&gate,(size_t)N*M2_VALD*sizeof(float));
+        cudaMalloc(&k,(size_t)N*M2_NKV*M2_HEAD*sizeof(float));
+        cudaMalloc(&v,(size_t)N*M2_NKV*M2_HEAD*sizeof(float));
+        cudaMalloc(&attn,(size_t)N*M2_NQ*M2_HEAD*sizeof(float));
+        cudaMalloc(&out,(size_t)N*M2_H*sizeof(float));
+        rms_norm_rows_kernel<<<N,256,32*sizeof(float)>>>(x,hin,an,M2_H,N,M2_EPS);
+        m2_gemm(qg,x,Wq,N,M2_H,M2_NQ*M2_HEAD*2);
+        m2_gemm(k,x,Wk,N,M2_H,M2_NKV*M2_HEAD);
+        m2_gemm(v,x,Wv,N,M2_H,M2_NKV*M2_HEAD);
+        m2_split_query_gate_kernel<<<(N*M2_NQ*M2_HEAD+255)/256,256>>>(q,gate,qg,N);
+        per_head_rms_norm_rows_kernel<<<dim3(M2_NQ,N),256,32*sizeof(float)>>>(q,qn,M2_NQ,M2_HEAD,N,M2_EPS);
+        per_head_rms_norm_rows_kernel<<<dim3(M2_NKV,N),256,32*sizeof(float)>>>(k,kn,M2_NKV,M2_HEAD,N,M2_EPS);
+        m2_partial_rope_kernel<<<dim3((M2_ROT/2+31)/32,M2_NQ,N),32>>>(q,M2_NQ,N);
+        m2_partial_rope_kernel<<<dim3((M2_ROT/2+31)/32,M2_NKV,N),32>>>(k,M2_NKV,N);
+        m2_gqa_attn_kernel<<<dim3(M2_NQ,N),256,(size_t)N*sizeof(float)>>>(attn,q,k,v,N);
+        m2_sigmoid_gate_mul_kernel<<<(N*M2_VALD+255)/256,256>>>(attn,gate,N*M2_VALD);
+        m2_gemm(out,attn,Wo,N,M2_NQ*M2_HEAD,M2_H);
+        cudaError_t e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) { fprintf(stderr,"M2 FULL: %s\n",cudaGetErrorString(e)); rc=1; }
+        double mad=0, rel=m2_relerr(out,ref,(size_t)N*M2_H,&mad);
+        printf("M2 FULL-attn  : max-abs %.3e  rel %.3e  -> %s\n", mad, rel, rel<1e-2?"PASS":"FAIL");
+        if (rel>=1e-2) rc=1;
+        cudaFree(Wq);cudaFree(Wk);cudaFree(Wv);cudaFree(Wo);cudaFree(an);cudaFree(qn);cudaFree(kn);
+        cudaFree(hin);cudaFree(ref);cudaFree(x);cudaFree(qg);cudaFree(q);cudaFree(gate);cudaFree(k);
+        cudaFree(v);cudaFree(attn);cudaFree(out);
+    }
+
+    // ───────── GDN layer (recurrent + chunk) ─────────
+    {
+        int NPAD = ((N + M2_CHUNK - 1) / M2_CHUNK) * M2_CHUNK;
+        float *Wqkv=m2_dev(h_Wqkv,(size_t)M2_CONVDIM*M2_H), *Wgate=m2_dev(h_Wgate,(size_t)M2_VALD*M2_H),
+              *Wbeta=m2_dev(h_Wbeta,(size_t)M2_TSR*M2_H), *Walpha=m2_dev(h_Walpha,(size_t)M2_TSR*M2_H),
+              *conv=m2_dev(h_conv,(size_t)M2_CONVDIM*M2_CK), *ssma=m2_dev(h_ssma,M2_TSR),
+              *dtb=m2_dev(h_dtb,M2_TSR), *ssmn=m2_dev(h_ssmn,M2_SD), *Wout=m2_dev(h_Wout,(size_t)M2_H*M2_VALD),
+              *gn=m2_dev(h_gn,M2_H), *hin=m2_dev(h_in_gdn,(size_t)N*M2_H),
+              *refR=m2_dev(h_ref_recur,(size_t)N*M2_H), *refC=m2_dev(h_ref_chunk,(size_t)N*M2_H);
+        float *x,*qkv,*z,*b,*a,*conv_out,*qk_q,*qk_k,*vv,*gg,*bb,*core,*gnorm,*outR,*outC,*scratch;
+        cudaMalloc(&x,(size_t)N*M2_H*sizeof(float));
+        cudaMalloc(&qkv,(size_t)N*M2_CONVDIM*sizeof(float));
+        cudaMalloc(&z,(size_t)N*M2_VALD*sizeof(float));
+        cudaMalloc(&b,(size_t)N*M2_TSR*sizeof(float));
+        cudaMalloc(&a,(size_t)N*M2_TSR*sizeof(float));
+        cudaMalloc(&conv_out,(size_t)N*M2_CONVDIM*sizeof(float));
+        cudaMalloc(&qk_q,(size_t)NPAD*M2_NKH*M2_SD*sizeof(float));
+        cudaMalloc(&qk_k,(size_t)NPAD*M2_NKH*M2_SD*sizeof(float));
+        cudaMalloc(&vv,(size_t)NPAD*M2_NVH*M2_SD*sizeof(float));
+        cudaMalloc(&gg,(size_t)NPAD*M2_TSR*sizeof(float));
+        cudaMalloc(&bb,(size_t)NPAD*M2_TSR*sizeof(float));
+        cudaMalloc(&core,(size_t)N*M2_NVH*M2_SD*sizeof(float));
+        cudaMalloc(&gnorm,(size_t)N*M2_VALD*sizeof(float));
+        cudaMalloc(&outR,(size_t)N*M2_H*sizeof(float));
+        cudaMalloc(&outC,(size_t)N*M2_H*sizeof(float));
+        cudaMalloc(&scratch,(size_t)M2_NVH*M2_SCR_PER*sizeof(float));
+        cudaMemset(qk_q,0,(size_t)NPAD*M2_NKH*M2_SD*sizeof(float));
+        cudaMemset(qk_k,0,(size_t)NPAD*M2_NKH*M2_SD*sizeof(float));
+        cudaMemset(vv,0,(size_t)NPAD*M2_NVH*M2_SD*sizeof(float));
+        cudaMemset(gg,0,(size_t)NPAD*M2_TSR*sizeof(float));
+        cudaMemset(bb,0,(size_t)NPAD*M2_TSR*sizeof(float));
+        rms_norm_rows_kernel<<<N,256,32*sizeof(float)>>>(x,hin,gn,M2_H,N,M2_EPS);
+        m2_gemm(qkv,x,Wqkv,N,M2_H,M2_CONVDIM);
+        m2_gemm(z,x,Wgate,N,M2_H,M2_VALD);
+        m2_gemm(b,x,Wbeta,N,M2_H,M2_TSR);
+        m2_gemm(a,x,Walpha,N,M2_H,M2_TSR);
+        m2_conv_silu_kernel<<<dim3((M2_CONVDIM+127)/128,N),128>>>(conv_out,qkv,conv,N);
+        // split conv_out[N,8192] -> q[NPAD,16,128], k[NPAD,16,128], v[NPAD,32,128]
+        // q = conv[:, 0:2048], k = conv[:, 2048:4096], v = conv[:, 4096:8192]
+        for (int n=0;n<N;n++) {
+            cudaMemcpy(qk_q+(size_t)n*M2_NKH*M2_SD, conv_out+(size_t)n*M2_CONVDIM,            (size_t)M2_KEYD*sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(qk_k+(size_t)n*M2_NKH*M2_SD, conv_out+(size_t)n*M2_CONVDIM+M2_KEYD,    (size_t)M2_KEYD*sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(vv  +(size_t)n*M2_NVH*M2_SD, conv_out+(size_t)n*M2_CONVDIM+2*M2_KEYD,  (size_t)M2_VALD*sizeof(float), cudaMemcpyDeviceToDevice);
+        }
+        m2_l2norm_heads_kernel<<<dim3(M2_NKH,N),128>>>(qk_q,M2_NKH,M2_SD,N);
+        m2_l2norm_heads_kernel<<<dim3(M2_NKH,N),128>>>(qk_k,M2_NKH,M2_SD,N);
+        m2_decay_beta_kernel<<<(N*M2_TSR+255)/256,256>>>(gg,bb,a,b,ssma,dtb,N);
+        size_t smR = ((size_t)M2_SD*M2_SD + 3*M2_SD)*sizeof(float);
+        m2_gdn_recurrent_kernel<<<M2_NVH,128,smR>>>(core,qk_q,qk_k,vv,gg,bb,N);
+        m2_gated_norm_kernel<<<dim3(M2_NVH,N),128,32*sizeof(float)>>>(gnorm,core,z,ssmn,N);
+        m2_gemm(outR,gnorm,Wout,N,M2_VALD,M2_H);
+        cudaError_t e1 = cudaDeviceSynchronize();
+        if (e1 != cudaSuccess) { fprintf(stderr,"M2 GDN-recur: %s\n",cudaGetErrorString(e1)); rc=1; }
+        double madR=0, relR=m2_relerr(outR,refR,(size_t)N*M2_H,&madR);
+        printf("M2 GDN recur  : max-abs %.3e  rel %.3e  -> %s\n", madR, relR, relR<1e-2?"PASS":"FAIL");
+        if (relR>=1e-2) rc=1;
+        // chunk path (reuse same projections / conv / l2norm / decay)
+        cudaMemset(core,0,(size_t)N*M2_NVH*M2_SD*sizeof(float));
+        size_t smC = ((size_t)M2_SD*M2_SD + M2_CHUNK*M2_SD + 3*M2_CHUNK)*sizeof(float);
+        m2_gdn_chunk_kernel<<<M2_NVH,128,smC>>>(core,qk_q,qk_k,vv,gg,bb,scratch,N,NPAD);
+        m2_gated_norm_kernel<<<dim3(M2_NVH,N),128,32*sizeof(float)>>>(gnorm,core,z,ssmn,N);
+        m2_gemm(outC,gnorm,Wout,N,M2_VALD,M2_H);
+        cudaError_t e2 = cudaDeviceSynchronize();
+        if (e2 != cudaSuccess) { fprintf(stderr,"M2 GDN-chunk: %s\n",cudaGetErrorString(e2)); rc=1; }
+        double madC=0, relC=m2_relerr(outC,refC,(size_t)N*M2_H,&madC);
+        printf("M2 GDN chunk  : max-abs %.3e  rel %.3e  -> %s\n", madC, relC, relC<1e-2?"PASS":"FAIL");
+        if (relC>=1e-2) rc=1;
+        double madE=0, relE=m2_relerr(outC,outR,(size_t)N*M2_H,&madE);
+        printf("M2 GDN chunk==recur: max-abs %.3e  rel %.3e  -> %s\n", madE, relE, relE<1e-3?"PASS":"FAIL");
+        if (relE>=1e-3) rc=1;
+        cudaFree(Wqkv);cudaFree(Wgate);cudaFree(Wbeta);cudaFree(Walpha);cudaFree(conv);cudaFree(ssma);
+        cudaFree(dtb);cudaFree(ssmn);cudaFree(Wout);cudaFree(gn);cudaFree(hin);cudaFree(refR);cudaFree(refC);
+        cudaFree(x);cudaFree(qkv);cudaFree(z);cudaFree(b);cudaFree(a);cudaFree(conv_out);cudaFree(qk_q);
+        cudaFree(qk_k);cudaFree(vv);cudaFree(gg);cudaFree(bb);cudaFree(core);cudaFree(gnorm);cudaFree(outR);
+        cudaFree(outC);cudaFree(scratch);
+    }
+    free(blob);
+    return rc;
+}
+

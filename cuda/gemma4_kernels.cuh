@@ -126,6 +126,15 @@ gemma4_engine_t* gemma4_engine_create(
 
 void gemma4_engine_destroy(gemma4_engine_t *eng);
 
+// ─── Qwen3.5 hybrid (qwen35) M2 per-layer kernel parity self-test ──────────────
+// Reads the torch reference binary written by cuda/qwen35_layer_ref.py (dequantized
+// fp32 weights + a fixed input hidden + the reference mixer outputs), runs the qwen35
+// FULL gated-softmax-attention and GDN (gated-deltanet) mixer kernels in fp32, and
+// asserts max-abs relative error < 1e-2 vs torch for BOTH layer kinds AND that the GDN
+// chunked-scan output matches the single-step recurrence. Returns 0 on pass, non-zero
+// on failure. CUDA-free of the engine: it allocates its own device buffers.
+int qwen35_m2_layer_selftest(const char *ref_bin_path);
+
 // ─── Core inference ──────────────────────────────────────────────────
 
 // Prefill: process n_tokens in sequence, filling KV cache.
