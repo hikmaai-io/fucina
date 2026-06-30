@@ -30,7 +30,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test \
-        qwen35-prefill-test qwen35-fp8-test qwen35-mtp-test fp8-block-test \
+        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -203,6 +203,22 @@ qwen35-prefill-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_prefill \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_prefill $(QWEN35_MODEL)"
+
+# ─── Qwen3.5 hybrid (qwen35) P3 LONG-CONTEXT argmax parity vs llama.cpp (GPU) ───
+# The Gated-DeltaNet fp32 recurrent state accumulates over every position, so long-context argmax
+# flips are exactly where state drift surfaces. Drives the INTEGRATED continuous-batching path
+# (seq_add → qwen35 batched prefill, then step_batch decode) on a ~1k-token AND a ~4k-token
+# natural-text prompt (committed ids in cuda/qwen35_longctx_{1k,4k}.ids) and asserts the greedy
+# continuation matches the pinned llama.cpp reference over 40 tokens (40/40, both lengths).
+# Regenerate the prompt ids + pinned references with the validated libllama harness:
+#   scratchpad/make_text.py | llama-tokenize --ids --no-bos  → cuda/qwen35_longctx_*.ids
+#   scratchpad/llama_ref_greedy <gguf> <ids> 40              → REF_1K / REF_4K in the test
+qwen35-longctx-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_longctx.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_longctx \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_longctx $(QWEN35_MODEL) \
+		$(CURDIR)/cuda/qwen35_longctx_1k.ids $(CURDIR)/cuda/qwen35_longctx_4k.ids"
 
 # ─── Qwen3.5 FP8 block-quant decode GEMV standalone validation (GPU) ─────
 # Validates cuda/fp8_block.cuh (DeepSeek block-fp8 decode GEMV) vs a host dequant+dot reference
