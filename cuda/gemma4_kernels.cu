@@ -3610,7 +3610,7 @@ struct gemma4_engine {
     // Resident BF16 prefill-weight cache: dequant each projection ONCE, reuse across prefills
     // (kills the per-prefill ~45% dequant cost). Auto-enabled when device memory allows; on OOM
     // it self-disables and the per-tile dequant fallback runs. [layer][WC_* slot].
-    __nv_bfloat16 *d_q35_wc[GEMMA4_CAP_LAYERS][10];
+    __nv_bfloat16 *d_q35_wc[GEMMA4_CAP_LAYERS][12];
     int            q35_wcache_on;                    // 1 = cache prefill weights in BF16
     cudaGraphExec_t q35_graph[GEMMA4_MAX_SEQS + 1];
     int      q35_graph_failed;                // global disable (env or capture failure)
@@ -4655,7 +4655,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_q35_kbx = NULL; eng->d_q35_vbx = NULL; eng->d_q35_pb = NULL;
     eng->d_q35_scores = NULL; eng->d_q35_attn_cap = 0; eng->q35_wcache_on = 0;
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++)
-        for (int p = 0; p < 10; p++) eng->d_q35_wc[l][p] = NULL;
+        for (int p = 0; p < 12; p++) eng->d_q35_wc[l][p] = NULL;
     eng->q35_graph_failed = 0; eng->q35_graph_logged = 0;
     for (int b = 0; b <= GEMMA4_MAX_SEQS; b++) eng->q35_graph[b] = NULL;
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
@@ -6194,7 +6194,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_q35_kbx); CUDA_FREE(eng->d_q35_vbx); CUDA_FREE(eng->d_q35_pb);
     CUDA_FREE(eng->d_q35_scores);
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++)
-        for (int p = 0; p < 10; p++) CUDA_FREE(eng->d_q35_wc[l][p]);
+        for (int p = 0; p < 12; p++) CUDA_FREE(eng->d_q35_wc[l][p]);
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -15892,7 +15892,7 @@ static void q35_full_attn_tc(gemma4_engine_t *eng, float *attn, const float *qb,
 }
 
 // qwen35 prefill weight-cache slots (one per distinct projection a layer can hold).
-enum { WC_QKV=0, WC_Z, WC_OUT, WC_Q, WC_K, WC_V, WC_O, WC_GATE, WC_UP, WC_DOWN };
+enum { WC_QKV=0, WC_Z, WC_OUT, WC_Q, WC_K, WC_V, WC_O, WC_GATE, WC_UP, WC_DOWN, WC_A, WC_B };
 
 // Tensor-core BF16 GEMM for ONE qwen35 prefill projection: get the BF16 weight (from the resident
 // cache, or dequant on the fly), cast the FP32 activation tile to BF16, then a cuBLAS tensor-core
@@ -16020,8 +16020,8 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             // tiny alpha/beta projections (out_dim=TSR=32) stay on the dp4a GEMV — GEMM not worth it.
             q35_proj_gemm(eng, qkv, Tn.ssm.in_qkv, Tn.ssm.fmt_in_qkv, xn, H, CONVD, T, st, &eng->d_q35_wc[l][WC_QKV]);
             q35_proj_gemm(eng, zc,  Tn.ssm.in_z,   Tn.ssm.fmt_in_z,   xn, H, INNER, T, st, &eng->d_q35_wc[l][WC_Z]);
-            gemv_batched_w(eng, ac, Wq(Tn.ssm.in_a), xn, H, TSR,   T, st, Tn.ssm.fmt_in_a);   // alpha
-            gemv_batched_w(eng, bc, Wq(Tn.ssm.in_b), xn, H, TSR,   T, st, Tn.ssm.fmt_in_b);   // beta
+            q35_proj_gemm(eng, ac,  Tn.ssm.in_a,   Tn.ssm.fmt_in_a,   xn, H, TSR,   T, st, &eng->d_q35_wc[l][WC_A]);   // alpha
+            q35_proj_gemm(eng, bc,  Tn.ssm.in_b,   Tn.ssm.fmt_in_b,   xn, H, TSR,   T, st, &eng->d_q35_wc[l][WC_B]);   // beta
             // RECURRENT: causal conv1d ring — ONE batched launch over the whole T-row tile,
             // reading the per-slot ring for the CK-1 carry positions; then advance the ring.
             qwen35_b_conv_chunk_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(
