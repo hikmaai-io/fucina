@@ -3157,8 +3157,9 @@ typedef struct gemma4_seq {
 // Decoupled from GEMMA4_MAX_SEQS (the decode/spec concurrency cap). The tensor-core prefill GEMM
 // dequantizes each weight to BF16 ONCE PER TILE, so a wide tile amortizes that fixed dequant over
 // the whole prompt (a 4096-token prompt = ONE tile = one dequant pass). The per-slot KV/state
-// arenas stay MAX_SEQS-sized; only the per-row compute + activation scratch widens to this.
-#define QWEN35_PF_TILE 4096
+// arenas stay MAX_SEQS-sized; only the per-row compute + activation scratch widens to this. 8192
+// keeps a full ctx-8192 prompt as a SINGLE base==0 tile: one weight touch + all-tensor-core attn.
+#define QWEN35_PF_TILE 8192
 
 struct gemma4_engine {
     // GGUF data (mmap'd)
@@ -15688,8 +15689,10 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     // allows (memory-constrained clients keep the per-tile dequant). Env force: 1=on, 0=off.
     {
         size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb);
-        const size_t need = (size_t)2 * eng->cfg.n_layers * 350ull * 1024 * 1024;  // ~rough BF16 wts
-        eng->q35_wcache_on = (freeb > need + (size_t)20ull * 1024 * 1024 * 1024) ? 1 : 0;
+        // Rough BF16 cache size: the GEMM'd projections are ~0.5 GB/layer at 9B. Enable when the
+        // cache plus a 5 GB working margin fits in free device memory.
+        const size_t need = (size_t)eng->cfg.n_layers * 520ull * 1024 * 1024;       // ~BF16 wts
+        eng->q35_wcache_on = (freeb > need + (size_t)5ull * 1024 * 1024 * 1024) ? 1 : 0;
         if (const char *e = getenv("FUCINA_QWEN35_WCACHE")) eng->q35_wcache_on = (atoi(e) != 0);
         fprintf(stderr, "fucina: qwen35 prefill weight-cache %s (free %.1f GiB)\n",
                 eng->q35_wcache_on ? "ON" : "off", freeb / (1024.0*1024*1024));
@@ -16005,7 +16008,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, T);
             // base==0: the whole causal prompt is this tile → tensor-core GEMM attention (reads
             // kb/vb directly). base>0 (chunked continuation): scalar kernel over the full cache.
-            if (base == 0 && T <= 4096 && ensure_q35_attn_scratch(eng, T))
+            if (base == 0 && T <= 8192 && ensure_q35_attn_scratch(eng, T))
                 q35_full_attn_tc(eng, attn, qb, kb, vb, T, st);
             else
                 qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
