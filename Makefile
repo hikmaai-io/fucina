@@ -29,7 +29,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
-        qwen35-detect-test \
+        qwen35-detect-test qwen35-load-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -143,6 +143,17 @@ QWEN35_MODEL ?= /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf
 qwen35-detect-test:
 	g++ -std=c++17 -O2 -Wall -Wextra -Icuda cuda/test_qwen35_detect.cc -o /tmp/fucina_qwen35_detect
 	/tmp/fucina_qwen35_detect $(QWEN35_MODEL)
+
+# ─── Qwen3.5 hybrid (qwen35) M1 loader gate (GPU) ───────────────────────
+# Loads the qwen35 Q4_K_M GGUF through gemma4_engine_create. The loader dumps each layer
+# index + KIND (FULL/LINEAR) with its resolved tensor shapes and validates every shape
+# against the arch spec; a missing/misshaped tensor → create returns NULL → this gate fails.
+# GPU command — wrap in the shared GB10 flock when running by hand.
+qwen35-load-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_load.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_load \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_load $(QWEN35_MODEL)"
 
 # ─── Qwen3 dense numeric parity vs llama.cpp (GPU) ──────────────────────
 # Feeds llama.cpp's input ids for "The capital of France is" through fucina's

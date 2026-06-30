@@ -3269,6 +3269,27 @@ struct gemma4_engine {
             // (attn_v + ffn_down vary), so the bulk dispatch must read the tensor's own format
             // rather than the engine-wide eng->format. 0 = unset (e.g. global-layer attn_v).
             uint8_t fmt_q, fmt_k, fmt_v, fmt_o, fmt_gate, fmt_up, fmt_down;
+
+            // ── Qwen3.5 hybrid gated-deltanet (LINEAR) layer tensors (GEMMA4_ARCH_QWEN3_5 only) ──
+            // Zero on every other arch AND on the hybrid's FULL layers (those reuse attn_q/k/v/
+            // output + attn_q_norm/attn_k_norm above; attn_q is the 2×-wide [query|gate] proj). The
+            // shared pre-mixer / pre-FFN norms + dense SwiGLU FFN reuse attn_norm/ffn_norm/ffn_*.
+            // GGUF tensor names (per the qwen35 export): attn_qkv, attn_gate, ssm_{alpha,beta,a,
+            // dt.bias,conv1d,norm,out}. Dims confirmed: in_qkv [hidden→2·grp·st+inner],
+            // in_z [hidden→inner], in_a/in_b [hidden→time_step_rank], a_log/dt_bias [time_step_rank],
+            // conv1d [conv_kernel×conv_dim] F32, norm [state_size] F32, out [inner→hidden].
+            struct {
+                uint64_t in_qkv;   // blk.l.attn_qkv.weight   q+k+v fused in-proj (Q5_K here)
+                uint64_t in_z;     // blk.l.attn_gate.weight  output-gate (z) in-proj
+                uint64_t in_a;     // blk.l.ssm_alpha.weight  decay (a) in-proj  [→ time_step_rank]
+                uint64_t in_b;     // blk.l.ssm_beta.weight   beta  (b) in-proj  [→ time_step_rank]
+                uint64_t a_log;    // blk.l.ssm_a             A_log  [time_step_rank]  F32
+                uint64_t dt_bias;  // blk.l.ssm_dt.bias       dt bias[time_step_rank]  F32
+                uint64_t conv1d;   // blk.l.ssm_conv1d.weight depthwise causal conv  [kernel×conv_dim] F32
+                uint64_t norm;     // blk.l.ssm_norm.weight   gated RMSNorm gain [state_size]  F32
+                uint64_t out;      // blk.l.ssm_out.weight    out-proj  [inner→hidden]
+                uint8_t  fmt_in_qkv, fmt_in_z, fmt_in_a, fmt_in_b, fmt_out;
+            } ssm;
         } layers[GEMMA4_CAP_LAYERS];
 
         uint64_t output_norm;        // [hidden_size] (FP32)
@@ -3819,6 +3840,47 @@ static int gguf_find_tensor_offset(
     return gguf_find_tensor(data, size, name, offset_out, n_bytes_out, NULL);
 }
 
+// Resolve a tensor's per-dimension shape (ggml ne[]: ne[0]=fastest/in-dim, ne[1]=out-dim, …).
+// Fills dims_out[0..3] (unused dims left at their incoming value is NOT guaranteed — caller
+// should pre-zero) and *n_dims_out. Returns 0 on found, -1 otherwise. Mirrors gguf_find_tensor.
+static int gguf_tensor_dims(
+    const uint8_t *data,
+    uint64_t       size,
+    const char    *name,
+    uint64_t       dims_out[4],
+    int           *n_dims_out)
+{
+    const gguf_header_t *hdr = (const gguf_header_t *)data;
+    if (size < sizeof(gguf_header_t)) return -1;
+    if (hdr->magic != 0x46554747) return -1;
+    if (hdr->version != 3) return -1;
+
+    const uint8_t *end = data + size;
+    const uint8_t *p = gguf_skip_metadata(data, size);
+    if (!p) return -1;
+
+    for (uint64_t t = 0; t < hdr->tensor_count; t++) {
+        uint64_t nlen = 0;
+        const char *tname = gguf_read_str(&p, end, &nlen);
+        if (!tname) return -1;
+        if (p + 4 > end) return -1;
+        uint32_t n_dims; memcpy(&n_dims, p, 4); p += 4;
+        if (p + (uint64_t)n_dims * 8 + 12 > end) return -1;
+        uint64_t dv[4] = {1, 1, 1, 1};
+        for (uint32_t d = 0; d < n_dims; d++) {
+            uint64_t v; memcpy(&v, p, 8); p += 8;
+            if (d < 4) dv[d] = v;
+        }
+        p += 12; // skip gtype(4) + offset(8)
+        if (gguf_str_eq(tname, nlen, name)) {
+            if (dims_out)   for (int d = 0; d < 4; d++) dims_out[d] = dv[d];
+            if (n_dims_out) *n_dims_out = (int)n_dims;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 // Map a GGML tensor type → fucina FORMAT_*; -1 for an unsupported bulk-weight type.
 static inline int ggml_to_fmt(uint32_t gt) {
     switch (gt) {
@@ -4288,6 +4350,102 @@ static void gemma4_apply_cfg(gemma4_engine_t *eng) {
     eng->n_layers_global = eng->n_global;
 }
 
+// ── Qwen3.5 hybrid (M1): per-layer tensor-layout dump + shape validation ─────────────────────────
+// Prints each layer index + KIND (FULL softmax-GQA / LINEAR gated-deltanet) with the resolved GGUF
+// shapes of its tensor set, and checks every shape against the arch spec derived from eng->cfg.
+// Returns 0 if every tensor is present and correctly shaped, -1 otherwise (→ the load aborts).
+// Self-contained: re-queries the GGUF by tensor name (independent of the recorded offset table) so a
+// renamed/misshaped tensor is caught at load rather than producing garbage in the (M2+) forward.
+static int qwen35_dump_and_validate(const gemma4_engine_t *eng) {
+    const uint8_t *gd = eng->gguf_data; const uint64_t gs = eng->gguf_size;
+    const gemma4_model_config_t *c = &eng->cfg;
+    const int H   = c->hidden_size;            // 4096 hidden
+    const int HD  = c->head_dim;               // 256  attention head dim
+    const int NH  = c->n_heads;                // 16   query heads
+    const int NKV = c->n_kv_global;            // 4    kv heads (GQA)
+    const int I   = c->intermediate;           // 12288 SwiGLU FFN
+    const int ST  = c->ssm_state_size;         // 128  per-head key/value state dim
+    const int CK  = c->ssm_conv_kernel;        // 4    depthwise conv kernel
+    const int INNER = c->ssm_inner_size;       // 4096 value path (= time_step_rank*state)
+    const int GRP = c->ssm_group_count;        // 16   key/query heads
+    const int TSR = c->ssm_time_step_rank;     // 32   value heads (a/b/A_log/dt width)
+    const int key_dim  = GRP * ST;             // 2048 (q and k each)
+    const int conv_dim = 2 * key_dim + INNER;  // 8192 (q+k+v fused = qkv out = conv channels)
+    int errs = 0, nfull = 0, nlin = 0;
+
+    uint64_t dim[4]; int nd;
+    auto fetch = [&](const char *name)->bool {
+        for (int i=0;i<4;i++) dim[i]=0; nd=0;
+        return gguf_tensor_dims(gd, gs, name, dim, &nd) == 0;
+    };
+    // 2D weight check: GGUF ne = [in, out] (ne[0] fastest = in-dim).
+    auto chk2 = [&](const char *name, int ein, int eout)->void {
+        if (!fetch(name)) { fprintf(stderr, "    MISSING  %s\n", name); errs++; return; }
+        if (!(nd==2 && (int)dim[0]==ein && (int)dim[1]==eout)) {
+            fprintf(stderr, "    MISSHAPE %s ne=[%llu,%llu] expected [%d,%d]\n", name,
+                    (unsigned long long)dim[0],(unsigned long long)dim[1], ein, eout); errs++; }
+    };
+    auto chk1 = [&](const char *name, int e0)->void {
+        if (!fetch(name)) { fprintf(stderr, "    MISSING  %s\n", name); errs++; return; }
+        if (!(nd==1 && (int)dim[0]==e0)) {
+            fprintf(stderr, "    MISSHAPE %s ne=[%llu] expected [%d]\n", name,
+                    (unsigned long long)dim[0], e0); errs++; }
+    };
+
+    fprintf(stderr, "fucina: qwen35 layout — hidden=%d head_dim=%d (q-heads %d, kv-heads %d), "
+            "intermediate=%d, conv_dim=%d, state=%dx%d, rotary_dim=%d, full-interval=%d\n",
+            H, HD, NH, NKV, I, conv_dim, ST, ST, c->rotary_dim, c->full_attention_interval);
+
+    char nm[128];
+    for (int l = 0; l < c->n_layers; l++) {
+        bool full = (c->attn_kind[l] == GEMMA4_ATTN_FULL);
+        // shared norms + dense SwiGLU FFN (both layer kinds)
+        snprintf(nm,sizeof(nm),"blk.%d.attn_norm.weight",l);           chk1(nm, H);
+        snprintf(nm,sizeof(nm),"blk.%d.post_attention_norm.weight",l); chk1(nm, H);
+        snprintf(nm,sizeof(nm),"blk.%d.ffn_gate.weight",l);            chk2(nm, H, I);
+        snprintf(nm,sizeof(nm),"blk.%d.ffn_up.weight",l);              chk2(nm, H, I);
+        snprintf(nm,sizeof(nm),"blk.%d.ffn_down.weight",l);            chk2(nm, I, H);
+        if (full) {
+            nfull++;
+            fprintf(stderr, "  L%2d FULL   attn_q[%d->%d] k/v[%d->%d] o[%d->%d] q/k_norm[%d] "
+                    "ffn[%d->%d->%d]\n", l, H, 2*NH*HD, H, NKV*HD, NH*HD, H, HD, H, I, H);
+            snprintf(nm,sizeof(nm),"blk.%d.attn_q.weight",l);      chk2(nm, H, 2*NH*HD);
+            snprintf(nm,sizeof(nm),"blk.%d.attn_k.weight",l);      chk2(nm, H, NKV*HD);
+            snprintf(nm,sizeof(nm),"blk.%d.attn_v.weight",l);      chk2(nm, H, NKV*HD);
+            snprintf(nm,sizeof(nm),"blk.%d.attn_output.weight",l); chk2(nm, NH*HD, H);
+            snprintf(nm,sizeof(nm),"blk.%d.attn_q_norm.weight",l); chk1(nm, HD);
+            snprintf(nm,sizeof(nm),"blk.%d.attn_k_norm.weight",l); chk1(nm, HD);
+        } else {
+            nlin++;
+            fprintf(stderr, "  L%2d LINEAR qkv[%d->%d] z[%d->%d] a/b[%d->%d] A_log[%d] dt[%d] "
+                    "conv[%dx%d] norm[%d] out[%d->%d]\n", l, H, conv_dim, H, INNER, H, TSR, TSR,
+                    TSR, CK, conv_dim, ST, INNER, H);
+            snprintf(nm,sizeof(nm),"blk.%d.attn_qkv.weight",l);   chk2(nm, H, conv_dim);
+            snprintf(nm,sizeof(nm),"blk.%d.attn_gate.weight",l);  chk2(nm, H, INNER);
+            snprintf(nm,sizeof(nm),"blk.%d.ssm_alpha.weight",l);  chk2(nm, H, TSR);
+            snprintf(nm,sizeof(nm),"blk.%d.ssm_beta.weight",l);   chk2(nm, H, TSR);
+            snprintf(nm,sizeof(nm),"blk.%d.ssm_a",l);             chk1(nm, TSR);
+            snprintf(nm,sizeof(nm),"blk.%d.ssm_dt.bias",l);       chk1(nm, TSR);
+            snprintf(nm,sizeof(nm),"blk.%d.ssm_conv1d.weight",l); chk2(nm, CK, conv_dim);
+            snprintf(nm,sizeof(nm),"blk.%d.ssm_norm.weight",l);   chk1(nm, ST);
+            snprintf(nm,sizeof(nm),"blk.%d.ssm_out.weight",l);    chk2(nm, INNER, H);
+        }
+    }
+    // model-level tensors
+    chk1("output_norm.weight", H);
+    chk2("token_embd.weight", H, c->vocab_size);
+    if (fetch("output.weight")) chk2("output.weight", H, c->vocab_size);  // untied lm_head
+
+    int exp_full = 0;
+    for (int i = 0; i < c->n_layers; i++) if (c->attn_kind[i] == GEMMA4_ATTN_FULL) exp_full++;
+    fprintf(stderr, "fucina: qwen35 layers: %d FULL / %d LINEAR (expected %d FULL by (i+1)%%%d==0); "
+            "shape errors=%d\n", nfull, nlin, exp_full, c->full_attention_interval, errs);
+    if (nfull != exp_full || nfull + nlin != c->n_layers) {
+        fprintf(stderr, "fucina: qwen35 layer-kind count mismatch\n"); errs++;
+    }
+    return errs == 0 ? 0 : -1;
+}
+
 // Compute the NVFP4-prefill weight footprint (bytes) WITHOUT building anything: the sum
 // over (layer, projection) of the packed E2M1 weights [out_dim × in_dim/2] plus the
 // swizzled E4M3 block scales [pad(out,128) × pad(in/16,4)]. Mirrors the per-projection
@@ -4616,6 +4774,14 @@ gemma4_engine_t* gemma4_engine_create(
                     eng->cfg.n_kv_global, eng->cfg.head_dim, eng->cfg.n_experts,
                     eng->cfg.n_experts_used, eng->cfg.expert_ffn, eng->cfg.vocab_size,
                     eng->cfg.rope_theta_global);
+        } else if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+            fprintf(stderr, "fucina: detected Qwen3.5 hybrid arch: %d layers (%d FULL softmax-GQA / "
+                    "%d LINEAR gated-deltanet, full every %d), hidden %d, FFN %d, %d heads, %d KV "
+                    "heads, head_dim %d, rotary_dim %d, vocab %d, rope_theta %.0f\n",
+                    eng->cfg.n_layers, eng->cfg.n_full, eng->cfg.n_layers - eng->cfg.n_full,
+                    eng->cfg.full_attention_interval, eng->cfg.hidden_size, eng->cfg.intermediate,
+                    eng->cfg.n_heads, eng->cfg.n_kv_global, eng->cfg.head_dim, eng->cfg.rotary_dim,
+                    eng->cfg.vocab_size, eng->cfg.rope_theta_global);
         } else {
             fprintf(stderr, "fucina: detected Gemma-4 arch: %d layers, hidden %d, FFN %d, "
                     "%d heads, KV %d sliding/%d global, %d global layers, softcap %.1f\n",
@@ -4672,6 +4838,65 @@ gemma4_engine_t* gemma4_engine_create(
     // Load per-layer tensors (M0: loop over the detected layer count, not the 12B max).
     char tname[128];
     for (int l = 0; l < eng->cfg.n_layers; l++) {
+        // ── Qwen3.5 hybrid (M1): the per-layer tensor SET depends on the layer KIND. ──
+        // FULL (softmax-GQA) layers ship the Qwen3-style attn_{q,k,v,output,q_norm,k_norm}
+        // (attn_q is the 2×-wide [query|gate] proj); LINEAR (gated-deltanet) layers ship
+        // attn_qkv/attn_gate + ssm_{alpha,beta,a,dt.bias,conv1d,norm,out}. BOTH kinds share
+        // attn_norm (pre-mixer) + the pre-FFN RMSNorm (named "post_attention_norm" in this
+        // GGUF → loaded into the ffn_norm slot) + the dense SwiGLU FFN. Gated on QWEN3_5 so
+        // every other arch falls through to the original loop body byte-for-byte unchanged.
+        if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+            // shared: pre-mixer norm
+            snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", l);
+            LOAD_TENSOR_OFFSET(tname, layers[l].attn_norm);
+            // shared: pre-FFN RMSNorm (this GGUF names it post_attention_norm) → ffn_norm slot
+            snprintf(tname, sizeof(tname), "blk.%d.post_attention_norm.weight", l);
+            LOAD_TENSOR_OFFSET(tname, layers[l].ffn_norm);
+            // shared: dense SwiGLU FFN
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
+            LOAD_TENSOR_OFFSET(tname, layers[l].ffn_gate); LOAD_WT_FMT(tname, layers[l].fmt_gate);
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", l);
+            LOAD_TENSOR_OFFSET(tname, layers[l].ffn_up);   LOAD_WT_FMT(tname, layers[l].fmt_up);
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
+            LOAD_TENSOR_OFFSET(tname, layers[l].ffn_down); LOAD_WT_FMT(tname, layers[l].fmt_down);
+
+            if (eng->cfg.attn_kind[l] == GEMMA4_ATTN_FULL) {
+                snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].attn_q);      LOAD_WT_FMT(tname, layers[l].fmt_q);
+                snprintf(tname, sizeof(tname), "blk.%d.attn_k.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].attn_k);      LOAD_WT_FMT(tname, layers[l].fmt_k);
+                snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].attn_v);      LOAD_WT_FMT(tname, layers[l].fmt_v);
+                snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].attn_output); LOAD_WT_FMT(tname, layers[l].fmt_o);
+                snprintf(tname, sizeof(tname), "blk.%d.attn_q_norm.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].attn_q_norm);
+                snprintf(tname, sizeof(tname), "blk.%d.attn_k_norm.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].attn_k_norm);
+            } else {
+                // LINEAR (gated-deltanet) tensor set
+                snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].ssm.in_qkv);  LOAD_WT_FMT(tname, layers[l].ssm.fmt_in_qkv);
+                snprintf(tname, sizeof(tname), "blk.%d.attn_gate.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].ssm.in_z);    LOAD_WT_FMT(tname, layers[l].ssm.fmt_in_z);
+                snprintf(tname, sizeof(tname), "blk.%d.ssm_alpha.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].ssm.in_a);    LOAD_WT_FMT(tname, layers[l].ssm.fmt_in_a);
+                snprintf(tname, sizeof(tname), "blk.%d.ssm_beta.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].ssm.in_b);    LOAD_WT_FMT(tname, layers[l].ssm.fmt_in_b);
+                snprintf(tname, sizeof(tname), "blk.%d.ssm_a", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].ssm.a_log);
+                snprintf(tname, sizeof(tname), "blk.%d.ssm_dt.bias", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].ssm.dt_bias);
+                snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].ssm.conv1d);
+                snprintf(tname, sizeof(tname), "blk.%d.ssm_norm.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].ssm.norm);
+                snprintf(tname, sizeof(tname), "blk.%d.ssm_out.weight", l);
+                LOAD_TENSOR_OFFSET(tname, layers[l].ssm.out);     LOAD_WT_FMT(tname, layers[l].ssm.fmt_out);
+            }
+            continue;   // qwen35 layer fully loaded; skip the generic body below
+        }
+
         snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
         LOAD_TENSOR_OFFSET(tname, layers[l].attn_q);
         LOAD_WT_FMT(tname, layers[l].fmt_q);
@@ -4762,6 +4987,13 @@ gemma4_engine_t* gemma4_engine_create(
     #undef LOAD_TENSOR_OFFSET
     #undef LOAD_TENSOR_REQUIRED
     #undef LOAD_WT_FMT
+
+    // Qwen3.5 hybrid (M1): dump the resolved per-layer tensor layout and validate every
+    // shape against the arch spec. A missing or misshaped tensor flips missing_required so
+    // the load aborts below rather than running the (M2+) forward against garbage bytes.
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+        if (qwen35_dump_and_validate(eng) != 0) missing_required = true;
+    }
 
     // A model-defining tensor was missing: the GGUF is corrupt or not a gemma-4
     // model. Fail the load rather than run inference against offset-0 garbage.
