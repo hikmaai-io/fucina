@@ -927,25 +927,28 @@ static void mmvq_batched_launch(
 {
     const int NWARPS = 8; int b = NWARPS*32;             // warp-per-row (Step 5): no smem
     dim3 g((out_dim + NWARPS - 1) / NWARPS);
-    #define LAUNCH(NK)                                                                  \
+    #define LAUNCH(NK,O)                                                                \
         do { if (fmt == 2)                                                              \
-            mmvq_q4_0_batched_kernel<NK><<<g,b,0,stream>>>(out,weight,qx,dx,sx,in_dim,out_dim); \
+            mmvq_q4_0_batched_kernel<NK><<<g,b,0,stream>>>(out+(size_t)(O)*out_dim,weight,qx+(size_t)(O)*in_dim,dx+(size_t)(O)*(in_dim>>5),sx+(size_t)(O)*(in_dim>>5),in_dim,out_dim); \
         else                                                                           \
-            mmvq_q8_0_batched_kernel<NK><<<g,b,0,stream>>>(out,weight,qx,dx,in_dim,out_dim); \
+            mmvq_q8_0_batched_kernel<NK><<<g,b,0,stream>>>(out+(size_t)(O)*out_dim,weight,qx+(size_t)(O)*in_dim,dx+(size_t)(O)*(in_dim>>5),in_dim,out_dim); \
         } while (0)
     switch (K) {
-        case 1: LAUNCH(1); break;  case 2: LAUNCH(2); break;
-        case 3: LAUNCH(3); break;  case 4: LAUNCH(4); break;
-        case 5: LAUNCH(5); break;  case 6: LAUNCH(6); break;
-        case 7: LAUNCH(7); break;  case 8: LAUNCH(8); break;
-        default:
-            for (int o = 0; o < K; o += 8) {
-                int kk = (K - o < 8) ? (K - o) : 8;
-                mmvq_batched_launch(out + (size_t)o*out_dim, weight,
-                                    qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
-                                    sx + (size_t)o*(in_dim>>5),
-                                    in_dim, out_dim, kk, fmt, stream);
-            }
+        case 1: LAUNCH(1,0); return;  case 2: LAUNCH(2,0); return;
+        case 3: LAUNCH(3,0); return;  case 4: LAUNCH(4,0); return;
+        case 5: LAUNCH(5,0); return;  case 6: LAUNCH(6,0); return;
+        case 7: LAUNCH(7,0); return;  case 8: LAUNCH(8,0); return;
+        default: break;
+    }
+    // K>8: 32-row groups (32x weight-read amortization for wide prefill), then 8, then remainder.
+    int o = 0;
+    for (; o + 32 <= K; o += 32) LAUNCH(32, o);
+    for (; o + 8  <= K; o += 8)  LAUNCH(8,  o);
+    int rem = K - o;
+    switch (rem) {
+        case 1: LAUNCH(1,o); break;  case 2: LAUNCH(2,o); break;  case 3: LAUNCH(3,o); break;
+        case 4: LAUNCH(4,o); break;  case 5: LAUNCH(5,o); break;  case 6: LAUNCH(6,o); break;
+        case 7: LAUNCH(7,o); break;  default: break;
     }
     #undef LAUNCH
 }
@@ -1635,17 +1638,26 @@ static void mmvq_q4_k_packed_batched_launch(
     int in_dim, int out_dim, int K, cudaStream_t stream)
 {
     const int NWARPS = 8; int b = NWARPS*32; dim3 g((out_dim + NWARPS - 1) / NWARPS);
-    #define LPP_Q4K(NK) mmvq_q4_k_packed_batched_kernel<NK><<<g,b,0,stream>>>(out,w,qx,dx,sx,in_dim,out_dim)
+    // NK = activation columns served per single weight-row read. Wide prefill tiles want the
+    // largest NK (weight bytes amortize over NK rows); decode (K<=16) keeps the small cases.
+    #define LPP_Q4K(NK,O) mmvq_q4_k_packed_batched_kernel<NK><<<g,b,0,stream>>>( \
+        out + (size_t)(O)*out_dim, w, qx + (size_t)(O)*in_dim, \
+        dx + (size_t)(O)*(in_dim>>5), sx + (size_t)(O)*(in_dim>>5), in_dim, out_dim)
     switch (K) {
-        case 1: LPP_Q4K(1); break; case 2: LPP_Q4K(2); break; case 3: LPP_Q4K(3); break; case 4: LPP_Q4K(4); break;
-        case 5: LPP_Q4K(5); break; case 6: LPP_Q4K(6); break; case 7: LPP_Q4K(7); break; case 8: LPP_Q4K(8); break;
-        default:
-            for (int o = 0; o < K; o += 8) {
-                int kk = (K - o < 8) ? (K - o) : 8;
-                mmvq_q4_k_packed_batched_launch(out + (size_t)o*out_dim, w,
-                                                qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
-                                                sx + (size_t)o*(in_dim>>5), in_dim, out_dim, kk, stream);
-            }
+        case 1: LPP_Q4K(1,0); return; case 2: LPP_Q4K(2,0); return; case 3: LPP_Q4K(3,0); return;
+        case 4: LPP_Q4K(4,0); return; case 5: LPP_Q4K(5,0); return; case 6: LPP_Q4K(6,0); return;
+        case 7: LPP_Q4K(7,0); return; case 8: LPP_Q4K(8,0); return;
+        default: break;
+    }
+    // K>8: 32-row groups (32x weight-read amortization for prefill), then 8-row, then remainder.
+    int o = 0;
+    for (; o + 32 <= K; o += 32) LPP_Q4K(32, o);
+    for (; o + 8  <= K; o += 8)  LPP_Q4K(8,  o);
+    int rem = K - o;
+    switch (rem) {
+        case 1: LPP_Q4K(1,o); break; case 2: LPP_Q4K(2,o); break; case 3: LPP_Q4K(3,o); break;
+        case 4: LPP_Q4K(4,o); break; case 5: LPP_Q4K(5,o); break; case 6: LPP_Q4K(6,o); break;
+        case 7: LPP_Q4K(7,o); break; default: break;
     }
     #undef LPP_Q4K
 }
@@ -3141,6 +3153,13 @@ typedef struct gemma4_seq {
 // GEMMA4_SPEC_MAX rows — so B independent rows reuse that scratch directly.
 #define GEMMA4_MAX_SEQS GEMMA4_SPEC_MAX
 
+// Prefill TILE width: how many prompt tokens one batched weight-pass covers (qwen35 hybrid).
+// Decoupled from GEMMA4_MAX_SEQS (the decode/spec concurrency cap). The tensor-core prefill GEMM
+// dequantizes each weight to BF16 ONCE PER TILE, so a wide tile amortizes that fixed dequant over
+// the whole prompt (a 4096-token prompt = ONE tile = one dequant pass). The per-slot KV/state
+// arenas stay MAX_SEQS-sized; only the per-row compute + activation scratch widens to this.
+#define QWEN35_PF_TILE 4096
+
 struct gemma4_engine {
     // GGUF data (mmap'd)
     const uint8_t *gguf_data;
@@ -3574,8 +3593,13 @@ struct gemma4_engine {
     float   *d_q35_ring[GEMMA4_CAP_LAYERS];   // LINEAR l: [MAX_SEQS][CONVD*(CK-1)] fp32 conv ring
     float   *d_q35_Kc[GEMMA4_CAP_LAYERS];     // FULL   l: [MAX_SEQS][maxctx*NKV*HD] fp32 K
     float   *d_q35_Vc[GEMMA4_CAP_LAYERS];     // FULL   l: [MAX_SEQS][maxctx*NKV*HD] fp32 V
-    int     *d_q35_rowslot;                   // [MAX_SEQS] per-row slot id (state-arena index)
-    float   *d_q35_sb[24];                    // per-row batched compute scratch (see Q35_* enum)
+    int     *d_q35_rowslot;                   // [PF_TILE] per-row slot id (state-arena index)
+    float   *d_q35_sb[24];                    // [PF_TILE rows] batched compute scratch (Q35_* enum)
+    float   *d_q35_chunk_scr;                 // GDN chunk-scan per-v-head WY/UT scratch [NVH*M2_SCR_PER]
+    int     *d_q35_pf_pos;                    // [PF_TILE] prefill per-row absolute position
+    int32_t *d_q35_pf_tok;                    // [PF_TILE] prefill per-row token id
+    __nv_bfloat16 *d_q35_wbf16[2];            // prefill weight dequant ping-pong [max(in*out)] BF16
+    __nv_bfloat16 *d_q35_xbf16;               // prefill activation BF16 [PF_TILE * max_in_dim]
     cudaGraphExec_t q35_graph[GEMMA4_MAX_SEQS + 1];
     int      q35_graph_failed;                // global disable (env or capture failure)
     uint64_t q35_graph_logged;
@@ -4612,7 +4636,9 @@ gemma4_engine_t* gemma4_engine_create(
     eng->multiseq_graph_failed = 0; eng->multiseq_graph_logged = 0;
     // qwen35 M4 batched-decode arenas (lazy; allocated on first qwen35 seq_add).
     eng->q35_ready = 0; eng->q35_maxctx = 0; eng->q35_graph_enabled = 1;
-    eng->d_q35_rowslot = NULL;
+    eng->d_q35_rowslot = NULL; eng->d_q35_chunk_scr = NULL;
+    eng->d_q35_pf_pos = NULL; eng->d_q35_pf_tok = NULL;
+    eng->d_q35_wbf16[0] = NULL; eng->d_q35_wbf16[1] = NULL; eng->d_q35_xbf16 = NULL;
     eng->q35_graph_failed = 0; eng->q35_graph_logged = 0;
     for (int b = 0; b <= GEMMA4_MAX_SEQS; b++) eng->q35_graph[b] = NULL;
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
@@ -5087,11 +5113,14 @@ gemma4_engine_t* gemma4_engine_create(
     cudaMalloc(&eng->d_qx, (size_t)q_in * sizeof(int8_t));
     cudaMalloc(&eng->d_dx, (size_t)(q_in/32) * sizeof(float));
     cudaMalloc(&eng->d_sx, (size_t)(q_in/32) * sizeof(int));   // Q4_0 −8 fold
-    // Batched (speculative-decode) variant: NK ≤ SPEC_MAX activation vectors at once.
+    // Batched variant: NK activation vectors quantized at once. Sized for the WIDER of the
+    // spec-decode cap (SPEC_MAX rows) and the qwen35 prefill tile (PF_TILE rows), since
+    // gemv_batched_w quantizes K*in_dim into this scratch and prefill drives K up to PF_TILE.
+    const int q_rows = (QWEN35_PF_TILE > GEMMA4_SPEC_MAX) ? QWEN35_PF_TILE : GEMMA4_SPEC_MAX;
     eng->d_qx_b = NULL; eng->d_dx_b = NULL; eng->d_sx_b = NULL;
-    cudaMalloc(&eng->d_qx_b, (size_t)GEMMA4_SPEC_MAX * q_in * sizeof(int8_t));
-    cudaMalloc(&eng->d_dx_b, (size_t)GEMMA4_SPEC_MAX * (q_in/32) * sizeof(float));
-    cudaMalloc(&eng->d_sx_b, (size_t)GEMMA4_SPEC_MAX * (q_in/32) * sizeof(int));
+    cudaMalloc(&eng->d_qx_b, (size_t)q_rows * q_in * sizeof(int8_t));
+    cudaMalloc(&eng->d_dx_b, (size_t)q_rows * (q_in/32) * sizeof(float));
+    cudaMalloc(&eng->d_sx_b, (size_t)q_rows * (q_in/32) * sizeof(int));
     if (!eng->d_qx || !eng->d_dx || !eng->d_sx || !eng->d_qx_b || !eng->d_dx_b || !eng->d_sx_b) {
         fprintf(stderr, "fucina: dp4a activation scratch alloc failed\n");
         gemma4_engine_destroy(eng);
@@ -6138,6 +6167,12 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     }
     for (int i = 0; i < 24; i++) CUDA_FREE(eng->d_q35_sb[i]);
     CUDA_FREE(eng->d_q35_rowslot);
+    CUDA_FREE(eng->d_q35_chunk_scr);
+    CUDA_FREE(eng->d_q35_pf_pos);
+    CUDA_FREE(eng->d_q35_pf_tok);
+    CUDA_FREE(eng->d_q35_wbf16[0]);
+    CUDA_FREE(eng->d_q35_wbf16[1]);
+    CUDA_FREE(eng->d_q35_xbf16);
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -15366,6 +15401,185 @@ __global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k,
     for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) Sg[idx] = S[idx];
 }
 
+// ── PREFILL chunked GDN/conv (P-perf): replace the per-token recurrence launches ────────────
+// These process a whole T-row prefill TILE (all rows the same slot) in ONE launch each, carrying
+// the genuine recurrence through the per-slot arenas (S / conv ring) exactly as the per-token
+// kernels do — so the produced state and `core` are bit-identical to the token-by-token path.
+
+// Batched stateful causal depthwise conv1d (k=CK) + SiLU over a T-row tile. Reads the per-slot
+// ring for the CK-1 positions BEFORE the tile (carry from earlier chunks) and the tile itself for
+// in-tile history. Does NOT mutate the ring (see qwen35_b_ring_update_kernel, run after).
+__global__ void qwen35_b_conv_chunk_kernel(float *conv_out, const float *qkv, const float *ring,
+                                           const float *cw, int slot, int conv_dim, int T) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = blockIdx.y;
+    if (c >= conv_dim || r >= T) return;
+    const int K = M2_CK, HK = M2_CK - 1;
+    const float *rg = ring + ((size_t)slot * conv_dim + c) * HK;   // [HK] positions base-HK..base-1
+    float acc = 0.f;
+    #pragma unroll
+    for (int j = 0; j < K; j++) {
+        int sr = r - (K - 1) + j;                                  // tile-relative source row
+        float val = (sr >= 0) ? qkv[(size_t)sr * conv_dim + c] : rg[HK + sr];
+        acc += cw[c * K + j] * val;
+    }
+    conv_out[(size_t)r * conv_dim + c] = acc / (1.f + __expf(-acc));   // SiLU
+}
+
+// Advance the per-slot conv ring to hold the last CK-1 raw-qkv inputs of the tile (= positions
+// base+T-HK..base+T-1), handling T<HK by folding in the old ring. Run AFTER the conv reads.
+__global__ void qwen35_b_ring_update_kernel(float *ring, const float *qkv, int slot,
+                                            int conv_dim, int T) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    const int HK = M2_CK - 1;
+    float *rg = ring + ((size_t)slot * conv_dim + c) * HK;
+    float old[M2_CK - 1];
+    #pragma unroll
+    for (int j = 0; j < HK; j++) old[j] = rg[j];
+    float nv[M2_CK - 1];
+    #pragma unroll
+    for (int idx = 0; idx < HK; idx++) {
+        int rel = T - HK + idx;                                    // tile-relative position
+        nv[idx] = (rel >= 0) ? qkv[(size_t)rel * conv_dim + c] : old[HK + rel];
+    }
+    #pragma unroll
+    for (int idx = 0; idx < HK; idx++) rg[idx] = nv[idx];
+}
+
+// GDN chunked parallel-scan (WY/UT form) over a T-row prefill TILE, carrying the per-slot fp32
+// state S in/out of the arena S_arena[slot]. Mathematically identical to qwen35_b_gdn_kernel run
+// token-by-token (and to the M2 chunk==recur self-test). One block per v-head, CHUNK=64.
+// q/k indexed [row,NKH,SD]; v/g/beta indexed [row,NVH]; reads inputs only at rows < T (guarded),
+// so the T-row scratch needs no NPAD zero-padding. NPAD = roundup(T,CHUNK) drives the chunk count.
+__global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const float *k,
+                                          const float *v, const float *g, const float *beta,
+                                          float *S_arena, float *scratch, int slot, int N, int NPAD) {
+    int vh  = blockIdx.x;
+    int kh  = vh % M2_NKH;
+    int tid = threadIdx.x;
+    const int CS = M2_CHUNK, SD = M2_SD;
+    extern __shared__ float sm[];
+    float *S    = sm;                 // [SD*SD] carried state
+    float *kch  = S + SD * SD;        // [CS*SD] cached k-chunk
+    float *gc   = kch + CS * SD;      // [CS] cumulative decay
+    float *bet  = gc + CS;            // [CS] beta per chunk row
+    float *rowb = bet + CS;           // [CS] fwd-subst scratch row
+    float *Tm    = scratch + (size_t)vh * M2_SCR_PER;
+    float *u     = Tm + CS * CS;
+    float *kcd   = u + CS * SD;
+    float *vnew  = kcd + CS * SD;
+    float *aintra= vnew + CS * SD;
+    float *Sg   = S_arena + ((size_t)slot * M2_NVH + vh) * SD * SD;
+    float scale = rsqrtf((float)SD);
+    for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = Sg[idx];   // carry-in
+    __syncthreads();
+
+    int n_chunks = NPAD / CS;
+    for (int c = 0; c < n_chunks; c++) {
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+            int r = idx / SD, d = idx % SD;
+            int gt = c * CS + r;
+            kch[idx] = (gt < N) ? k[((size_t)gt * M2_NKH + kh) * SD + d] : 0.f;
+        }
+        for (int r = tid; r < CS; r += blockDim.x) {
+            int gt = c * CS + r;
+            bet[r] = (gt < N) ? beta[(size_t)gt * M2_NVH + vh] : 0.f;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float acc = 0.f;
+            for (int r = 0; r < CS; r++) {
+                int gt = c * CS + r;
+                acc += (gt < N) ? g[(size_t)gt * M2_NVH + vh] : 0.f;
+                gc[r] = acc;
+            }
+        }
+        __syncthreads();
+        for (int idx = tid; idx < CS * CS; idx += blockDim.x) {
+            int i = idx / CS, j = idx % CS;
+            float val = 0.f;
+            if (i > j) {
+                float dot = 0.f;
+                for (int d = 0; d < SD; d++) dot += kch[i * SD + d] * bet[i] * kch[j * SD + d];
+                val = -dot * __expf(gc[i] - gc[j]);
+            }
+            Tm[idx] = val;
+        }
+        __syncthreads();
+        for (int i = 1; i < CS; i++) {
+            for (int m = tid; m < i; m += blockDim.x) rowb[m] = Tm[i * CS + m];
+            __syncthreads();
+            for (int m = tid; m < i; m += blockDim.x) {
+                float acc = rowb[m];
+                for (int nn = 0; nn < i; nn++) acc += rowb[nn] * Tm[nn * CS + m];
+                Tm[i * CS + m] = acc;
+            }
+            __syncthreads();
+        }
+        for (int i = tid; i < CS; i += blockDim.x) Tm[i * CS + i] += 1.f;
+        __syncthreads();
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+            int i = idx / SD, d = idx % SD;
+            float su = 0.f, sk = 0.f;
+            for (int s = 0; s < CS; s++) {
+                float t = Tm[i * CS + s];
+                int gt = c * CS + s;
+                float vv = (gt < N) ? v[((size_t)gt * M2_NVH + vh) * SD + d] : 0.f;
+                su += t * (vv * bet[s]);
+                sk += t * (kch[s * SD + d] * bet[s] * __expf(gc[s]));
+            }
+            u[idx] = su; kcd[idx] = sk;
+        }
+        __syncthreads();
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+            int i = idx / SD, d = idx % SD;
+            float vp = 0.f;
+            for (int kd = 0; kd < SD; kd++) vp += kcd[i * SD + kd] * S[kd * SD + d];
+            vnew[idx] = u[idx] - vp;
+        }
+        __syncthreads();
+        for (int idx = tid; idx < CS * CS; idx += blockDim.x) {
+            int i = idx / CS, j = idx % CS;
+            float val = 0.f;
+            if (i >= j) {
+                int gti = c * CS + i;
+                float dot = 0.f;
+                for (int d = 0; d < SD; d++) {
+                    float qv = (gti < N) ? q[((size_t)gti * M2_NKH + kh) * SD + d] * scale : 0.f;
+                    dot += qv * kch[j * SD + d];
+                }
+                val = dot * __expf(gc[i] - gc[j]);
+            }
+            aintra[idx] = val;
+        }
+        __syncthreads();
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+            int i = idx / SD, d = idx % SD;
+            int gti = c * CS + i;
+            if (gti >= N) continue;
+            float inter = 0.f;
+            float egi = __expf(gc[i]);
+            for (int kd = 0; kd < SD; kd++)
+                inter += q[((size_t)gti * M2_NKH + kh) * SD + kd] * scale * egi * S[kd * SD + d];
+            float intra = 0.f;
+            for (int j = 0; j <= i; j++) intra += aintra[i * CS + j] * vnew[j * SD + d];
+            core[((size_t)gti * M2_NVH + vh) * SD + d] = inter + intra;
+        }
+        __syncthreads();
+        float glast = gc[CS - 1];
+        for (int idx = tid; idx < SD * SD; idx += blockDim.x) {
+            int kd = idx / SD, d = idx % SD;
+            float acc = S[idx] * __expf(glast);
+            for (int r = 0; r < CS; r++)
+                acc += kch[r * SD + kd] * __expf(glast - gc[r]) * vnew[r * SD + d];
+            S[idx] = acc;
+        }
+        __syncthreads();
+    }
+    for (int idx = tid; idx < SD * SD; idx += blockDim.x) Sg[idx] = S[idx];   // carry-out
+}
+
 // Lazily allocate the qwen35 M4 per-slot state arenas + per-row compute scratch (qwen35 only).
 static int ensure_q35_scratch(gemma4_engine_t *eng) {
     if (eng->q35_ready) return 0;
@@ -15411,10 +15625,24 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
         (size_t)KEYD, (size_t)KEYD, (size_t)VALD, (size_t)VALD, (size_t)INNER,
         (size_t)I, (size_t)I, (size_t)I
     };
+    // Per-row compute scratch widens to the prefill tile (decode uses only the first B<=MS rows);
+    // the per-slot KV/state arenas below stay MS-sized, so memory stays bounded.
+    const int PF = (QWEN35_PF_TILE > MS) ? QWEN35_PF_TILE : MS;
     int ok = 1;
     for (int i = 0; i < 24 && ok; i++)
-        ok &= cudaMalloc(&eng->d_q35_sb[i], (size_t)MS * SBSZ[i] * sizeof(float)) == cudaSuccess;
-    ok = ok && cudaMalloc(&eng->d_q35_rowslot, (size_t)MS * sizeof(int)) == cudaSuccess;
+        ok &= cudaMalloc(&eng->d_q35_sb[i], (size_t)PF * SBSZ[i] * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->d_q35_rowslot, (size_t)PF * sizeof(int)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->d_q35_chunk_scr, (size_t)NVH * M2_SCR_PER * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->d_q35_pf_pos, (size_t)PF * sizeof(int)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->d_q35_pf_tok, (size_t)PF * sizeof(int32_t)) == cudaSuccess;
+    // Tensor-core prefill GEMM scratch: dequant each projection weight → BF16 (ping-pong for
+    // dequant/compute overlap), and the per-tile activation → BF16. Sized for the largest qwen35
+    // projection (FFN I×H) and the widest GEMM in_dim (I).
+    const size_t wbf_max = (size_t)I * H;          // FFN gate/up/down dominate (I=intermediate)
+    const size_t xbf_max = (size_t)PF * I;
+    ok = ok && cudaMalloc(&eng->d_q35_wbf16[0], wbf_max * sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->d_q35_wbf16[1], wbf_max * sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->d_q35_xbf16,    xbf_max * sizeof(__nv_bfloat16)) == cudaSuccess;
     for (int l = 0; l < L && ok; l++) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
             ok &= cudaMalloc(&eng->d_q35_Kc[l], (size_t)MS*maxctx*NKV*HD*sizeof(float)) == cudaSuccess;
@@ -15425,8 +15653,11 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
         }
     }
     size_t smGDN = ((size_t)SD * SD + 3 * SD) * sizeof(float);
+    size_t smGDNchunk = ((size_t)SD * SD + M2_CHUNK * SD + 3 * M2_CHUNK) * sizeof(float);
     ok = ok && cudaFuncSetAttribute(qwen35_b_gdn_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDN) == cudaSuccess;
+    ok = ok && cudaFuncSetAttribute(qwen35_b_gdn_chunk_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDNchunk) == cudaSuccess;
     ok = ok && cudaFuncSetAttribute(qwen35_b_attn_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, maxctx * (int)sizeof(float)) == cudaSuccess;
     if (!ok) { fprintf(stderr, "fucina: qwen35 M4 scratch alloc/opt-in failed\n"); return -1; }
@@ -15562,6 +15793,21 @@ static int qwen35_ms_run(gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *
     return 0;
 }
 
+// Tensor-core BF16 GEMM for ONE qwen35 prefill projection: dequant the quantized weight to BF16,
+// cast the FP32 activation tile to BF16, then a cuBLAS tensor-core GEMM → FP32 dst[T×out_dim].
+// Prefill is COMPUTE-bound, so this replaces the decode-oriented dp4a gemv_batched_w (warp-per-
+// output-row, ~3 effective TFLOPS) which is built for 1–few rows, not a wide prompt tile.
+// dst/x are token-major; weight is row-major [out_dim][in_dim] (= BF16 col-major [in_dim×out_dim]).
+static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fmt,
+                          const float *x_f32, int in_dim, int out_dim, int T, cudaStream_t st) {
+    const uint8_t *w = weight_fp8(eng, off);
+    bool packed = use_packed_q4k(eng, fmt, w);
+    dequant_proj_to_bf16(eng->d_q35_wbf16[0], w, (uint64_t)in_dim * out_dim, fmt, packed, st);
+    f32_to_bf16_kernel<<<(unsigned)(((size_t)T * in_dim + 255) / 256), 256, 0, st>>>(
+        eng->d_q35_xbf16, x_f32, (uint64_t)T * in_dim);
+    gemm_bf16(eng, eng->d_q35_wbf16[0], eng->d_q35_xbf16, dst, in_dim, out_dim, T);
+}
+
 // Zero a slot's GDN recurrent state + conv ring (the FULL-layer K/V cache needs no zeroing —
 // attention only reads positions [0..pos] written this sequence).
 static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
@@ -15596,7 +15842,7 @@ static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
 // State (S / ring / FULL K-V) persists in the per-slot arenas across chunks AND across calls, so
 // this is also the chunked-prefill primitive (caller resets the slot once before the first
 // chunk). do_sample=1 argmaxes the LAST row of the LAST chunk into *first_tok_out. Returns 0/-1.
-static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int base, int T,
+static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, int T,
                                       int want_logits, cudaStream_t st) {
     (void)base;
     const gemma4_model_config_t *c = &eng->cfg;
@@ -15606,14 +15852,14 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int base, int T,
     const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
     const int maxctx = eng->q35_maxctx;
     const float eps = 1e-6f;
-    const size_t smGDN = ((size_t)SD * SD + 3 * SD) * sizeof(float);
+    const size_t smGDNchunk = ((size_t)SD * SD + M2_CHUNK * SD + 3 * M2_CHUNK) * sizeof(float);
     const size_t smATT = (size_t)maxctx * sizeof(float);
     auto Wq = [&](uint64_t off) -> const uint8_t* { return weight_fp8(eng, off); };
     auto Wf = [&](uint64_t off) -> const float*   {
         return (const float*)(eng->d_weights + (off - eng->tdata_start)); };
-    int   *d_pos  = eng->d_ms_pos;
+    int   *d_pos  = eng->d_q35_pf_pos;     // wide prefill-tile position array
     int   *d_slot = eng->d_q35_rowslot;
-    int32_t *d_tok = (int32_t*)eng->d_sb[0];
+    int32_t *d_tok = eng->d_q35_pf_tok;    // wide prefill-tile token array
     float *x=eng->d_q35_sb[Q35_X], *xn=eng->d_q35_sb[Q35_XN], *qg=eng->d_q35_sb[Q35_QG],
           *qb=eng->d_q35_sb[Q35_QB], *gate=eng->d_q35_sb[Q35_GATE], *kb=eng->d_q35_sb[Q35_KB],
           *vb=eng->d_q35_sb[Q35_VB], *attn=eng->d_q35_sb[Q35_ATTN], *mix=eng->d_q35_sb[Q35_MIX],
@@ -15623,6 +15869,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int base, int T,
           *vh=eng->d_q35_sb[Q35_VH], *core=eng->d_q35_sb[Q35_CORE], *gnorm=eng->d_q35_sb[Q35_GNORM],
           *fg=eng->d_q35_sb[Q35_FG], *fu=eng->d_q35_sb[Q35_FU], *fa=eng->d_q35_sb[Q35_FA];
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+    const int NPAD = ((T + M2_CHUNK - 1) / M2_CHUNK) * M2_CHUNK;   // GDN chunk-scan padded length
 
     embed_w(eng, x, eng->d_token_embd, d_tok, T, H, st);
 
@@ -15630,9 +15877,9 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int base, int T,
         const auto &Tn = eng->tensors.layers[l];
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.attn_norm), H, T, eps);
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
-            gemv_batched_w(eng, qg, Wq(Tn.attn_q),      xn, H, 2*NQ*HD, T, st, Tn.fmt_q);
-            gemv_batched_w(eng, kb, Wq(Tn.attn_k),      xn, H, NKV*HD,  T, st, Tn.fmt_k);
-            gemv_batched_w(eng, vb, Wq(Tn.attn_v),      xn, H, NKV*HD,  T, st, Tn.fmt_v);
+            q35_proj_gemm(eng, qg, Tn.attn_q, Tn.fmt_q, xn, H, 2*NQ*HD, T, st);
+            q35_proj_gemm(eng, kb, Tn.attn_k, Tn.fmt_k, xn, H, NKV*HD,  T, st);
+            q35_proj_gemm(eng, vb, Tn.attn_v, Tn.fmt_v, xn, H, NKV*HD,  T, st);
             m2_split_query_gate_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(qb, gate, qg, T);
             per_head_rms_norm_rows_kernel<<<dim3(NQ,T),256,32*sizeof(float),st>>>(qb, Wf(Tn.attn_q_norm), NQ, HD, T, eps);
             per_head_rms_norm_rows_kernel<<<dim3(NKV,T),256,32*sizeof(float),st>>>(kb, Wf(Tn.attn_k_norm), NKV, HD, T, eps);
@@ -15643,37 +15890,37 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int base, int T,
             qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
                 attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T);
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
-            gemv_batched_w(eng, mix, Wq(Tn.attn_output), attn, NQ*HD, H, T, st, Tn.fmt_o);
+            q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st);
         } else {
-            // in_qkv requantized Q5_K→Q8_0 at load → native dp4a GEMV (P5), no per-step fp32 dequant.
-            gemv_batched_w(eng, qkv, Wq(Tn.ssm.in_qkv), xn, H, CONVD, T, st, Tn.ssm.fmt_in_qkv);
-            gemv_batched_w(eng, zc, Wq(Tn.ssm.in_z), xn, H, INNER, T, st, Tn.ssm.fmt_in_z);
+            // Weight-heavy projections via tensor-core BF16 GEMM (prefill is compute-bound). The
+            // tiny alpha/beta projections (out_dim=TSR=32) stay on the dp4a GEMV — GEMM not worth it.
+            q35_proj_gemm(eng, qkv, Tn.ssm.in_qkv, Tn.ssm.fmt_in_qkv, xn, H, CONVD, T, st);
+            q35_proj_gemm(eng, zc,  Tn.ssm.in_z,   Tn.ssm.fmt_in_z,   xn, H, INNER, T, st);
             gemv_batched_w(eng, ac, Wq(Tn.ssm.in_a), xn, H, TSR,   T, st, Tn.ssm.fmt_in_a);   // alpha
             gemv_batched_w(eng, bc, Wq(Tn.ssm.in_b), xn, H, TSR,   T, st, Tn.ssm.fmt_in_b);   // beta
-            // RECURRENT: causal conv1d ring, one token at a time (B=1, row-offset pointers).
-            for (int t = 0; t < T; t++)
-                qwen35_b_conv_kernel<<<dim3(grid1d((size_t)CONVD),1),256,0,st>>>(
-                    conv + (size_t)t*CONVD, qkv + (size_t)t*CONVD, eng->d_q35_ring[l],
-                    Wf(Tn.ssm.conv1d), d_slot, CONVD, 1);
+            // RECURRENT: causal conv1d ring — ONE batched launch over the whole T-row tile,
+            // reading the per-slot ring for the CK-1 carry positions; then advance the ring.
+            qwen35_b_conv_chunk_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(
+                conv, qkv, eng->d_q35_ring[l], Wf(Tn.ssm.conv1d), slot, CONVD, T);
+            qwen35_b_ring_update_kernel<<<grid1d((size_t)CONVD),256,0,st>>>(
+                eng->d_q35_ring[l], qkv, slot, CONVD, T);
             qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(qh, kh, vh, conv, T);
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(qh, NKH, SD, T);
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(kh, NKH, SD, T);
             m2_decay_beta_kernel<<<grid1d((size_t)T*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(Tn.ssm.a_log), Wf(Tn.ssm.dt_bias), T);
-            // RECURRENT: delta-rule state S update, one token at a time (B=1, row-offset pointers).
-            for (int t = 0; t < T; t++)
-                qwen35_b_gdn_kernel<<<dim3(NVH,1),128,smGDN,st>>>(
-                    core + (size_t)t*VALD, qh + (size_t)t*KEYD, kh + (size_t)t*KEYD,
-                    vh + (size_t)t*VALD, gg + (size_t)t*TSR, bb + (size_t)t*TSR,
-                    eng->d_q35_S[l], d_slot, 1);
+            // RECURRENT: delta-rule state S update — ONE chunked parallel-scan launch over the
+            // whole tile (CHUNK=64), carrying the per-slot fp32 state S in/out of the arena.
+            qwen35_b_gdn_chunk_kernel<<<NVH,128,smGDNchunk,st>>>(
+                core, qh, kh, vh, gg, bb, eng->d_q35_S[l], eng->d_q35_chunk_scr, slot, T, NPAD);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T);
-            gemv_batched_w(eng, mix, Wq(Tn.ssm.out), gnorm, INNER, H, T, st, Tn.ssm.fmt_out);
+            q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st);
         }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.ffn_norm), H, T, eps);
-        gemv_batched_w(eng, fg, Wq(Tn.ffn_gate), xn, H, I, T, st, Tn.fmt_gate);
-        gemv_batched_w(eng, fu, Wq(Tn.ffn_up),   xn, H, I, T, st, Tn.fmt_up);
+        q35_proj_gemm(eng, fg, Tn.ffn_gate, Tn.fmt_gate, xn, H, I, T, st);
+        q35_proj_gemm(eng, fu, Tn.ffn_up,   Tn.fmt_up,   xn, H, I, T, st);
         silu_glu_kernel<<<grid1d((size_t)T*I),256,0,st>>>(fa, fg, fu, T*I);
-        gemv_batched_w(eng, mix, Wq(Tn.ffn_down), fa, I, H, T, st, Tn.fmt_down);
+        q35_proj_gemm(eng, mix, Tn.ffn_down, Tn.fmt_down, fa, I, H, T, st);
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
     }
 
@@ -15693,18 +15940,18 @@ static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t 
     if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
     if (base + n > eng->q35_maxctx) return -1;
     cudaStream_t st = eng->stream;
-    const int CH = GEMMA4_MAX_SEQS;
-    int h_slot[GEMMA4_MAX_SEQS], h_pos[GEMMA4_MAX_SEQS];
+    const int CH = QWEN35_PF_TILE;             // wide prefill tile (amortizes the 5 GB weight read)
+    int h_slot[QWEN35_PF_TILE], h_pos[QWEN35_PF_TILE];
     int done = 0;
     while (done < n) {
         int T = n - done; if (T > CH) T = CH;
         int b = base + done;
         for (int r = 0; r < T; r++) { h_slot[r] = slot; h_pos[r] = b + r; }
-        cudaMemcpyAsync((int32_t*)eng->d_sb[0], tokens + done, (size_t)T*sizeof(int32_t), cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(eng->d_ms_pos,         h_pos,         (size_t)T*sizeof(int),     cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(eng->d_q35_rowslot,    h_slot,        (size_t)T*sizeof(int),     cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(eng->d_q35_pf_tok,  tokens + done, (size_t)T*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(eng->d_q35_pf_pos,  h_pos,         (size_t)T*sizeof(int),     cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(eng->d_q35_rowslot, h_slot,        (size_t)T*sizeof(int),     cudaMemcpyHostToDevice, st);
         int want = (do_sample && done + T >= n);   // sample only the final row of the final chunk
-        qwen35_prefill_chunk_body(eng, b, T, want, st);
+        qwen35_prefill_chunk_body(eng, slot, b, T, want, st);
         done += T;
     }
     int32_t first = 0;
