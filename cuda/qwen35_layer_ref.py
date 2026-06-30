@@ -109,8 +109,8 @@ def gdn_proj(h):
     q = conv[:, :KEYD].reshape(N, NKH, SD)
     k = conv[:, KEYD:2 * KEYD].reshape(N, NKH, SD)
     v = conv[:, 2 * KEYD:].reshape(N, NVH, SD)
-    q = q.repeat_interleave(NVH // NKH, dim=1)               # [N,32,128]
-    k = k.repeat_interleave(NVH // NKH, dim=1)
+    q = q.repeat(1, NVH // NKH, 1)                           # [N,32,128] TILE (HF repeat,
+    k = k.repeat(1, NVH // NKH, 1)                           # v-head vh ↔ k/q-head vh%NKH)
     beta = torch.sigmoid(b)                                  # [N,32]
     g = W(f"blk.{GDN_L}.ssm_a") * F.softplus(a + W(f"blk.{GDN_L}.ssm_dt.bias"))  # [N,32]
     return x, z, q, k, v, beta, g

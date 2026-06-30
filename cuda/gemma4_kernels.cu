@@ -14319,7 +14319,7 @@ __global__ void m2_gated_norm_kernel(float *out, const float *core, const float 
 __global__ void m2_gdn_recurrent_kernel(float *core, const float *q, const float *k,
                                         const float *v, const float *g, const float *beta, int N) {
     int vh  = blockIdx.x;
-    int kh  = vh / (M2_NVH / M2_NKH);
+    int kh  = vh % M2_NKH;   // TILE expand (HF repeat): v-head vh ↔ k/q-head vh % NKH
     int tid = threadIdx.x;
     extern __shared__ float sm[];
     float *S   = sm;                 // [SD*SD] k-major: S[kd*SD+vd]
@@ -14369,7 +14369,7 @@ __global__ void m2_gdn_chunk_kernel(float *core, const float *q, const float *k,
                                     const float *g, const float *beta, float *scratch,
                                     int N, int NPAD) {
     int vh  = blockIdx.x;
-    int kh  = vh / (M2_NVH / M2_NKH);
+    int kh  = vh % M2_NKH;   // TILE expand (HF repeat): v-head vh ↔ k/q-head vh % NKH
     int tid = threadIdx.x;
     const int CS = M2_CHUNK, SD = M2_SD;
     extern __shared__ float sm[];
