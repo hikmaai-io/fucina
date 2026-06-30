@@ -30,7 +30,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test \
-        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-decode-bench fp8-block-test \
+        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-decode-bench fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -142,6 +142,7 @@ packed-kv-test:
 # engine. CUDA-free (gemma4_detect.h has its own GGUF reader) → plain g++, no flock.
 QWEN35_MODEL ?= /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf
 QWEN35_FP8_MODEL ?= /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8
+QWEN35_MOE_FP8_MODEL ?= /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8
 qwen35-detect-test:
 	g++ -std=c++17 -O2 -Wall -Wextra -Icuda cuda/test_qwen35_detect.cc -o /tmp/fucina_qwen35_detect
 	/tmp/fucina_qwen35_detect $(QWEN35_MODEL)
@@ -251,6 +252,19 @@ qwen35-mtp-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_mtp \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_mtp $(QWEN35_FP8_MODEL)"
+
+# ─── Qwen3.5-35B-A3B MoE (qwen3_5_moe) P6 FP8 safetensors forward greedy parity (GPU) ───
+# Loads the OFFICIAL Qwen3.5-35B-A3B-FP8 checkpoint (DeepSeek block-fp8 safetensors, text path) and
+# drives the hybrid stack token-by-token through qwen35_moe_fp8_forward_greedy (same GDN+FULL mixer
+# as the 9B dense path, hidden 2048 / 2 KV heads, dense MLP replaced by the 256-expert top-8
+# softmax-renorm mixture + sigmoid-gated shared expert), asserting the first 8 greedy continuation
+# ids of "The capital of France is" match the torch MoE oracle [11751,13,198,760,6511,314,9338,369]
+# (8/8). Regenerate the oracle ids with: $(PYTHON) cuda/qwen35_moe_fp8_ref.py $(QWEN35_MOE_FP8_MODEL)
+qwen35-moe-fp8-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_moe_fp8.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_moe_fp8 \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_moe_fp8 $(QWEN35_MOE_FP8_MODEL)"
 
 # ─── Qwen3.5 hybrid (qwen35) P5 served-path decode tok/s bench (GPU, not a gate) ───
 # Times NSTEP single-token decode steps through the SERVED step_batch path

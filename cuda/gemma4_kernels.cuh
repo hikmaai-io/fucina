@@ -173,6 +173,20 @@ void  qwen35_fp8_free(void *model);
 int   qwen35_fp8_spec_greedy(void *model, const int32_t *in_ids, int n_prompt,
                              int32_t *out_ids, int n_gen, long *drafted_out, long *accepted_out);
 
+// ─── Qwen3.5-35B-A3B MoE hybrid (qwen3_5_moe) P6: FP8 block-quant safetensors path ─────────────
+// Loads the OFFICIAL Qwen3.5-35B-A3B-FP8 checkpoint (same DeepSeek-V3 block-fp8 schema as the 9B,
+// text path model.language_model.*) and runs the hybrid forward with the dense SwiGLU MLP replaced
+// by the Qwen3_5MoeSparseMoeBlock: a 256-expert top-8 softmax-renorm mixture + a sigmoid-gated
+// shared expert (both moe_intermediate 512). Hidden 2048, 2 KV heads; GDN geometry is identical to
+// the 9B path (kernels reused). Self-contained device buffers + handle separate from the 9B q35fp8
+// path so the dense 9B forward stays byte-identical. Greedy argmax continuation, mirrors
+// qwen35_fp8_forward_greedy. The 9B dense checkpoint (no mlp.experts.*) loads through qwen35_fp8_load
+// instead; this entry rejects a non-MoE checkpoint.
+void *qwen35_moe_fp8_load(const char *path);
+int   qwen35_moe_fp8_forward_greedy(void *model, const int32_t *in_ids, int n_prompt,
+                                    int32_t *out_ids, int n_gen);
+void  qwen35_moe_fp8_free(void *model);
+
 // ─── Core inference ──────────────────────────────────────────────────
 
 // Prefill: process n_tokens in sequence, filling KV cache.
