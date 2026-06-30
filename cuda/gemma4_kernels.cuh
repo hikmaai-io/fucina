@@ -151,6 +151,19 @@ int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids, int n_pro
 // Returns 0 on PASS. The engine must have been created from a qwen35 GGUF.
 int qwen35_batch_selftest(gemma4_engine_t *eng);
 
+// ─── Qwen3.5 hybrid (qwen35) M5: FP8 block-quant safetensors path ──────────────
+// Loads the OFFICIAL Qwen3.5-9B FP8 checkpoint (DeepSeek-V3 block-fp8: F8_E4M3 weights +
+// weight_scale_inv BF16 [out/128,in/128] block scales; norms/embed/lm_head/conv1d/A_log/dt_bias/
+// in_proj_a/b stay BF16/F32) and runs the same hybrid forward as qwen35_forward_greedy with the
+// projections driven by the fp8_block decode GEMV. Text path only (model.language_model.*).
+//   qwen35_fp8_load   — parse + upload; returns an opaque model handle (NULL on failure).
+//   qwen35_fp8_forward_greedy — greedy argmax continuation (mirrors qwen35_forward_greedy).
+//   qwen35_fp8_free   — release all device buffers.
+void *qwen35_fp8_load(const char *path);
+int   qwen35_fp8_forward_greedy(void *model, const int32_t *in_ids, int n_prompt,
+                                int32_t *out_ids, int n_gen);
+void  qwen35_fp8_free(void *model);
+
 // ─── Core inference ──────────────────────────────────────────────────
 
 // Prefill: process n_tokens in sequence, filling KV cache.
