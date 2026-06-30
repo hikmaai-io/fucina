@@ -7806,7 +7806,8 @@ int gemma4_engine_prefill_batched(
     // eng->cur prefill is gemma-layout-only: running it on Qwen3 weights corrupts
     // the CUDA context (illegal launch → "invalid device context") and SIGSEGVs the
     // single-flight HTTP path. Decline early so warmup and any caller stay safe.
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) return -2;
+    // qwen35 is likewise paged-multiseq-only (its own hybrid forward); decline here too.
+    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
     if (eng->cur.n_tokens != 0) return -2;             // need fresh sequence
     if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
     // Batched attention materializes [HEADS][N×N] score buffers (fp32+bf16, ~6 B/elem).
@@ -8942,7 +8943,7 @@ int gemma4_engine_prefill_flash(
     if (!eng->loaded || n_tokens <= 0) return -1;
     // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
     // flash prefill is gemma-layout-only. Decline so it never runs on Qwen3 weights.
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) return -2;
+    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
     // FORMAT_NVFP4: this path is BF16/MMQ-only (no FP4 GEMM) and would deref the NULL Q4_0
     // store. prefill_batched forces use_fp4=true for all N (so it never returns -2 here), but
     // guard anyway so a future change can't silently route NVFP4 through the Q4_0/BF16 path.
@@ -9307,7 +9308,7 @@ int gemma4_engine_prefill(
     // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
     // token-by-token loop uses gemma-layout decode_layer. Decline cleanly rather than
     // emit garbage / crash, so the single-flight HTTP fallthrough fails gracefully.
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) return -1;
+    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -1;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -11163,6 +11164,22 @@ static int step_batch_spec_impl(
     int32_t *out_tokens, int *out_lens,
     const int32_t *ext_drafts, const int *ext_dlens)
 {
+    // qwen35 hybrid: the GGUF carries no MTP head, and the stateful GDN/conv recurrence makes
+    // a wide parallel draft-row verify (the gemma/qwen3 path below) both inapplicable AND unsafe
+    // (decode_multiseq_forward is gemma/qwen3-layout — it would corrupt qwen35 weights). Serve
+    // the spec ABI as plain LOSSLESS single-token steps: each row's run = {real argmax}, byte-
+    // identical to greedy decode. (A future GGUF with the MTP head can widen this.)
+    if (eng && eng->loaded && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+        if (B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
+        int32_t toks[GEMMA4_MAX_SEQS];
+        int rc = qwen35_step_batch(eng, slots, in_tokens, B, toks);
+        if (rc != 0) return rc;
+        for (int r = 0; r < B; r++) {
+            if (out_lens)   out_lens[r] = (toks[r] == -1) ? -1 : 1;  // -1 = KV-exhausted sentinel
+            if (out_tokens) out_tokens[r * GEMMA4_SPEC_MAX] = toks[r];
+        }
+        return 0;
+    }
     if (!eng || !eng->loaded || !eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
     if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
     cudaStream_t stream = eng->stream;
@@ -11370,6 +11387,17 @@ extern "C" void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot) {
 
 // Number of free slots available for new sequences.
 extern "C" int gemma4_engine_seq_capacity(gemma4_engine_t *eng) {
+    // qwen35 hybrid: no paged-KV pool (paged_cap is 0 — the per-slot fp32 GDN/conv/FULL-KV
+    // arenas are pre-allocated for ALL GEMMA4_MAX_SEQS slots in ensure_q35_scratch), so the
+    // free capacity is simply the unused slot count. Honor FUCINA_PAGED_MAXSEQS as a cap.
+    if (eng && eng->loaded && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+        int cap = GEMMA4_MAX_SEQS;
+        if (const char *ms = getenv("FUCINA_PAGED_MAXSEQS")) { int v = atoi(ms); if (v > 0 && v < cap) cap = v; }
+        int used = 0;
+        for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (eng->slots[i].used) used++;
+        int free_eff = cap - used;
+        return free_eff > 0 ? free_eff : 0;
+    }
     if (!eng || !eng->paged_enabled) return 0;
     // Free capacity is bounded by what the BLOCK POOL can back (paged_cap), not
     // the raw slot count: admitting more would over-subscribe the pool and let one
@@ -13771,7 +13799,14 @@ int gemma4_engine_get_n_layers(const gemma4_engine_t *eng) {
 // the paged multiseq + continuous-batching path (single-flight prefill declines),
 // so the Go server uses this to auto-enable the batch scheduler for those models.
 int gemma4_engine_is_qwen3_family(const gemma4_engine_t *eng) {
-    return (eng && GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) ? 1 : 0;
+    // qwen35 is part of the Qwen3 family for SERVING-CONTROL purposes (the Go server uses
+    // this to auto-enable continuous batching and to reject the single-flight path): it is
+    // served exclusively through the paged-multiseq ABI (seq_add/step_batch route to the
+    // qwen35 hybrid impls). It is intentionally NOT in the GEMMA4_IS_QWEN3_FAMILY macro,
+    // which gates the fp8 paged-KV POOL allocation — qwen35 carries its own fp32 GDN/conv/
+    // FULL-KV arenas instead, so it must skip that pool path. Hence the explicit OR here.
+    return (eng && (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) ||
+                    eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)) ? 1 : 0;
 }
 
 // ─── Timing accessors (for Go-side speed logging) ─────────────────────
@@ -14130,6 +14165,24 @@ void gemma4_engine_graph_stats(const gemma4_engine_t *eng,
 // defers to flash, which needs only the BF16 scratch).
 int gemma4_engine_warmup(gemma4_engine_t *eng) {
     if (!eng || !eng->loaded) return -1;
+    // qwen35 hybrid warmup: pre-pay the per-slot fp32 GDN/conv/FULL-KV arena allocations
+    // (ensure_q35_scratch) AND capture the B=1 decode graph with a tiny throwaway sequence,
+    // via its OWN paged ABI. The gemma/qwen3 warmup below (alloc_prefill_scratch +
+    // build_bf16_weights + decode_graph_ensure/batched_graph_ensure + cuBLAS prefill passes)
+    // is gemma-layout-only and would corrupt the qwen35 weights/context, so it must be skipped.
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+        const char *nw0 = getenv("FUCINA_NO_WARMUP_PASS");
+        if (nw0 && nw0[0] == '1') return 0;
+        int32_t wp[5] = { 760, 6511, 314, 9338, 369 };  // "The capital of France is" (valid ids)
+        int32_t first = 0;
+        int slot = gemma4_engine_seq_add(eng, wp, 5, &first, 0.f, 0, 0.f, 0.f, 0);
+        if (slot >= 0) {
+            int sl = slot; int32_t in = first, out = 0;
+            for (int i = 0; i < 2; i++) { gemma4_engine_step_batch(eng, &sl, &in, 1, &out); in = out; }
+            gemma4_engine_seq_remove(eng, slot);
+        }
+        return 0;
+    }
     int rc = 0;
     if (alloc_prefill_scratch(eng) != 0) rc = -1;
     if (build_bf16_weights(eng) != 0)    rc = -1;
