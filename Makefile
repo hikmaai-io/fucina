@@ -30,7 +30,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test \
-        qwen35-fp8-test qwen35-mtp-test fp8-block-test \
+        qwen35-prefill-test qwen35-fp8-test qwen35-mtp-test fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -191,6 +191,18 @@ qwen35-batch-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_batch \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_batch $(QWEN35_MODEL)"
+
+# ─── Qwen3.5 hybrid (qwen35) P1 BATCHED single-pass prefill gate (GPU) ───
+# Drives the continuous-batching ABI (seq_add → qwen35_prefill_batched, then step_batch) and
+# asserts: (1) the integrated batched prefill reproduces the qwen35_forward_greedy oracle's
+# France->Paris 8/8 continuation; (2) on a 512-token prompt the batched prefill's first token
+# is bit-identical to the token-by-token path; (3) prints the prefill TTFT slow-vs-fast (the
+# token-by-token 149 s path vs the batched path) — expect a LARGE drop.
+qwen35-prefill-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_prefill.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_prefill \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_prefill $(QWEN35_MODEL)"
 
 # ─── Qwen3.5 FP8 block-quant decode GEMV standalone validation (GPU) ─────
 # Validates cuda/fp8_block.cuh (DeepSeek block-fp8 decode GEMV) vs a host dequant+dot reference

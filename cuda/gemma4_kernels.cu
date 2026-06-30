@@ -15574,6 +15574,150 @@ static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
     }
 }
 
+// ── Qwen3.5 (qwen35) BATCHED single-pass prefill — kills the token-by-token 149 s ────────────
+// P1: prefill ONE sequence's `n` tokens at absolute positions [base, base+n) in CHUNKS of up to
+// GEMMA4_MAX_SEQS rows, ONE weight pass per chunk (the GEMV/GEMM projections + FFN are batched
+// over the chunk's rows) instead of one full weight pass PER TOKEN. This is the only thing that
+// made qwen35 prefill 149 s for a ~1200-token prompt: token-by-token re-streamed all 5 GiB of
+// weights once per token. Here every weight read amortizes over the chunk.
+//
+// Per layer the chunk forward is the proven M4 batched body, except the two GDN kernels that
+// carry a genuine intra-sequence recurrence:
+//   • FULL  layers — fully batched: each chunk row writes its K/V to the per-slot FULL cache,
+//     then attends [0,pos] (the ragged causal order — row t reads rows [base..base+t] written
+//     THIS pass plus everything from earlier chunks). Bit-identical to token-by-token.
+//   • LINEAR(GDN) layers — the weight-heavy projections (in_qkv / in_z / in_a / in_b / out and
+//     the gated-norm) are BATCHED over the chunk; the two recurrent kernels (causal conv1d ring
+//     + delta-rule state S) run token-SEQUENTIALLY within the chunk via the SAME M4 stateful
+//     kernels (B=1, row-offset pointers), so the per-slot conv ring + GDN state S advance exactly
+//     as token-by-token. The conv/GDN kernels touch no weights, so serializing them is cheap.
+//
+// Every kernel is the same M3/M4 kernel the 8/8 oracle (qwen35_forward_greedy) uses, so the
+// produced per-slot state AND the greedily sampled first token are bit-identical to the oracle.
+// State (S / ring / FULL K-V) persists in the per-slot arenas across chunks AND across calls, so
+// this is also the chunked-prefill primitive (caller resets the slot once before the first
+// chunk). do_sample=1 argmaxes the LAST row of the LAST chunk into *first_tok_out. Returns 0/-1.
+static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int base, int T,
+                                      int want_logits, cudaStream_t st) {
+    (void)base;
+    const gemma4_model_config_t *c = &eng->cfg;
+    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV;
+    const int INNER=M2_VALD, CONVD=M2_CONVDIM, NKH=M2_NKH, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, ROT=M2_ROT;
+    const int KEYD=M2_KEYD, VALD=M2_VALD;
+    const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
+    const int maxctx = eng->q35_maxctx;
+    const float eps = 1e-6f;
+    const size_t smGDN = ((size_t)SD * SD + 3 * SD) * sizeof(float);
+    const size_t smATT = (size_t)maxctx * sizeof(float);
+    auto Wq = [&](uint64_t off) -> const uint8_t* { return weight_fp8(eng, off); };
+    auto Wf = [&](uint64_t off) -> const float*   {
+        return (const float*)(eng->d_weights + (off - eng->tdata_start)); };
+    int   *d_pos  = eng->d_ms_pos;
+    int   *d_slot = eng->d_q35_rowslot;
+    int32_t *d_tok = (int32_t*)eng->d_sb[0];
+    float *x=eng->d_q35_sb[Q35_X], *xn=eng->d_q35_sb[Q35_XN], *qg=eng->d_q35_sb[Q35_QG],
+          *qb=eng->d_q35_sb[Q35_QB], *gate=eng->d_q35_sb[Q35_GATE], *kb=eng->d_q35_sb[Q35_KB],
+          *vb=eng->d_q35_sb[Q35_VB], *attn=eng->d_q35_sb[Q35_ATTN], *mix=eng->d_q35_sb[Q35_MIX],
+          *qkv=eng->d_q35_sb[Q35_QKV], *conv=eng->d_q35_sb[Q35_CONV], *zc=eng->d_q35_sb[Q35_ZC],
+          *ac=eng->d_q35_sb[Q35_AC], *bc=eng->d_q35_sb[Q35_BC], *gg=eng->d_q35_sb[Q35_GG],
+          *bb=eng->d_q35_sb[Q35_BB], *qh=eng->d_q35_sb[Q35_QH], *kh=eng->d_q35_sb[Q35_KH],
+          *vh=eng->d_q35_sb[Q35_VH], *core=eng->d_q35_sb[Q35_CORE], *gnorm=eng->d_q35_sb[Q35_GNORM],
+          *fg=eng->d_q35_sb[Q35_FG], *fu=eng->d_q35_sb[Q35_FU], *fa=eng->d_q35_sb[Q35_FA];
+    float *dq = eng->d_q35_dq;
+    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+
+    embed_w(eng, x, eng->d_token_embd, d_tok, T, H, st);
+
+    for (int l = 0; l < L; l++) {
+        const auto &Tn = eng->tensors.layers[l];
+        rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.attn_norm), H, T, eps);
+        if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
+            gemv_batched_w(eng, qg, Wq(Tn.attn_q),      xn, H, 2*NQ*HD, T, st, Tn.fmt_q);
+            gemv_batched_w(eng, kb, Wq(Tn.attn_k),      xn, H, NKV*HD,  T, st, Tn.fmt_k);
+            gemv_batched_w(eng, vb, Wq(Tn.attn_v),      xn, H, NKV*HD,  T, st, Tn.fmt_v);
+            m2_split_query_gate_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(qb, gate, qg, T);
+            per_head_rms_norm_rows_kernel<<<dim3(NQ,T),256,32*sizeof(float),st>>>(qb, Wf(Tn.attn_q_norm), NQ, HD, T, eps);
+            per_head_rms_norm_rows_kernel<<<dim3(NKV,T),256,32*sizeof(float),st>>>(kb, Wf(Tn.attn_k_norm), NKV, HD, T, eps);
+            qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NQ,T),32,0,st>>>(qb, NQ, d_pos, T);
+            qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NKV,T),32,0,st>>>(kb, NKV, d_pos, T);
+            qwen35_b_kv_write_kernel<<<dim3(grid1d((size_t)NKV*HD),T),256,0,st>>>(
+                eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, T);
+            qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
+                attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T);
+            m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
+            gemv_batched_w(eng, mix, Wq(Tn.attn_output), attn, NQ*HD, H, T, st, Tn.fmt_o);
+        } else {
+            qwen35_dequant_q5k_f32_kernel<<<(unsigned)(((size_t)CONVD*H/256+255)/256),256,0,st>>>(
+                dq, Wq(Tn.ssm.in_qkv), (uint64_t)CONVD*H/256);
+            m2_gemm_s(qkv, xn, dq, T, H, CONVD, st);
+            gemv_batched_w(eng, zc, Wq(Tn.ssm.in_z), xn, H, INNER, T, st, Tn.ssm.fmt_in_z);
+            gemv_batched_w(eng, ac, Wq(Tn.ssm.in_a), xn, H, TSR,   T, st, Tn.ssm.fmt_in_a);   // alpha
+            gemv_batched_w(eng, bc, Wq(Tn.ssm.in_b), xn, H, TSR,   T, st, Tn.ssm.fmt_in_b);   // beta
+            // RECURRENT: causal conv1d ring, one token at a time (B=1, row-offset pointers).
+            for (int t = 0; t < T; t++)
+                qwen35_b_conv_kernel<<<dim3(grid1d((size_t)CONVD),1),256,0,st>>>(
+                    conv + (size_t)t*CONVD, qkv + (size_t)t*CONVD, eng->d_q35_ring[l],
+                    Wf(Tn.ssm.conv1d), d_slot, CONVD, 1);
+            qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(qh, kh, vh, conv, T);
+            m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(qh, NKH, SD, T);
+            m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(kh, NKH, SD, T);
+            m2_decay_beta_kernel<<<grid1d((size_t)T*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(Tn.ssm.a_log), Wf(Tn.ssm.dt_bias), T);
+            // RECURRENT: delta-rule state S update, one token at a time (B=1, row-offset pointers).
+            for (int t = 0; t < T; t++)
+                qwen35_b_gdn_kernel<<<dim3(NVH,1),128,smGDN,st>>>(
+                    core + (size_t)t*VALD, qh + (size_t)t*KEYD, kh + (size_t)t*KEYD,
+                    vh + (size_t)t*VALD, gg + (size_t)t*TSR, bb + (size_t)t*TSR,
+                    eng->d_q35_S[l], d_slot, 1);
+            m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T);
+            gemv_batched_w(eng, mix, Wq(Tn.ssm.out), gnorm, INNER, H, T, st, Tn.ssm.fmt_out);
+        }
+        residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
+        rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.ffn_norm), H, T, eps);
+        gemv_batched_w(eng, fg, Wq(Tn.ffn_gate), xn, H, I, T, st, Tn.fmt_gate);
+        gemv_batched_w(eng, fu, Wq(Tn.ffn_up),   xn, H, I, T, st, Tn.fmt_up);
+        silu_glu_kernel<<<grid1d((size_t)T*I),256,0,st>>>(fa, fg, fu, T*I);
+        gemv_batched_w(eng, mix, Wq(Tn.ffn_down), fa, I, H, T, st, Tn.fmt_down);
+        residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
+    }
+
+    if (want_logits) {
+        // Final norm over all T rows, but the LM head (VOC=248320, the most expensive GEMV) only on
+        // the LAST row — the only one whose logits the caller samples for the first generated token.
+        rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, T, eps);
+        gemv_w(eng, eng->d_logits, Wq(eng->tensors.output_weight),
+               xn + (size_t)(T-1)*H, H, VOC, st, eng->tensors.output_fmt);
+        argmax_rows_kernel<<<1,32,0,st>>>(eng->d_logits, eng->d_ms_outtok, 1, VOC);
+    }
+}
+
+static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t *tokens, int n,
+                                  int base, int do_sample, int32_t *first_tok_out) {
+    if (!eng || !eng->loaded || slot < 0 || slot >= GEMMA4_MAX_SEQS || !tokens || n <= 0) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
+    if (base + n > eng->q35_maxctx) return -1;
+    cudaStream_t st = eng->stream;
+    const int CH = GEMMA4_MAX_SEQS;
+    int h_slot[GEMMA4_MAX_SEQS], h_pos[GEMMA4_MAX_SEQS];
+    int done = 0;
+    while (done < n) {
+        int T = n - done; if (T > CH) T = CH;
+        int b = base + done;
+        for (int r = 0; r < T; r++) { h_slot[r] = slot; h_pos[r] = b + r; }
+        cudaMemcpyAsync((int32_t*)eng->d_sb[0], tokens + done, (size_t)T*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(eng->d_ms_pos,         h_pos,         (size_t)T*sizeof(int),     cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(eng->d_q35_rowslot,    h_slot,        (size_t)T*sizeof(int),     cudaMemcpyHostToDevice, st);
+        int want = (do_sample && done + T >= n);   // sample only the final row of the final chunk
+        qwen35_prefill_chunk_body(eng, b, T, want, st);
+        done += T;
+    }
+    int32_t first = 0;
+    if (do_sample) cudaMemcpyAsync(&first, eng->d_ms_outtok, sizeof(int32_t), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    if (do_sample && first_tok_out) *first_tok_out = first;
+    return 0;
+}
+
 static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_prompt,
                           int32_t *first_token_out, float temp, int top_k, float top_p,
                           float min_p, uint64_t seed) {
@@ -15588,6 +15732,19 @@ static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_pro
     s->used = 1; s->n_tokens = 0; s->samp_temp = 0.f; s->n_sampled = 0; s->mtp_h_valid = 0;
     cudaStream_t st = eng->stream;
     qwen35_slot_reset(eng, slot, st);
+    // P1: BATCHED single-pass prefill (one weight pass per ≤GEMMA4_MAX_SEQS-token chunk) instead of
+    // token-by-token (which re-streamed all weights per token → 149 s). g_fucina_force_slow_prefill
+    // forces the proven token-by-token loop for the dual-path determinism self-test.
+    extern int g_fucina_force_slow_prefill;
+    if (!g_fucina_force_slow_prefill) {
+        int32_t ft = 0;
+        if (qwen35_prefill_batched(eng, slot, prompt, n_prompt, /*base=*/0, /*do_sample=*/1, &ft) != 0) {
+            s->used = 0; return -1;
+        }
+        s->n_tokens = n_prompt;
+        if (first_token_out) *first_token_out = ft;
+        return slot;
+    }
     gemma4_seq *one[1] = { s };
     for (int i = 0; i < n_prompt; i++) {   // sequential prefill (GDN recurrence is per-position)
         int pos = i; int32_t tok = prompt[i]; int want = (i == n_prompt - 1);
@@ -15624,6 +15781,18 @@ static int qwen35_seq_prefill_chunk(gemma4_engine_t *eng, int slot, const int32_
     if (!s->used) return -1;
     if (s->n_tokens + n > eng->q35_maxctx) return -1;
     cudaStream_t st = eng->stream;
+    // P1: BATCHED chunk prefill — one weight pass per ≤GEMMA4_MAX_SEQS-token sub-chunk, appending at
+    // the slot's current position (state persists in the per-slot arenas). g_fucina_force_slow_prefill
+    // forces the token-by-token loop for the dual-path determinism self-test.
+    extern int g_fucina_force_slow_prefill;
+    if (!g_fucina_force_slow_prefill) {
+        int32_t ft = 0;
+        if (qwen35_prefill_batched(eng, slot, tokens, n, /*base=*/s->n_tokens, do_sample, &ft) != 0)
+            return -1;
+        s->n_tokens += n;
+        if (do_sample && first_token_out) *first_token_out = ft;
+        return 0;
+    }
     gemma4_seq *one[1] = { s };
     for (int i = 0; i < n; i++) {
         int pos = s->n_tokens + i; int32_t tok = tokens[i]; int want = (do_sample && i == n - 1);
