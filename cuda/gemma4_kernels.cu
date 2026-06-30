@@ -15831,6 +15831,19 @@ struct q35fp8_layer {
     float *in_norm, *post_norm;             // shared: pre-mixer / pre-FFN RMSNorm (+1 baked) [H]
     q35fp8_proj gate, up, down;             // shared: SwiGLU MLP
 };
+// M6: single-MTP draft head (mtp.* tensors; FP8 checkpoint only — the GGUF dropped them).
+// One FULL-attention decoder layer reused verbatim from the backbone full-attn shape, plus the
+// fc-fusion prologue (concat[norm(embed), norm(h_prev)] → fc) and a final mtp.norm before the
+// (shared, untied) lm_head. h_prev = the main model's POST-final-norm hidden (vLLM convention).
+struct q35fp8_mtp {
+    int   loaded;
+    float *pre_e, *pre_h;             // pre_fc_norm_embedding / _hidden  [H] (+1)
+    float *fc;                        // fc.weight BF16→F32 [H, 2H] (m2_gemm: OUT=H, INN=2H)
+    float *in_norm, *post_norm, *fnorm;  // input_layernorm / post_attention_layernorm / mtp.norm [H] (+1)
+    q35fp8_proj q, k, v, o;           // self_attn (gated 2× q), FP8 block
+    float *q_norm, *k_norm;           // per-head RMSNorm gains [HEAD] (+1)
+    q35fp8_proj gate, up, down;       // SwiGLU MLP, FP8 block
+};
 struct q35fp8_model {
     gemma4_model_config_t cfg;
     cudaStream_t stream;
@@ -15840,6 +15853,7 @@ struct q35fp8_model {
     float *lm_head;     // [vocab*H] f32
     float *d_logits;    // [vocab]
     q35fp8_layer L[GEMMA4_CAP_LAYERS];
+    q35fp8_mtp   mtp;   // M6 draft head
 };
 
 static void *q35fp8_up_bytes(const void *host, size_t nbytes) {
@@ -15940,6 +15954,33 @@ extern "C" void *qwen35_fp8_load(const char *path) {
             if (T.a_coef) q35fp8_neg_exp_kernel<<<(unsigned)((TSR + 255) / 256), 256>>>(T.a_coef, TSR);
             ok = ok && T.ina && T.inb && T.conv1d && T.dt_bias && T.ssm_norm && T.a_coef;
         }
+    }
+    // ── M6: optional single-MTP draft head (mtp.*). Best-effort: a checkpoint without the head
+    //    (or a partial one) simply leaves m->mtp.loaded=0 — the M5 forward is unaffected. ──
+    {
+        q35fp8_mtp &P = m->mtp;
+        auto MT = [&](const char *k){ return std::string("mtp.") + k; };
+        bool mok = true;
+        P.pre_e     = q35fp8_up_bf16_f32(M.find(MT("pre_fc_norm_embedding.weight")), 1.0f);
+        P.pre_h     = q35fp8_up_bf16_f32(M.find(MT("pre_fc_norm_hidden.weight")),    1.0f);
+        P.fc        = q35fp8_up_bf16_f32(M.find(MT("fc.weight")),                    0.0f);  // [H,2H]
+        P.in_norm   = q35fp8_up_bf16_f32(M.find(MT("layers.0.input_layernorm.weight")),          1.0f);
+        P.post_norm = q35fp8_up_bf16_f32(M.find(MT("layers.0.post_attention_layernorm.weight")), 1.0f);
+        P.fnorm     = q35fp8_up_bf16_f32(M.find(MT("norm.weight")),                  1.0f);
+        P.q_norm    = q35fp8_up_bf16_f32(M.find(MT("layers.0.self_attn.q_norm.weight")), 1.0f);
+        P.k_norm    = q35fp8_up_bf16_f32(M.find(MT("layers.0.self_attn.k_norm.weight")), 1.0f);
+        mok = mok && P.pre_e && P.pre_h && P.fc && P.in_norm && P.post_norm && P.fnorm && P.q_norm && P.k_norm;
+        mok = mok && q35fp8_load_proj(M, MT("layers.0.self_attn.q_proj.weight"), P.q, 2*NQ*HD, H);
+        mok = mok && q35fp8_load_proj(M, MT("layers.0.self_attn.k_proj.weight"), P.k, NKV*HD,  H);
+        mok = mok && q35fp8_load_proj(M, MT("layers.0.self_attn.v_proj.weight"), P.v, NKV*HD,  H);
+        mok = mok && q35fp8_load_proj(M, MT("layers.0.self_attn.o_proj.weight"), P.o, H, NQ*HD);
+        mok = mok && q35fp8_load_proj(M, MT("layers.0.mlp.gate_proj.weight"), P.gate, I, H);
+        mok = mok && q35fp8_load_proj(M, MT("layers.0.mlp.up_proj.weight"),   P.up,   I, H);
+        mok = mok && q35fp8_load_proj(M, MT("layers.0.mlp.down_proj.weight"), P.down, H, I);
+        cudaDeviceSynchronize();
+        if (cudaGetLastError() != cudaSuccess) mok = false;
+        P.loaded = mok ? 1 : 0;
+        fprintf(stderr, "qwen35_fp8_load: MTP draft head %s\n", mok ? "loaded (22 tensors)" : "absent/partial — spec disabled");
     }
     cudaDeviceSynchronize();
     if (cudaGetLastError() != cudaSuccess) ok = false;
@@ -16097,6 +16138,284 @@ extern "C" void qwen35_fp8_free(void *model) {
             if (T.ssm_norm) cudaFree(T.ssm_norm); if (T.a_coef) cudaFree(T.a_coef);
         }
     }
+    if (m->mtp.loaded) {
+        q35fp8_mtp &P = m->mtp;
+        float *bf[] = {P.pre_e,P.pre_h,P.fc,P.in_norm,P.post_norm,P.fnorm,P.q_norm,P.k_norm};
+        for (float *b : bf) if (b) cudaFree(b);
+        FW(P.q); FW(P.k); FW(P.v); FW(P.o); FW(P.gate); FW(P.up); FW(P.down);
+    }
     delete m;
+}
+
+// =========================================================================
+// ─── M6: Qwen3.5 single-MTP draft head + LOSSLESS speculative decode ──────
+// =========================================================================
+// Self-contained on the M5 FP8 path (the only checkpoint that ships the mtp.* head — the GGUF
+// conversion drops it). The backbone hybrid mixer is STATEFUL (per-V-head GDN recurrent state +
+// conv ring + per-FULL-layer KV), so unlike a paged-softmax model the draft tokens cannot be
+// verified in one wide parallel forward and rolled back. Instead the verify is a SEQUENTIAL
+// stop-at-first-reject single-row decode: process the pending token (always 1 emit), and while the
+// next draft matched the just-computed target argmax, keep stepping. Because we NEVER step a
+// rejected draft, the recurrent state lands exactly at "after the accepted prefix" with NO rollback
+// — and every emitted token is the real backbone greedy argmax, so the continuation is
+// BIT-IDENTICAL to qwen35_fp8_forward_greedy (lossless). The MTP only changes how many backbone
+// steps run per call; it never changes which token is emitted.
+//
+// MTP draft = chain-local: a fresh tiny KV cache per round, seeded with h_prev = the backbone's
+// POST-final-norm hidden of the last committed token (vLLM Qwen3_5MultiTokenPredictor convention).
+// h_prev already carries full context, so even draft-chain-only attention drafts well (torch ref:
+// mean ~1.4 accepted/round). Faithful persistent-KV would lift that to ~2.8 but needs a prompt-wide
+// MTP pass + rollback; chain-local is the lossless, accept>0, stable minimum the gate asks for.
+
+#define Q35_MTP_DEPTH_DEFAULT 4
+
+struct q35fp8_ctx {
+    q35fp8_model *m; cudaStream_t st; int maxctx, L;
+    // backbone single-token scratch (mirrors qwen35_fp8_forward_greedy locals)
+    float *x,*xn,*qg,*qb,*gate,*kb,*vb,*attn,*mix,*qkv,*conv_out,*zc,*ac,*bc,*gg,*bb,
+          *qh,*kh,*vh,*core,*gnorm,*ffn_g,*ffn_u,*ffn_a,*hbuf;
+    int   *d_arg;
+    float **Kc,**Vc,**Sst,**ring;             // persistent per-layer state
+    // MTP scratch + chain-local KV
+    float *me,*mcat,*mxfc,*mxn,*mqg,*mqb,*mgate,*mkb,*mvb,*mattn,*mmix,*mr2,*mxn2,*mxn3,
+          *mffg,*mffu,*mffa,*mhid,*mKc,*mVc;
+};
+
+static void q35fp8_ctx_free(q35fp8_ctx *c) {
+    if (!c) return;
+    float *bb[] = {c->x,c->xn,c->qg,c->qb,c->gate,c->kb,c->vb,c->attn,c->mix,c->qkv,c->conv_out,
+        c->zc,c->ac,c->bc,c->gg,c->bb,c->qh,c->kh,c->vh,c->core,c->gnorm,c->ffn_g,c->ffn_u,c->ffn_a,
+        c->hbuf,c->me,c->mcat,c->mxfc,c->mxn,c->mqg,c->mqb,c->mgate,c->mkb,c->mvb,c->mattn,c->mmix,
+        c->mr2,c->mxn2,c->mxn3,c->mffg,c->mffu,c->mffa,c->mhid,c->mKc,c->mVc};
+    for (float *b : bb) if (b) cudaFree(b);
+    if (c->d_arg) cudaFree(c->d_arg);
+    if (c->Kc)  { for (int l=0;l<c->L;l++) if (c->Kc[l])  cudaFree(c->Kc[l]);  free(c->Kc); }
+    if (c->Vc)  { for (int l=0;l<c->L;l++) if (c->Vc[l])  cudaFree(c->Vc[l]);  free(c->Vc); }
+    if (c->Sst) { for (int l=0;l<c->L;l++) if (c->Sst[l]) cudaFree(c->Sst[l]); free(c->Sst); }
+    if (c->ring){ for (int l=0;l<c->L;l++) if (c->ring[l])cudaFree(c->ring[l]);free(c->ring); }
+}
+
+static int q35fp8_ctx_init(q35fp8_ctx *c, q35fp8_model *m, int maxctx) {
+    memset(c, 0, sizeof(*c));
+    c->m = m; c->st = m->stream; c->maxctx = maxctx; c->L = m->n_layers;
+    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV, INNER=M2_VALD, CONVD=M2_CONVDIM,
+              NKH=M2_NKH, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, I=m->inter, Dm=GEMMA4_SPEC_MAX;
+    bool ok = true;
+    #define CKC(p,n) do { if (cudaMalloc(&(c->p),(size_t)(n)*sizeof(float))!=cudaSuccess) ok=false; } while(0)
+    CKC(x,H); CKC(xn,H); CKC(qg,2*NQ*HD); CKC(qb,NQ*HD); CKC(gate,NQ*HD); CKC(kb,NKV*HD);
+    CKC(vb,NKV*HD); CKC(attn,NQ*HD); CKC(mix,H); CKC(qkv,CONVD); CKC(conv_out,CONVD); CKC(zc,INNER);
+    CKC(ac,TSR); CKC(bc,TSR); CKC(gg,TSR); CKC(bb,TSR); CKC(qh,NKH*SD); CKC(kh,NKH*SD);
+    CKC(vh,NVH*SD); CKC(core,NVH*SD); CKC(gnorm,INNER); CKC(ffn_g,I); CKC(ffn_u,I); CKC(ffn_a,I);
+    CKC(hbuf,H);
+    CKC(me,H); CKC(mcat,2*H); CKC(mxfc,H); CKC(mxn,H); CKC(mqg,2*NQ*HD); CKC(mqb,NQ*HD);
+    CKC(mgate,NQ*HD); CKC(mkb,NKV*HD); CKC(mvb,NKV*HD); CKC(mattn,NQ*HD); CKC(mmix,H); CKC(mr2,H);
+    CKC(mxn2,H); CKC(mxn3,H); CKC(mffg,I); CKC(mffu,I); CKC(mffa,I); CKC(mhid,H);
+    CKC(mKc,(size_t)Dm*NKV*HD); CKC(mVc,(size_t)Dm*NKV*HD);
+    #undef CKC
+    if (cudaMalloc(&c->d_arg, sizeof(int)) != cudaSuccess) ok = false;
+    c->Kc=(float**)calloc(c->L,sizeof(float*)); c->Vc=(float**)calloc(c->L,sizeof(float*));
+    c->Sst=(float**)calloc(c->L,sizeof(float*)); c->ring=(float**)calloc(c->L,sizeof(float*));
+    if (!c->Kc||!c->Vc||!c->Sst||!c->ring) ok=false;
+    for (int l=0; l<c->L && ok; l++) {
+        if (m->cfg.attn_kind[l]==GEMMA4_ATTN_FULL) {
+            if (cudaMalloc(&c->Kc[l],(size_t)maxctx*NKV*HD*sizeof(float))!=cudaSuccess) ok=false;
+            if (cudaMalloc(&c->Vc[l],(size_t)maxctx*NKV*HD*sizeof(float))!=cudaSuccess) ok=false;
+        } else {
+            if (cudaMalloc(&c->Sst[l], (size_t)NVH*SD*SD*sizeof(float))!=cudaSuccess) ok=false;
+            if (cudaMalloc(&c->ring[l],(size_t)CONVD*(M2_CK-1)*sizeof(float))!=cudaSuccess) ok=false;
+            if (ok) { cudaMemsetAsync(c->Sst[l],0,(size_t)NVH*SD*SD*sizeof(float),c->st);
+                      cudaMemsetAsync(c->ring[l],0,(size_t)CONVD*(M2_CK-1)*sizeof(float),c->st); }
+        }
+    }
+    if (!ok) { q35fp8_ctx_free(c); return -1; }
+    return 0;
+}
+
+// One backbone token at absolute position `pos` (advances Kc/Vc/Sst/ring in place). Bit-identical
+// to one iteration of qwen35_fp8_forward_greedy's loop. want_hidden → ctx->hbuf = POST-final-norm
+// hidden (h_prev for the MTP); returns the greedy argmax when want_argmax, else -1.
+static int q35fp8_main_step(q35fp8_ctx *c, int32_t token, int pos, int want_hidden, int want_argmax) {
+    q35fp8_model *m = c->m; cudaStream_t st = c->st;
+    const gemma4_model_config_t *cfg = &m->cfg; const float eps = M2_EPS;
+    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV, INNER=M2_VALD, CONVD=M2_CONVDIM,
+              KEYD=M2_KEYD, NKH=M2_NKH, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, ROT=M2_ROT,
+              I=m->inter, VOC=m->vocab, L=c->L;
+    size_t smGDN = ((size_t)SD*SD + 3*SD)*sizeof(float);
+    cudaMemcpyAsync(c->x, m->embed + (size_t)token*H, (size_t)H*sizeof(float), cudaMemcpyDeviceToDevice, st);
+    for (int l=0; l<L; l++) {
+        q35fp8_layer &T = m->L[l];
+        rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(c->xn, c->x, T.in_norm, H, 1, eps);
+        if (cfg->attn_kind[l]==GEMMA4_ATTN_FULL) {
+            fp8_block_gemv_launch(c->qg, T.q.w, T.q.s, c->xn, H, 2*NQ*HD, st);
+            fp8_block_gemv_launch(c->kb, T.k.w, T.k.s, c->xn, H, NKV*HD, st);
+            fp8_block_gemv_launch(c->vb, T.v.w, T.v.s, c->xn, H, NKV*HD, st);
+            m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->qb, c->gate, c->qg, 1);
+            per_head_rms_norm_rows_kernel<<<dim3(NQ,1),256,32*sizeof(float),st>>>(c->qb, T.q_norm, NQ, HD, 1, eps);
+            per_head_rms_norm_rows_kernel<<<dim3(NKV,1),256,32*sizeof(float),st>>>(c->kb, T.k_norm, NKV, HD, 1, eps);
+            qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NQ),32,0,st>>>(c->qb, NQ, pos);
+            qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NKV),32,0,st>>>(c->kb, NKV, pos);
+            cudaMemcpyAsync(c->Kc[l]+(size_t)pos*NKV*HD, c->kb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
+            cudaMemcpyAsync(c->Vc[l]+(size_t)pos*NKV*HD, c->vb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
+            qwen35_attn_step_kernel<<<NQ,256,(size_t)(pos+1)*sizeof(float),st>>>(c->attn, c->qb, c->Kc[l], c->Vc[l], pos);
+            m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->attn, c->gate, NQ*HD);
+            fp8_block_gemv_launch(c->mix, T.o.w, T.o.s, c->attn, NQ*HD, H, st);
+        } else {
+            fp8_block_gemv_launch(c->qkv, T.inqkv.w, T.inqkv.s, c->xn, H, CONVD, st);
+            fp8_block_gemv_launch(c->zc,  T.inz.w,   T.inz.s,   c->xn, H, INNER, st);
+            m2_gemm(c->ac, c->xn, T.ina, 1, H, TSR);
+            m2_gemm(c->bc, c->xn, T.inb, 1, H, TSR);
+            qwen35_conv_step_kernel<<<(CONVD+127)/128,128,0,st>>>(c->conv_out, c->qkv, c->ring[l], T.conv1d, CONVD);
+            cudaMemcpyAsync(c->qh, c->conv_out,        (size_t)KEYD*sizeof(float),  cudaMemcpyDeviceToDevice, st);
+            cudaMemcpyAsync(c->kh, c->conv_out+KEYD,   (size_t)KEYD*sizeof(float),  cudaMemcpyDeviceToDevice, st);
+            cudaMemcpyAsync(c->vh, c->conv_out+2*KEYD, (size_t)INNER*sizeof(float), cudaMemcpyDeviceToDevice, st);
+            m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(c->qh, NKH, SD, 1);
+            m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(c->kh, NKH, SD, 1);
+            m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(c->gg, c->bb, c->ac, c->bc, T.a_coef, T.dt_bias, 1);
+            qwen35_fp8_gdn_step_kernel<<<NVH,128,smGDN,st>>>(c->core, c->qh, c->kh, c->vh, c->gg, c->bb, c->Sst[l]);
+            m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(c->gnorm, c->core, c->zc, T.ssm_norm, 1);
+            fp8_block_gemv_launch(c->mix, T.out.w, T.out.s, c->gnorm, INNER, H, st);
+        }
+        qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(c->x, c->mix, H);
+        rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(c->xn, c->x, T.post_norm, H, 1, eps);
+        fp8_block_gemv_launch(c->ffn_g, T.gate.w, T.gate.s, c->xn, H, I, st);
+        fp8_block_gemv_launch(c->ffn_u, T.up.w,   T.up.s,   c->xn, H, I, st);
+        silu_glu_kernel<<<(I+255)/256,256,0,st>>>(c->ffn_a, c->ffn_g, c->ffn_u, I);
+        fp8_block_gemv_launch(c->mix, T.down.w, T.down.s, c->ffn_a, I, H, st);
+        qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(c->x, c->mix, H);
+    }
+    int argmax = -1;
+    if (want_hidden || want_argmax) {
+        rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(c->xn, c->x, m->out_norm, H, 1, eps);
+        if (want_hidden)
+            cudaMemcpyAsync(c->hbuf, c->xn, (size_t)H*sizeof(float), cudaMemcpyDeviceToDevice, st);
+        if (want_argmax) {
+            m2_gemm(m->d_logits, c->xn, m->lm_head, 1, H, VOC);
+            qwen35_argmax_kernel<<<1,256,0,st>>>(m->d_logits, VOC, c->d_arg);
+            cudaMemcpyAsync(&argmax, c->d_arg, sizeof(int), cudaMemcpyDeviceToHost, st);
+            cudaStreamSynchronize(st);
+        }
+    }
+    return argmax;
+}
+
+// One MTP draft step (chain-local KV at index `idx`, absolute RoPE position `pos`). in_tok is the
+// token to embed; h_prev[H] the previous hidden (backbone post-norm for idx 0, else the MTP
+// residual stream of the prior depth). Writes the new MTP residual stream to ctx->mhid (re-fed as
+// h_prev for the next depth) and returns the drafted argmax.
+static int q35fp8_mtp_step(q35fp8_ctx *c, int32_t in_tok, const float *h_prev, int idx, int pos) {
+    q35fp8_model *m = c->m; cudaStream_t st = c->st; q35fp8_mtp &P = m->mtp;
+    const float eps = M2_EPS;
+    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV, ROT=M2_ROT, I=m->inter, VOC=m->vocab;
+    // fc-fusion: cat[ norm_e(embed(in_tok)) | norm_h(h_prev) ] → fc → residual stream xfc
+    cudaMemcpyAsync(c->me, m->embed + (size_t)in_tok*H, (size_t)H*sizeof(float), cudaMemcpyDeviceToDevice, st);
+    rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(c->mcat,     c->me,  P.pre_e, H, 1, eps);
+    rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(c->mcat + H, h_prev, P.pre_h, H, 1, eps);
+    m2_gemm(c->mxfc, c->mcat, P.fc, 1, 2*H, H);
+    // one FULL-attn decoder layer (gated GQA + SwiGLU), residual = mxfc
+    rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(c->mxn, c->mxfc, P.in_norm, H, 1, eps);
+    fp8_block_gemv_launch(c->mqg, P.q.w, P.q.s, c->mxn, H, 2*NQ*HD, st);
+    fp8_block_gemv_launch(c->mkb, P.k.w, P.k.s, c->mxn, H, NKV*HD, st);
+    fp8_block_gemv_launch(c->mvb, P.v.w, P.v.s, c->mxn, H, NKV*HD, st);
+    m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->mqb, c->mgate, c->mqg, 1);
+    per_head_rms_norm_rows_kernel<<<dim3(NQ,1),256,32*sizeof(float),st>>>(c->mqb, P.q_norm, NQ, HD, 1, eps);
+    per_head_rms_norm_rows_kernel<<<dim3(NKV,1),256,32*sizeof(float),st>>>(c->mkb, P.k_norm, NKV, HD, 1, eps);
+    qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NQ),32,0,st>>>(c->mqb, NQ, pos);
+    qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NKV),32,0,st>>>(c->mkb, NKV, pos);
+    cudaMemcpyAsync(c->mKc+(size_t)idx*NKV*HD, c->mkb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
+    cudaMemcpyAsync(c->mVc+(size_t)idx*NKV*HD, c->mvb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
+    qwen35_attn_step_kernel<<<NQ,256,(size_t)(idx+1)*sizeof(float),st>>>(c->mattn, c->mqb, c->mKc, c->mVc, idx);
+    m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->mattn, c->mgate, NQ*HD);
+    fp8_block_gemv_launch(c->mmix, P.o.w, P.o.s, c->mattn, NQ*HD, H, st);
+    cudaMemcpyAsync(c->mr2, c->mxfc, (size_t)H*sizeof(float), cudaMemcpyDeviceToDevice, st);
+    qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(c->mr2, c->mmix, H);            // r2 = xfc + attn_out
+    rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(c->mxn2, c->mr2, P.post_norm, H, 1, eps);
+    fp8_block_gemv_launch(c->mffg, P.gate.w, P.gate.s, c->mxn2, H, I, st);
+    fp8_block_gemv_launch(c->mffu, P.up.w,   P.up.s,   c->mxn2, H, I, st);
+    silu_glu_kernel<<<(I+255)/256,256,0,st>>>(c->mffa, c->mffg, c->mffu, I);
+    fp8_block_gemv_launch(c->mmix, P.down.w, P.down.s, c->mffa, I, H, st);
+    qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(c->mr2, c->mmix, H);            // r2 += mlp → MTP residual stream
+    cudaMemcpyAsync(c->mhid, c->mr2, (size_t)H*sizeof(float), cudaMemcpyDeviceToDevice, st);
+    rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(c->mxn3, c->mr2, P.fnorm, H, 1, eps);
+    m2_gemm(m->d_logits, c->mxn3, m->lm_head, 1, H, VOC);
+    qwen35_argmax_kernel<<<1,256,0,st>>>(m->d_logits, VOC, c->d_arg);
+    int draft = -1;
+    cudaMemcpyAsync(&draft, c->d_arg, sizeof(int), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    return draft;
+}
+
+// LOSSLESS speculative greedy decode. Emits EXACTLY the same out_ids[0..n_gen-1] as
+// qwen35_fp8_forward_greedy (verified by the gate), while drafting with the MTP head. Writes the
+// cumulative drafted/accepted counts (accept-rate proxy) when the pointers are non-NULL.
+extern "C" int qwen35_fp8_spec_greedy(void *model, const int32_t *in_ids, int n_prompt,
+                                      int32_t *out_ids, int n_gen, long *drafted_out, long *accepted_out) {
+    q35fp8_model *m = (q35fp8_model *)model;
+    if (!m || n_prompt <= 0 || n_gen <= 0) return -1;
+    if (!m->mtp.loaded) { fprintf(stderr, "qwen35_fp8_spec_greedy: MTP head not loaded\n"); return -2; }
+    static int depth = -1;
+    if (depth < 0) { const char *e = getenv("FUCINA_QWEN35_MTP_K"); depth = e ? atoi(e) : Q35_MTP_DEPTH_DEFAULT; }
+    if (depth < 1) depth = 1;
+    if (depth > GEMMA4_SPEC_MAX - 1) depth = GEMMA4_SPEC_MAX - 1;
+
+    size_t smGDN = ((size_t)M2_SD*M2_SD + 3*M2_SD)*sizeof(float);
+    if (cudaFuncSetAttribute(qwen35_fp8_gdn_step_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDN) != cudaSuccess) return -4;
+
+    q35fp8_ctx ctx;
+    int maxctx = n_prompt + n_gen + 8;
+    if (q35fp8_ctx_init(&ctx, m, maxctx) != 0) return -5;
+    cudaStream_t st = ctx.st;
+    int rc = 0; long drafted = 0, accepted = 0;
+    int32_t draft[GEMMA4_SPEC_MAX];
+
+    // ── Prefill: process the prompt, capturing h_prev (post-norm hidden of the last prompt token)
+    //    and the first generated token N0 (= out_ids[0]). ──
+    for (int p = 0; p < n_prompt - 1; p++)
+        if (q35fp8_main_step(&ctx, in_ids[p], p, 0, 0) , cudaGetLastError() != cudaSuccess) { rc = -7; goto done; }
+    {
+        int N0 = q35fp8_main_step(&ctx, in_ids[n_prompt-1], n_prompt-1, /*want_hidden=*/1, /*want_argmax=*/1);
+        if (N0 < 0 || cudaGetLastError() != cudaSuccess) { rc = -7; goto done; }
+        out_ids[0] = N0;
+    }
+
+    // ── Spec decode: draft up to `depth`, verify SEQUENTIALLY (stop at first reject). ──
+    {
+        int emitted = 1;                 // out_ids[0] already produced
+        int32_t pend = out_ids[0];       // pending token to process next
+        int pos = n_prompt;              // absolute position of `pend`
+        while (emitted < n_gen) {
+            // 1) draft d_0..d_{D-1} from the chain (h_prev = backbone hidden of last committed token).
+            int D = depth; if (D > n_gen - emitted) D = n_gen - emitted;   // never draft past the budget
+            int32_t dtok = pend; const float *hprev = ctx.hbuf;
+            for (int j = 0; j < D; j++) {
+                int d = q35fp8_mtp_step(&ctx, dtok, hprev, j, pos + j);
+                if (d < 0 || cudaGetLastError() != cudaSuccess) { rc = -8; goto done; }
+                draft[j] = d; dtok = d; hprev = ctx.mhid;
+            }
+            drafted += D;
+            // 2) verify: always emit the pending token's target; extend while drafts match.
+            int t = q35fp8_main_step(&ctx, pend, pos, /*want_hidden=*/1, /*want_argmax=*/1);
+            if (t < 0 || cudaGetLastError() != cudaSuccess) { rc = -7; goto done; }
+            out_ids[emitted++] = t; pos++;
+            int a = 0;
+            while (a < D && t == draft[a] && emitted < n_gen) {
+                // draft[a] was correct ⇒ step it (it equals t) and read the next target.
+                pend = draft[a];
+                t = q35fp8_main_step(&ctx, pend, pos, /*want_hidden=*/1, /*want_argmax=*/1);
+                if (t < 0 || cudaGetLastError() != cudaSuccess) { rc = -7; goto done; }
+                out_ids[emitted++] = t; pos++; a++;
+            }
+            accepted += a;
+            pend = t;                    // next pending token = last target; h_prev = ctx.hbuf (fresh)
+        }
+    }
+
+done:
+    cudaStreamSynchronize(st);
+    if (cudaGetLastError() != cudaSuccess && rc == 0) rc = -9;
+    if (drafted_out)  *drafted_out  = drafted;
+    if (accepted_out) *accepted_out = accepted;
+    q35fp8_ctx_free(&ctx);
+    return rc;
 }
 

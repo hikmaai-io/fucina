@@ -164,6 +164,15 @@ int   qwen35_fp8_forward_greedy(void *model, const int32_t *in_ids, int n_prompt
                                 int32_t *out_ids, int n_gen);
 void  qwen35_fp8_free(void *model);
 
+// ─── Qwen3.5 hybrid (qwen35) M6: single-MTP draft head + LOSSLESS speculative decode ──────
+// Loads the 22 mtp.* tensors (FP8 checkpoint only; the GGUF drops the head) inside qwen35_fp8_load.
+// qwen35_fp8_spec_greedy drives the MTP draft head + a sequential stop-at-first-reject verify on
+// the stateful hybrid backbone: it emits the SAME out_ids[0..n_gen-1] as qwen35_fp8_forward_greedy
+// (lossless), while *drafted_out/*accepted_out report the cumulative draft accept counts (>0).
+// Returns 0 on success, -2 if the checkpoint has no MTP head. Depth via FUCINA_QWEN35_MTP_K (def 4).
+int   qwen35_fp8_spec_greedy(void *model, const int32_t *in_ids, int n_prompt,
+                             int32_t *out_ids, int n_gen, long *drafted_out, long *accepted_out);
+
 // ─── Core inference ──────────────────────────────────────────────────
 
 // Prefill: process n_tokens in sequence, filling KV cache.
