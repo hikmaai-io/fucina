@@ -292,6 +292,10 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 	var ggmlModel string
 	var mergesRaw []string
 	var tokenTypes []int32
+	// Whether the GGUF explicitly carried add_bos_token. Qwen3/Qwen3-MoE set it to 0;
+	// the Qwen3.5 export omits it, so for gpt2 vocabs we fall back to add_bos=false
+	// (llama.cpp's BPE default) rather than the gemma default-true below.
+	addBosSeen := false
 
 	p := &ggufReader{data: ggufData, size: ggufSize, pos: 0}
 
@@ -413,6 +417,7 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 		case "tokenizer.ggml.add_bos_token":
 			if b, ok := p.readBool(valType); ok {
 				t.addBOS = b
+				addBosSeen = true
 			}
 		case "tokenizer.ggml.add_eos_token":
 			if b, ok := p.readBool(valType); ok {
@@ -455,10 +460,29 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 		}
 		return def
 	}
-	t.StartOfTurn = lookup("<|turn>", 105)
-	t.EndOfTurn = lookup("<turn|>", 106)
-	t.ChannelOpen = lookup("<|channel>", 100)
-	t.ChannelEnd = lookup("<channel|>", 101)
+	// GPT-2/Qwen byte-level vocabs (tokenizer.ggml.model=="gpt2": Qwen3, Qwen3-MoE,
+	// Qwen3.5) carry NONE of the gemma turn/channel control-marker literals. Their
+	// gemma default ids (105/106/100/101) collide with unrelated single-byte tokens
+	// (e.g. id 106 == "®" in the Qwen3.5 vocab), which would make IsStop fire spuriously
+	// mid-generation. For gpt2 vocabs default the absent markers to -1 (no token); for
+	// gemma (model=="gemma4", where the literals are present) the lookup hits and the
+	// default never applies, so this is a no-op there.
+	markerDef := func(def int32) int32 {
+		if ggmlModel == "gpt2" {
+			return -1
+		}
+		return def
+	}
+	// gpt2 vocabs that omit add_bos_token (the Qwen3.5 export) default to add_bos=false,
+	// matching llama.cpp's BPE default — otherwise the gemma default-true would prepend a
+	// spurious BOS (=2) and break greedy parity. Qwen3/Qwen3-MoE set the key explicitly.
+	if ggmlModel == "gpt2" && !addBosSeen {
+		t.addBOS = false
+	}
+	t.StartOfTurn = lookup("<|turn>", markerDef(105))
+	t.EndOfTurn = lookup("<turn|>", markerDef(106))
+	t.ChannelOpen = lookup("<|channel>", markerDef(100))
+	t.ChannelEnd = lookup("<channel|>", markerDef(101))
 	t.ToolOpen = lookup("<|tool>", -1)
 	t.ToolEnd = lookup("<tool|>", -1)
 	t.ToolCallOpen = lookup("<|tool_call>", -1)
