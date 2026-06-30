@@ -15910,7 +15910,8 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             m2_decay_beta_kernel<<<grid1d((size_t)T*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(Tn.ssm.a_log), Wf(Tn.ssm.dt_bias), T);
             // RECURRENT: delta-rule state S update — ONE chunked parallel-scan launch over the
             // whole tile (CHUNK=64), carrying the per-slot fp32 state S in/out of the arena.
-            qwen35_b_gdn_chunk_kernel<<<NVH,128,smGDNchunk,st>>>(
+            // 256 threads: the O(SD*SD)=16384-element state loops stride over 2x the lanes.
+            qwen35_b_gdn_chunk_kernel<<<NVH,256,smGDNchunk,st>>>(
                 core, qh, kh, vh, gg, bb, eng->d_q35_S[l], eng->d_q35_chunk_scr, slot, T, NPAD);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T);
             q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st);
