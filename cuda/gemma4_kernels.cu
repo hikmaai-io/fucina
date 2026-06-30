@@ -3554,6 +3554,30 @@ struct gemma4_engine {
     uint64_t multiseq_graph_logged;
     static_assert(GEMMA4_MAX_SEQS <= 63, "multiseq_graph_logged bitmask overflow");
 
+    // ── Qwen3.5 (qwen35) M4 batched continuous-batching hybrid state (lazy, qwen35 only) ──
+    // The qwen35 hybrid mixer does NOT fit the paged fp8 KV / split-K model: the 24 LINEAR
+    // layers carry a fixed-size fp32 GDN recurrent state + conv ring (NOT a KV cache), and the
+    // 8 FULL layers keep an fp32 K/V cache (kept fp32 so the batched decode is BIT-IDENTICAL to
+    // the M3 single-seq forward — no fp8 quantization in the loop). All four arenas are indexed
+    // by layer; each entry is a [MAX_SEQS]-strided slab the batched kernels address by the
+    // per-row→slot map d_q35_rowslot (graph-resident, refreshed each step OUTSIDE the capture,
+    // exactly like d_ms_pos). The B-row decode body is captured ONCE per batch size B (q35_graph)
+    // and replayed. Everything here is allocated only for GEMMA4_ARCH_QWEN3_5; all other arches
+    // leave these NULL/0 (byte-identical). See ensure_q35_scratch / qwen35_decode_multiseq_body.
+    int      q35_ready;                       // 1 once arenas + scratch allocated
+    int      q35_maxctx;                      // FULL-layer K/V cache capacity (positions)
+    int      q35_graph_enabled;               // run-time graph toggle (1 default; test flips it)
+    float   *d_q35_S[GEMMA4_CAP_LAYERS];      // LINEAR l: [MAX_SEQS][NVH*SD*SD]   fp32 GDN state
+    float   *d_q35_ring[GEMMA4_CAP_LAYERS];   // LINEAR l: [MAX_SEQS][CONVD*(CK-1)] fp32 conv ring
+    float   *d_q35_Kc[GEMMA4_CAP_LAYERS];     // FULL   l: [MAX_SEQS][maxctx*NKV*HD] fp32 K
+    float   *d_q35_Vc[GEMMA4_CAP_LAYERS];     // FULL   l: [MAX_SEQS][maxctx*NKV*HD] fp32 V
+    int     *d_q35_rowslot;                   // [MAX_SEQS] per-row slot id (state-arena index)
+    float   *d_q35_dq;                        // [CONVD*H] Q5_K→fp32 dequant scratch (per-step)
+    float   *d_q35_sb[24];                    // per-row batched compute scratch (see Q35_* enum)
+    cudaGraphExec_t q35_graph[GEMMA4_MAX_SEQS + 1];
+    int      q35_graph_failed;                // global disable (env or capture failure)
+    uint64_t q35_graph_logged;
+
     // ── Paged KV pools (Phase 2; allocated only when paged mode is enabled) ──
     // The continuous-batching KV store: one physical block pool per cache class,
     // shared by all in-flight sequences (each holds a per-seq block table into
@@ -4584,6 +4608,16 @@ gemma4_engine_t* gemma4_engine_create(
     eng->batched_graph_failed = 0; eng->d_specpos = NULL;
     for (int b = 0; b <= GEMMA4_MAX_SEQS; b++) eng->multiseq_graph[b] = NULL;
     eng->multiseq_graph_failed = 0; eng->multiseq_graph_logged = 0;
+    // qwen35 M4 batched-decode arenas (lazy; allocated on first qwen35 seq_add).
+    eng->q35_ready = 0; eng->q35_maxctx = 0; eng->q35_graph_enabled = 1;
+    eng->d_q35_rowslot = NULL; eng->d_q35_dq = NULL;
+    eng->q35_graph_failed = 0; eng->q35_graph_logged = 0;
+    for (int b = 0; b <= GEMMA4_MAX_SEQS; b++) eng->q35_graph[b] = NULL;
+    for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
+        eng->d_q35_S[l] = NULL; eng->d_q35_ring[l] = NULL;
+        eng->d_q35_Kc[l] = NULL; eng->d_q35_Vc[l] = NULL;
+    }
+    for (int i = 0; i < 24; i++) eng->d_q35_sb[i] = NULL;
     eng->spec_steps = eng->spec_drafted = eng->spec_accepted = eng->spec_emitted = 0;
     eng->pf_scratch_ready = 0;
     eng->d_pf_x = eng->d_pf_norm = eng->d_pf_q = eng->d_pf_k = eng->d_pf_v = NULL;
@@ -6051,6 +6085,16 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_ms_topp);
     CUDA_FREE(eng->d_ms_minp);
     CUDA_FREE(eng->d_ms_rnd);
+    // qwen35 M4 batched-decode arenas + captured graphs (no-ops when never allocated).
+    for (int b = 0; b <= GEMMA4_MAX_SEQS; b++)
+        if (eng->q35_graph[b]) { cudaGraphExecDestroy(eng->q35_graph[b]); eng->q35_graph[b] = NULL; }
+    for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
+        CUDA_FREE(eng->d_q35_S[l]); CUDA_FREE(eng->d_q35_ring[l]);
+        CUDA_FREE(eng->d_q35_Kc[l]); CUDA_FREE(eng->d_q35_Vc[l]);
+    }
+    for (int i = 0; i < 24; i++) CUDA_FREE(eng->d_q35_sb[i]);
+    CUDA_FREE(eng->d_q35_rowslot);
+    CUDA_FREE(eng->d_q35_dq);
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -10741,6 +10785,19 @@ static int decode_multiseq_forward(
 // the earlier suffix rows written THIS pass — exactly the ragged spec-verify
 // causality, hence bit-identical to the token-by-token path. Samples the first
 // generated token on the final row. Returns 0 / -1.
+// ── Qwen3.5 (qwen35) M4 batched continuous-batching entry points (defined far below,
+//    after the M2/M3 mixer kernels they build on). The extern "C" continuous-batching
+//    ABI routes to these for GEMMA4_ARCH_QWEN3_5 (its hybrid GDN/full state does not fit
+//    the paged fp8 KV pool — it carries its own fp32 GDN/conv/KV arenas). ──
+static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_prompt,
+                          int32_t *first_token_out, float temp, int top_k, float top_p,
+                          float min_p, uint64_t seed);
+static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
+                             const int32_t *in_tokens, int B, int32_t *out_tokens);
+static int qwen35_seq_open(gemma4_engine_t *eng);
+static int qwen35_seq_prefill_chunk(gemma4_engine_t *eng, int slot, const int32_t *tokens,
+                                    int n, int do_sample, int32_t *first_token_out);
+
 static int prefill_suffix_batched(gemma4_engine_t *eng, gemma4_seq *s,
                                   const int32_t *suffix, int M, int do_sample, int32_t *first_tok_out)
 {
@@ -10776,6 +10833,8 @@ extern "C" int gemma4_engine_seq_add(
     gemma4_engine_t *eng, const int32_t *prompt, int n_prompt, int32_t *first_token_out,
     float temp, int top_k, float top_p, float min_p, uint64_t seed)
 {
+    if (eng && eng->loaded && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)
+        return qwen35_seq_add(eng, prompt, n_prompt, first_token_out, temp, top_k, top_p, min_p, seed);
     if (!eng || !eng->loaded || !eng->paged_enabled || !prompt || n_prompt <= 0) return -1;
     int slot = -1;
     for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (!eng->slots[i].used) { slot = i; break; }
@@ -10929,6 +10988,8 @@ extern "C" int gemma4_engine_seq_open_prefix(
     float temp, int top_k, float top_p, float min_p, uint64_t seed)
 {
     if (shared_out) *shared_out = 0;
+    if (eng && eng->loaded && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)
+        return qwen35_seq_open(eng);   // no cross-request prefix cache on the qwen35 hybrid
     int slot = gemma4_engine_seq_open(eng, temp, top_k, top_p, min_p, seed);
     if (slot < 0) return -1;
     if (!eng->prefix_cache_enabled || !prompt || n_prompt <= 0) return slot;
@@ -10948,6 +11009,8 @@ extern "C" int gemma4_engine_seq_open_prefix(
 extern "C" int gemma4_engine_seq_open(
     gemma4_engine_t *eng, float temp, int top_k, float top_p, float min_p, uint64_t seed)
 {
+    if (eng && eng->loaded && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)
+        return qwen35_seq_open(eng);
     if (!eng || !eng->loaded || !eng->paged_enabled) return -1;
     int slot = -1;
     for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (!eng->slots[i].used) { slot = i; break; }
@@ -10976,6 +11039,8 @@ extern "C" int gemma4_engine_seq_prefill_chunk(
     gemma4_engine_t *eng, int slot, const int32_t *tokens, int n,
     int do_sample, int32_t *first_token_out)
 {
+    if (eng && eng->loaded && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)
+        return qwen35_seq_prefill_chunk(eng, slot, tokens, n, do_sample, first_token_out);
     if (!eng || !eng->loaded || !eng->paged_enabled) return -1;
     if (slot < 0 || slot >= GEMMA4_MAX_SEQS || !tokens || n <= 0) return -1;
     gemma4_seq *s = &eng->slots[slot];
@@ -11026,6 +11091,8 @@ extern "C" int gemma4_engine_seq_prefill_chunk(
 extern "C" int gemma4_engine_step_batch(
     gemma4_engine_t *eng, const int *slots, const int32_t *in_tokens, int B, int32_t *out_tokens)
 {
+    if (eng && eng->loaded && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)
+        return qwen35_step_batch(eng, slots, in_tokens, B, out_tokens);
     if (!eng || !eng->loaded || !eng->paged_enabled || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
     if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
 
@@ -11278,6 +11345,12 @@ extern "C" int gemma4_engine_step_batch_spec_ext(
 // Free a slot's block tables back to the pools and mark it free.
 extern "C" void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot) {
     if (!eng || slot < 0 || slot >= GEMMA4_MAX_SEQS) return;
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+        // qwen35 carries no paged KV / prefix-cache state; the per-slot GDN/conv/KV arenas
+        // are re-zeroed on the next seq_add, so releasing the slot is just clearing the flag.
+        eng->slots[slot].used = 0; eng->slots[slot].n_tokens = 0;
+        return;
+    }
     gemma4_seq *s = &eng->slots[slot];
     paged_table_release(&eng->slid_pool, &s->slid_bt);
     if (eng->prefix_cache_enabled) {
@@ -11345,6 +11418,10 @@ extern "C" void gemma4_engine_prefix_cache_stats(const gemma4_engine_t *eng,
 // each sequence agrees >= 90%). Mirrors the FUCINA_PAGED_*_SELFTEST create hooks.
 static void gemma4_engine_batch_selftest(gemma4_engine_t *eng) {
     if (!eng->paged_enabled) return;
+    // qwen35 has its own hybrid batched path (own fp32 GDN/conv/KV arenas, not the paged
+    // fp8 pool) and a dedicated M4 gate (qwen35_batch_selftest); this Gemma/Qwen3 greedy+
+    // sampling self-test does not apply to it.
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return;
     const int NSEQ = 3;
     const int KSTEP = 32;
     // Three distinct short prompts (token ids in-vocab; avoid specials).
@@ -15044,5 +15121,621 @@ cleanup:
     if (Sst) { for (int l=0;l<L;l++) if (Sst[l]) cudaFree(Sst[l]); free(Sst); }
     if (ring){ for (int l=0;l<L;l++) if (ring[l])cudaFree(ring[l]);free(ring); }
     return rc;
+}
+
+// =========================================================================
+// ─── M4: Qwen3.5 paged-batched + CUDA-graph hybrid decode ───────────────
+// =========================================================================
+// The B-row continuous-batching decode for qwen35. Each row is an INDEPENDENT sequence
+// at its own absolute position carrying its OWN hybrid state: the 8 FULL layers an fp32
+// K/V cache, the 24 LINEAR layers an fp32 GDN recurrent state S + conv ring. All state
+// lives in per-SLOT arenas (engine d_q35_*), addressed by the per-row→slot map
+// d_q35_rowslot — so a row's math touches only its own slot and the batch is exactly
+// B independent single-row decodes (the batch self-test invariant). The same arithmetic
+// the M3 single-seq forward (qwen35_forward_greedy) reached 8/8 parity with, lifted to
+// B rows: the FULL-attn / GDN / conv kernels are the M3 stateful kernels with an added
+// (row,slot) index; the projections use the batched dp4a gemv (gemv_batched_w) / the
+// natural-layout fp32 GEMM (m2_gemm_s) — both row-independent. Per-step varying inputs
+// (tokens d_sb[0], positions d_ms_pos, row→slot d_q35_rowslot) are DEVICE-resident so the
+// whole body is CUDA-graph-capturable: captured once per B (q35_graph), replayed per step.
+
+// per-row batched compute-scratch slots (d_q35_sb[]); sizes set in ensure_q35_scratch.
+enum {
+    Q35_X=0, Q35_XN, Q35_QG, Q35_QB, Q35_GATE, Q35_KB, Q35_VB, Q35_ATTN, Q35_MIX, Q35_QKV,
+    Q35_CONV, Q35_ZC, Q35_AC, Q35_BC, Q35_GG, Q35_BB, Q35_QH, Q35_KH, Q35_VH, Q35_CORE,
+    Q35_GNORM, Q35_FG, Q35_FU, Q35_FA
+};
+
+// Stream-aware natural-layout GEMM (the M3 m2_gemm with an explicit stream so the batched
+// body is fully on the capture stream). out[n,o] = Σ_i in[n,i]·W[o,i], W row-major [OUT,IN].
+static void m2_gemm_s(float *out, const float *in, const float *W,
+                      int N, int INN, int OUT, cudaStream_t st) {
+    dim3 grid((unsigned)OUT, (unsigned)N);
+    m2_gemm_kernel<<<grid, 128, 0, st>>>(out, in, W, N, INN, OUT);
+}
+
+// Partial NEOX RoPE on the first ROT dims of each head for B rows, each at its OWN absolute
+// position pos[row]. x is [B][n_heads][HEAD] row-major. Bit-identical to M3 qwen35_rope_pos.
+__global__ void qwen35_b_rope_kernel(float *x, int n_heads, const int *pos, int B) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // 0..ROT/2-1
+    int h = blockIdx.y, r = blockIdx.z;
+    if (i >= M2_ROT / 2 || h >= n_heads || r >= B) return;
+    float *hd = x + ((size_t)r * n_heads + h) * M2_HEAD;
+    float inv = powf(M2_THETA, -(float)(2 * i) / (float)M2_ROT);
+    float ang = (float)pos[r] * inv;
+    float c = cosf(ang), s = sinf(ang);
+    float a = hd[i], b = hd[i + M2_ROT / 2];
+    hd[i]              = a * c - b * s;
+    hd[i + M2_ROT / 2] = b * c + a * s;
+}
+
+// Write each row's current K/V (kb/vb [B][NKV*HD]) into the per-slot FULL-layer K/V cache
+// at (slot=rowslot[r], pos=pos[r]). Cache base = slot*maxctx*NKV*HD; token offset = pos*NKV*HD.
+__global__ void qwen35_b_kv_write_kernel(float *Kc, float *Vc, const float *kb, const float *vb,
+                                         const int *pos, const int *rowslot, int maxctx, int B) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over NKV*HD
+    int r   = blockIdx.y;
+    if (r >= B || idx >= M2_NKV * M2_HEAD) return;
+    int slot = rowslot[r], p = pos[r];
+    size_t base = ((size_t)slot * maxctx + p) * M2_NKV * M2_HEAD;
+    size_t src  = (size_t)r * M2_NKV * M2_HEAD + idx;
+    Kc[base + idx] = kb[src];
+    Vc[base + idx] = vb[src];
+}
+
+// Single-query causal GQA softmax for B rows against the per-slot FULL-layer K/V cache.
+// One block per (query-head, row); reads pos[r]/slot=rowslot[r]; scores in dynamic shared
+// (maxctx floats; only [0..pos] touched). Arithmetic bit-identical to M3 qwen35_attn_step.
+__global__ void qwen35_b_attn_kernel(float *out, const float *q, const float *Kc, const float *Vc,
+                                     const int *pos, const int *rowslot, int maxctx, int B) {
+    int hd = blockIdx.x;   // query head 0..NQ-1
+    int r  = blockIdx.y;   // row
+    if (hd >= M2_NQ || r >= B) return;
+    int slot = rowslot[r], p = pos[r];
+    int kv  = hd / (M2_NQ / M2_NKV);
+    int tid = threadIdx.x;
+    extern __shared__ float sc[];   // [maxctx]
+    const float *qr = q + ((size_t)r * M2_NQ + hd) * M2_HEAD;
+    const float *Kb = Kc + (size_t)slot * maxctx * M2_NKV * M2_HEAD;
+    const float *Vb = Vc + (size_t)slot * maxctx * M2_NKV * M2_HEAD;
+    float scale = rsqrtf((float)M2_HEAD);
+    for (int j = tid; j <= p; j += blockDim.x) {
+        const float *kr = Kb + ((size_t)j * M2_NKV + kv) * M2_HEAD;
+        float acc = 0.f;
+        for (int d = 0; d < M2_HEAD; d++) acc += qr[d] * kr[d];
+        sc[j] = acc * scale;
+    }
+    __syncthreads();
+    __shared__ float red[32];
+    float m = -1e30f;
+    for (int j = tid; j <= p; j += blockDim.x) m = fmaxf(m, sc[j]);
+    m = block_reduce_max(m, red);
+    __shared__ float msh; if (tid == 0) msh = m; __syncthreads(); m = msh;
+    float ssum = 0.f;
+    for (int j = tid; j <= p; j += blockDim.x) { float e = __expf(sc[j] - m); sc[j] = e; ssum += e; }
+    ssum = block_reduce_sum(ssum, red);
+    __shared__ float ssh; if (tid == 0) ssh = ssum; __syncthreads();
+    float inv = 1.f / ssh;
+    for (int d = tid; d < M2_HEAD; d += blockDim.x) {
+        float acc = 0.f;
+        for (int j = 0; j <= p; j++)
+            acc += sc[j] * Vb[((size_t)j * M2_NKV + kv) * M2_HEAD + d];
+        out[((size_t)r * M2_NQ + hd) * M2_HEAD + d] = acc * inv;
+    }
+}
+
+// Stateful causal depthwise conv1d (k=CK) + SiLU for B rows over conv_dim channels; each row's
+// CK-1 history lives in its per-slot ring [conv_dim][CK-1]. Bit-identical to M3 qwen35_conv_step.
+__global__ void qwen35_b_conv_kernel(float *conv_out, const float *qkv, float *ring,
+                                     const float *cw, const int *rowslot, int conv_dim, int B) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = blockIdx.y;
+    if (c >= conv_dim || r >= B) return;
+    const int K = M2_CK, HK = M2_CK - 1;
+    int slot = rowslot[r];
+    float *rg = ring + ((size_t)slot * conv_dim + c) * HK;       // [HK] oldest..newest
+    const float *xr = qkv + (size_t)r * conv_dim;
+    float acc = 0.f;
+    #pragma unroll
+    for (int j = 0; j < HK; j++) acc += cw[c * K + j] * rg[j];
+    acc += cw[c * K + HK] * xr[c];
+    conv_out[(size_t)r * conv_dim + c] = acc / (1.f + __expf(-acc));   // SiLU
+    #pragma unroll
+    for (int j = 0; j < HK - 1; j++) rg[j] = rg[j + 1];
+    rg[HK - 1] = xr[c];
+}
+
+// Split each row's conv output [B][CONVD] into contiguous qh[B][KEYD], kh[B][KEYD], vh[B][VALD].
+__global__ void qwen35_b_split_qkv_kernel(float *qh, float *kh, float *vh, const float *conv, int B) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over CONVD
+    int r   = blockIdx.y;
+    if (r >= B || idx >= M2_CONVDIM) return;
+    const float *cr = conv + (size_t)r * M2_CONVDIM;
+    if      (idx < M2_KEYD)     qh[(size_t)r * M2_KEYD + idx]               = cr[idx];
+    else if (idx < 2 * M2_KEYD) kh[(size_t)r * M2_KEYD + (idx - M2_KEYD)]  = cr[idx];
+    else                        vh[(size_t)r * M2_VALD + (idx - 2*M2_KEYD)] = cr[idx];
+}
+
+// GDN single-step delta-rule recurrence for B rows; each (v-head,row) block loads/stores the
+// carried fp32 state S[SD×SD] from the per-slot arena. Bit-identical to M3 qwen35_gdn_step.
+__global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k, const float *v,
+                                    const float *g, const float *beta, float *S_arena,
+                                    const int *rowslot, int B) {
+    int vh = blockIdx.x;
+    int r  = blockIdx.y;
+    if (vh >= M2_NVH || r >= B) return;
+    int slot = rowslot[r];
+    int kh  = vh % M2_NKH;   // TILE expand (HF repeat): v-head vh ↔ k/q-head vh % NKH
+    int tid = threadIdx.x;
+    extern __shared__ float sm[];
+    float *S   = sm;                 // [SD*SD] k-major
+    float *kt  = S + M2_SD * M2_SD;  // [SD]
+    float *qt  = kt + M2_SD;         // [SD]
+    float *dlt = qt + M2_SD;         // [SD]
+    float *Sg  = S_arena + ((size_t)slot * M2_NVH + vh) * M2_SD * M2_SD;
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] = Sg[idx];
+    __syncthreads();
+    float scale = rsqrtf((float)M2_SD);
+    const float *qr = q + (size_t)r * M2_NKH * M2_SD;
+    const float *kr = k + (size_t)r * M2_NKH * M2_SD;
+    const float *vr = v + (size_t)r * M2_NVH * M2_SD;
+    if (tid < M2_SD) {
+        kt[tid] = kr[(size_t)kh * M2_SD + tid];
+        qt[tid] = qr[(size_t)kh * M2_SD + tid] * scale;
+    }
+    __syncthreads();
+    float gt = __expf(g[(size_t)r * M2_NVH + vh]);
+    float bt = beta[(size_t)r * M2_NVH + vh];
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] *= gt;
+    __syncthreads();
+    if (tid < M2_SD) {
+        float acc = 0.f;
+        for (int kd = 0; kd < M2_SD; kd++) acc += S[kd * M2_SD + tid] * kt[kd];
+        float vv = vr[(size_t)vh * M2_SD + tid];
+        dlt[tid] = (vv - acc) * bt;
+    }
+    __syncthreads();
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) {
+        int kd = idx / M2_SD, vd = idx % M2_SD;
+        S[idx] += kt[kd] * dlt[vd];
+    }
+    __syncthreads();
+    if (tid < M2_SD) {
+        float acc = 0.f;
+        for (int kd = 0; kd < M2_SD; kd++) acc += S[kd * M2_SD + tid] * qt[kd];
+        core[((size_t)r * M2_NVH + vh) * M2_SD + tid] = acc;
+    }
+    __syncthreads();
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) Sg[idx] = S[idx];
+}
+
+// Lazily allocate the qwen35 M4 per-slot state arenas + per-row compute scratch (qwen35 only).
+static int ensure_q35_scratch(gemma4_engine_t *eng) {
+    if (eng->q35_ready) return 0;
+    if (eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -1;
+    if (!eng->d_token_embd) {
+        fprintf(stderr, "fucina: qwen35 M4: token_embd Q8_0 convert missing\n"); return -1;
+    }
+    // The qwen35 batched body reuses d_ms_pos (per-row position) + d_ms_outtok (per-row argmax),
+    // both allocated by ensure_ms_scratch — required even though qwen35 uses no paged KV pool.
+    if (ensure_ms_scratch(eng) != 0) {
+        fprintf(stderr, "fucina: qwen35 M4: ensure_ms_scratch failed\n"); return -1;
+    }
+    const gemma4_model_config_t *c = &eng->cfg;
+    const int MS = GEMMA4_MAX_SEQS, L = c->n_layers;
+    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV, INNER=M2_VALD, CONVD=M2_CONVDIM;
+    const int KEYD=M2_KEYD, VALD=M2_VALD, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, CK=M2_CK;
+    const int I = c->intermediate;
+    // geometry must match the M2/M3 #defines (the mixer kernels bake them).
+    if (c->hidden_size != H || c->head_dim != HD || c->n_heads != NQ || c->n_kv_global != NKV ||
+        c->ssm_state_size != SD || c->ssm_group_count != M2_NKH || c->ssm_time_step_rank != NVH ||
+        c->ssm_conv_kernel != CK || c->rotary_dim != M2_ROT) {
+        fprintf(stderr, "fucina: qwen35 M4: geometry mismatch vs M2 constants\n"); return -1;
+    }
+
+    int dev = 0; cudaGetDevice(&dev);
+    int optinMax = 49152;
+    cudaDeviceGetAttribute(&optinMax, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    int capctx = optinMax / (int)sizeof(float) - 64;    // attn stores `maxctx` scores in shared
+    int maxctx = (int)eng->context_size;
+    if (const char *e = getenv("FUCINA_QWEN35_MAXCTX")) { int v = atoi(e); if (v > 0) maxctx = v; }
+    if (maxctx < 1) maxctx = 4096;
+    if (maxctx > capctx) {
+        fprintf(stderr, "fucina: qwen35 M4 attn caps context at %d (store-in-shared); requested %d\n",
+                capctx, maxctx);
+        maxctx = capctx;
+    }
+    eng->q35_maxctx = maxctx;
+
+    const size_t SBSZ[24] = {
+        (size_t)H, (size_t)H, (size_t)2*NQ*HD, (size_t)NQ*HD, (size_t)NQ*HD,
+        (size_t)NKV*HD, (size_t)NKV*HD, (size_t)NQ*HD, (size_t)H, (size_t)CONVD,
+        (size_t)CONVD, (size_t)INNER, (size_t)TSR, (size_t)TSR, (size_t)TSR, (size_t)TSR,
+        (size_t)KEYD, (size_t)KEYD, (size_t)VALD, (size_t)VALD, (size_t)INNER,
+        (size_t)I, (size_t)I, (size_t)I
+    };
+    int ok = 1;
+    for (int i = 0; i < 24 && ok; i++)
+        ok &= cudaMalloc(&eng->d_q35_sb[i], (size_t)MS * SBSZ[i] * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->d_q35_dq, (size_t)CONVD * H * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->d_q35_rowslot, (size_t)MS * sizeof(int)) == cudaSuccess;
+    for (int l = 0; l < L && ok; l++) {
+        if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
+            ok &= cudaMalloc(&eng->d_q35_Kc[l], (size_t)MS*maxctx*NKV*HD*sizeof(float)) == cudaSuccess;
+            ok &= cudaMalloc(&eng->d_q35_Vc[l], (size_t)MS*maxctx*NKV*HD*sizeof(float)) == cudaSuccess;
+        } else {
+            ok &= cudaMalloc(&eng->d_q35_S[l],  (size_t)MS*NVH*SD*SD*sizeof(float)) == cudaSuccess;
+            ok &= cudaMalloc(&eng->d_q35_ring[l],(size_t)MS*CONVD*(CK-1)*sizeof(float)) == cudaSuccess;
+        }
+    }
+    size_t smGDN = ((size_t)SD * SD + 3 * SD) * sizeof(float);
+    ok = ok && cudaFuncSetAttribute(qwen35_b_gdn_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDN) == cudaSuccess;
+    ok = ok && cudaFuncSetAttribute(qwen35_b_attn_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, maxctx * (int)sizeof(float)) == cudaSuccess;
+    if (!ok) { fprintf(stderr, "fucina: qwen35 M4 scratch alloc/opt-in failed\n"); return -1; }
+    if (getenv("FUCINA_NO_BATCHED_GRAPH")) eng->q35_graph_enabled = 0;
+    eng->q35_ready = 1;
+    fprintf(stderr, "fucina: qwen35 M4 batched arenas ready (maxctx=%d, MAX_SEQS=%d)\n", maxctx, MS);
+    return 0;
+}
+
+// Kernel-launch-only B-row hybrid forward (all per-step inputs DEVICE-resident → graph-safe).
+// Advances each row's per-slot GDN state / conv ring / FULL-layer K/V; leaves B logit rows in
+// d_sb[11]; when want_argmax, appends the per-row greedy argmax into d_ms_outtok.
+static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_argmax, cudaStream_t st) {
+    const gemma4_model_config_t *c = &eng->cfg;
+    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV;
+    const int INNER=M2_VALD, CONVD=M2_CONVDIM, NKH=M2_NKH, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, ROT=M2_ROT;
+    const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
+    const int maxctx = eng->q35_maxctx;
+    const float eps = 1e-6f;
+    const size_t smGDN = ((size_t)SD * SD + 3 * SD) * sizeof(float);
+    const size_t smATT = (size_t)maxctx * sizeof(float);
+    auto Wq = [&](uint64_t off) -> const uint8_t* { return weight_fp8(eng, off); };
+    auto Wf = [&](uint64_t off) -> const float*   {
+        return (const float*)(eng->d_weights + (off - eng->tdata_start)); };
+    int   *d_pos  = eng->d_ms_pos;
+    int   *d_slot = eng->d_q35_rowslot;
+    int32_t *d_tok = (int32_t*)eng->d_sb[0];
+    float *x=eng->d_q35_sb[Q35_X], *xn=eng->d_q35_sb[Q35_XN], *qg=eng->d_q35_sb[Q35_QG],
+          *qb=eng->d_q35_sb[Q35_QB], *gate=eng->d_q35_sb[Q35_GATE], *kb=eng->d_q35_sb[Q35_KB],
+          *vb=eng->d_q35_sb[Q35_VB], *attn=eng->d_q35_sb[Q35_ATTN], *mix=eng->d_q35_sb[Q35_MIX],
+          *qkv=eng->d_q35_sb[Q35_QKV], *conv=eng->d_q35_sb[Q35_CONV], *zc=eng->d_q35_sb[Q35_ZC],
+          *ac=eng->d_q35_sb[Q35_AC], *bc=eng->d_q35_sb[Q35_BC], *gg=eng->d_q35_sb[Q35_GG],
+          *bb=eng->d_q35_sb[Q35_BB], *qh=eng->d_q35_sb[Q35_QH], *kh=eng->d_q35_sb[Q35_KH],
+          *vh=eng->d_q35_sb[Q35_VH], *core=eng->d_q35_sb[Q35_CORE], *gnorm=eng->d_q35_sb[Q35_GNORM],
+          *fg=eng->d_q35_sb[Q35_FG], *fu=eng->d_q35_sb[Q35_FU], *fa=eng->d_q35_sb[Q35_FA];
+    float *dq = eng->d_q35_dq;
+    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+
+    embed_w(eng, x, eng->d_token_embd, d_tok, B, H, st);
+
+    for (int l = 0; l < L; l++) {
+        const auto &T = eng->tensors.layers[l];
+        rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(T.attn_norm), H, B, eps);
+        if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
+            gemv_batched_w(eng, qg, Wq(T.attn_q),      xn, H, 2*NQ*HD, B, st, T.fmt_q);
+            gemv_batched_w(eng, kb, Wq(T.attn_k),      xn, H, NKV*HD,  B, st, T.fmt_k);
+            gemv_batched_w(eng, vb, Wq(T.attn_v),      xn, H, NKV*HD,  B, st, T.fmt_v);
+            m2_split_query_gate_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(qb, gate, qg, B);
+            per_head_rms_norm_rows_kernel<<<dim3(NQ,B),256,32*sizeof(float),st>>>(qb, Wf(T.attn_q_norm), NQ, HD, B, eps);
+            per_head_rms_norm_rows_kernel<<<dim3(NKV,B),256,32*sizeof(float),st>>>(kb, Wf(T.attn_k_norm), NKV, HD, B, eps);
+            qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NQ,B),32,0,st>>>(qb, NQ, d_pos, B);
+            qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NKV,B),32,0,st>>>(kb, NKV, d_pos, B);
+            qwen35_b_kv_write_kernel<<<dim3(grid1d((size_t)NKV*HD),B),256,0,st>>>(
+                eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, B);
+            qwen35_b_attn_kernel<<<dim3(NQ,B),256,smATT,st>>>(
+                attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, B);
+            m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(attn, gate, B*NQ*HD);
+            gemv_batched_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, B, st, T.fmt_o);
+        } else {
+            qwen35_dequant_q5k_f32_kernel<<<(unsigned)(((size_t)CONVD*H/256+255)/256),256,0,st>>>(
+                dq, Wq(T.ssm.in_qkv), (uint64_t)CONVD*H/256);
+            m2_gemm_s(qkv, xn, dq, B, H, CONVD, st);
+            gemv_batched_w(eng, zc, Wq(T.ssm.in_z), xn, H, INNER, B, st, T.ssm.fmt_in_z);
+            gemv_batched_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   B, st, T.ssm.fmt_in_a);   // alpha
+            gemv_batched_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   B, st, T.ssm.fmt_in_b);   // beta
+            qwen35_b_conv_kernel<<<dim3(grid1d((size_t)CONVD),B),256,0,st>>>(
+                conv, qkv, eng->d_q35_ring[l], Wf(T.ssm.conv1d), d_slot, CONVD, B);
+            qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),B),256,0,st>>>(qh, kh, vh, conv, B);
+            m2_l2norm_heads_kernel<<<dim3(NKH,B),128,0,st>>>(qh, NKH, SD, B);
+            m2_l2norm_heads_kernel<<<dim3(NKH,B),128,0,st>>>(kh, NKH, SD, B);
+            m2_decay_beta_kernel<<<grid1d((size_t)B*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), B);
+            qwen35_b_gdn_kernel<<<dim3(NVH,B),128,smGDN,st>>>(core, qh, kh, vh, gg, bb, eng->d_q35_S[l], d_slot, B);
+            m2_gated_norm_kernel<<<dim3(NVH,B),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), B);
+            gemv_batched_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, B, st, T.ssm.fmt_out);
+        }
+        residual_add_kernel<<<grid1d((size_t)B*H),256,0,st>>>(x, mix, B*H);
+        rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(T.ffn_norm), H, B, eps);
+        gemv_batched_w(eng, fg, Wq(T.ffn_gate), xn, H, I, B, st, T.fmt_gate);
+        gemv_batched_w(eng, fu, Wq(T.ffn_up),   xn, H, I, B, st, T.fmt_up);
+        silu_glu_kernel<<<grid1d((size_t)B*I),256,0,st>>>(fa, fg, fu, B*I);
+        gemv_batched_w(eng, mix, Wq(T.ffn_down), fa, I, H, B, st, T.fmt_down);
+        residual_add_kernel<<<grid1d((size_t)B*H),256,0,st>>>(x, mix, B*H);
+    }
+
+    rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, B, eps);
+    gemv_batched_w(eng, eng->d_sb[11], Wq(eng->tensors.output_weight), xn, H, VOC, B, st, eng->tensors.output_fmt);
+    if (want_argmax)
+        argmax_rows_kernel<<<B,32,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, B, VOC);
+}
+
+// Capture the B-row decode (want_argmax) once and instantiate it; replayed per step with the
+// per-step varying device inputs refreshed outside the capture (tokens/positions/row→slot).
+static int qwen35_ms_graph_ensure(gemma4_engine_t *eng, int B) {
+    if (B < 1 || B > GEMMA4_MAX_SEQS) return -1;
+    if (eng->q35_graph[B]) return 0;
+    if (eng->q35_graph_failed) return -1;
+    cudaStream_t cs = NULL; cudaGraph_t g = NULL;
+    int ok = cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) == cudaSuccess;
+    if (ok && cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+        qwen35_decode_multiseq_body(eng, B, /*want_argmax=*/1, cs);
+        ok = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != NULL;
+    } else ok = 0;
+    if (ok) ok = cudaGraphInstantiate(&eng->q35_graph[B], g, 0) == cudaSuccess;
+    if (g)  cudaGraphDestroy(g);
+    if (cs) cudaStreamDestroy(cs);
+    if (!ok || !eng->q35_graph[B]) {
+        eng->q35_graph[B] = NULL; eng->q35_graph_failed = 1; cudaGetLastError();
+        fprintf(stderr, "fucina: qwen35 M4 batch graph capture failed (B=%d) — per-kernel launches\n", B);
+        return -1;
+    }
+    if (!(eng->q35_graph_logged & (1ULL << B))) {
+        fprintf(stderr, "fucina: qwen35 M4 batch graph captured (B=%d)\n", B);
+        eng->q35_graph_logged |= (1ULL << B);
+    }
+    return 0;
+}
+
+// Refresh the per-step device inputs then run one B-row forward (graph fast path when greedy +
+// enabled, else the per-kernel body). slv/in_tok/positions are host arrays of length B.
+static int qwen35_ms_run(gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *in_tok,
+                         const int *positions, int B, int want_argmax, int use_graph) {
+    cudaStream_t st = eng->stream;
+    int h_slot[GEMMA4_MAX_SEQS];
+    for (int r = 0; r < B; r++) h_slot[r] = (int)(slv[r] - eng->slots);
+    cudaMemcpyAsync((int32_t*)eng->d_sb[0], in_tok, (size_t)B*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(eng->d_ms_pos, positions, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(eng->d_q35_rowslot, h_slot, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, st);
+    if (use_graph && want_argmax && eng->q35_graph_enabled && qwen35_ms_graph_ensure(eng, B) == 0) {
+        if (cudaGraphLaunch(eng->q35_graph[B], st) == cudaSuccess) return 0;
+        cudaGetLastError();
+        cudaGraphExecDestroy(eng->q35_graph[B]); eng->q35_graph[B] = NULL; eng->q35_graph_failed = 1;
+        fprintf(stderr, "fucina: qwen35 M4 graph replay failed — per-kernel launches\n");
+    }
+    qwen35_decode_multiseq_body(eng, B, want_argmax, st);
+    return 0;
+}
+
+// Zero a slot's GDN recurrent state + conv ring (the FULL-layer K/V cache needs no zeroing —
+// attention only reads positions [0..pos] written this sequence).
+static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
+    const gemma4_model_config_t *c = &eng->cfg;
+    const int NVH=M2_NVH, SD=M2_SD, CONVD=M2_CONVDIM, CK=M2_CK;
+    for (int l = 0; l < c->n_layers; l++) if (c->attn_kind[l] != GEMMA4_ATTN_FULL) {
+        cudaMemsetAsync(eng->d_q35_S[l]   + (size_t)slot*NVH*SD*SD, 0, (size_t)NVH*SD*SD*sizeof(float), st);
+        cudaMemsetAsync(eng->d_q35_ring[l]+ (size_t)slot*CONVD*(CK-1), 0, (size_t)CONVD*(CK-1)*sizeof(float), st);
+    }
+}
+
+static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_prompt,
+                          int32_t *first_token_out, float temp, int top_k, float top_p,
+                          float min_p, uint64_t seed) {
+    (void)temp; (void)top_k; (void)top_p; (void)min_p; (void)seed;   // M4: greedy only
+    if (!eng || !eng->loaded || !prompt || n_prompt <= 0) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
+    if (n_prompt > eng->q35_maxctx) return -1;
+    int slot = -1;
+    for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (!eng->slots[i].used) { slot = i; break; }
+    if (slot < 0) return -1;
+    gemma4_seq *s = &eng->slots[slot];
+    s->used = 1; s->n_tokens = 0; s->samp_temp = 0.f; s->n_sampled = 0; s->mtp_h_valid = 0;
+    cudaStream_t st = eng->stream;
+    qwen35_slot_reset(eng, slot, st);
+    gemma4_seq *one[1] = { s };
+    for (int i = 0; i < n_prompt; i++) {   // sequential prefill (GDN recurrence is per-position)
+        int pos = i; int32_t tok = prompt[i]; int want = (i == n_prompt - 1);
+        qwen35_ms_run(eng, one, &tok, &pos, 1, want, /*use_graph=*/0);
+    }
+    int32_t first = 0;
+    cudaMemcpyAsync(&first, eng->d_ms_outtok, sizeof(int32_t), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    { cudaError_t e = cudaGetLastError();
+      if (e != cudaSuccess) { fprintf(stderr, "qwen35_seq_add: CUDA error during prefill: %s\n",
+                                      cudaGetErrorString(e)); s->used = 0; return -1; } }
+    s->n_tokens = n_prompt;
+    if (first_token_out) *first_token_out = first;
+    return slot;
+}
+
+static int qwen35_seq_open(gemma4_engine_t *eng) {
+    if (!eng || !eng->loaded) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
+    int slot = -1;
+    for (int i = 0; i < GEMMA4_MAX_SEQS; i++) if (!eng->slots[i].used) { slot = i; break; }
+    if (slot < 0) return -1;
+    gemma4_seq *s = &eng->slots[slot];
+    s->used = 1; s->n_tokens = 0; s->samp_temp = 0.f; s->n_sampled = 0; s->mtp_h_valid = 0;
+    qwen35_slot_reset(eng, slot, eng->stream);
+    return slot;
+}
+
+static int qwen35_seq_prefill_chunk(gemma4_engine_t *eng, int slot, const int32_t *tokens,
+                                    int n, int do_sample, int32_t *first_token_out) {
+    if (!eng || !eng->loaded || slot < 0 || slot >= GEMMA4_MAX_SEQS || !tokens || n <= 0) return -1;
+    if (ensure_q35_scratch(eng) != 0) return -1;
+    gemma4_seq *s = &eng->slots[slot];
+    if (!s->used) return -1;
+    if (s->n_tokens + n > eng->q35_maxctx) return -1;
+    cudaStream_t st = eng->stream;
+    gemma4_seq *one[1] = { s };
+    for (int i = 0; i < n; i++) {
+        int pos = s->n_tokens + i; int32_t tok = tokens[i]; int want = (do_sample && i == n - 1);
+        qwen35_ms_run(eng, one, &tok, &pos, 1, want, /*use_graph=*/0);
+    }
+    int32_t first = 0;
+    if (do_sample) cudaMemcpyAsync(&first, eng->d_ms_outtok, sizeof(int32_t), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    s->n_tokens += n;
+    if (do_sample && first_token_out) *first_token_out = first;
+    return 0;
+}
+
+static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
+                             const int32_t *in_tokens, int B, int32_t *out_tokens) {
+    if (!eng || !eng->loaded || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
+    gemma4_seq *slv[GEMMA4_MAX_SEQS]; int positions[GEMMA4_MAX_SEQS];
+    int32_t in2[GEMMA4_MAX_SEQS]; int rowmap[GEMMA4_MAX_SEQS]; int Bv = 0;
+    for (int r = 0; r < B; r++) {
+        int id = slots[r];
+        if (id < 0 || id >= GEMMA4_MAX_SEQS || !eng->slots[id].used) return -1;
+        gemma4_seq *s = &eng->slots[id];
+        if (s->n_tokens >= eng->q35_maxctx) { if (out_tokens) out_tokens[r] = -1; continue; }
+        slv[Bv] = s; positions[Bv] = s->n_tokens; in2[Bv] = in_tokens[r]; rowmap[Bv] = r; Bv++;
+    }
+    if (Bv == 0) return 0;
+    qwen35_ms_run(eng, slv, in2, positions, Bv, /*want_argmax=*/1, /*use_graph=*/1);
+    int32_t outs[GEMMA4_MAX_SEQS];
+    cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)Bv*sizeof(int32_t), cudaMemcpyDeviceToHost, eng->stream);
+    cudaStreamSynchronize(eng->stream);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    for (int v = 0; v < Bv; v++) {
+        slv[v]->n_tokens = positions[v] + 1;
+        if (out_tokens) out_tokens[rowmap[v]] = outs[v];
+    }
+    return 0;
+}
+
+// ── M4 gate self-test (qwen35) ─────────────────────────────────────────────────────────
+// Drives the qwen35 continuous-batching ABI (seq_add prefill + step_batch decode) and asserts
+//   (1) B-row batched decode (graph ON) is BIT-IDENTICAL per row to that row run alone B=1
+//       (graph OFF) — the batch self-test invariant (row independence + graph correctness);
+//   (2) graph-ON == graph-OFF for the B-row batch (CUDA-graph determinism);
+//   (3) the batched path reproduces the proven M3 single-seq forward (qwen35_forward_greedy)
+//       — the France→Paris 8/8 continuation — so the batch is not merely self-consistent.
+// Returns 0 on PASS. Prints a verbatim, paste-able report.
+extern "C" int qwen35_batch_selftest(gemma4_engine_t *eng) {
+    if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) {
+        fprintf(stderr, "qwen35_batch_selftest: engine is not qwen35\n"); return 1;
+    }
+    const int NSEQ = 3, KSTEP = 24, NP = 5;
+    // seq 0 = "The capital of France is" (the M3 reference prompt); 1,2 = arbitrary in-vocab ids.
+    int32_t prompt[NSEQ][NP] = {
+        { 760, 6511, 314, 9338, 369 },
+        { 785, 6722, 315, 9625, 374 },
+        { 100, 200, 300, 400, 500 },
+    };
+    int32_t ref[NSEQ][KSTEP], bat[NSEQ][KSTEP], boff[NSEQ][KSTEP];
+
+    // (A) reference: each seq ALONE, B=1, graph OFF.
+    eng->q35_graph_enabled = 0;
+    for (int q = 0; q < NSEQ; q++) {
+        int32_t first = 0;
+        int slot = gemma4_engine_seq_add(eng, prompt[q], NP, &first, 0.f, 0, 0.f, 0.f, 0);
+        if (slot < 0) { fprintf(stderr, "qwen35_batch_selftest: seq_add(ref) failed\n"); return 1; }
+        int32_t tok = first;
+        for (int k = 0; k < KSTEP; k++) {
+            ref[q][k] = tok; int32_t nxt = 0; int sl = slot;
+            if (gemma4_engine_step_batch(eng, &sl, &tok, 1, &nxt) != 0) {
+                fprintf(stderr, "qwen35_batch_selftest: step(ref) failed\n");
+                gemma4_engine_seq_remove(eng, slot); return 1;
+            }
+            tok = nxt;
+        }
+        gemma4_engine_seq_remove(eng, slot);
+    }
+
+    // (B) batched: all NSEQ together, B=NSEQ, graph ON.
+    eng->q35_graph_enabled = 1;
+    {
+        int slot[NSEQ]; int32_t cur[NSEQ];
+        for (int q = 0; q < NSEQ; q++) {
+            int32_t first = 0;
+            slot[q] = gemma4_engine_seq_add(eng, prompt[q], NP, &first, 0.f, 0, 0.f, 0.f, 0);
+            if (slot[q] < 0) { fprintf(stderr, "qwen35_batch_selftest: seq_add(batch) failed\n"); return 1; }
+            cur[q] = first;
+        }
+        for (int k = 0; k < KSTEP; k++) {
+            int32_t nxt[NSEQ];
+            for (int q = 0; q < NSEQ; q++) bat[q][k] = cur[q];
+            if (gemma4_engine_step_batch(eng, slot, cur, NSEQ, nxt) != 0) {
+                fprintf(stderr, "qwen35_batch_selftest: step(batch) failed\n");
+                for (int q = 0; q < NSEQ; q++) gemma4_engine_seq_remove(eng, slot[q]); return 1;
+            }
+            for (int q = 0; q < NSEQ; q++) cur[q] = nxt[q];
+        }
+        for (int q = 0; q < NSEQ; q++) gemma4_engine_seq_remove(eng, slot[q]);
+    }
+
+    // (C) batched again, B=NSEQ, graph OFF (graph determinism check).
+    eng->q35_graph_enabled = 0;
+    {
+        int slot[NSEQ]; int32_t cur[NSEQ];
+        for (int q = 0; q < NSEQ; q++) {
+            int32_t first = 0;
+            slot[q] = gemma4_engine_seq_add(eng, prompt[q], NP, &first, 0.f, 0, 0.f, 0.f, 0);
+            if (slot[q] < 0) { fprintf(stderr, "qwen35_batch_selftest: seq_add(boff) failed\n"); return 1; }
+            cur[q] = first;
+        }
+        for (int k = 0; k < KSTEP; k++) {
+            int32_t nxt[NSEQ];
+            for (int q = 0; q < NSEQ; q++) boff[q][k] = cur[q];
+            if (gemma4_engine_step_batch(eng, slot, cur, NSEQ, nxt) != 0) {
+                fprintf(stderr, "qwen35_batch_selftest: step(boff) failed\n");
+                for (int q = 0; q < NSEQ; q++) gemma4_engine_seq_remove(eng, slot[q]); return 1;
+            }
+            for (int q = 0; q < NSEQ; q++) cur[q] = nxt[q];
+        }
+        for (int q = 0; q < NSEQ; q++) gemma4_engine_seq_remove(eng, slot[q]);
+    }
+    eng->q35_graph_enabled = 1;
+
+    // ── compare ──
+    int indep_ok = 1, graph_ok = 1;
+    for (int q = 0; q < NSEQ; q++) {
+        int agree = 0, gagree = 0, fm = -1;
+        for (int k = 0; k < KSTEP; k++) {
+            if (bat[q][k] == ref[q][k]) agree++; else if (fm < 0) fm = k;
+            if (bat[q][k] == boff[q][k]) gagree++;
+        }
+        if (agree  != KSTEP) indep_ok = 0;
+        if (gagree != KSTEP) graph_ok = 0;
+        fprintf(stderr,
+            "qwen35 M4 seq %d: B=%d(graph) vs B=1(per-kernel) %d/%d bit-identical%s%s; "
+            "graph-on vs graph-off %d/%d\n",
+            q, NSEQ, agree, KSTEP,
+            (fm >= 0) ? "  first-mismatch@" : "", "", gagree, KSTEP);
+        if (fm >= 0)
+            fprintf(stderr, "qwen35 M4   seq %d first mismatch step %d (B=1 %d vs B=%d %d)\n",
+                    q, fm, ref[q][fm], NSEQ, bat[q][fm]);
+    }
+
+    // (D) M3 cross-check: the batched decode of seq 0 must reproduce qwen35_forward_greedy.
+    const int NGEN = 12, GATE = 8;
+    int32_t m3[NGEN] = {0};
+    int m3_ok = (qwen35_forward_greedy(eng, prompt[0], NP, m3, NGEN) == 0);
+    int m3_agree = 0;
+    if (m3_ok) {
+        // ref[0] = [first, then KSTEP-1 decoded]; m3 = [first, then NGEN-1 decoded]. Compare GATE.
+        for (int k = 0; k < GATE && k < KSTEP; k++) if (ref[0][k] == m3[k]) m3_agree++;
+        fprintf(stderr, "qwen35 M4 seq 0 vs M3 forward (France->Paris): ");
+        for (int k = 0; k < GATE; k++) fprintf(stderr, "%d%s", ref[0][k], (k<GATE-1)?",":"");
+        fprintf(stderr, "  (M3: ");
+        for (int k = 0; k < GATE; k++) fprintf(stderr, "%d%s", m3[k], (k<GATE-1)?",":"");
+        fprintf(stderr, ")  %d/%d\n", m3_agree, GATE);
+    } else {
+        fprintf(stderr, "qwen35 M4 seq 0 vs M3 forward: qwen35_forward_greedy failed\n");
+    }
+
+    int pass = indep_ok && graph_ok && m3_ok && (m3_agree == GATE);
+    fprintf(stderr,
+        "qwen35 M4 batched-decode gate: row-independence=%s graph-on==off=%s M3-parity=%s(%d/%d) — %s\n",
+        indep_ok ? "PASS" : "FAIL", graph_ok ? "PASS" : "FAIL",
+        (m3_ok && m3_agree == GATE) ? "PASS" : "FAIL", m3_agree, GATE,
+        pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
 }
 

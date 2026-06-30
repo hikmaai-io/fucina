@@ -144,6 +144,13 @@ int qwen35_m2_layer_selftest(const char *ref_bin_path);
 int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids, int n_prompt,
                           int32_t *out_ids, int n_gen);
 
+// ─── Qwen3.5 hybrid (qwen35) M4 batched continuous-batching decode gate ────────
+// Drives the qwen35 continuous-batching ABI (seq_add prefill + step_batch decode) and asserts:
+// (1) B-row batched decode is BIT-IDENTICAL per row to that row run alone B=1 (row independence),
+// (2) graph-ON == graph-OFF, (3) the batched path reproduces the M3 single-seq France->Paris 8/8.
+// Returns 0 on PASS. The engine must have been created from a qwen35 GGUF.
+int qwen35_batch_selftest(gemma4_engine_t *eng);
+
 // ─── Core inference ──────────────────────────────────────────────────
 
 // Prefill: process n_tokens in sequence, filling KV cache.
