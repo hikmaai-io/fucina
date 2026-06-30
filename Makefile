@@ -30,7 +30,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test \
-        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test fp8-block-test \
+        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-decode-bench fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -251,6 +251,17 @@ qwen35-mtp-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_mtp \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_mtp $(QWEN35_FP8_MODEL)"
+
+# ─── Qwen3.5 hybrid (qwen35) P5 served-path decode tok/s bench (GPU, not a gate) ───
+# Times NSTEP single-token decode steps through the SERVED step_batch path
+# (qwen35_decode_multiseq_body / CUDA-graph). Used to measure the P5 in_qkv Q5_K→Q8_0
+# native-GEMV win (8.0 -> 30.5 tok/s on Qwen3.5-9B Q4_K_M). Override NSTEP=N on the CLI.
+QWEN35_BENCH_NSTEP ?= 128
+qwen35-decode-bench: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_decode_bench.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_decode_bench \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_decode_bench $(QWEN35_MODEL) $(QWEN35_BENCH_NSTEP)"
 
 # ─── Qwen3 dense numeric parity vs llama.cpp (GPU) ──────────────────────
 # Feeds llama.cpp's input ids for "The capital of France is" through fucina's

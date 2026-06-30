@@ -3574,7 +3574,6 @@ struct gemma4_engine {
     float   *d_q35_Kc[GEMMA4_CAP_LAYERS];     // FULL   l: [MAX_SEQS][maxctx*NKV*HD] fp32 K
     float   *d_q35_Vc[GEMMA4_CAP_LAYERS];     // FULL   l: [MAX_SEQS][maxctx*NKV*HD] fp32 V
     int     *d_q35_rowslot;                   // [MAX_SEQS] per-row slot id (state-arena index)
-    float   *d_q35_dq;                        // [CONVD*H] Q5_K→fp32 dequant scratch (per-step)
     float   *d_q35_sb[24];                    // per-row batched compute scratch (see Q35_* enum)
     cudaGraphExec_t q35_graph[GEMMA4_MAX_SEQS + 1];
     int      q35_graph_failed;                // global disable (env or capture failure)
@@ -4612,7 +4611,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->multiseq_graph_failed = 0; eng->multiseq_graph_logged = 0;
     // qwen35 M4 batched-decode arenas (lazy; allocated on first qwen35 seq_add).
     eng->q35_ready = 0; eng->q35_maxctx = 0; eng->q35_graph_enabled = 1;
-    eng->d_q35_rowslot = NULL; eng->d_q35_dq = NULL;
+    eng->d_q35_rowslot = NULL;
     eng->q35_graph_failed = 0; eng->q35_graph_logged = 0;
     for (int b = 0; b <= GEMMA4_MAX_SEQS; b++) eng->q35_graph[b] = NULL;
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
@@ -5477,6 +5476,48 @@ gemma4_engine_t* gemma4_engine_create(
             fprintf(stderr, "fucina: requantized %d Q5_K bulk attention tensor(s) -> Q8_0\n", n_q5k_bulk);
     }
 
+    // ── Qwen3.5 GDN in-proj (attn_qkv) Q5_K → Q8_0 requant (P5 decode perf) ─────────────────
+    // The 24 GDN/LINEAR layers' fused in-proj (blk.l.attn_qkv.weight, [CONVD=8192 × H=4096]) ships
+    // Q5_K. The served decode/prefill formerly materialized the WHOLE weight to fp32 every layer,
+    // every step (qwen35_dequant_q5k_f32_kernel → m2_gemm: ~134 MB write + 134 MB read per GDN
+    // layer per token), bypassing the native dp4a GEMV every other projection uses. Requantize each
+    // once to Q8_0 into its own device buffer + a pointer override, then flip fmt_in_qkv to Q8_0 so
+    // every read site (oracle + decode_multiseq_body + prefill_chunk_body) reads it through the
+    // validated gemv_batched_w / gemv_w dp4a path (8.5-bit weight, no per-step fp32 dequant) — the
+    // SAME proven mechanism the attn_q/k/v/o Q5_K tensors above already use. Qwen3.5-only (attn_qkv
+    // exists on no other arch; fmt_in_qkv is 0 elsewhere) → Gemma/Qwen3/MoE byte-unchanged.
+    if (eng->gguf_data && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+        int n_q5k_qkv = 0; char tn[128];
+        for (int l = 0; l < eng->cfg.n_layers; l++) {
+            if (eng->tensors.layers[l].ssm.fmt_in_qkv != (uint8_t)FORMAT_Q5_K) continue;
+            snprintf(tn, sizeof(tn), "blk.%d.attn_qkv.weight", l);
+            uint64_t off = 0, nel = 0; uint32_t gt = 0;
+            if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, tn, &off, &nel, &gt) != 0) continue;
+            if (gt != GGML_TYPE_Q5_K) continue;
+            unsigned char *q8 = convert_q5k_to_q8_0((const unsigned char*)(eng->gguf_data + off), (int64_t)nel);
+            if (!q8) { fprintf(stderr, "fucina: %s Q5_K->Q8_0 alloc failed\n", tn); continue; }
+            size_t q8bytes = (size_t)(nel / 32) * 34;
+            unsigned char *d_buf = NULL;
+            if (cudaMalloc(&d_buf, q8bytes) != cudaSuccess) {
+                cudaGetLastError(); free(q8);
+                fprintf(stderr, "fucina: %s Q8_0 cudaMalloc(%zu) failed\n", tn, q8bytes); continue;
+            }
+            cudaMemcpy(d_buf, q8, q8bytes, cudaMemcpyHostToDevice); free(q8);
+            if (eng->n_wt_override < (int)(sizeof(eng->wt_override_off)/sizeof(eng->wt_override_off[0]))) {
+                eng->wt_override_off[eng->n_wt_override] = off;
+                eng->wt_override_ptr[eng->n_wt_override] = d_buf;
+                eng->n_wt_override++;
+                eng->tensors.layers[l].ssm.fmt_in_qkv = (uint8_t)FORMAT_Q8_0;   // read as Q8_0 thereafter
+                n_q5k_qkv++;
+            } else {
+                fprintf(stderr, "fucina: weight override table full — %s NOT overridden\n", tn);
+                cudaFree(d_buf);
+            }
+        }
+        if (n_q5k_qkv)
+            fprintf(stderr, "fucina: requantized %d Qwen3.5 GDN in_qkv Q5_K tensor(s) -> Q8_0\n", n_q5k_qkv);
+    }
+
     // ── Qwen3-MoE expert/router tensors ──────────────────────────────────
     // Resolve the three 3D expert slabs (ffn_gate_exps / ffn_up_exps / ffn_down_exps) + the F32
     // router (ffn_gate_inp) per layer. gate/up are uniformly Q4_K (grouped Q4_K GEMM). down is
@@ -6096,7 +6137,6 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     }
     for (int i = 0; i < 24; i++) CUDA_FREE(eng->d_q35_sb[i]);
     CUDA_FREE(eng->d_q35_rowslot);
-    CUDA_FREE(eng->d_q35_dq);
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -14991,35 +15031,6 @@ __global__ void qwen35_argmax_kernel(const float *v, int n, int *out_idx) {
     if (tid == 0) *out_idx = si[0];
 }
 
-// Q5_K superblock (176 B) → fp32, natural element order. Mirrors dequant_q5_k_superblock
-// (host) bit-for-bit; used only for the LINEAR layers' Q5_K attn_qkv (no native Q5_K dp4a).
-__global__ void qwen35_dequant_q5k_f32_kernel(float *dst, const uint8_t *src, uint64_t n_super) {
-    uint64_t sb = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (sb >= n_super) return;
-    const uint8_t *blk = src + sb * 176;
-    __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
-    __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
-    float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
-    const uint8_t *sc = blk + 4;    // 12 B packed 6-bit scales+mins
-    const uint8_t *qh = blk + 16;   // 32 B high bits
-    const uint8_t *qs = blk + 48;   // 128 B low nibbles
-    float *out = dst + sb * 256;
-    for (int j = 0; j < 8; j++) {
-        int s, m;
-        if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; }
-        else { s = (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4);
-               m = (sc[j + 4] >> 4)   | ((sc[j]     >> 6) << 4); }
-        float dl = d * (float)s, ml = dmin * (float)m;
-        const uint8_t *q = qs + (j / 2) * 32;
-        int shift = (j & 1) ? 4 : 0;
-        for (int i = 0; i < 32; i++) {
-            int lo = (q[i] >> shift) & 0x0F;
-            int hi = (qh[i] >> j) & 1;
-            out[j * 32 + i] = dl * (float)(lo + (hi << 4)) - ml;
-        }
-    }
-}
-
 // Single-seq greedy hybrid forward. Fills out_ids[0..n_gen-1] with the greedy continuation of
 // the prompt in_ids[0..n_prompt-1]. Returns 0 on success, non-zero on error. Token-by-token:
 // each position runs one full hybrid layer stack, carrying GDN state + conv ring + KV cache.
@@ -15068,7 +15079,7 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
     float *x=nullptr,*xn=nullptr,*qg=nullptr,*qb=nullptr,*gate=nullptr,*kb=nullptr,*vb=nullptr,
           *attn=nullptr,*mix=nullptr,*qkv=nullptr,*conv_out=nullptr,*zc=nullptr,*ac=nullptr,
           *bc=nullptr,*gg=nullptr,*bb=nullptr,*qh=nullptr,*kh=nullptr,*vh=nullptr,*core=nullptr,
-          *gnorm=nullptr,*ffn_g=nullptr,*ffn_u=nullptr,*ffn_a=nullptr,*dq=nullptr;
+          *gnorm=nullptr,*ffn_g=nullptr,*ffn_u=nullptr,*ffn_a=nullptr;
     // ── persistent per-layer state (only the relevant layer kind is touched) ──
     float **Kc = (float**)calloc(L, sizeof(float*));
     float **Vc = (float**)calloc(L, sizeof(float*));
@@ -15086,7 +15097,6 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
     CK_MALLOC(ac, TSR); CK_MALLOC(bc, TSR); CK_MALLOC(gg, TSR); CK_MALLOC(bb, TSR);
     CK_MALLOC(qh, NKH*SD); CK_MALLOC(kh, NKH*SD); CK_MALLOC(vh, NVH*SD); CK_MALLOC(core, NVH*SD);
     CK_MALLOC(gnorm, INNER); CK_MALLOC(ffn_g, I); CK_MALLOC(ffn_u, I); CK_MALLOC(ffn_a, I);
-    CK_MALLOC(dq, (size_t)CONVD*H);
     for (int l = 0; l < L; l++) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
             CK_MALLOC(Kc[l], (size_t)nsteps*NKV*HD);
@@ -15123,10 +15133,9 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                 m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(attn, gate, NQ*HD);
                 gemv_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, st, T.fmt_o);
             } else {
-                // GDN (LINEAR): Q5_K attn_qkv → fp32 dequant + m2_gemm; others via dp4a gemv_w.
-                qwen35_dequant_q5k_f32_kernel<<<(unsigned)(((size_t)CONVD*H/256+255)/256),256,0,st>>>(
-                    dq, Wq(T.ssm.in_qkv), (uint64_t)CONVD*H/256);
-                m2_gemm(qkv, xn, dq, 1, H, CONVD);
+                // GDN (LINEAR): in_qkv requantized Q5_K→Q8_0 at load → native dp4a gemv_w (P5), like
+                // every other projection (no per-step fp32 dequant). fmt_in_qkv is Q8_0 post-requant.
+                gemv_w(eng, qkv, Wq(T.ssm.in_qkv), xn, H, CONVD, st, T.ssm.fmt_in_qkv);
                 gemv_w(eng, zc, Wq(T.ssm.in_z), xn, H, INNER, st, T.ssm.fmt_in_z);
                 gemv_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   st, T.ssm.fmt_in_a);   // alpha
                 gemv_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   st, T.ssm.fmt_in_b);   // beta
@@ -15169,7 +15178,7 @@ cleanup:
     #undef CK_MALLOC
     cudaStreamSynchronize(st);
     if (d_tok) cudaFree(d_tok); if (d_arg) cudaFree(d_arg);
-    float *bufs[] = {x,xn,qg,qb,gate,kb,vb,attn,mix,qkv,conv_out,zc,ac,bc,gg,bb,qh,kh,vh,core,gnorm,ffn_g,ffn_u,ffn_a,dq};
+    float *bufs[] = {x,xn,qg,qb,gate,kb,vb,attn,mix,qkv,conv_out,zc,ac,bc,gg,bb,qh,kh,vh,core,gnorm,ffn_g,ffn_u,ffn_a};
     for (float *b : bufs) if (b) cudaFree(b);
     if (Kc)  { for (int l=0;l<L;l++) if (Kc[l])  cudaFree(Kc[l]);  free(Kc); }
     if (Vc)  { for (int l=0;l<L;l++) if (Vc[l])  cudaFree(Vc[l]);  free(Vc); }
@@ -15189,8 +15198,8 @@ cleanup:
 // B independent single-row decodes (the batch self-test invariant). The same arithmetic
 // the M3 single-seq forward (qwen35_forward_greedy) reached 8/8 parity with, lifted to
 // B rows: the FULL-attn / GDN / conv kernels are the M3 stateful kernels with an added
-// (row,slot) index; the projections use the batched dp4a gemv (gemv_batched_w) / the
-// natural-layout fp32 GEMM (m2_gemm_s) — both row-independent. Per-step varying inputs
+// (row,slot) index; the projections (in_qkv now Q8_0 like the rest) use the batched dp4a
+// gemv (gemv_batched_w) — all row-independent. Per-step varying inputs
 // (tokens d_sb[0], positions d_ms_pos, row→slot d_q35_rowslot) are DEVICE-resident so the
 // whole body is CUDA-graph-capturable: captured once per B (q35_graph), replayed per step.
 
@@ -15200,14 +15209,6 @@ enum {
     Q35_CONV, Q35_ZC, Q35_AC, Q35_BC, Q35_GG, Q35_BB, Q35_QH, Q35_KH, Q35_VH, Q35_CORE,
     Q35_GNORM, Q35_FG, Q35_FU, Q35_FA
 };
-
-// Stream-aware natural-layout GEMM (the M3 m2_gemm with an explicit stream so the batched
-// body is fully on the capture stream). out[n,o] = Σ_i in[n,i]·W[o,i], W row-major [OUT,IN].
-static void m2_gemm_s(float *out, const float *in, const float *W,
-                      int N, int INN, int OUT, cudaStream_t st) {
-    dim3 grid((unsigned)OUT, (unsigned)N);
-    m2_gemm_kernel<<<grid, 128, 0, st>>>(out, in, W, N, INN, OUT);
-}
 
 // Partial NEOX RoPE on the first ROT dims of each head for B rows, each at its OWN absolute
 // position pos[row]. x is [B][n_heads][HEAD] row-major. Bit-identical to M3 qwen35_rope_pos.
@@ -15412,7 +15413,6 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     int ok = 1;
     for (int i = 0; i < 24 && ok; i++)
         ok &= cudaMalloc(&eng->d_q35_sb[i], (size_t)MS * SBSZ[i] * sizeof(float)) == cudaSuccess;
-    ok = ok && cudaMalloc(&eng->d_q35_dq, (size_t)CONVD * H * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->d_q35_rowslot, (size_t)MS * sizeof(int)) == cudaSuccess;
     for (int l = 0; l < L && ok; l++) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
@@ -15461,7 +15461,6 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
           *bb=eng->d_q35_sb[Q35_BB], *qh=eng->d_q35_sb[Q35_QH], *kh=eng->d_q35_sb[Q35_KH],
           *vh=eng->d_q35_sb[Q35_VH], *core=eng->d_q35_sb[Q35_CORE], *gnorm=eng->d_q35_sb[Q35_GNORM],
           *fg=eng->d_q35_sb[Q35_FG], *fu=eng->d_q35_sb[Q35_FU], *fa=eng->d_q35_sb[Q35_FA];
-    float *dq = eng->d_q35_dq;
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
 
     embed_w(eng, x, eng->d_token_embd, d_tok, B, H, st);
@@ -15485,9 +15484,8 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(attn, gate, B*NQ*HD);
             gemv_batched_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, B, st, T.fmt_o);
         } else {
-            qwen35_dequant_q5k_f32_kernel<<<(unsigned)(((size_t)CONVD*H/256+255)/256),256,0,st>>>(
-                dq, Wq(T.ssm.in_qkv), (uint64_t)CONVD*H/256);
-            m2_gemm_s(qkv, xn, dq, B, H, CONVD, st);
+            // in_qkv requantized Q5_K→Q8_0 at load → native dp4a GEMV (P5), no per-step fp32 dequant.
+            gemv_batched_w(eng, qkv, Wq(T.ssm.in_qkv), xn, H, CONVD, B, st, T.ssm.fmt_in_qkv);
             gemv_batched_w(eng, zc, Wq(T.ssm.in_z), xn, H, INNER, B, st, T.ssm.fmt_in_z);
             gemv_batched_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   B, st, T.ssm.fmt_in_a);   // alpha
             gemv_batched_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   B, st, T.ssm.fmt_in_b);   // beta
@@ -15623,7 +15621,6 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int base, int T,
           *bb=eng->d_q35_sb[Q35_BB], *qh=eng->d_q35_sb[Q35_QH], *kh=eng->d_q35_sb[Q35_KH],
           *vh=eng->d_q35_sb[Q35_VH], *core=eng->d_q35_sb[Q35_CORE], *gnorm=eng->d_q35_sb[Q35_GNORM],
           *fg=eng->d_q35_sb[Q35_FG], *fu=eng->d_q35_sb[Q35_FU], *fa=eng->d_q35_sb[Q35_FA];
-    float *dq = eng->d_q35_dq;
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
 
     embed_w(eng, x, eng->d_token_embd, d_tok, T, H, st);
@@ -15647,9 +15644,8 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int base, int T,
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
             gemv_batched_w(eng, mix, Wq(Tn.attn_output), attn, NQ*HD, H, T, st, Tn.fmt_o);
         } else {
-            qwen35_dequant_q5k_f32_kernel<<<(unsigned)(((size_t)CONVD*H/256+255)/256),256,0,st>>>(
-                dq, Wq(Tn.ssm.in_qkv), (uint64_t)CONVD*H/256);
-            m2_gemm_s(qkv, xn, dq, T, H, CONVD, st);
+            // in_qkv requantized Q5_K→Q8_0 at load → native dp4a GEMV (P5), no per-step fp32 dequant.
+            gemv_batched_w(eng, qkv, Wq(Tn.ssm.in_qkv), xn, H, CONVD, T, st, Tn.ssm.fmt_in_qkv);
             gemv_batched_w(eng, zc, Wq(Tn.ssm.in_z), xn, H, INNER, T, st, Tn.ssm.fmt_in_z);
             gemv_batched_w(eng, ac, Wq(Tn.ssm.in_a), xn, H, TSR,   T, st, Tn.ssm.fmt_in_a);   // alpha
             gemv_batched_w(eng, bc, Wq(Tn.ssm.in_b), xn, H, TSR,   T, st, Tn.ssm.fmt_in_b);   // beta
