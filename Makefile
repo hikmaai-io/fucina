@@ -30,7 +30,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test \
-        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-decode-bench fp8-block-test \
+        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -276,6 +276,18 @@ qwen35-decode-bench: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_decode_bench \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_decode_bench $(QWEN35_MODEL) $(QWEN35_BENCH_NSTEP)"
+
+# ─── Qwen3.5 FP8 same-checkpoint single-stream bench (GPU) ───────────────
+# P7 apples-to-apples anchor: single-stream decode tok/s + prefill latency of the FP8
+# reference path on the SAME official Qwen3.5-9B-FP8 checkpoint vLLM serves. Isolates
+# fucina's per-token FP8 compute from the Q4_K_M-vs-FP8 quant gap of the served comparison.
+# NOTE: the FP8 path is the token-by-token reference oracle (no CUDA-graph/batching); the
+# optimized fucina server runs the GGUF. Pair with scripts/bench_serving.py (HTTP harness).
+qwen35-fp8-bench: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_fp8_bench.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_fp8_bench \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_fp8_bench $(QWEN35_FP8_MODEL)"
 
 # ─── Qwen3 dense numeric parity vs llama.cpp (GPU) ──────────────────────
 # Feeds llama.cpp's input ids for "The capital of France is" through fucina's
