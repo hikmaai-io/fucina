@@ -3600,6 +3600,12 @@ struct gemma4_engine {
     int32_t *d_q35_pf_tok;                    // [PF_TILE] prefill per-row token id
     __nv_bfloat16 *d_q35_wbf16[2];            // prefill weight dequant ping-pong [max(in*out)] BF16
     __nv_bfloat16 *d_q35_xbf16;               // prefill activation BF16 [PF_TILE * max_in_dim]
+    // FULL-layer one-shot prefill attention via tensor-core GEMMs (base==0 only).
+    __nv_bfloat16 *d_q35_qb, *d_q35_kb, *d_q35_vb;   // BF16 Q[N*NQ*HD] / K,V[N*NKV*HD]
+    __nv_bfloat16 *d_q35_kbx, *d_q35_vbx;            // GQA-broadcast BF16 K,V [N*NQ*HD]
+    __nv_bfloat16 *d_q35_pb;                         // BF16 softmax probs [NQ*N*N]
+    float         *d_q35_scores;                     // FP32 QKᵀ scores [NQ*N*N]
+    int            d_q35_attn_cap;                   // N this attn scratch is sized for (0=off)
     cudaGraphExec_t q35_graph[GEMMA4_MAX_SEQS + 1];
     int      q35_graph_failed;                // global disable (env or capture failure)
     uint64_t q35_graph_logged;
@@ -4639,6 +4645,9 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_q35_rowslot = NULL; eng->d_q35_chunk_scr = NULL;
     eng->d_q35_pf_pos = NULL; eng->d_q35_pf_tok = NULL;
     eng->d_q35_wbf16[0] = NULL; eng->d_q35_wbf16[1] = NULL; eng->d_q35_xbf16 = NULL;
+    eng->d_q35_qb = NULL; eng->d_q35_kb = NULL; eng->d_q35_vb = NULL;
+    eng->d_q35_kbx = NULL; eng->d_q35_vbx = NULL; eng->d_q35_pb = NULL;
+    eng->d_q35_scores = NULL; eng->d_q35_attn_cap = 0;
     eng->q35_graph_failed = 0; eng->q35_graph_logged = 0;
     for (int b = 0; b <= GEMMA4_MAX_SEQS; b++) eng->q35_graph[b] = NULL;
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
@@ -6173,6 +6182,9 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_q35_wbf16[0]);
     CUDA_FREE(eng->d_q35_wbf16[1]);
     CUDA_FREE(eng->d_q35_xbf16);
+    CUDA_FREE(eng->d_q35_qb); CUDA_FREE(eng->d_q35_kb); CUDA_FREE(eng->d_q35_vb);
+    CUDA_FREE(eng->d_q35_kbx); CUDA_FREE(eng->d_q35_vbx); CUDA_FREE(eng->d_q35_pb);
+    CUDA_FREE(eng->d_q35_scores);
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -15793,6 +15805,69 @@ static int qwen35_ms_run(gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *
     return 0;
 }
 
+// Lazily (re)allocate the FULL-layer one-shot tensor-core attention scratch for a prompt of N
+// rows. The O(NQ·N²) score/prob buffers dominate (~1.6 GB at N=4096), so this is built only on
+// the first long base==0 prefill and grown as needed — never resident for short-prompt usage.
+static bool ensure_q35_attn_scratch(gemma4_engine_t *eng, int N) {
+    if (N <= eng->d_q35_attn_cap && eng->d_q35_scores) return true;
+    #define Q35_FREE(p) do { if (p) { cudaFree(p); (p) = NULL; } } while (0)
+    Q35_FREE(eng->d_q35_qb); Q35_FREE(eng->d_q35_kb); Q35_FREE(eng->d_q35_vb);
+    Q35_FREE(eng->d_q35_kbx); Q35_FREE(eng->d_q35_vbx); Q35_FREE(eng->d_q35_pb);
+    Q35_FREE(eng->d_q35_scores);
+    eng->d_q35_attn_cap = 0;
+    const int NQ = M2_NQ, NKV = M2_NKV, HD = M2_HEAD;
+    const size_t oq = (size_t)NQ * HD, okv = (size_t)NKV * HD, nn = (size_t)NQ * N * N;
+    bool ok = true;
+    ok &= cudaMalloc(&eng->d_q35_qb,  (size_t)N*oq*sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_q35_kb,  (size_t)N*okv*sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_q35_vb,  (size_t)N*okv*sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_q35_kbx, (size_t)N*oq*sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_q35_vbx, (size_t)N*oq*sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_q35_pb,  nn*sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_q35_scores, nn*sizeof(float)) == cudaSuccess;
+    if (!ok) {
+        Q35_FREE(eng->d_q35_qb); Q35_FREE(eng->d_q35_kb); Q35_FREE(eng->d_q35_vb);
+        Q35_FREE(eng->d_q35_kbx); Q35_FREE(eng->d_q35_vbx); Q35_FREE(eng->d_q35_pb);
+        Q35_FREE(eng->d_q35_scores);
+        return false;
+    }
+    eng->d_q35_attn_cap = N;
+    return true;
+    #undef Q35_FREE
+}
+
+// FULL-layer one-shot prefill attention via tensor-core GEMMs (base==0: queries attend only
+// within the tile, which IS the whole causal prompt). Replaces the scalar O(N²) qwen35_b_attn
+// kernel. qb is post q-norm + RoPE [N][NQ][HD]; kb/vb post k-norm+RoPE / raw value [N][NKV][HD].
+// Writes attn[N][NQ*HD]. Scale rsqrt(HD), causal, no softcap — identical math to the scalar path.
+static void q35_full_attn_tc(gemma4_engine_t *eng, float *attn, const float *qb,
+                             const float *kb, const float *vb, int N, cudaStream_t st) {
+    const int NQ = M2_NQ, NKV = M2_NKV, HD = M2_HEAD;
+    const size_t oq = (size_t)NQ * HD, okv = (size_t)NKV * HD;
+    auto g1 = [](size_t n){ return (unsigned)((n + 255) / 256); };
+    f32_to_bf16_kernel<<<g1((size_t)N*oq),256,0,st>>>(eng->d_q35_qb, qb, (size_t)N*oq);
+    f32_to_bf16_kernel<<<g1((size_t)N*okv),256,0,st>>>(eng->d_q35_kb, kb, (size_t)N*okv);
+    f32_to_bf16_kernel<<<g1((size_t)N*okv),256,0,st>>>(eng->d_q35_vb, vb, (size_t)N*okv);
+    kv_broadcast_bf16_kernel<<<dim3(g1(HD),NQ,N),256,0,st>>>(eng->d_q35_kbx, eng->d_q35_kb, N, NQ, NKV, HD);
+    kv_broadcast_bf16_kernel<<<dim3(g1(HD),NQ,N),256,0,st>>>(eng->d_q35_vbx, eng->d_q35_vb, N, NQ, NKV, HD);
+    const float scale = rsqrtf((float)HD), b0 = 0.0f;
+    long long sNN = (long long)N * N;
+    // S[h] = scale · Q[h]ᵀ·K[h]   (col-major [hd×N], ld=oq, stride=hd)
+    cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, N, HD,
+        &scale, eng->d_q35_qb,  CUDA_R_16BF, (int)oq, (long long)HD,
+                eng->d_q35_kbx, CUDA_R_16BF, (int)oq, (long long)HD,
+        &b0,    eng->d_q35_scores, CUDA_R_32F, N, sNN,
+        NQ, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    attn_softmax_batched_kernel<<<dim3(N,NQ),256,32*sizeof(float),st>>>(eng->d_q35_scores, eng->d_q35_pb, N, 0);
+    const float a1 = 1.0f;
+    // O[h] = V[h]·P[h]ᵀ  (col-major [hd×N], ld=oq, stride=hd)
+    cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_N, CUBLAS_OP_T, HD, N, N,
+        &a1, eng->d_q35_vbx, CUDA_R_16BF, (int)oq, (long long)HD,
+             eng->d_q35_pb,  CUDA_R_16BF, N, sNN,
+        &b0, attn, CUDA_R_32F, (int)oq, (long long)HD,
+        NQ, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
 // Tensor-core BF16 GEMM for ONE qwen35 prefill projection: dequant the quantized weight to BF16,
 // cast the FP32 activation tile to BF16, then a cuBLAS tensor-core GEMM → FP32 dst[T×out_dim].
 // Prefill is COMPUTE-bound, so this replaces the decode-oriented dp4a gemv_batched_w (warp-per-
@@ -15844,7 +15919,6 @@ static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
 // chunk). do_sample=1 argmaxes the LAST row of the LAST chunk into *first_tok_out. Returns 0/-1.
 static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, int T,
                                       int want_logits, cudaStream_t st) {
-    (void)base;
     const gemma4_model_config_t *c = &eng->cfg;
     const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV;
     const int INNER=M2_VALD, CONVD=M2_CONVDIM, NKH=M2_NKH, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, ROT=M2_ROT;
@@ -15887,8 +15961,13 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NKV,T),32,0,st>>>(kb, NKV, d_pos, T);
             qwen35_b_kv_write_kernel<<<dim3(grid1d((size_t)NKV*HD),T),256,0,st>>>(
                 eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, T);
-            qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
-                attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T);
+            // base==0: the whole causal prompt is this tile → tensor-core GEMM attention (reads
+            // kb/vb directly). base>0 (chunked continuation): scalar kernel over the full cache.
+            if (base == 0 && T <= 4096 && ensure_q35_attn_scratch(eng, T))
+                q35_full_attn_tc(eng, attn, qb, kb, vb, T, st);
+            else
+                qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
+                    attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T);
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
             q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st);
         } else {
