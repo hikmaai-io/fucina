@@ -15845,12 +15845,18 @@ extern "C" int qwen35_batch_selftest(gemma4_engine_t *eng) {
     if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) {
         fprintf(stderr, "qwen35_batch_selftest: engine is not qwen35\n"); return 1;
     }
-    const int NSEQ = 3, KSTEP = 24, NP = 5;
-    // seq 0 = "The capital of France is" (the M3 reference prompt); 1,2 = arbitrary in-vocab ids.
-    int32_t prompt[NSEQ][NP] = {
+    const int NSEQ = 3, KSTEP = 24, MAXP = 11;
+    // RAGGED prompt lengths (5/8/11) so the three rows sit at DIFFERENT absolute positions in
+    // every batched step — the genuine continuous-batching case (sequences that joined at
+    // different times). With equal lengths the rows happen to share positions, which masks any
+    // per-row position bug (d_ms_pos / rowslot / FULL-cache write offset / GDN-state slot key).
+    // seq 0 = "The capital of France is" (the M3 reference prompt, kept at 5 for the oracle);
+    // seq 1,2 = arbitrary in-vocab ids of length 8 and 11.
+    const int NPq[NSEQ] = { 5, 8, 11 };
+    int32_t prompt[NSEQ][MAXP] = {
         { 760, 6511, 314, 9338, 369 },
-        { 785, 6722, 315, 9625, 374 },
-        { 100, 200, 300, 400, 500 },
+        { 785, 6722, 315, 9625, 374, 1024, 2048, 4096 },
+        { 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100 },
     };
     int32_t ref[NSEQ][KSTEP], bat[NSEQ][KSTEP], boff[NSEQ][KSTEP];
 
@@ -15858,7 +15864,7 @@ extern "C" int qwen35_batch_selftest(gemma4_engine_t *eng) {
     eng->q35_graph_enabled = 0;
     for (int q = 0; q < NSEQ; q++) {
         int32_t first = 0;
-        int slot = gemma4_engine_seq_add(eng, prompt[q], NP, &first, 0.f, 0, 0.f, 0.f, 0);
+        int slot = gemma4_engine_seq_add(eng, prompt[q], NPq[q], &first, 0.f, 0, 0.f, 0.f, 0);
         if (slot < 0) { fprintf(stderr, "qwen35_batch_selftest: seq_add(ref) failed\n"); return 1; }
         int32_t tok = first;
         for (int k = 0; k < KSTEP; k++) {
@@ -15878,7 +15884,7 @@ extern "C" int qwen35_batch_selftest(gemma4_engine_t *eng) {
         int slot[NSEQ]; int32_t cur[NSEQ];
         for (int q = 0; q < NSEQ; q++) {
             int32_t first = 0;
-            slot[q] = gemma4_engine_seq_add(eng, prompt[q], NP, &first, 0.f, 0, 0.f, 0.f, 0);
+            slot[q] = gemma4_engine_seq_add(eng, prompt[q], NPq[q], &first, 0.f, 0, 0.f, 0.f, 0);
             if (slot[q] < 0) { fprintf(stderr, "qwen35_batch_selftest: seq_add(batch) failed\n"); return 1; }
             cur[q] = first;
         }
@@ -15900,7 +15906,7 @@ extern "C" int qwen35_batch_selftest(gemma4_engine_t *eng) {
         int slot[NSEQ]; int32_t cur[NSEQ];
         for (int q = 0; q < NSEQ; q++) {
             int32_t first = 0;
-            slot[q] = gemma4_engine_seq_add(eng, prompt[q], NP, &first, 0.f, 0, 0.f, 0.f, 0);
+            slot[q] = gemma4_engine_seq_add(eng, prompt[q], NPq[q], &first, 0.f, 0, 0.f, 0.f, 0);
             if (slot[q] < 0) { fprintf(stderr, "qwen35_batch_selftest: seq_add(boff) failed\n"); return 1; }
             cur[q] = first;
         }
@@ -15928,9 +15934,9 @@ extern "C" int qwen35_batch_selftest(gemma4_engine_t *eng) {
         if (agree  != KSTEP) indep_ok = 0;
         if (gagree != KSTEP) graph_ok = 0;
         fprintf(stderr,
-            "qwen35 M4 seq %d: B=%d(graph) vs B=1(per-kernel) %d/%d bit-identical%s%s; "
-            "graph-on vs graph-off %d/%d\n",
-            q, NSEQ, agree, KSTEP,
+            "qwen35 M4 seq %d (prompt=%d, decode pos %d..%d): B=%d(graph) vs B=1(per-kernel) "
+            "%d/%d bit-identical%s%s; graph-on vs graph-off %d/%d\n",
+            q, NPq[q], NPq[q], NPq[q] + KSTEP - 1, NSEQ, agree, KSTEP,
             (fm >= 0) ? "  first-mismatch@" : "", "", gagree, KSTEP);
         if (fm >= 0)
             fprintf(stderr, "qwen35 M4   seq %d first mismatch step %d (B=1 %d vs B=%d %d)\n",
@@ -15940,7 +15946,7 @@ extern "C" int qwen35_batch_selftest(gemma4_engine_t *eng) {
     // (D) M3 cross-check: the batched decode of seq 0 must reproduce qwen35_forward_greedy.
     const int NGEN = 12, GATE = 8;
     int32_t m3[NGEN] = {0};
-    int m3_ok = (qwen35_forward_greedy(eng, prompt[0], NP, m3, NGEN) == 0);
+    int m3_ok = (qwen35_forward_greedy(eng, prompt[0], NPq[0], m3, NGEN) == 0);
     int m3_agree = 0;
     if (m3_ok) {
         // ref[0] = [first, then KSTEP-1 decoded]; m3 = [first, then NGEN-1 decoded]. Compare GATE.
