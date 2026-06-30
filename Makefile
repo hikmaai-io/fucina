@@ -29,7 +29,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
-        qwen35-detect-test qwen35-load-test qwen35-layer-parity-test \
+        qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -167,6 +167,17 @@ qwen35-layer-parity-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_layer_parity \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_layer_parity $(QWEN35_M2_REF)"
+
+# ─── Qwen3.5 hybrid (qwen35) M3 single-seq forward greedy parity (GPU) ───
+# Drives the FULL qwen35 hybrid stack (24 GDN linear + 8 FULL output-gated softmax-GQA layers,
+# carrying GDN state + conv ring + per-FULL-layer KV cache) token-by-token through
+# qwen35_forward_greedy and asserts the first 8 greedy continuation ids of "The capital of
+# France is" match the llama-simple reference [11751,13,198,57590,369,279,6511,314] (8/8).
+qwen35-parity-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_parity.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_parity \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_parity $(QWEN35_MODEL)"
 
 # ─── Qwen3 dense numeric parity vs llama.cpp (GPU) ──────────────────────
 # Feeds llama.cpp's input ids for "The capital of France is" through fucina's

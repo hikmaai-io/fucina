@@ -7172,6 +7172,12 @@ static int build_packed_q4k(gemma4_engine_t *eng)
 {
     if (eng->q4k_packed) return 0;
     if (!eng->d_weights) return -1;
+    // Qwen3.5 hybrid (M3): its single-seq forward reads Q4_K weights via the NATURAL-layout
+    // native dp4a (gemv_w) and Q5_K via a natural-layout fp32 dequant; it must NOT see the
+    // de-interleaved (packed) superblock layout. Skip the in-place repack so d_weights stays
+    // natural Q4_K for qwen35. Gated on the new arch → every other arch keeps the packed
+    // decode GEMV byte-identical.
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return 0;
     const char *no_packed = getenv("FUCINA_NO_PACKED");
     if (no_packed && no_packed[0] == '1') return -1;
 
@@ -14689,6 +14695,354 @@ int qwen35_m2_layer_selftest(const char *ref_bin_path) {
         cudaFree(outC);cudaFree(scratch);
     }
     free(blob);
+    return rc;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// ─── Qwen3.5 hybrid (qwen35) M3: single-seq hybrid forward (8/8 greedy argmax parity) ───────
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Token-by-token forward over the qwen35 GGUF that carries the GDN recurrent state + conv ring
+// (LINEAR layers) and a per-FULL-layer KV cache across tokens. Per-layer dispatch is driven by
+// cfg.attn_kind[]: LINEAR → gated-deltanet step (fp32 state), FULL → output-gated softmax GQA.
+//
+// Reuse map: projections / FFN / lm_head go through the VALIDATED quantized dp4a gemv_w
+// (native Q4_K / Q6_K — the same kernels Qwen3 reached 8/8 with); the only non-dp4a weight is
+// the LINEAR layers' Q5_K attn_qkv (no native Q5_K kernel) which is dequantized to fp32 and run
+// through the M2 fp32 m2_gemm. The mixer math reuses the M2 kernels (split q|gate, per-head
+// q/k norm, partial NEOX RoPE, GDN conv/l2norm/decay/recurrence/gated-norm) which M2 already
+// validated < 1e-2 vs the HF torch reference. The embedding uses the engine's Q8_0
+// token_embd convert (d_token_embd). Everything here is gated on GEMMA4_ARCH_QWEN3_5.
+
+// Partial NEOX RoPE on the first M2_ROT dims of each head at an ARBITRARY position `pos`
+// (the M2 kernel hard-codes pos = row index; decode needs the real sequence position). 1 row.
+__global__ void qwen35_rope_pos_kernel(float *x, int n_heads, int pos) {
+    int i   = blockIdx.x * blockDim.x + threadIdx.x;     // 0..ROT/2-1
+    int h   = blockIdx.y;
+    if (i >= M2_ROT / 2 || h >= n_heads) return;
+    float *hd = x + (size_t)h * M2_HEAD;
+    float inv = powf(M2_THETA, -(float)(2 * i) / (float)M2_ROT);
+    float ang = (float)pos * inv;
+    float c = cosf(ang), s = sinf(ang);
+    float a = hd[i], b = hd[i + M2_ROT / 2];
+    hd[i]              = a * c - b * s;
+    hd[i + M2_ROT / 2] = b * c + a * s;
+}
+
+// Single-query causal GQA softmax against the KV cache: query head hd at position `pos`
+// attends cached keys 0..pos. Kc/Vc are [pos+1][NKV][HEAD] (current pos already written).
+// One block per query head; scores in dynamic shared (pos+1 floats). Mirrors m2_gqa_attn.
+__global__ void qwen35_attn_step_kernel(float *out, const float *q,
+                                        const float *Kc, const float *Vc, int pos) {
+    int hd  = blockIdx.x;            // query head 0..NQ-1
+    int tid = threadIdx.x;
+    int kv  = hd / (M2_NQ / M2_NKV);
+    extern __shared__ float sc[];    // [pos+1] scores
+    const float *qr = q + (size_t)hd * M2_HEAD;
+    float scale = rsqrtf((float)M2_HEAD);
+    for (int j = tid; j <= pos; j += blockDim.x) {
+        const float *kr = Kc + ((size_t)j * M2_NKV + kv) * M2_HEAD;
+        float acc = 0.f;
+        for (int d = 0; d < M2_HEAD; d++) acc += qr[d] * kr[d];
+        sc[j] = acc * scale;
+    }
+    __syncthreads();
+    __shared__ float red[32];
+    float m = -1e30f;
+    for (int j = tid; j <= pos; j += blockDim.x) m = fmaxf(m, sc[j]);
+    m = block_reduce_max(m, red);
+    __shared__ float msh; if (tid == 0) msh = m; __syncthreads(); m = msh;
+    float ssum = 0.f;
+    for (int j = tid; j <= pos; j += blockDim.x) { float e = __expf(sc[j] - m); sc[j] = e; ssum += e; }
+    ssum = block_reduce_sum(ssum, red);
+    __shared__ float ssh; if (tid == 0) ssh = ssum; __syncthreads();
+    float inv = 1.f / ssh;
+    for (int d = tid; d < M2_HEAD; d += blockDim.x) {
+        float acc = 0.f;
+        for (int j = 0; j <= pos; j++)
+            acc += sc[j] * Vc[((size_t)j * M2_NKV + kv) * M2_HEAD + d];
+        out[(size_t)hd * M2_HEAD + d] = acc * inv;
+    }
+}
+
+// Stateful causal depthwise conv1d (k=CK) + SiLU for ONE token over conv_dim channels. The
+// previous CK-1 inputs live in a per-channel ring buffer `ring` [conv_dim][CK-1] (oldest..
+// newest); after computing the output the ring is shifted left and the current input appended.
+// Equivalent to m2_conv_silu's zero-left-pad form when the ring starts zeroed. cw is [conv_dim,CK].
+__global__ void qwen35_conv_step_kernel(float *conv_out, const float *qkv, float *ring,
+                                        const float *cw, int conv_dim) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    const int K = M2_CK, HK = M2_CK - 1;
+    float acc = 0.f;
+    #pragma unroll
+    for (int j = 0; j < HK; j++) acc += cw[c * K + j] * ring[(size_t)c * HK + j];
+    acc += cw[c * K + HK] * qkv[c];
+    conv_out[c] = acc / (1.f + __expf(-acc));                 // SiLU
+    #pragma unroll
+    for (int j = 0; j < HK - 1; j++) ring[(size_t)c * HK + j] = ring[(size_t)c * HK + j + 1];
+    ring[(size_t)c * HK + (HK - 1)] = qkv[c];
+}
+
+// GDN single-step delta-rule recurrence for ONE token that LOADS the carried per-v-head fp32
+// state S[SD×SD] from S_io, applies the step, and STORES it back. Identical arithmetic to
+// m2_gdn_recurrent_kernel run one token at a time (the M2 chunk==recur gate proved the
+// recurrence is correct). One block per v-head; q/k indexed by k-head kh = vh/(NVH/NKH).
+__global__ void qwen35_gdn_step_kernel(float *core, const float *q, const float *k,
+                                       const float *v, const float *g, const float *beta,
+                                       float *S_io) {
+    int vh  = blockIdx.x;
+    // q/k (16 heads) expand to the 32 v-heads by TILING (v-head vh ↔ k/q-head vh % NKH), i.e.
+    // HF's repeat(NVH/NKH) — NOT repeat_interleave (vh/(NVH/NKH)). Verified token-for-token vs
+    // llama.cpp's GATED_DELTA_NET: interleave gives generic output, tile recovers " Paris".
+    int kh  = vh % M2_NKH;
+    int tid = threadIdx.x;
+    extern __shared__ float sm[];
+    float *S   = sm;                 // [SD*SD] k-major: S[kd*SD+vd]
+    float *kt  = S + M2_SD * M2_SD;  // [SD]
+    float *qt  = kt + M2_SD;         // [SD]
+    float *dlt = qt + M2_SD;         // [SD]
+    float *Sg  = S_io + (size_t)vh * M2_SD * M2_SD;
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] = Sg[idx];
+    __syncthreads();
+    float scale = rsqrtf((float)M2_SD);
+    if (tid < M2_SD) {
+        kt[tid] = k[(size_t)kh * M2_SD + tid];
+        qt[tid] = q[(size_t)kh * M2_SD + tid] * scale;
+    }
+    __syncthreads();
+    float gt = __expf(g[vh]);
+    float bt = beta[vh];
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] *= gt;
+    __syncthreads();
+    if (tid < M2_SD) {                            // kv_mem + delta, thread per v-dim
+        float acc = 0.f;
+        for (int kd = 0; kd < M2_SD; kd++) acc += S[kd * M2_SD + tid] * kt[kd];
+        float vv = v[(size_t)vh * M2_SD + tid];
+        dlt[tid] = (vv - acc) * bt;
+    }
+    __syncthreads();
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) {   // S += k ⊗ delta
+        int kd = idx / M2_SD, vd = idx % M2_SD;
+        S[idx] += kt[kd] * dlt[vd];
+    }
+    __syncthreads();
+    if (tid < M2_SD) {                            // o = S^T q
+        float acc = 0.f;
+        for (int kd = 0; kd < M2_SD; kd++) acc += S[kd * M2_SD + tid] * qt[kd];
+        core[(size_t)vh * M2_SD + tid] = acc;
+    }
+    __syncthreads();
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) Sg[idx] = S[idx];
+}
+
+// out[i] += y[i]   (residual add over n elements)
+__global__ void qwen35_add_kernel(float *x, const float *y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
+// Greedy argmax over v[n] (single block, lowest-index tie-break) → *out_idx.
+__global__ void qwen35_argmax_kernel(const float *v, int n, int *out_idx) {
+    int tid = threadIdx.x;
+    float bv = -1e30f; int bi = 0;
+    for (int i = tid; i < n; i += blockDim.x) { float x = v[i]; if (x > bv) { bv = x; bi = i; } }
+    __shared__ float sv[256]; __shared__ int si[256];
+    sv[tid] = bv; si[tid] = bi; __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sv[tid + s] > sv[tid] || (sv[tid + s] == sv[tid] && si[tid + s] < si[tid])) {
+                sv[tid] = sv[tid + s]; si[tid] = si[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) *out_idx = si[0];
+}
+
+// Q5_K superblock (176 B) → fp32, natural element order. Mirrors dequant_q5_k_superblock
+// (host) bit-for-bit; used only for the LINEAR layers' Q5_K attn_qkv (no native Q5_K dp4a).
+__global__ void qwen35_dequant_q5k_f32_kernel(float *dst, const uint8_t *src, uint64_t n_super) {
+    uint64_t sb = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb >= n_super) return;
+    const uint8_t *blk = src + sb * 176;
+    __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+    __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+    float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+    const uint8_t *sc = blk + 4;    // 12 B packed 6-bit scales+mins
+    const uint8_t *qh = blk + 16;   // 32 B high bits
+    const uint8_t *qs = blk + 48;   // 128 B low nibbles
+    float *out = dst + sb * 256;
+    for (int j = 0; j < 8; j++) {
+        int s, m;
+        if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; }
+        else { s = (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4);
+               m = (sc[j + 4] >> 4)   | ((sc[j]     >> 6) << 4); }
+        float dl = d * (float)s, ml = dmin * (float)m;
+        const uint8_t *q = qs + (j / 2) * 32;
+        int shift = (j & 1) ? 4 : 0;
+        for (int i = 0; i < 32; i++) {
+            int lo = (q[i] >> shift) & 0x0F;
+            int hi = (qh[i] >> j) & 1;
+            out[j * 32 + i] = dl * (float)(lo + (hi << 4)) - ml;
+        }
+    }
+}
+
+// Single-seq greedy hybrid forward. Fills out_ids[0..n_gen-1] with the greedy continuation of
+// the prompt in_ids[0..n_prompt-1]. Returns 0 on success, non-zero on error. Token-by-token:
+// each position runs one full hybrid layer stack, carrying GDN state + conv ring + KV cache.
+extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids, int n_prompt,
+                                     int32_t *out_ids, int n_gen) {
+    if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) {
+        fprintf(stderr, "qwen35_forward_greedy: engine is not a qwen35 arch\n"); return -1;
+    }
+    const gemma4_model_config_t *c = &eng->cfg;
+    // The M2/M3 mixer kernels bake the qwen35-9B geometry as #defines; refuse a mismatch.
+    if (c->hidden_size != M2_H || c->head_dim != M2_HEAD || c->n_heads != M2_NQ ||
+        c->n_kv_global != M2_NKV || c->ssm_state_size != M2_SD ||
+        c->ssm_group_count != M2_NKH || c->ssm_time_step_rank != M2_NVH ||
+        c->ssm_conv_kernel != M2_CK || c->rotary_dim != M2_ROT) {
+        fprintf(stderr, "qwen35_forward_greedy: geometry mismatch vs M2 constants\n"); return -2;
+    }
+    if (!eng->d_token_embd) {
+        fprintf(stderr, "qwen35_forward_greedy: token_embd Q8_0 convert missing\n"); return -3;
+    }
+    cudaStream_t st = eng->stream;
+    const float eps = 1e-6f;
+    const int H = M2_H, HD = M2_HEAD, NQ = M2_NQ, NKV = M2_NKV;
+    const int INNER = M2_VALD, CONVD = M2_CONVDIM, KEYD = M2_KEYD;
+    const int NKH = M2_NKH, NVH = M2_NVH, SD = M2_SD, TSR = M2_TSR, ROT = M2_ROT;
+    const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
+    // Positions processed: the last prompt token (which yields out_ids[0]) plus n_gen-1
+    // re-fed drafted tokens. p ∈ [0, nsteps); out_ids[i] is produced at p = (n_prompt-1)+i.
+    const int nsteps = n_prompt + n_gen - 1;
+    (void)ROT; (void)KEYD;
+
+    // ── GDN state shared-mem opt-in (S[SD×SD] + kt+qt+dlt = ~65.5 KB > 48 KB default). ──
+    size_t smGDN = ((size_t)SD * SD + 3 * SD) * sizeof(float);
+    if (cudaFuncSetAttribute(qwen35_gdn_step_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDN) != cudaSuccess) {
+        fprintf(stderr, "qwen35_forward_greedy: GDN shared-mem opt-in failed (%zu B)\n", smGDN);
+        return -4;
+    }
+
+    auto Wq  = [&](uint64_t off) -> const uint8_t* { return weight_fp8(eng, off); };
+    auto Wf  = [&](uint64_t off) -> const float*   {
+        return (const float*)(eng->d_weights + (off - eng->tdata_start)); };
+
+    int rc = 0;
+    // ── per-token scratch ──
+    int32_t *d_tok = nullptr; int *d_arg = nullptr;
+    float *x=nullptr,*xn=nullptr,*qg=nullptr,*qb=nullptr,*gate=nullptr,*kb=nullptr,*vb=nullptr,
+          *attn=nullptr,*mix=nullptr,*qkv=nullptr,*conv_out=nullptr,*zc=nullptr,*ac=nullptr,
+          *bc=nullptr,*gg=nullptr,*bb=nullptr,*qh=nullptr,*kh=nullptr,*vh=nullptr,*core=nullptr,
+          *gnorm=nullptr,*ffn_g=nullptr,*ffn_u=nullptr,*ffn_a=nullptr,*dq=nullptr;
+    // ── persistent per-layer state (only the relevant layer kind is touched) ──
+    float **Kc = (float**)calloc(L, sizeof(float*));
+    float **Vc = (float**)calloc(L, sizeof(float*));
+    float **Sst = (float**)calloc(L, sizeof(float*));
+    float **ring = (float**)calloc(L, sizeof(float*));
+    if (!Kc || !Vc || !Sst || !ring) { rc = -5; goto cleanup; }
+
+    #define CK_MALLOC(p, n) do { if (cudaMalloc(&(p), (size_t)(n) * sizeof(float)) != cudaSuccess) { \
+        fprintf(stderr, "qwen35_forward_greedy: cudaMalloc failed (%s)\n", #p); rc = -6; goto cleanup; } } while(0)
+    if (cudaMalloc(&d_tok, sizeof(int32_t)) != cudaSuccess ||
+        cudaMalloc(&d_arg, sizeof(int))     != cudaSuccess) { rc = -6; goto cleanup; }
+    CK_MALLOC(x, H); CK_MALLOC(xn, H); CK_MALLOC(qg, 2*NQ*HD); CK_MALLOC(qb, NQ*HD);
+    CK_MALLOC(gate, NQ*HD); CK_MALLOC(kb, NKV*HD); CK_MALLOC(vb, NKV*HD); CK_MALLOC(attn, NQ*HD);
+    CK_MALLOC(mix, H); CK_MALLOC(qkv, CONVD); CK_MALLOC(conv_out, CONVD); CK_MALLOC(zc, INNER);
+    CK_MALLOC(ac, TSR); CK_MALLOC(bc, TSR); CK_MALLOC(gg, TSR); CK_MALLOC(bb, TSR);
+    CK_MALLOC(qh, NKH*SD); CK_MALLOC(kh, NKH*SD); CK_MALLOC(vh, NVH*SD); CK_MALLOC(core, NVH*SD);
+    CK_MALLOC(gnorm, INNER); CK_MALLOC(ffn_g, I); CK_MALLOC(ffn_u, I); CK_MALLOC(ffn_a, I);
+    CK_MALLOC(dq, (size_t)CONVD*H);
+    for (int l = 0; l < L; l++) {
+        if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
+            CK_MALLOC(Kc[l], (size_t)nsteps*NKV*HD);
+            CK_MALLOC(Vc[l], (size_t)nsteps*NKV*HD);
+        } else {
+            CK_MALLOC(Sst[l],  (size_t)NVH*SD*SD);
+            CK_MALLOC(ring[l], (size_t)CONVD*(M2_CK-1));
+            cudaMemsetAsync(Sst[l],  0, (size_t)NVH*SD*SD*sizeof(float), st);
+            cudaMemsetAsync(ring[l], 0, (size_t)CONVD*(M2_CK-1)*sizeof(float), st);
+        }
+    }
+
+    for (int p = 0; p < nsteps; p++) {
+        int32_t token = (p < n_prompt) ? in_ids[p] : out_ids[p - n_prompt];
+        cudaMemcpyAsync(d_tok, &token, sizeof(int32_t), cudaMemcpyHostToDevice, st);
+        embed_w(eng, x, eng->d_token_embd, d_tok, 1, H, st);
+
+        for (int l = 0; l < L; l++) {
+            // pre-mixer RMSNorm
+            rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.layers[l].attn_norm), H, 1, eps);
+            const auto &T = eng->tensors.layers[l];
+            if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
+                gemv_w(eng, qg, Wq(T.attn_q),      xn, H, 2*NQ*HD, st, T.fmt_q);
+                gemv_w(eng, kb, Wq(T.attn_k),      xn, H, NKV*HD,  st, T.fmt_k);
+                gemv_w(eng, vb, Wq(T.attn_v),      xn, H, NKV*HD,  st, T.fmt_v);
+                m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(qb, gate, qg, 1);
+                per_head_rms_norm_rows_kernel<<<dim3(NQ,1),256,32*sizeof(float),st>>>(qb, Wf(T.attn_q_norm), NQ, HD, 1, eps);
+                per_head_rms_norm_rows_kernel<<<dim3(NKV,1),256,32*sizeof(float),st>>>(kb, Wf(T.attn_k_norm), NKV, HD, 1, eps);
+                qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NQ),32,0,st>>>(qb, NQ, p);
+                qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NKV),32,0,st>>>(kb, NKV, p);
+                cudaMemcpyAsync(Kc[l]+(size_t)p*NKV*HD, kb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
+                cudaMemcpyAsync(Vc[l]+(size_t)p*NKV*HD, vb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
+                qwen35_attn_step_kernel<<<NQ,256,(size_t)(p+1)*sizeof(float),st>>>(attn, qb, Kc[l], Vc[l], p);
+                m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(attn, gate, NQ*HD);
+                gemv_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, st, T.fmt_o);
+            } else {
+                // GDN (LINEAR): Q5_K attn_qkv → fp32 dequant + m2_gemm; others via dp4a gemv_w.
+                qwen35_dequant_q5k_f32_kernel<<<(unsigned)(((size_t)CONVD*H/256+255)/256),256,0,st>>>(
+                    dq, Wq(T.ssm.in_qkv), (uint64_t)CONVD*H/256);
+                m2_gemm(qkv, xn, dq, 1, H, CONVD);
+                gemv_w(eng, zc, Wq(T.ssm.in_z), xn, H, INNER, st, T.ssm.fmt_in_z);
+                gemv_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   st, T.ssm.fmt_in_a);   // alpha
+                gemv_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   st, T.ssm.fmt_in_b);   // beta
+                qwen35_conv_step_kernel<<<(CONVD+127)/128,128,0,st>>>(conv_out, qkv, ring[l], Wf(T.ssm.conv1d), CONVD);
+                cudaMemcpyAsync(qh, conv_out,             (size_t)KEYD*sizeof(float),  cudaMemcpyDeviceToDevice, st);
+                cudaMemcpyAsync(kh, conv_out+KEYD,        (size_t)KEYD*sizeof(float),  cudaMemcpyDeviceToDevice, st);
+                cudaMemcpyAsync(vh, conv_out+2*KEYD,      (size_t)INNER*sizeof(float), cudaMemcpyDeviceToDevice, st);
+                m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(qh, NKH, SD, 1);
+                m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(kh, NKH, SD, 1);
+                m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), 1);
+                qwen35_gdn_step_kernel<<<NVH,128,smGDN,st>>>(core, qh, kh, vh, gg, bb, Sst[l]);
+                m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), 1);
+                gemv_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, st, T.ssm.fmt_out);
+            }
+            qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(x, mix, H);
+            // pre-FFN RMSNorm (post_attention_norm loaded into the ffn_norm slot) + SwiGLU
+            rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(xn, x, Wf(T.ffn_norm), H, 1, eps);
+            gemv_w(eng, ffn_g, Wq(T.ffn_gate), xn, H, I, st, T.fmt_gate);
+            gemv_w(eng, ffn_u, Wq(T.ffn_up),   xn, H, I, st, T.fmt_up);
+            silu_glu_kernel<<<(I+255)/256,256,0,st>>>(ffn_a, ffn_g, ffn_u, I);
+            gemv_w(eng, mix, Wq(T.ffn_down), ffn_a, I, H, st, T.fmt_down);
+            qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(x, mix, H);
+        }
+
+        if (p >= n_prompt - 1) {   // final norm + lm_head + argmax (skip on interior prompt tokens)
+            rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, 1, eps);
+            gemv_w(eng, eng->d_logits, Wq(eng->tensors.output_weight), xn, H, VOC, st, eng->tensors.output_fmt);
+            qwen35_argmax_kernel<<<1,256,0,st>>>(eng->d_logits, VOC, d_arg);
+            int argmax = 0;
+            cudaMemcpyAsync(&argmax, d_arg, sizeof(int), cudaMemcpyDeviceToHost, st);
+            cudaStreamSynchronize(st);
+            out_ids[p - (n_prompt - 1)] = argmax;
+        }
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { fprintf(stderr, "qwen35_forward_greedy: CUDA error at pos %d: %s\n",
+                                        p, cudaGetErrorString(e)); rc = -7; goto cleanup; }
+    }
+
+cleanup:
+    #undef CK_MALLOC
+    cudaStreamSynchronize(st);
+    if (d_tok) cudaFree(d_tok); if (d_arg) cudaFree(d_arg);
+    float *bufs[] = {x,xn,qg,qb,gate,kb,vb,attn,mix,qkv,conv_out,zc,ac,bc,gg,bb,qh,kh,vh,core,gnorm,ffn_g,ffn_u,ffn_a,dq};
+    for (float *b : bufs) if (b) cudaFree(b);
+    if (Kc)  { for (int l=0;l<L;l++) if (Kc[l])  cudaFree(Kc[l]);  free(Kc); }
+    if (Vc)  { for (int l=0;l<L;l++) if (Vc[l])  cudaFree(Vc[l]);  free(Vc); }
+    if (Sst) { for (int l=0;l<L;l++) if (Sst[l]) cudaFree(Sst[l]); free(Sst); }
+    if (ring){ for (int l=0;l<L;l++) if (ring[l])cudaFree(ring[l]);free(ring); }
     return rc;
 }
 

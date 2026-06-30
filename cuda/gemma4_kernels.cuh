@@ -135,6 +135,15 @@ void gemma4_engine_destroy(gemma4_engine_t *eng);
 // on failure. CUDA-free of the engine: it allocates its own device buffers.
 int qwen35_m2_layer_selftest(const char *ref_bin_path);
 
+// ─── Qwen3.5 hybrid (qwen35) M3 single-seq hybrid greedy forward ───────────────
+// Token-by-token forward over a loaded qwen35 engine that carries the GDN recurrent state +
+// conv ring (LINEAR layers) and a per-FULL-layer KV cache across tokens, dispatching per layer
+// off cfg.attn_kind[]. Fills out_ids[0..n_gen-1] with the greedy (argmax) continuation of the
+// prompt in_ids[0..n_prompt-1]. Returns 0 on success, non-zero on error. The engine must have
+// been created from a qwen35 GGUF (gemma4_engine_create auto-detects the arch).
+int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids, int n_prompt,
+                          int32_t *out_ids, int n_gen);
+
 // ─── Core inference ──────────────────────────────────────────────────
 
 // Prefill: process n_tokens in sequence, filling KV cache.
