@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -382,6 +383,20 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 		s.chunk = ce
 		s.chunkSize = defaultPrefillChunk
 		s.chunkMin = defaultPrefillChunkMin
+		// Overrides: some engines (e.g. the Qwen3.5 hybrid, whose prefill GEMM dequantizes
+		// weights per tile) prefer FEWER, WIDER prefill passes — a large chunkMin routes a
+		// long prompt through the one-shot prefill (one dequant) instead of many 256-token
+		// chunks (one dequant each). Trades decode-interleaving for TTFT.
+		if v := os.Getenv("FUCINA_PREFILL_CHUNK"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				s.chunkSize = n
+			}
+		}
+		if v := os.Getenv("FUCINA_PREFILL_CHUNK_MIN"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				s.chunkMin = n
+			}
+		}
 	}
 	if ps, ok := engine.(PrefixCacheStatsEngine); ok {
 		s.prefixStats = ps
