@@ -4255,6 +4255,27 @@ static void gemma4_apply_cfg(gemma4_engine_t *eng) {
     gemma4_model_config_t *c = &eng->cfg;
     eng->n_global         = 0;
     eng->n_layers_sliding = 0;
+
+    // Qwen3.5 hybrid: lower the per-layer attention KIND (cfg.attn_kind[]) into layer_types.
+    // FULL softmax-GQA layers route through the engine's global full-attention class; LINEAR
+    // gated-deltanet layers are dispatched off cfg.attn_kind[] by the (M-stage) GDN forward, and
+    // are parked as LAYER_SLIDING here purely so the layer_types array is fully populated (their
+    // attention is NEVER taken via the sliding/global softmax path). Gated on QWEN3_5 so no other
+    // arch's layer_types lowering changes.
+    if (c->arch == GEMMA4_ARCH_QWEN3_5) {
+        for (int i = 0; i < c->n_layers && i < GEMMA4_CAP_LAYERS; i++) {
+            if (c->attn_kind[i] == GEMMA4_ATTN_FULL) {
+                eng->layer_types[i] = LAYER_GLOBAL;
+                eng->global_layer_indices[eng->n_global++] = i;
+            } else {
+                eng->layer_types[i] = LAYER_SLIDING;  // GDN (linear); dispatched on attn_kind[]
+                eng->n_layers_sliding++;
+            }
+        }
+        eng->n_layers_global = eng->n_global;
+        return;
+    }
+
     for (int i = 0; i < c->n_layers && i < GEMMA4_CAP_LAYERS; i++) {
         if (c->is_global[i]) {
             eng->layer_types[i] = LAYER_GLOBAL;

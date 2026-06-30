@@ -43,6 +43,16 @@ enum {
     GEMMA4_ARCH_QWEN3    = 1,   // Qwen3 dense (full-causal all layers, separate V, silu-glu, no softcap)
     GEMMA4_ARCH_QWEN3MOE = 2,   // Qwen3 MoE (qwen3moe): IDENTICAL attention/norm/rope/KV to Qwen3 dense,
                                 // but the dense FFN becomes a 128-expert top-8 SiLU-GLU mixture.
+    GEMMA4_ARCH_QWEN3_5  = 3,   // Qwen3.5 hybrid (qwen35): per-layer mix of FULL softmax-GQA (output-gated,
+                                // partial-RoPE, q/k norm) and LINEAR gated-deltanet (SSM) layers, period-4
+                                // full at (i+1)%full_attention_interval==0; SwiGLU MLP, untied lm_head.
+};
+
+// Per-layer attention kind for the Qwen3.5 hybrid (cfg.attn_kind[]). FULL = softmax GQA
+// (reuses the engine's "global" full-attention class); LINEAR = gated-deltanet recurrence.
+enum {
+    GEMMA4_ATTN_FULL   = 0,
+    GEMMA4_ATTN_LINEAR = 1,
 };
 
 // Qwen3 dense and Qwen3-MoE share an IDENTICAL attention/norm/rope/KV/head_dim layout — only the FFN
@@ -82,6 +92,23 @@ typedef struct gemma4_model_config_t {
     int   n_experts;         // 0 (dense) / 128 (qwen3moe)
     int   n_experts_used;    // 0 (dense) / 8   (qwen3moe top-k)
     int   expert_ffn;        // 0 (dense) / 768 (qwen3moe per-expert FFN intermediate)
+
+    // ── Qwen3.5 hybrid (GEMMA4_ARCH_QWEN3_5) ────────────────────────────────────────────────────
+    // Zero for non-hybrid archs. Per-layer attention kind (GEMMA4_ATTN_FULL / GEMMA4_ATTN_LINEAR):
+    // full-attn iff (i+1)%full_attention_interval==0, else gated-deltanet (linear). The FULL layers
+    // are also marked is_global[i]=1 so they route through the engine's existing global GQA class;
+    // the LINEAR layers are dispatched off attn_kind[] by the (M-stage) gated-deltanet forward.
+    uint8_t attn_kind[GEMMA4_CAP_LAYERS]; // GEMMA4_ATTN_FULL / GEMMA4_ATTN_LINEAR per layer
+    int   full_attention_interval; // 4   (full layer iff (i+1)%interval==0); 0 for non-hybrid
+    int   n_full;                  // 8   (count of FULL softmax-attention layers)
+    int   rotary_dim;              // 64  (partial-RoPE width applied to the first rotary_dim of
+                                   //      head_dim 256; the remaining dims pass through). 0 = full RoPE.
+    // Gated-DeltaNet (SSM) geometry for the LINEAR layers, read from qwen35.ssm.*:
+    int   ssm_state_size;          // 128 (per-head key/value state dim)
+    int   ssm_conv_kernel;         // 4   (depthwise causal conv1d kernel over concat[q;k;v])
+    int   ssm_inner_size;          // 4096 (value-path inner width = n_v_heads * state_size)
+    int   ssm_group_count;         // 16  (key/query heads; value heads = repeat_interleave 16→32)
+    int   ssm_time_step_rank;      // 32  (num value heads; A_log/dt_bias/b/a width)
 } gemma4_model_config_t;
 
 #endif // GEMMA4_CONFIG_H

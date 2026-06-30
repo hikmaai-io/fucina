@@ -29,6 +29,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
+        qwen35-detect-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -133,6 +134,15 @@ packed-kv-test:
 	$(NVCC) -arch=$(CUDA_ARCH) -o /tmp/fucina_packed_kv_test \
 		cuda/packed_kv_test.cu -diag-suppress 550
 	/tmp/fucina_packed_kv_test
+
+# ─── Qwen3.5 hybrid (qwen35) arch detection (HOST-only, no GPU) ──────────
+# Proves gemma4_detect_from_gguf reads the qwen35.* GGUF metadata into the config
+# (dims + the period-4 FULL/LINEAR per-layer attention pattern) WITHOUT the CUDA
+# engine. CUDA-free (gemma4_detect.h has its own GGUF reader) → plain g++, no flock.
+QWEN35_MODEL ?= /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf
+qwen35-detect-test:
+	g++ -std=c++17 -O2 -Wall -Wextra -Icuda cuda/test_qwen35_detect.cc -o /tmp/fucina_qwen35_detect
+	/tmp/fucina_qwen35_detect $(QWEN35_MODEL)
 
 # ─── Qwen3 dense numeric parity vs llama.cpp (GPU) ──────────────────────
 # Feeds llama.cpp's input ids for "The capital of France is" through fucina's

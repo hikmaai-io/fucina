@@ -296,6 +296,98 @@ static inline int gemma4_detect_qwen3moe(const uint8_t *data, uint64_t size,
     #undef G4D_FAIL
 }
 
+// Qwen3.5 hybrid (qwen35) → gemma4_model_config_t. Per-layer mix of FULL softmax-GQA layers
+// (output-gated, partial-RoPE, learned per-head q/k norm — a superset of the Qwen3-dense full-attn
+// block) and LINEAR gated-deltanet (SSM) layers. The cadence is period-`full_attention_interval`:
+// layer i is FULL iff (i+1)%interval==0, else LINEAR. We read the qwen35.* namespaced keys: the
+// usual block/embedding/ffn/head geometry (key_length 256, head_count 16, head_count_kv 4 GQA),
+// the partial-rotary width (rope.dimension_count 64 of head_dim 256), the full-attention interval,
+// and the gated-deltanet ssm.* dims (state 128, conv 4, inner 4096, group 16, time_step_rank 32).
+// FULL layers are also flagged is_global[]=1 so they reuse the engine's global full-attention
+// class; LINEAR layers carry attn_kind=GEMMA4_ATTN_LINEAR for the (later) GDN forward dispatch.
+static inline int gemma4_detect_qwen3_5(const uint8_t *data, uint64_t size,
+                                        gemma4_model_config_t *cfg,
+                                        char *err, size_t errlen) {
+    #define G4D_FAIL(...) do { if (err) snprintf(err, errlen, __VA_ARGS__); return -1; } while (0)
+    uint32_t bc = 0, embd = 0, ffn = 0, hc = 0, hckv = 0, kl = 0;
+    if (g4d_u32(data, size, "qwen35.block_count", &bc) != 0)              G4D_FAIL("missing qwen35.block_count");
+    if (g4d_u32(data, size, "qwen35.embedding_length", &embd) != 0)       G4D_FAIL("missing qwen35.embedding_length");
+    if (g4d_u32(data, size, "qwen35.feed_forward_length", &ffn) != 0)     G4D_FAIL("missing qwen35.feed_forward_length");
+    if (g4d_u32(data, size, "qwen35.attention.head_count", &hc) != 0)     G4D_FAIL("missing qwen35.attention.head_count");
+    if (g4d_u32(data, size, "qwen35.attention.head_count_kv", &hckv) != 0) G4D_FAIL("missing qwen35.attention.head_count_kv");
+    if (g4d_u32(data, size, "qwen35.attention.key_length", &kl) != 0)     G4D_FAIL("missing qwen35.attention.key_length");
+
+    if ((int)bc > GEMMA4_CAP_LAYERS) G4D_FAIL("block_count %u exceeds GEMMA4_CAP_LAYERS %d", bc, GEMMA4_CAP_LAYERS);
+    if ((int)hc > GEMMA4_CAP_HEADS)  G4D_FAIL("head_count %u exceeds GEMMA4_CAP_HEADS %d", hc, GEMMA4_CAP_HEADS);
+    if ((int)hckv > GEMMA4_CAP_KV_HEADS) G4D_FAIL("head_count_kv %u exceeds GEMMA4_CAP_KV_HEADS %d", hckv, GEMMA4_CAP_KV_HEADS);
+    if ((int)kl > GEMMA4_GLOBAL_HEAD_DIM) G4D_FAIL("key_length %u exceeds GEMMA4_GLOBAL_HEAD_DIM %d", kl, GEMMA4_GLOBAL_HEAD_DIM);
+
+    cfg->arch         = GEMMA4_ARCH_QWEN3_5;
+    cfg->head_dim     = (int)kl;          // 256
+    cfg->n_layers     = (int)bc;
+    cfg->hidden_size  = (int)embd;
+    cfg->intermediate = (int)ffn;
+    cfg->n_heads      = (int)hc;
+    // GQA: same KV head count on every FULL layer. The engine routes FULL layers through its
+    // "global" full-attention class, so n_kv_global carries the real per-layer KV count;
+    // n_kv_sliding is set equal so the sliding-pool sizing/guards stay valid (unused here).
+    cfg->n_kv_global  = (int)hckv;
+    cfg->n_kv_sliding = (int)hckv;
+
+    uint32_t vocab = 0;
+    if (g4d_u32(data, size, "qwen35.vocab_size", &vocab) == 0 && vocab > 0) {
+        cfg->vocab_size = (int)vocab;
+    } else {
+        g4d_array_t toks;
+        if (g4d_meta(data, size, "tokenizer.ggml.tokens", G4D_T_ARRAY, &toks) == 0)
+            cfg->vocab_size = (int)toks.count;
+    }
+    if (cfg->vocab_size <= 0) G4D_FAIL("qwen35: could not determine vocab size");
+
+    cfg->softcap = 0.0f;   // Qwen3.5 has no logit softcap
+
+    float fb = 10000000.0f;   // rope theta 1e7
+    g4d_f32(data, size, "qwen35.rope.freq_base", &fb);
+    cfg->rope_theta_global  = fb;
+    cfg->rope_theta_sliding = fb;
+
+    // Partial rotary: rope is applied to only the first `rope.dimension_count` dims of head_dim.
+    uint32_t rdim = 0;
+    if (g4d_u32(data, size, "qwen35.rope.dimension_count", &rdim) == 0) cfg->rotary_dim = (int)rdim;
+
+    // Full-attention cadence (period). Default to 4 if the kv is absent.
+    uint32_t fai = 4;
+    g4d_u32(data, size, "qwen35.full_attention_interval", &fai);
+    cfg->full_attention_interval = (int)fai;
+
+    // Gated-DeltaNet (SSM) geometry for the LINEAR layers.
+    uint32_t ss = 0, ck = 0, isz = 0, gc = 0, tsr = 0;
+    g4d_u32(data, size, "qwen35.ssm.state_size",     &ss);
+    g4d_u32(data, size, "qwen35.ssm.conv_kernel",    &ck);
+    g4d_u32(data, size, "qwen35.ssm.inner_size",     &isz);
+    g4d_u32(data, size, "qwen35.ssm.group_count",    &gc);
+    g4d_u32(data, size, "qwen35.ssm.time_step_rank", &tsr);
+    cfg->ssm_state_size     = (int)ss;
+    cfg->ssm_conv_kernel    = (int)ck;
+    cfg->ssm_inner_size     = (int)isz;
+    cfg->ssm_group_count    = (int)gc;
+    cfg->ssm_time_step_rank = (int)tsr;
+
+    // Per-layer attention kind: FULL iff (i+1)%interval==0, else LINEAR. FULL layers also
+    // get is_global[]=1 so they reuse the engine's global full-attention path.
+    int interval = (cfg->full_attention_interval > 0) ? cfg->full_attention_interval : 4;
+    cfg->n_full   = 0;
+    cfg->n_global = 0;
+    for (int i = 0; i < cfg->n_layers && i < GEMMA4_CAP_LAYERS; i++) {
+        int is_full = (((i + 1) % interval) == 0);
+        cfg->attn_kind[i] = (uint8_t)(is_full ? GEMMA4_ATTN_FULL : GEMMA4_ATTN_LINEAR);
+        cfg->is_global[i] = (uint8_t)is_full;
+        if (is_full) { cfg->n_full++; cfg->n_global++; }
+    }
+    return 0;
+    #undef G4D_FAIL
+}
+
 // ── Detection: GGUF → gemma4_model_config_t ─────────────────────────────────────────────────────
 // `data`/`size` is the mmap'd (or fully read) GGUF file. Returns 0 on success, -1 on a fatal
 // inconsistency (missing required kv, or counts exceeding the compiled capacity maxima). On
@@ -315,6 +407,8 @@ static inline int gemma4_detect_from_gguf(const uint8_t *data, uint64_t size,
                 return gemma4_detect_qwen3(data, size, cfg, err, errlen);
             if (strcmp(arch, "qwen3moe") == 0)
                 return gemma4_detect_qwen3moe(data, size, cfg, err, errlen);
+            if (strcmp(arch, "qwen35") == 0)
+                return gemma4_detect_qwen3_5(data, size, cfg, err, errlen);
         }
     }
     cfg->arch = GEMMA4_ARCH_GEMMA4;
