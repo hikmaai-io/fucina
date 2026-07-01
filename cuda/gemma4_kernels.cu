@@ -5834,8 +5834,12 @@ gemma4_engine_t* gemma4_engine_create(
         // decision (gemm path) declines to build it and falls back to BF16/MMQ (slower, but
         // no extra copy). An EXPLICIT FUCINA_FP4=1 force-overrides at the prefill site.
         // FORMAT_NVFP4 residency keeps no separate prefill copy (the store IS the residency),
-        // so there is nothing extra to bill there — gate on a GGUF d_weights model.
-        bool fp4_possible = eng->d_weights && eng->format != FORMAT_NVFP4;
+        // so there is nothing extra to bill there — gate on a GGUF d_weights model. The Qwen3.5
+        // HYBRID prefill uses q35_proj_gemm (BF16 cache), NEVER gemm_nvfp4 — and proj_desc can't
+        // even describe its 2×-wide gated query / GDN tensors — so the NVFP4 copy would be unused,
+        // wrong-shaped waste. Don't reserve its ~3.4 GB budget (frees it for the KV/weight-cache).
+        bool fp4_possible = eng->d_weights && eng->format != FORMAT_NVFP4
+                            && eng->cfg.arch != GEMMA4_ARCH_QWEN3_5;
         // EXPLICIT FUCINA_FP4=0 opts the prefill copy out entirely — it will never be built,
         // so don't reserve its bytes here (give that room to ctx) and report it as such.
         const char *fp4_env = getenv("FUCINA_FP4");
