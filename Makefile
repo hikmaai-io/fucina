@@ -242,6 +242,18 @@ qwen35-fp8-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_fp8 $(QWEN35_FP8_MODEL)"
 
+# ─── Qwen3.5 FP8-9B served through the REAL batched engine (not the B=1 oracle) (GPU) ───
+# Loads the official Qwen3.5-9B FP8 checkpoint via gemma4_engine_create (FORMAT_FP8_BLOCK loader:
+# every FP8 proj → d_weights + per-128 block-scale table; norms/conv/a_log → f32; in_a/in_b + embed
+# + lm_head → Q8_0) and asserts (A) the engine's token-by-token greedy continuation of "The capital
+# of France is" matches the torch FP8 oracle 8/8, AND (B) the batched self-test (row independence +
+# graph determinism + batched==token-by-token) passes on the same engine.
+qwen35-fp8-engine-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_fp8_engine.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_fp8_engine \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_fp8_engine $(QWEN35_FP8_MODEL)"
+
 # ─── Qwen3.5 hybrid (qwen35) M6 single-MTP draft head + LOSSLESS spec (GPU) ───
 # Loads the 22 mtp.* tensors (FP8 checkpoint only) and asserts the MTP-drafted speculative decode
 # (qwen35_fp8_spec_greedy) emits the IDENTICAL continuation to plain greedy (qwen35_fp8_forward_greedy

@@ -3490,6 +3490,7 @@ struct gemma4_engine {
     // embedding table doubles as the (tied) LM head. d_lmhead_bf16 ALIASES d_embed_bf16 when tied
     // — destroy frees it only if the pointers differ (double-free guard). NULL on GGUF models.
     __nv_bfloat16 *d_embed_bf16;   // [vocab × hidden] BF16 embeddings
+    float *d_embed_f32;            // [vocab × hidden] F32 embeddings (FP8/qwen35: exact per-step input)
     __nv_bfloat16 *d_lmhead_bf16;  // [vocab × hidden] BF16 LM head (== d_embed_bf16 when tied)
     // FP8 E4M3 per-row-quantized UNTIED LM head (FORMAT_NVFP4 only). The untied BF16 head is 2 GB,
     // read every token; quantizing it to 1 B/elem per-row halves the head bandwidth. Set only when
@@ -4305,6 +4306,11 @@ static void gemma4_engine_fast_prefill_selftest(gemma4_engine_t *eng); // dual-p
 // create-fork can call it.
 static int nvfp4_load_from_safetensors(gemma4_engine_t *eng, const char *path,
                                        const nvfp4ld::Layout *layout, st::Model *model);
+// Qwen3.5 block-FP8 checkpoint → batched engine. setup_cfg sets eng->cfg early; fill_engine fills
+// d_weights/tensors + FORMAT_FP8_BLOCK + scale table late (after create's d_weights=NULL reset).
+// Bodies far below (near the FP8 oracle). Forward-declared so create can call them.
+static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO);
+static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO);
 
 // Build a proxy hidden state from a real embedding row: out[h] = emb[tok][h] · w_out_norm[h] / rms.
 // The trained embedding rows live in the head's input space, and the final RMSNorm is exactly what
@@ -4740,11 +4746,32 @@ gemma4_engine_t* gemma4_engine_create(
     // and the residency/BF16 load can all see it).
     st::Model nvfp4_model;
     nvfp4ld::Layout nvfp4_layout;
+    // Qwen3.5 block-FP8: opened here (function scope) so the late weight-fill in the residency block
+    // can still see the mmap'd tensors after the cfg is applied.
+    st::Model fp8_model;
+    qwen35fp8::Layout fp8_layout;
 
     int embd_is_q6k = 0;       // GGUF QAT-only (Q6_K token_embd → Q8_0)
     int embd_is_q4k = 0;       // Unsloth UD (Q4_K token_embd → Q8_0; native-Q4_K head enabled)
     uint32_t embd_src_type = 0; // token_embd GGML type (Q6_K or Q4_K → both become Q8_0)
+
+    // ── Qwen3.5 block-FP8 checkpoint? (model_type qwen3_5 + quant_method fp8). Serve it through the
+    // real batched engine — fill d_weights/tensors with FORMAT_FP8_BLOCK + the scale table — instead
+    // of the B=1 qwen35_fp8_forward_greedy oracle. is_fp8 then skips every NVFP4/GGUF weight block. ──
+    bool is_fp8 = false;
     if (is_nvfp4) {
+        std::string ferr;
+        if (fp8_model.open(model_path, ferr) && qwen35fp8::detect(fp8_model, fp8_layout, ferr)) {
+            if (qwen35_fp8_setup_cfg(eng, fp8_model, fp8_layout) != 0) {
+                fprintf(stderr, "fucina: Qwen3.5 FP8 cfg setup failed\n");
+                gemma4_engine_destroy(eng); return NULL;
+            }
+            gemma4_apply_cfg(eng);   // derive layer_types / global_layer_indices / n_* from cfg
+            is_fp8 = true;
+            fprintf(stderr, "fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine\n");
+        }
+    }
+    if (is_nvfp4 && !is_fp8) {
         std::string err;
         if (!nvfp4_model.open(model_path, err)) {
             fprintf(stderr, "fucina: NVFP4 open '%s' failed: %s\n", model_path, err.c_str());
@@ -5269,6 +5296,10 @@ gemma4_engine_t* gemma4_engine_create(
         }
         UPLOAD_NORM(eng->d_w_out_norm, eng->tensors.output_norm, hs);
         #undef UPLOAD_NORM
+      } else if (is_fp8) {
+        // Qwen3.5 FP8: the qwen35 forward reads norms via Wf() from d_weights offsets (filled by
+        // qwen35_fp8_fill_engine), NOT from this d_w_* store — leave it unused. h_out_scale=1.0
+        // was set in setup_cfg.
       } else {
         // NVFP4: norms ship BF16 in the safetensors checkpoint. Upload each to a temp BF16
         // device buffer and convert to the FLOAT norm store via bf16_to_f32_kernel. A missing
@@ -5335,7 +5366,16 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_lmhead_q6k = NULL; eng->lmhead_q6k = 0;
     eng->d_lmhead_q4k = NULL; eng->lmhead_q4k = 0;
     eng->n_wt_override = 0;
-  if (is_nvfp4) {
+  if (is_fp8) {
+    // ── Qwen3.5 block-FP8 residency: fill d_weights/tensors/scale-table + Q8_0 embed/lm_head here,
+    // AFTER create's unconditional d_weights=NULL reset above, so the fill survives. ─────────────
+    if (qwen35_fp8_fill_engine(eng, fp8_model, fp8_layout) != 0) {
+        fprintf(stderr, "fucina: Qwen3.5 FP8 weight fill failed\n");
+        gemma4_engine_destroy(eng);
+        return NULL;
+    }
+    eng->nvfp4_decode_ready = 0;   // FP8 uses the Q8_0/FP8-block decode path, not the BF16 NVFP4 one
+  } else if (is_nvfp4) {
     // ── NVFP4 SINGLE-STORE residency + BF16 embed / LM head ──────────────
     // nvfp4_model's mmap MUST stay alive through nvfp4_load_from_safetensors (it copies the
     // tensor bytes H2D synchronously and ends with cudaDeviceSynchronize) and through the embed
@@ -6432,12 +6472,18 @@ static inline void mmvq_q4aware(
 
 // `wfmt` overrides the weight format (default −1 = engine format). The mixed QAT
 // model passes FORMAT_Q8_0 for the converted token_embd/LM-head while layers are Q4_0.
+static inline const __nv_bfloat16 *wscale_fp8(const gemma4_engine_t *eng, const uint8_t *w);  // fwd
+
 static inline void gemv_w(
     const gemma4_engine_t *eng,
     float *out, const uint8_t *weight, const float *x,
     int in_dim, int out_dim, cudaStream_t stream, int wfmt = -1)
 {
     int fmt = (wfmt < 0) ? FMT(eng) : wfmt;
+    if (fmt == FORMAT_FP8_BLOCK) {   // block-FP8 (Qwen3.5-9B FP8): float activation, per-128 scale
+        fp8_block_gemv_launch(out, weight, wscale_fp8(eng, weight), x, in_dim, out_dim, stream);
+        return;
+    }
     // Quantize the activation to int8 (+ per-block Σ for the Q4_0 −8 fold), then
     // warp-per-row dp4a MMVQ (llama.cpp-parity bandwidth, no block sync). Step 5.
     // The native Q6_K LM head rides the same int8 activation (its −32 is folded into
@@ -6526,7 +6572,10 @@ static inline void embed_w(
     int batch, int hidden_size, cudaStream_t stream, int efmt = -1)
 {
     (void)efmt;   // the token_embd table is always Q8_0 (native, or converted from Q6_K)
-    if (eng->format == FORMAT_NVFP4) {   // BF16 embedding table (the passed `table` is unused)
+    // NVFP4 always, and FP8/safetensors when the BF16 table is resident: use it (the per-step token
+    // embedding feeds the recurrent GDN state, so Q8_0 rounding compounds over decode steps).
+    if (eng->format == FORMAT_NVFP4 ||
+        (eng->format == FORMAT_FP8_BLOCK && eng->d_embed_bf16)) {  // BF16 table (`table` unused)
         embed_lookup_bf16_kernel<<<batch, 256, 0, stream>>>(
             out, eng->d_embed_bf16, tokens, batch, hidden_size);
         return;
@@ -14824,9 +14873,10 @@ static float *m2_dev(const float *host, size_t n) {
     cudaMemcpy(d, host, n * sizeof(float), cudaMemcpyHostToDevice);
     return d;
 }
-static void m2_gemm(float *out, const float *in, const float *W, int N, int INN, int OUT) {
+static void m2_gemm(float *out, const float *in, const float *W, int N, int INN, int OUT,
+                    cudaStream_t stream = 0) {
     dim3 grid((unsigned)OUT, (unsigned)N);
-    m2_gemm_kernel<<<grid, 128>>>(out, in, W, N, INN, OUT);
+    m2_gemm_kernel<<<grid, 128, 0, stream>>>(out, in, W, N, INN, OUT);
 }
 // max-abs-rel error of dev[n] vs reference dev_ref[n]: max|a-b| / max|ref|.
 static double m2_relerr(const float *d_a, const float *d_ref, size_t n, double *out_maxabs) {
@@ -15180,6 +15230,9 @@ __global__ void qwen35_argmax_kernel(const float *v, int n, int *out_idx) {
 // Single-seq greedy hybrid forward. Fills out_ids[0..n_gen-1] with the greedy continuation of
 // the prompt in_ids[0..n_prompt-1]. Returns 0 on success, non-zero on error. Token-by-token:
 // each position runs one full hybrid layer stack, carrying GDN state + conv ring + KV cache.
+// FP8/safetensors GDN uses the repeat-interleave head expansion (body defined near the FP8 oracle).
+__global__ void qwen35_fp8_gdn_step_kernel(float *core, const float *q, const float *k,
+                                           const float *v, const float *g, const float *beta, float *S_io);
 extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids, int n_prompt,
                                      int32_t *out_ids, int n_gen) {
     if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) {
@@ -15212,6 +15265,13 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
     if (cudaFuncSetAttribute(qwen35_gdn_step_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDN) != cudaSuccess) {
         fprintf(stderr, "qwen35_forward_greedy: GDN shared-mem opt-in failed (%zu B)\n", smGDN);
+        return -4;
+    }
+    // FP8/safetensors GDN uses the interleave kernel — opt IT into the same dynamic-smem cap.
+    if (eng->format == FORMAT_FP8_BLOCK &&
+        cudaFuncSetAttribute(qwen35_fp8_gdn_step_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDN) != cudaSuccess) {
+        fprintf(stderr, "qwen35_forward_greedy: FP8 GDN shared-mem opt-in failed (%zu B)\n", smGDN);
         return -4;
     }
 
@@ -15258,7 +15318,11 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
     for (int p = 0; p < nsteps; p++) {
         int32_t token = (p < n_prompt) ? in_ids[p] : out_ids[p - n_prompt];
         cudaMemcpyAsync(d_tok, &token, sizeof(int32_t), cudaMemcpyHostToDevice, st);
-        embed_w(eng, x, eng->d_token_embd, d_tok, 1, H, st);
+        if (eng->format == FORMAT_FP8_BLOCK && eng->d_embed_f32)   // exact f32 embed (oracle parity)
+            cudaMemcpyAsync(x, eng->d_embed_f32 + (size_t)token*H, (size_t)H*sizeof(float),
+                            cudaMemcpyDeviceToDevice, st);
+        else
+            embed_w(eng, x, eng->d_token_embd, d_tok, 1, H, st);
 
         for (int l = 0; l < L; l++) {
             // pre-mixer RMSNorm
@@ -15283,8 +15347,13 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                 // every other projection (no per-step fp32 dequant). fmt_in_qkv is Q8_0 post-requant.
                 gemv_w(eng, qkv, Wq(T.ssm.in_qkv), xn, H, CONVD, st, T.ssm.fmt_in_qkv);
                 gemv_w(eng, zc, Wq(T.ssm.in_z), xn, H, INNER, st, T.ssm.fmt_in_z);
-                gemv_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   st, T.ssm.fmt_in_a);   // alpha
-                gemv_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   st, T.ssm.fmt_in_b);   // beta
+                if (eng->format == FORMAT_FP8_BLOCK) {   // in_a/in_b are f32 (oracle parity)
+                    m2_gemm(ac, xn, Wf(T.ssm.in_a), 1, H, TSR);   // alpha
+                    m2_gemm(bc, xn, Wf(T.ssm.in_b), 1, H, TSR);   // beta
+                } else {
+                    gemv_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   st, T.ssm.fmt_in_a);   // alpha
+                    gemv_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   st, T.ssm.fmt_in_b);   // beta
+                }
                 qwen35_conv_step_kernel<<<(CONVD+127)/128,128,0,st>>>(conv_out, qkv, ring[l], Wf(T.ssm.conv1d), CONVD);
                 cudaMemcpyAsync(qh, conv_out,             (size_t)KEYD*sizeof(float),  cudaMemcpyDeviceToDevice, st);
                 cudaMemcpyAsync(kh, conv_out+KEYD,        (size_t)KEYD*sizeof(float),  cudaMemcpyDeviceToDevice, st);
@@ -15292,7 +15361,13 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                 m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(qh, NKH, SD, 1);
                 m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(kh, NKH, SD, 1);
                 m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), 1);
-                qwen35_gdn_step_kernel<<<NVH,128,smGDN,st>>>(core, qh, kh, vh, gg, bb, Sst[l]);
+                // Head expansion differs by checkpoint layout: the GGUF (llama.cpp) permutes the GDN
+                // q/k heads → TILE (vh%NKH); the FP8/safetensors keep HF order → repeat_INTERLEAVE
+                // (vh/(NVH/NKH)), matching the torch-verified oracle. Route by format.
+                if (eng->format == FORMAT_FP8_BLOCK)
+                    qwen35_fp8_gdn_step_kernel<<<NVH,128,smGDN,st>>>(core, qh, kh, vh, gg, bb, Sst[l]);
+                else
+                    qwen35_gdn_step_kernel<<<NVH,128,smGDN,st>>>(core, qh, kh, vh, gg, bb, Sst[l]);
                 m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), 1);
                 gemv_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, st, T.ssm.fmt_out);
             }
@@ -15308,7 +15383,10 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
 
         if (p >= n_prompt - 1) {   // final norm + lm_head + argmax (skip on interior prompt tokens)
             rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, 1, eps);
-            gemv_w(eng, eng->d_logits, Wq(eng->tensors.output_weight), xn, H, VOC, st, eng->tensors.output_fmt);
+            if (eng->format == FORMAT_FP8_BLOCK)   // BF16 untied head (Q8_0 flips the 248320-vocab argmax)
+                bf16_head_gemv_launch(eng->d_logits, eng->d_lmhead_bf16, xn, H, VOC, st);
+            else
+                gemv_w(eng, eng->d_logits, Wq(eng->tensors.output_weight), xn, H, VOC, st, eng->tensors.output_fmt);
             qwen35_argmax_kernel<<<1,256,0,st>>>(eng->d_logits, VOC, d_arg);
             int argmax = 0;
             cudaMemcpyAsync(&argmax, d_arg, sizeof(int), cudaMemcpyDeviceToHost, st);
@@ -15462,12 +15540,14 @@ __global__ void qwen35_b_split_qkv_kernel(float *qh, float *kh, float *vh, const
 // carried fp32 state S[SD×SD] from the per-slot arena. Bit-identical to M3 qwen35_gdn_step.
 __global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k, const float *v,
                                     const float *g, const float *beta, float *S_arena,
-                                    const int *rowslot, int B) {
+                                    const int *rowslot, int B, int interleave) {
     int vh = blockIdx.x;
     int r  = blockIdx.y;
     if (vh >= M2_NVH || r >= B) return;
     int slot = rowslot[r];
-    int kh  = vh % M2_NKH;   // TILE expand (HF repeat): v-head vh ↔ k/q-head vh % NKH
+    // GGUF (llama.cpp) permutes GDN q/k heads → TILE (vh%NKH); FP8/safetensors keep HF order →
+    // repeat-INTERLEAVE (vh/(NVH/NKH)). See [[qwen35-fp8-engine-serving]].
+    int kh  = interleave ? (vh / (M2_NVH / M2_NKH)) : (vh % M2_NKH);
     int tid = threadIdx.x;
     extern __shared__ float sm[];
     float *S   = sm;                 // [SD*SD] k-major
@@ -15601,9 +15681,11 @@ __device__ inline void wmma_gemm_tf32(float *C, const float *A, const float *B,
 // so the T-row scratch needs no NPAD zero-padding. NPAD = roundup(T,CHUNK) drives the chunk count.
 __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const float *k,
                                           const float *v, const float *g, const float *beta,
-                                          float *S_arena, float *scratch, int slot, int N, int NPAD) {
+                                          float *S_arena, float *scratch, int slot, int N, int NPAD,
+                                          int interleave) {
     int vh  = blockIdx.x;
-    int kh  = vh % M2_NKH;
+    // TILE (GGUF) vs repeat-INTERLEAVE (FP8/safetensors). See [[qwen35-fp8-engine-serving]].
+    int kh  = interleave ? (vh / (M2_NVH / M2_NKH)) : (vh % M2_NKH);
     int tid = threadIdx.x;
     const int CS = M2_CHUNK, SD = M2_SD;
     extern __shared__ float sm[];
@@ -15887,15 +15969,20 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             // in_qkv requantized Q5_K→Q8_0 at load → native dp4a GEMV (P5), no per-step fp32 dequant.
             gemv_batched_w(eng, qkv, Wq(T.ssm.in_qkv), xn, H, CONVD, B, st, T.ssm.fmt_in_qkv);
             gemv_batched_w(eng, zc, Wq(T.ssm.in_z), xn, H, INNER, B, st, T.ssm.fmt_in_z);
-            gemv_batched_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   B, st, T.ssm.fmt_in_a);   // alpha
-            gemv_batched_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   B, st, T.ssm.fmt_in_b);   // beta
+            if (eng->format == FORMAT_FP8_BLOCK) {   // in_a/in_b are f32 (oracle parity)
+                m2_gemm(ac, xn, Wf(T.ssm.in_a), B, H, TSR, st);   // alpha
+                m2_gemm(bc, xn, Wf(T.ssm.in_b), B, H, TSR, st);   // beta
+            } else {
+                gemv_batched_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   B, st, T.ssm.fmt_in_a);   // alpha
+                gemv_batched_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   B, st, T.ssm.fmt_in_b);   // beta
+            }
             qwen35_b_conv_kernel<<<dim3(grid1d((size_t)CONVD),B),256,0,st>>>(
                 conv, qkv, eng->d_q35_ring[l], Wf(T.ssm.conv1d), d_slot, CONVD, B);
             qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),B),256,0,st>>>(qh, kh, vh, conv, B);
             m2_l2norm_heads_kernel<<<dim3(NKH,B),128,0,st>>>(qh, NKH, SD, B);
             m2_l2norm_heads_kernel<<<dim3(NKH,B),128,0,st>>>(kh, NKH, SD, B);
             m2_decay_beta_kernel<<<grid1d((size_t)B*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), B);
-            qwen35_b_gdn_kernel<<<dim3(NVH,B),256,smGDN,st>>>(core, qh, kh, vh, gg, bb, eng->d_q35_S[l], d_slot, B);  // 256 thr: 2x lanes on the SD*SD state loops
+            qwen35_b_gdn_kernel<<<dim3(NVH,B),256,smGDN,st>>>(core, qh, kh, vh, gg, bb, eng->d_q35_S[l], d_slot, B, eng->format==FORMAT_FP8_BLOCK);  // 256 thr: 2x lanes on the SD*SD state loops
             m2_gated_norm_kernel<<<dim3(NVH,B),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), B);
             gemv_batched_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, B, st, T.ssm.fmt_out);
         }
@@ -15909,7 +15996,11 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
     }
 
     rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, B, eps);
-    gemv_batched_w(eng, eng->d_sb[11], Wq(eng->tensors.output_weight), xn, H, VOC, B, st, eng->tensors.output_fmt);
+    if (eng->format == FORMAT_FP8_BLOCK)   // BF16 untied head per row (Q8_0 flips the 248320 argmax)
+        for (int rr = 0; rr < B; rr++)
+            bf16_head_gemv_launch(eng->d_sb[11]+(size_t)rr*VOC, eng->d_lmhead_bf16, xn+(size_t)rr*H, H, VOC, st);
+    else
+        gemv_batched_w(eng, eng->d_sb[11], Wq(eng->tensors.output_weight), xn, H, VOC, B, st, eng->tensors.output_fmt);
     if (want_argmax)
         argmax_rows_kernel<<<B,32,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, B, VOC);
 }
@@ -16076,6 +16167,17 @@ static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fm
                           const float *x_f32, int in_dim, int out_dim, int T, cudaStream_t st,
                           int l, int slot) {
     const uint8_t *w = weight_fp8(eng, off);
+    // Qwen3.5 block-FP8: float-activation FP8 GEMM, weight amortized across ≤FP8_MAXB rows; loop the
+    // wide prefill tile in FP8_MAXB chunks. (l/slot unused here — no per-slot NVFP4 build.)
+    if (fmt == FORMAT_FP8_BLOCK) {
+        const __nv_bfloat16 *sc = wscale_fp8(eng, w);
+        for (int b0 = 0; b0 < T; b0 += FP8_MAXB) {
+            int bb = (T - b0 < FP8_MAXB) ? (T - b0) : FP8_MAXB;
+            fp8_block_gemm_launch(dst + (size_t)b0*out_dim, w, sc, x_f32 + (size_t)b0*in_dim,
+                                  in_dim, out_dim, bb, st);
+        }
+        return;
+    }
     bool packed = use_packed_q4k(eng, fmt, w);
     const uint64_t n = (uint64_t)in_dim * out_dim;
     // activation → BF16 once (both the NVFP4 and BF16 GEMM paths consume it)
@@ -16217,8 +16319,13 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             // tiny alpha/beta projections (out_dim=TSR=32) stay on the dp4a GEMV — GEMM not worth it.
             q35_proj_gemm(eng, qkv, Tn.ssm.in_qkv, Tn.ssm.fmt_in_qkv, xn, H, CONVD, T, st, l, WC_QKV);
             q35_proj_gemm(eng, zc,  Tn.ssm.in_z,   Tn.ssm.fmt_in_z,   xn, H, INNER, T, st, l, WC_Z);
-            q35_proj_gemm(eng, ac,  Tn.ssm.in_a,   Tn.ssm.fmt_in_a,   xn, H, TSR,   T, st, l, WC_A);   // alpha
-            q35_proj_gemm(eng, bc,  Tn.ssm.in_b,   Tn.ssm.fmt_in_b,   xn, H, TSR,   T, st, l, WC_B);   // beta
+            if (eng->format == FORMAT_FP8_BLOCK) {   // in_a/in_b are f32 (oracle parity)
+                m2_gemm(ac, xn, Wf(Tn.ssm.in_a), T, H, TSR, st);   // alpha
+                m2_gemm(bc, xn, Wf(Tn.ssm.in_b), T, H, TSR, st);   // beta
+            } else {
+                q35_proj_gemm(eng, ac,  Tn.ssm.in_a,   Tn.ssm.fmt_in_a,   xn, H, TSR,   T, st, l, WC_A);   // alpha
+                q35_proj_gemm(eng, bc,  Tn.ssm.in_b,   Tn.ssm.fmt_in_b,   xn, H, TSR,   T, st, l, WC_B);   // beta
+            }
             // RECURRENT: causal conv1d ring — ONE batched launch over the whole T-row tile,
             // reading the per-slot ring for the CK-1 carry positions; then advance the ring.
             qwen35_b_conv_chunk_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(
@@ -16233,7 +16340,8 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             // whole tile (CHUNK=64), carrying the per-slot fp32 state S in/out of the arena.
             // 512 threads: the O(SD*SD)=16384-element state/matmul loops stride over 4x the lanes.
             qwen35_b_gdn_chunk_kernel<<<NVH,512,smGDNchunk,st>>>(
-                core, qh, kh, vh, gg, bb, eng->d_q35_S[l], eng->d_q35_chunk_scr, slot, T, NPAD);
+                core, qh, kh, vh, gg, bb, eng->d_q35_S[l], eng->d_q35_chunk_scr, slot, T, NPAD,
+                eng->format==FORMAT_FP8_BLOCK);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T);
             q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, l, WC_OUT);
         }
@@ -16250,8 +16358,11 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
         // Final norm over all T rows, but the LM head (VOC=248320, the most expensive GEMV) only on
         // the LAST row — the only one whose logits the caller samples for the first generated token.
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, T, eps);
-        gemv_w(eng, eng->d_logits, Wq(eng->tensors.output_weight),
-               xn + (size_t)(T-1)*H, H, VOC, st, eng->tensors.output_fmt);
+        if (eng->format == FORMAT_FP8_BLOCK)   // BF16 untied head (no d_weights lm_head for FP8)
+            bf16_head_gemv_launch(eng->d_logits, eng->d_lmhead_bf16, xn + (size_t)(T-1)*H, H, VOC, st);
+        else
+            gemv_w(eng, eng->d_logits, Wq(eng->tensors.output_weight),
+                   xn + (size_t)(T-1)*H, H, VOC, st, eng->tensors.output_fmt);
         argmax_rows_kernel<<<1,32,0,st>>>(eng->d_logits, eng->d_ms_outtok, 1, VOC);
     }
 }
@@ -16680,6 +16791,183 @@ static bool q35fp8_load_proj(const st::Model &M, const std::string &key,
     P.s = (const __nv_bfloat16 *)q35fp8_up_bytes(s->data, s->nbytes);
     P.in_dim = in_dim; P.out_dim = out_dim;
     return P.w && P.s;
+}
+
+// ── Serve the block-FP8 checkpoint through the REAL gemma4_engine_t (batched decode+prefill+graph)
+//    instead of the B=1 qwen35_fp8_forward_greedy oracle. Fills eng->d_weights + eng->tensors with
+//    byte offsets and FORMAT_FP8_BLOCK so the existing qwen35_decode_multiseq_body serves it via
+//    Wq(off)/gemv_batched_w; the per-128 block scale comes from eng->fp8_scale_tab (wscale_fp8). ──
+static inline float q35_bf16_to_f32_host(uint16_t b){ uint32_t u=(uint32_t)b<<16; float f; memcpy(&f,&u,4); return f; }
+
+// BF16 tensor → Q8_0 (host): per-32-block [fp16 scale][32 int8]. n_elem % 32 == 0.
+static unsigned char *q35_bf16_to_q8_0_host(const uint16_t *src, int64_t n_elem){
+    int64_t nblk = n_elem/32;
+    unsigned char *dst = (unsigned char*)malloc((size_t)nblk*34);
+    if(!dst) return nullptr;
+    for(int64_t b=0;b<nblk;b++){
+        float f[32], amax=0.0f;
+        for(int j=0;j<32;j++){ f[j]=q35_bf16_to_f32_host(src[b*32+j]); amax=fmaxf(amax,fabsf(f[j])); }
+        float scale=amax/127.0f, iscale=(scale>0.0f)?1.0f/scale:0.0f;
+        unsigned char *ob=dst+(size_t)b*34;
+        uint16_t hb=f2h_host(scale); ob[0]=(unsigned char)(hb&0xFF); ob[1]=(unsigned char)(hb>>8);
+        for(int j=0;j<32;j++){ int q=(int)lrintf(f[j]*iscale); q=q<-127?-127:(q>127?127:q); ob[2+j]=(unsigned char)(int8_t)q; }
+    }
+    return dst;
+}
+
+// One descriptor per tensor placed into eng->d_weights.
+struct q35fp8_desc { uint64_t *off; uint8_t *fmtp; const void *host; size_t bytes; int fmt; const void *scale_host; size_t scale_bytes; };
+
+// Set eng->cfg from the FP8 checkpoint (dims from M2_* + embed/gate shapes). Called EARLY (before the
+// cfg-dependent scratch allocations); the weight fill runs later, after create's d_weights=NULL reset.
+static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
+    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV, CONVD=M2_CONVDIM, INNER=M2_VALD, TSR=M2_TSR, SD=M2_SD, CK=M2_CK;
+    (void)CONVD;(void)INNER;
+    const st::Tensor *embT=M.find(LO.embed_key), *gateT=M.find(qwen35fp8::lkey(LO,0,"mlp.gate_proj.weight"));
+    if(!embT||!gateT){ fprintf(stderr,"qwen35_fp8_engine: missing embed/gate\n"); return -1; }
+    const int VOC=(int)embT->shape[0], I=(int)gateT->shape[0], L=LO.n_layers;
+    gemma4_model_config_t *c=&eng->cfg;
+    c->arch=GEMMA4_ARCH_QWEN3_5; c->n_layers=L; c->hidden_size=H; c->head_dim=HD; c->n_heads=NQ;
+    c->n_kv_global=NKV; c->n_kv_sliding=NKV;
+    c->intermediate=I; c->vocab_size=VOC; c->rotary_dim=M2_ROT; c->full_attention_interval=LO.full_attention_interval;
+    c->ssm_state_size=SD; c->ssm_conv_kernel=CK; c->ssm_inner_size=INNER; c->ssm_group_count=M2_NKH; c->ssm_time_step_rank=TSR;
+    int nfull=0;
+    for(int l=0;l<L;l++){ bool full=qwen35fp8::is_full(LO,l);
+        c->attn_kind[l]=full?GEMMA4_ATTN_FULL:GEMMA4_ATTN_LINEAR; c->is_global[l]=full?1:0; nfull+=full?1:0; }
+    c->n_full=nfull; c->n_global=nfull;
+    eng->format=FORMAT_FP8_BLOCK; eng->tdata_start=0;
+    eng->output_tied=0;                                     // untied LM head (tie_word_embeddings=false)
+    for(int l=0;l<GEMMA4_CAP_LAYERS;l++) eng->h_out_scale[l]=1.0f;  // qwen35 has no per-layer output scale
+    return 0;
+}
+
+static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
+    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV, CONVD=M2_CONVDIM, INNER=M2_VALD, TSR=M2_TSR;
+    const int VOC=eng->cfg.vocab_size, I=eng->cfg.intermediate, L=LO.n_layers;
+
+    std::vector<q35fp8_desc> D;
+    std::vector<void*> tofree;          // host temporaries (bf16→f32 / bf16→Q8_0) freed after upload
+    auto find=[&](const std::string&k)->const st::Tensor*{ return M.find(k); };
+    auto lk=[&](int l,const char*s){ return qwen35fp8::lkey(LO,l,s); };
+    // FP8 block weight: E4M3 bytes + BF16 block-scale sibling → FORMAT_FP8_BLOCK + scale-table entry.
+    auto put_fp8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int out_dim,int in_dim)->bool{
+        const st::Tensor*w=find(key), *s=find(key+"_scale_inv");
+        if(!w||!s){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
+        D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,s->data,s->nbytes}); return true;
+    };
+    // BF16 tensor → f32 in d_weights (norms/conv/dt_bias). neg_exp for A_log; scalar +1 baked for norms.
+    auto put_f32_from_bf16=[&](uint64_t*off,const std::string&key,float add,bool neg_exp)->bool{
+        const st::Tensor*t=find(key); if(!t){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
+        int64_t n=(int64_t)(t->nbytes/2); float*f=(float*)malloc((size_t)n*4);
+        const uint16_t*src=(const uint16_t*)t->data;
+        for(int64_t i=0;i<n;i++){ float v=q35_bf16_to_f32_host(src[i]); f[i]=neg_exp?(-expf(v)):(v+add); }
+        tofree.push_back(f); D.push_back({off,nullptr,f,(size_t)n*4,-1,nullptr,0}); return true;
+    };
+    // F32 tensor (already f32 on disk) → d_weights, optional neg_exp (A_log).
+    auto put_f32=[&](uint64_t*off,const std::string&key,bool neg_exp)->bool{
+        const st::Tensor*t=find(key); if(!t){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
+        int64_t n=(int64_t)(t->nbytes/4);
+        if(neg_exp){ float*f=(float*)malloc((size_t)n*4); const float*src=(const float*)t->data;
+            for(int64_t i=0;i<n;i++) f[i]=-expf(src[i]); tofree.push_back(f); D.push_back({off,nullptr,f,(size_t)n*4,-1,nullptr,0}); }
+        else D.push_back({off,nullptr,t->data,(size_t)n*4,-1,nullptr,0});
+        return true;
+    };
+    // BF16 tensor → Q8_0 in d_weights (in_a/in_b + lm_head).
+    auto put_q8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key)->bool{
+        const st::Tensor*t=find(key); if(!t){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
+        int64_t n=(int64_t)(t->nbytes/2); unsigned char*q8=q35_bf16_to_q8_0_host((const uint16_t*)t->data,n);
+        if(!q8) return false; tofree.push_back(q8); D.push_back({off,fmtp,q8,(size_t)(n/32)*34,FORMAT_Q8_0,nullptr,0}); return true;
+    };
+
+    bool ok=true;
+    auto &TS=eng->tensors;
+    for(int l=0; ok && l<L; l++){
+        auto &T=TS.layers[l];
+        ok=ok && put_f32_from_bf16(&T.attn_norm, lk(l,"input_layernorm.weight"), 1.0f,false);
+        ok=ok && put_f32_from_bf16(&T.ffn_norm,  lk(l,"post_attention_layernorm.weight"), 1.0f,false);
+        ok=ok && put_fp8(&T.ffn_gate,&T.fmt_gate, lk(l,"mlp.gate_proj.weight"), I, H);
+        ok=ok && put_fp8(&T.ffn_up,  &T.fmt_up,   lk(l,"mlp.up_proj.weight"),   I, H);
+        ok=ok && put_fp8(&T.ffn_down,&T.fmt_down, lk(l,"mlp.down_proj.weight"), H, I);
+        if(qwen35fp8::is_full(LO,l)){
+            ok=ok && put_fp8(&T.attn_q,&T.fmt_q, lk(l,"self_attn.q_proj.weight"), 2*NQ*HD, H);
+            ok=ok && put_fp8(&T.attn_k,&T.fmt_k, lk(l,"self_attn.k_proj.weight"), NKV*HD, H);
+            ok=ok && put_fp8(&T.attn_v,&T.fmt_v, lk(l,"self_attn.v_proj.weight"), NKV*HD, H);
+            ok=ok && put_fp8(&T.attn_output,&T.fmt_o, lk(l,"self_attn.o_proj.weight"), H, NQ*HD);
+            ok=ok && put_f32_from_bf16(&T.attn_q_norm, lk(l,"self_attn.q_norm.weight"), 1.0f,false);
+            ok=ok && put_f32_from_bf16(&T.attn_k_norm, lk(l,"self_attn.k_norm.weight"), 1.0f,false);
+        } else {
+            ok=ok && put_fp8(&T.ssm.in_qkv,&T.ssm.fmt_in_qkv, lk(l,"linear_attn.in_proj_qkv.weight"), CONVD, H);
+            ok=ok && put_fp8(&T.ssm.in_z,  &T.ssm.fmt_in_z,   lk(l,"linear_attn.in_proj_z.weight"),   INNER, H);
+            ok=ok && put_fp8(&T.ssm.out,   &T.ssm.fmt_out,    lk(l,"linear_attn.out_proj.weight"),    H, INNER);
+            // in_a/in_b (alpha/beta, out=32) stay f32 like the torch oracle (m2_gemm): they feed the
+            // GDN decay/beta and the recurrent state compounds Q8_0 error over decode steps.
+            ok=ok && put_f32_from_bf16(&T.ssm.in_a, lk(l,"linear_attn.in_proj_a.weight"), 0.0f,false);
+            ok=ok && put_f32_from_bf16(&T.ssm.in_b, lk(l,"linear_attn.in_proj_b.weight"), 0.0f,false);
+            ok=ok && put_f32_from_bf16(&T.ssm.conv1d,  lk(l,"linear_attn.conv1d.weight"), 0.0f,false);
+            ok=ok && put_f32_from_bf16(&T.ssm.dt_bias, lk(l,"linear_attn.dt_bias"),       0.0f,false);
+            ok=ok && put_f32(&T.ssm.norm,  lk(l,"linear_attn.norm.weight"), false);
+            // ssm_a = -exp(A_log): m2_decay_beta computes g = ssm_a·softplus(ac+dt_bias), and the
+            // decay is masked at p0 (S=0), so a wrong sign/scale here only shows from the 2nd token.
+            ok=ok && put_f32(&T.ssm.a_log, lk(l,"linear_attn.A_log"),       true);
+        }
+    }
+    // globals: output_norm (f32, +1), lm_head → Q8_0
+    ok=ok && put_f32_from_bf16(&TS.output_norm, LO.final_norm_key, 1.0f,false);
+    if(!ok){ for(void*p:tofree) free(p); return -2; }
+
+    // Lay out d_weights: 32-byte-aligned running offset; then one H2D copy per descriptor.
+    size_t total=0; for(auto&d:D){ total=(total+31)&~size_t(31); total+=d.bytes; }
+    total=(total+31)&~size_t(31);
+    if(cudaMalloc(&eng->d_weights,total)!=cudaSuccess){ for(void*p:tofree) free(p); return -3; }
+    eng->gguf_size=total;
+    // scale table (built alongside), then sorted by weight ptr for wscale_fp8's binary search.
+    eng->fp8_scale_tab=(gemma4_engine::fp8_scent*)malloc(D.size()*sizeof(gemma4_engine::fp8_scent));
+    eng->fp8_scale_n=0;
+    size_t run=0;
+    for(auto&d:D){
+        run=(run+31)&~size_t(31);
+        *d.off = run;                                     // tdata_start=0 → offset is the byte pos
+        if(d.fmtp) *d.fmtp=(uint8_t)d.fmt;
+        cudaMemcpy(eng->d_weights+run, d.host, d.bytes, cudaMemcpyHostToDevice);
+        if(d.fmt==FORMAT_FP8_BLOCK && d.scale_host){
+            __nv_bfloat16 *ds=nullptr;
+            if(cudaMalloc(&ds,d.scale_bytes)!=cudaSuccess){ for(void*p:tofree) free(p); return -4; }
+            cudaMemcpy(ds,d.scale_host,d.scale_bytes,cudaMemcpyHostToDevice);
+            eng->fp8_scale_tab[eng->fp8_scale_n++]=(gemma4_engine::fp8_scent){eng->d_weights+run,ds};
+        }
+        run+=d.bytes;
+    }
+    // insertion-sort the scale table by weight ptr (small: one entry per FP8 proj) for wscale_fp8's
+    // binary search. std::sort would pull in <algorithm>; this avoids the include.
+    for(int i=1;i<eng->fp8_scale_n;i++){ gemma4_engine::fp8_scent key=eng->fp8_scale_tab[i]; int j=i-1;
+        while(j>=0 && eng->fp8_scale_tab[j].w>key.w){ eng->fp8_scale_tab[j+1]=eng->fp8_scale_tab[j]; j--; }
+        eng->fp8_scale_tab[j+1]=key; }
+    for(void*p:tofree) free(p);
+
+    // token_embd → Q8_0 (separate d_token_embd; embed_w reads it).
+    const st::Tensor *embT=M.find(LO.embed_key);
+    if(!embT){ return -5; }
+    { int64_t n=(int64_t)VOC*H; unsigned char*q8=q35_bf16_to_q8_0_host((const uint16_t*)embT->data,n);
+      if(!q8) return -5; eng->d_token_embd=(unsigned char*)q35fp8_up_bytes(q8,(size_t)(n/32)*34); free(q8);
+      if(!eng->d_token_embd) return -5; }
+    // token_embd ALSO uploaded BF16 (d_embed_bf16); embed_w prefers it for FP8 (per-step input
+    // precision matters for the recurrent GDN state). d_token_embd (Q8_0) stays for the != NULL gate.
+    eng->d_embed_bf16=(__nv_bfloat16*)q35fp8_up_bytes(embT->data, embT->nbytes);
+    if(!eng->d_embed_bf16) return -5;
+    eng->d_embed_f32 = q35fp8_up_bf16_f32(embT, 0.0f);   // exact per-step input (oracle uses f32)
+    if(!eng->d_embed_f32) return -5;
+    // lm_head → BF16 (untied): the logits GEMV rides bf16_head_gemv_launch for the FP8 path (the
+    // 248320-vocab argmax is Q8_0-sensitive). Uploaded verbatim from the checkpoint's BF16 head.
+    { const st::Tensor *lmT=M.find(LO.lmhead_key);
+      if(!lmT){ fprintf(stderr,"qwen35_fp8_engine: missing lm_head %s\n",LO.lmhead_key.c_str()); return -5; }
+      eng->d_lmhead_bf16=(__nv_bfloat16*)q35fp8_up_bytes(lmT->data, lmT->nbytes);
+      if(!eng->d_lmhead_bf16) return -5; }
+    if(cudaMalloc(&eng->d_logits,(size_t)VOC*sizeof(float))!=cudaSuccess) return -6;
+    cudaDeviceSynchronize();
+    if(cudaGetLastError()!=cudaSuccess){ fprintf(stderr,"qwen35_fp8_engine: upload error\n"); return -7; }
+    fprintf(stderr,"fucina: qwen35 FP8-9B served via batched engine (%d layers, vocab %d, inter %d, %.2f GiB)\n",
+            L, VOC, I, total/(1024.0*1024*1024));
+    return 0;
 }
 
 extern "C" void *qwen35_fp8_load(const char *path) {
