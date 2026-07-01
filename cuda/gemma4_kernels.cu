@@ -15762,7 +15762,7 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             m2_l2norm_heads_kernel<<<dim3(NKH,B),128,0,st>>>(qh, NKH, SD, B);
             m2_l2norm_heads_kernel<<<dim3(NKH,B),128,0,st>>>(kh, NKH, SD, B);
             m2_decay_beta_kernel<<<grid1d((size_t)B*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), B);
-            qwen35_b_gdn_kernel<<<dim3(NVH,B),128,smGDN,st>>>(core, qh, kh, vh, gg, bb, eng->d_q35_S[l], d_slot, B);
+            qwen35_b_gdn_kernel<<<dim3(NVH,B),256,smGDN,st>>>(core, qh, kh, vh, gg, bb, eng->d_q35_S[l], d_slot, B);  // 256 thr: 2x lanes on the SD*SD state loops
             m2_gated_norm_kernel<<<dim3(NVH,B),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), B);
             gemv_batched_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, B, st, T.ssm.fmt_out);
         }
