@@ -3620,6 +3620,11 @@ struct gemma4_engine {
     uint8_t       *d_q35_fp4_wsc[GEMMA4_CAP_LAYERS][12]; // swizzled E4M3 block scales
     float         *d_q35_fp4_gsw;                        // device [L*12] per-tensor global scales
     int            q35_fp4_on;                           // 1 = NVFP4 prefill GEMM path
+    // FORMAT_FP8_BLOCK: weight-ptr → block-scale-ptr table (sorted by w; host-side binary search
+    // in gemv_batched_w to recover the per-128 scale that the offset scheme can't). qwen35 FP8-9B.
+    struct fp8_scent { const uint8_t *w; const __nv_bfloat16 *s; };
+    struct fp8_scent *fp8_scale_tab;
+    int            fp8_scale_n;
     cudaGraphExec_t q35_graph[GEMMA4_MAX_SEQS + 1];
     int      q35_graph_failed;                // global disable (env or capture failure)
     uint64_t q35_graph_logged;
@@ -4663,6 +4668,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_q35_kbx = NULL; eng->d_q35_vbx = NULL; eng->d_q35_pb = NULL;
     eng->d_q35_scores = NULL; eng->d_q35_attn_cap = 0; eng->q35_wcache_on = 0;
     eng->d_q35_fp4_gsw = NULL; eng->q35_fp4_on = 0;
+    eng->fp8_scale_tab = NULL; eng->fp8_scale_n = 0;
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++)
         for (int p = 0; p < 12; p++) {
             eng->d_q35_wc[l][p] = NULL;
@@ -6215,6 +6221,10 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
             CUDA_FREE(eng->d_q35_fp4_w[l][p]); CUDA_FREE(eng->d_q35_fp4_wsc[l][p]);
         }
     CUDA_FREE(eng->d_q35_fp4_gsw);
+    if (eng->fp8_scale_tab) {
+        for (int i = 0; i < eng->fp8_scale_n; i++) if (eng->fp8_scale_tab[i].s) cudaFree((void*)eng->fp8_scale_tab[i].s);
+        free(eng->fp8_scale_tab); eng->fp8_scale_tab = NULL; eng->fp8_scale_n = 0;
+    }
     CUDA_FREE(eng->d_suppress);
     CUDA_FREE(eng->d_w_attn_norm);
     CUDA_FREE(eng->d_w_post_attn_norm);
@@ -6451,6 +6461,18 @@ static inline void gemv_w(
     }
 }
 
+// FORMAT_FP8_BLOCK: recover a weight's per-128 block-scale pointer (host binary search over the
+// sorted ptr→scale table the FP8 loader built — the offset scheme can't derive it).
+static inline const __nv_bfloat16 *wscale_fp8(const gemma4_engine_t *eng, const uint8_t *w) {
+    int lo = 0, hi = eng->fp8_scale_n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1; const uint8_t *mw = eng->fp8_scale_tab[mid].w;
+        if (mw == w) return eng->fp8_scale_tab[mid].s;
+        if (mw < w) lo = mid + 1; else hi = mid - 1;
+    }
+    return nullptr;
+}
+
 // Batched GEMV: Y[K][out_dim] = X[K][in_dim] · weightᵀ, weight read once for all K.
 // One activation-quant pass over the whole [K × in_dim] block, then weight-row-reuse
 // dp4a MMVQ (Q8_0/Q4_0) or the fp32 Q6_K head kernel. K ≤ GEMMA4_SPEC_MAX (callers).
@@ -6460,6 +6482,10 @@ static inline void gemv_batched_w(
     int in_dim, int out_dim, int K, cudaStream_t stream, int wfmt = -1)
 {
     int fmt = (wfmt < 0) ? FMT(eng) : wfmt;
+    if (fmt == FORMAT_FP8_BLOCK) {        // block-FP8: float activation directly, no Q8_1 quant
+        fp8_block_gemm_launch(out, weight, wscale_fp8(eng, weight), x, in_dim, out_dim, K, stream);
+        return;
+    }
     quantize_q8_1_kernel<<<(K*in_dim)/32, 32, 0, stream>>>(
         x, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b, K*in_dim);
     if (fmt == FORMAT_Q6_K) {            // native Q6_K LM head (Step 8), batched over K rows

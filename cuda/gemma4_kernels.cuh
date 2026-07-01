@@ -82,6 +82,9 @@ typedef enum {
     FORMAT_Q5_K  = 6,  // GGML Q5_K super-blocks — appears on a few Qwen3 UD bulk weights (mixed
                        // attention). No native Q5_K kernel: each Q5_K bulk tensor is requantized to
                        // Q8_0 at load (wt_override) and thereafter read as FORMAT_Q8_0.
+    FORMAT_FP8_BLOCK = 7, // DeepSeek/Qwen3.5 block-FP8: F8_E4M3 weights [out][in] + per-128×128
+                       // BF16 block scale (weight_scale_inv). gemv_batched_w dispatches to the
+                       // fp8_block_gemm primitive; the scale ptr comes from the engine's ptr→scale table.
 } tensor_format_t;
 
 // ─── GGML Q8_0 block ──────────────────────────────────────────────────
