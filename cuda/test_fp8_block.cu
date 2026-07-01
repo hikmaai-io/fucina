@@ -63,6 +63,29 @@ int main() {
     double cosine = dot/(sqrt(na)*sqrt(nb)+1e-12);
     printf("fp8_block_gemv: cosine=%.6f  (sample ref=%.4f out=%.4f)\n", cosine, ref[0], out[0]);
     int ok = cosine >= 0.999;
+
+    // ── BATCHED parity: fp8_block_gemm (B rows) must equal B independent B=1 gemv calls, BITWISE ──
+    const int B = 5;
+    std::vector<float> xb((size_t)B*IN);
+    for (int b=0;b<B;b++) for (int i=0;i<IN;i++) xb[(size_t)b*IN+i] = frand(-2.0f,2.0f);
+    float *d_xb,*d_outb,*d_out1;
+    CK(cudaMalloc(&d_xb,(size_t)B*IN*sizeof(float)));
+    CK(cudaMalloc(&d_outb,(size_t)B*OUT*sizeof(float)));
+    CK(cudaMalloc(&d_out1,OUT*sizeof(float)));
+    CK(cudaMemcpy(d_xb,xb.data(),(size_t)B*IN*sizeof(float),cudaMemcpyHostToDevice));
+    fp8_block_gemm_launch(d_outb,d_w,d_s,d_xb,IN,OUT,B,0);
+    CK(cudaDeviceSynchronize());
+    std::vector<float> outb((size_t)B*OUT), out1(OUT);
+    CK(cudaMemcpy(outb.data(),d_outb,(size_t)B*OUT*sizeof(float),cudaMemcpyDeviceToHost));
+    int rowmism=0;
+    for (int b=0;b<B;b++){
+        fp8_block_gemv_launch(d_out1,d_w,d_s,d_xb+(size_t)b*IN,IN,OUT,0);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(out1.data(),d_out1,OUT*sizeof(float),cudaMemcpyDeviceToHost));
+        for (int o=0;o<OUT;o++) if (outb[(size_t)b*OUT+o] != out1[o]) rowmism++;
+    }
+    printf("fp8_block_gemm (B=%d) == %d× B=1 : %s (%d mismatches)\n", B, B, rowmism==0?"PASS":"FAIL", rowmism);
+    ok = ok && (rowmism==0);
     printf("%s\n", ok?"PASS":"FAIL");
     return ok?0:1;
 }
