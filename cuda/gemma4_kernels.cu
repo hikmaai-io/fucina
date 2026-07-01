@@ -19,6 +19,7 @@
                               // compiled into the engine TU but stay dormant until wired.
 #include <cuda_fp4.h>         // __nv_fp4_storage_t, NVFP4 E2M1 conversion (FUCINA_FP4)
 #include <cublasLt.h>         // NVFP4 block-scaled tensor-core GEMM (FUCINA_FP4)
+#include <mma.h>              // nvcuda::wmma tf32 tensor cores (GDN chunk-scan matmuls)
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
@@ -15473,6 +15474,43 @@ __global__ void qwen35_b_ring_update_kernel(float *ring, const float *qkv, int s
     for (int idx = 0; idx < HK; idx++) rg[idx] = nv[idx];
 }
 
+// Block-cooperative tf32 tensor-core GEMM: C[M×N] = A[M×K]·B[K×N] (+= if `add`), all row-major
+// fp32 (shared or global). tf32 (10-bit mantissa) preserves the delta-rule precision far better
+// than bf16. M,N multiples of 16; K multiple of 8. Warps split the 16×16 output tiles round-robin.
+__device__ inline void wmma_gemm_tf32(float *C, const float *A, const float *B,
+                                      int M, int N, int K, int ldc, int lda, int ldb,
+                                      int warp, int n_warps, bool add) {
+    using namespace nvcuda;
+    int n_nt = N / 16, n_tiles = (M / 16) * n_nt;
+    for (int tile = warp; tile < n_tiles; tile += n_warps) {
+        int mt = (tile / n_nt) * 16, nt = (tile % n_nt) * 16;
+        wmma::fragment<wmma::accumulator, 16, 16, 8, float> cf;
+        wmma::fill_fragment(cf, 0.0f);
+        for (int k = 0; k < K; k += 8) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf;
+            wmma::load_matrix_sync(af, A + (size_t)mt * lda + k, lda);
+            wmma::load_matrix_sync(bf, B + (size_t)k * ldb + nt, ldb);
+            #pragma unroll
+            for (int t = 0; t < af.num_elements; t++) af.x[t] = wmma::__float_to_tf32(af.x[t]);
+            #pragma unroll
+            for (int t = 0; t < bf.num_elements; t++) bf.x[t] = wmma::__float_to_tf32(bf.x[t]);
+            wmma::mma_sync(cf, af, bf, cf);
+        }
+        float *cp = C + (size_t)mt * ldc + nt;
+        if (add) {
+            wmma::fragment<wmma::accumulator, 16, 16, 8, float> of;
+            wmma::load_matrix_sync(of, cp, ldc, wmma::mem_row_major);
+            #pragma unroll
+            for (int t = 0; t < cf.num_elements; t++) cf.x[t] += of.x[t];
+        }
+        wmma::store_matrix_sync(cp, cf, ldc, wmma::mem_row_major);
+    }
+}
+
+// Per-v-head GDN scratch: WY/UT staging (M2_SCR_PER) + tf32-GEMM temps (qgs, kchsT, ctmp, Stmp).
+#define Q35_GDN_SCR (M2_SCR_PER + 3*M2_CHUNK*M2_SD + M2_SD*M2_SD)
+
 // GDN chunked parallel-scan (WY/UT form) over a T-row prefill TILE, carrying the per-slot fp32
 // state S in/out of the arena S_arena[slot]. Mathematically identical to qwen35_b_gdn_kernel run
 // token-by-token (and to the M2 chunk==recur self-test). One block per v-head, CHUNK=64.
@@ -15491,13 +15529,18 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
     float *gc   = kch + CS * SD;      // [CS] cumulative decay
     float *bet  = gc + CS;            // [CS] beta per chunk row
     float *rowb = bet + CS;           // [CS] fwd-subst scratch row
-    float *Tm    = scratch + (size_t)vh * M2_SCR_PER;
+    float *Tm    = scratch + (size_t)vh * Q35_GDN_SCR;
     float *u     = Tm + CS * CS;
     float *kcd   = u + CS * SD;
     float *vnew  = kcd + CS * SD;
     float *aintra= vnew + CS * SD;
+    float *qgs   = aintra + CS * CS;     // [CS*SD] q·scale·exp(gc) for the inter GEMM
+    float *kchsT = qgs + CS * SD;        // [SD*CS] (k·decay)^T for the state-update GEMM
+    float *ctmp  = kchsT + SD * CS;      // [CS*SD] core tile (before N-guarded copy-out)
+    float *Stmp  = ctmp + CS * SD;       // [SD*SD] state-update GEMM result
     float *Sg   = S_arena + ((size_t)slot * M2_NVH + vh) * SD * SD;
     float scale = rsqrtf((float)SD);
+    int warp = tid >> 5, n_warps = blockDim.x >> 5;
     for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = Sg[idx];   // carry-in
     __syncthreads();
 
@@ -15558,13 +15601,11 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
             u[idx] = su; kcd[idx] = sk;
         }
         __syncthreads();
-        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
-            int i = idx / SD, d = idx % SD;
-            float vp = 0.f;
-            for (int kd = 0; kd < SD; kd++) vp += kcd[i * SD + kd] * S[kd * SD + d];
-            vnew[idx] = u[idx] - vp;
-        }
+        // vnew = u - kcd@S  (tensor-core: vnew←kcd@S, then subtract u)
+        wmma_gemm_tf32(vnew, kcd, S, CS, SD, SD, SD, SD, SD, warp, n_warps, false);
         __syncthreads();
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) vnew[idx] = u[idx] - vnew[idx];
+        // aintra[i,j] = <q[i],k[j]>·exp(gc[i]-gc[j]) (i>=j); qgs[i,d] = q·scale·exp(gc[i])
         for (int idx = tid; idx < CS * CS; idx += blockDim.x) {
             int i = idx / CS, j = idx % CS;
             float val = 0.f;
@@ -15579,28 +15620,30 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
             }
             aintra[idx] = val;
         }
+        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+            int i = idx / SD, d = idx % SD, gti = c * CS + i;
+            qgs[idx] = (gti < N) ? q[((size_t)gti * M2_NKH + kh) * SD + d] * scale * __expf(gc[i]) : 0.f;
+        }
+        __syncthreads();
+        // core = qgs@S (inter) + aintra@vnew (intra), into ctmp, then N-guarded copy to core
+        wmma_gemm_tf32(ctmp, qgs, S, CS, SD, SD, SD, SD, SD, warp, n_warps, false);
+        __syncthreads();
+        wmma_gemm_tf32(ctmp, aintra, vnew, CS, SD, CS, SD, CS, SD, warp, n_warps, true);
         __syncthreads();
         for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
-            int i = idx / SD, d = idx % SD;
-            int gti = c * CS + i;
-            if (gti >= N) continue;
-            float inter = 0.f;
-            float egi = __expf(gc[i]);
-            for (int kd = 0; kd < SD; kd++)
-                inter += q[((size_t)gti * M2_NKH + kh) * SD + kd] * scale * egi * S[kd * SD + d];
-            float intra = 0.f;
-            for (int j = 0; j <= i; j++) intra += aintra[i * CS + j] * vnew[j * SD + d];
-            core[((size_t)gti * M2_NVH + vh) * SD + d] = inter + intra;
+            int i = idx / SD, d = idx % SD, gti = c * CS + i;
+            if (gti < N) core[((size_t)gti * M2_NVH + vh) * SD + d] = ctmp[idx];
+        }
+        // S = S·exp(glast) + (k·decay)^T @ vnew  (tensor-core)
+        float glast = gc[CS - 1];
+        for (int idx = tid; idx < SD * CS; idx += blockDim.x) {
+            int kd = idx / CS, r = idx % CS;                 // kchsT[kd][r] = kch[r][kd]·exp(glast-gc[r])
+            kchsT[idx] = kch[r * SD + kd] * __expf(glast - gc[r]);
         }
         __syncthreads();
-        float glast = gc[CS - 1];
-        for (int idx = tid; idx < SD * SD; idx += blockDim.x) {
-            int kd = idx / SD, d = idx % SD;
-            float acc = S[idx] * __expf(glast);
-            for (int r = 0; r < CS; r++)
-                acc += kch[r * SD + kd] * __expf(glast - gc[r]) * vnew[r * SD + d];
-            S[idx] = acc;
-        }
+        wmma_gemm_tf32(Stmp, kchsT, vnew, SD, SD, CS, SD, CS, SD, warp, n_warps, false);
+        __syncthreads();
+        for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = S[idx] * __expf(glast) + Stmp[idx];
         __syncthreads();
     }
     for (int idx = tid; idx < SD * SD; idx += blockDim.x) Sg[idx] = S[idx];   // carry-out
@@ -15658,7 +15701,7 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     for (int i = 0; i < 24 && ok; i++)
         ok &= cudaMalloc(&eng->d_q35_sb[i], (size_t)PF * SBSZ[i] * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->d_q35_rowslot, (size_t)PF * sizeof(int)) == cudaSuccess;
-    ok = ok && cudaMalloc(&eng->d_q35_chunk_scr, (size_t)NVH * M2_SCR_PER * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->d_q35_chunk_scr, (size_t)NVH * Q35_GDN_SCR * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->d_q35_pf_pos, (size_t)PF * sizeof(int)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->d_q35_pf_tok, (size_t)PF * sizeof(int32_t)) == cudaSuccess;
     // Tensor-core prefill GEMM scratch: dequant each projection weight → BF16 (ping-pong for
@@ -16039,7 +16082,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             // RECURRENT: delta-rule state S update — ONE chunked parallel-scan launch over the
             // whole tile (CHUNK=64), carrying the per-slot fp32 state S in/out of the arena.
             // 512 threads: the O(SD*SD)=16384-element state/matmul loops stride over 4x the lanes.
-            qwen35_b_gdn_chunk_kernel<<<NVH,1024,smGDNchunk,st>>>(
+            qwen35_b_gdn_chunk_kernel<<<NVH,256,smGDNchunk,st>>>(
                 core, qh, kh, vh, gg, bb, eng->d_q35_S[l], eng->d_q35_chunk_scr, slot, T, NPAD);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T);
             q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, &eng->d_q35_wc[l][WC_OUT]);
