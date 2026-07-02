@@ -964,7 +964,7 @@ func (a *BatchAdapter) SpecWorthwhile() bool { return a.eng.NExperts() == 0 }
 // through the one-shot path (one dequant); longer prompts chunk at 2048.
 func (a *BatchAdapter) PrefillChunkHint() (int, int) {
 	if a.eng.NExperts() > 0 {
-		return 2048, 8192
+		return 1024, 1024
 	}
 	return 0, 0
 }
