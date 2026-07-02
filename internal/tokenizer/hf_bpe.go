@@ -118,6 +118,16 @@ func NewFromHFJSON(path string) (*Tokenizer, error) {
 		}
 	}
 
+	// Byte-level BPE (Qwen/GPT-2 family: pre_tokenizer ByteLevel, "Ġ"-alphabet vocab) routes
+	// through the SAME gpt2 machinery the GGUF loader wires up: per-word pre-tokenization
+	// (linear-time overall — the metaspace bpeEncode is O(segment²) and was measured at
+	// 0.26 ms/token on a 2k prompt) and the byte→unicode alphabet for encode AND decode
+	// (fixes the raw "Ġ/Ċ" mojibake in streamed completions). Merges are already built.
+	if strings.Contains(string(data), `"ByteLevel"`) {
+		t.gpt2 = true
+		t.buildByteMaps()
+	}
+
 	// Control-token ids by string (Gemma-4; same lookups as the GGUF path).
 	lookup := func(s string, def int32) int32 {
 		if id, ok := t.tokenToID[s]; ok {
