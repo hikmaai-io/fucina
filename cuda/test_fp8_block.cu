@@ -86,6 +86,47 @@ int main() {
     }
     printf("fp8_block_gemm (B=%d) == %d× B=1 : %s (%d mismatches)\n", B, B, rowmism==0?"PASS":"FAIL", rowmism);
     ok = ok && (rowmism==0);
+
+    // ── GROUPED (MoE) parity: fp8_block_gemm_grouped must equal per-expert B=1 gemv, BITWISE ──
+    // E experts, each its own FP8 weight+scale; `total` rows grouped expert-contiguously.
+    {
+        const int E = 3, cnt[E] = {2, 3, 1};
+        int coloff[E], total = 0;
+        for (int e=0;e<E;e++){ coloff[e]=total; total+=cnt[e]; }
+        const int gSB = IN/128, gOB = OUT/128;
+        std::vector<uint8_t> gw((size_t)E*OUT*IN);
+        for (auto &b : gw){ __nv_fp8_e4m3 v; v=__nv_fp8_e4m3(frand(-0.4f,0.4f)); b=v.__x; }
+        std::vector<__nv_bfloat16> gs((size_t)E*gOB*gSB);
+        for (auto &s : gs) s=__float2bfloat16(frand(0.02f,0.08f));
+        std::vector<float> gx((size_t)total*IN);
+        for (auto &v : gx) v=frand(-2.0f,2.0f);
+        uint8_t *d_gw; __nv_bfloat16 *d_gs; float *d_gx,*d_gout,*d_g1; int *d_coloff,*d_count;
+        CK(cudaMalloc(&d_gw,gw.size())); CK(cudaMalloc(&d_gs,gs.size()*sizeof(__nv_bfloat16)));
+        CK(cudaMalloc(&d_gx,(size_t)total*IN*sizeof(float))); CK(cudaMalloc(&d_gout,(size_t)total*OUT*sizeof(float)));
+        CK(cudaMalloc(&d_g1,(size_t)OUT*sizeof(float))); CK(cudaMalloc(&d_coloff,E*sizeof(int))); CK(cudaMalloc(&d_count,E*sizeof(int)));
+        CK(cudaMemcpy(d_gw,gw.data(),gw.size(),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_gs,gs.data(),gs.size()*sizeof(__nv_bfloat16),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_gx,gx.data(),(size_t)total*IN*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_coloff,coloff,E*sizeof(int),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_count,cnt,E*sizeof(int),cudaMemcpyHostToDevice));
+        fp8_block_gemm_grouped_launch(d_gout, d_gw, (int64_t)OUT*IN, d_gs, (int64_t)gOB*gSB,
+                                      d_gx, d_coloff, d_count, E, IN, OUT, 0);
+        CK(cudaDeviceSynchronize());
+        std::vector<float> gout((size_t)total*OUT), g1(OUT);
+        CK(cudaMemcpy(gout.data(),d_gout,(size_t)total*OUT*sizeof(float),cudaMemcpyDeviceToHost));
+        int gmism=0;
+        for (int e=0;e<E;e++) for (int r=0;r<cnt[e];r++){
+            int row=coloff[e]+r;
+            fp8_block_gemv_launch(d_g1, d_gw+(size_t)e*OUT*IN, d_gs+(size_t)e*gOB*gSB, d_gx+(size_t)row*IN, IN, OUT, 0);
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(g1.data(),d_g1,OUT*sizeof(float),cudaMemcpyDeviceToHost));
+            for (int o=0;o<OUT;o++) if (gout[(size_t)row*OUT+o]!=g1[o]) gmism++;
+        }
+        printf("fp8_block_gemm_grouped (E=%d, tokens=%d) == per-expert B=1 : %s (%d mismatches)\n",
+               E, total, gmism==0?"PASS":"FAIL", gmism);
+        ok = ok && (gmism==0);
+    }
+
     printf("%s\n", ok?"PASS":"FAIL");
     return ok?0:1;
 }
