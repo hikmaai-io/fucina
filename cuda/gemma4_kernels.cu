@@ -1784,6 +1784,21 @@ static inline void dequant_proj_to_bf16(
     }
 }
 
+// Block-FP8 (E4M3 weight + per-128×128 BF16 block scale) → BF16, element-wise. Feeds the
+// tensor-core prefill GEMM: dequant ONCE per projection (cached when memory allows) instead
+// of the FP8_MAXB-chunked GEMV that re-read the weight T/16 times per prefill tile — the
+// measured 37× TTFT gap vs vLLM on the 35B MoE at a ~2k prompt.
+__global__ void dequant_fp8_block_to_bf16_kernel(
+    __nv_bfloat16 *dst, const uint8_t *w, const __nv_bfloat16 *sc, int in_dim, uint64_t n)
+{
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int row = (int)(i / in_dim), col = (int)(i % in_dim);
+    __nv_fp8_e4m3 v; v.__x = w[i];
+    float bs = __bfloat162float(sc[(size_t)(row >> 7) * (in_dim >> 7) + (col >> 7)]);
+    dst[i] = __float2bfloat16(float(v) * bs);
+}
+
 
 // =========================================================================
 // =========================================================================
@@ -15989,10 +16004,17 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     ok = ok && cudaMalloc(&eng->d_q35_pf_pos, (size_t)PF * sizeof(int)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->d_q35_pf_tok, (size_t)PF * sizeof(int32_t)) == cudaSuccess;
     // Tensor-core prefill GEMM scratch: dequant each projection weight → BF16 (ping-pong for
-    // dequant/compute overlap), and the per-tile activation → BF16. Sized for the largest qwen35
-    // projection (FFN I×H) and the widest GEMM in_dim (I).
-    const size_t wbf_max = (size_t)I * H;          // FFN gate/up/down dominate (I=intermediate)
-    const size_t xbf_max = (size_t)PF * I;
+    // dequant/compute overlap), and the per-tile activation → BF16. Sized by the largest qwen35
+    // projection and the widest GEMM in_dim ACROSS ALL variants (9B dense: FFN I×H dominates;
+    // 35B MoE: I is the tiny shared-expert inter, so in_qkv CONVD×H is the largest).
+    size_t wbf_max = (size_t)I * H;
+    if ((size_t)CONVD * H > wbf_max) wbf_max = (size_t)CONVD * H;
+    if ((size_t)2*NQ*HD * H > wbf_max) wbf_max = (size_t)2*NQ*HD * H;
+    int xin_max = I;
+    if (INNER > xin_max) xin_max = INNER;
+    if (NQ*HD > xin_max) xin_max = NQ*HD;
+    if (H > xin_max) xin_max = H;
+    const size_t xbf_max = (size_t)PF * xin_max;
     ok = ok && cudaMalloc(&eng->d_q35_wbf16[0], wbf_max * sizeof(__nv_bfloat16)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->d_q35_wbf16[1], wbf_max * sizeof(__nv_bfloat16)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->d_q35_xbf16,    xbf_max * sizeof(__nv_bfloat16)) == cudaSuccess;
@@ -16020,13 +16042,18 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     // allows (memory-constrained clients keep the per-tile dequant). Env force: 1=on, 0=off.
     {
         size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb);
-        // Rough BF16 cache size: the GEMM'd projections are ~0.5 GB/layer at 9B. Enable when the
+        // BF16 cache size from the ACTUAL dims (the GEMM'd per-layer projections): GDN in_qkv/
+        // in_z/out + FULL q/k/v/o + dense FFN gate/up/down. 9B: ~0.5 GB/layer; 35B MoE: ~70 MB/
+        // layer (experts are never wcached — they ride the grouped FP8 GEMM). Enable when the
         // cache plus a 5 GB working margin fits in free device memory.
-        const size_t need = (size_t)eng->cfg.n_layers * 520ull * 1024 * 1024;       // ~BF16 wts
+        const size_t per_layer = 2ull * (size_t)H *
+            ((size_t)CONVD + 2ull*INNER + 3ull*(size_t)I + 4ull*(size_t)NQ*HD);
+        const size_t need = (size_t)L * per_layer;
         eng->q35_wcache_on = (freeb > need + (size_t)5ull * 1024 * 1024 * 1024) ? 1 : 0;
         if (const char *e = getenv("FUCINA_QWEN35_WCACHE")) eng->q35_wcache_on = (atoi(e) != 0);
-        fprintf(stderr, "fucina: qwen35 prefill weight-cache %s (free %.1f GiB)\n",
-                eng->q35_wcache_on ? "ON" : "off", freeb / (1024.0*1024*1024));
+        fprintf(stderr, "fucina: qwen35 prefill weight-cache %s (need %.1f GiB, free %.1f GiB)\n",
+                eng->q35_wcache_on ? "ON" : "off",
+                need / (1024.0*1024*1024), freeb / (1024.0*1024*1024));
     }
     q35_fp4_setup(eng);   // NVFP4 4-bit tensor-core prefill GEMM (preferred; BF16 cache is fallback)
     eng->q35_ready = 1;
@@ -16295,15 +16322,46 @@ static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fm
                           const float *x_f32, int in_dim, int out_dim, int T, cudaStream_t st,
                           int l, int slot) {
     const uint8_t *w = weight_fp8(eng, off);
-    // Qwen3.5 block-FP8: float-activation FP8 GEMM, weight amortized across ≤FP8_MAXB rows; loop the
-    // wide prefill tile in FP8_MAXB chunks. (l/slot unused here — no per-slot NVFP4 build.)
+    // Qwen3.5 block-FP8. Short tiles (≤2 GEMV chunks): the float-activation FP8 GEMM, weight
+    // amortized across ≤FP8_MAXB rows. WIDE prefill tiles: dequant the projection to BF16 ONCE
+    // (cached in the per-layer weight-cache slot when memory allows) and ride the tensor-core
+    // BF16 GEMM — the chunked GEMV re-read the whole weight T/FP8_MAXB times per tile, which
+    // was the dominant prefill cost (43.9 s TTFT at a ~2k prompt on the 35B MoE).
     if (fmt == FORMAT_FP8_BLOCK) {
         const __nv_bfloat16 *sc = wscale_fp8(eng, w);
-        for (int b0 = 0; b0 < T; b0 += FP8_MAXB) {
-            int bb = (T - b0 < FP8_MAXB) ? (T - b0) : FP8_MAXB;
-            fp8_block_gemm_launch(dst + (size_t)b0*out_dim, w, sc, x_f32 + (size_t)b0*in_dim,
-                                  in_dim, out_dim, bb, st);
+        if (T <= 2 * FP8_MAXB) {
+            for (int b0 = 0; b0 < T; b0 += FP8_MAXB) {
+                int bb = (T - b0 < FP8_MAXB) ? (T - b0) : FP8_MAXB;
+                fp8_block_gemm_launch(dst + (size_t)b0*out_dim, w, sc, x_f32 + (size_t)b0*in_dim,
+                                      in_dim, out_dim, bb, st);
+            }
+            return;
         }
+        const uint64_t nfp = (uint64_t)in_dim * out_dim;
+        f32_to_bf16_kernel<<<(unsigned)(((size_t)T * in_dim + 255) / 256), 256, 0, st>>>(
+            eng->d_q35_xbf16, x_f32, (uint64_t)T * in_dim);
+        __nv_bfloat16 **wcslot = &eng->d_q35_wc[l][slot];
+        const __nv_bfloat16 *wbf;
+        if (*wcslot) {
+            wbf = *wcslot;
+        } else if (eng->q35_wcache_on) {
+            __nv_bfloat16 *buf = NULL;
+            if (cudaMalloc(&buf, nfp * sizeof(__nv_bfloat16)) == cudaSuccess) {
+                dequant_fp8_block_to_bf16_kernel<<<(unsigned)((nfp + 255) / 256), 256, 0, st>>>(
+                    buf, w, sc, in_dim, nfp);
+                *wcslot = buf; wbf = buf;
+            } else {
+                cudaGetLastError(); eng->q35_wcache_on = 0;
+                dequant_fp8_block_to_bf16_kernel<<<(unsigned)((nfp + 255) / 256), 256, 0, st>>>(
+                    eng->d_q35_wbf16[0], w, sc, in_dim, nfp);
+                wbf = eng->d_q35_wbf16[0];
+            }
+        } else {
+            dequant_fp8_block_to_bf16_kernel<<<(unsigned)((nfp + 255) / 256), 256, 0, st>>>(
+                eng->d_q35_wbf16[0], w, sc, in_dim, nfp);
+            wbf = eng->d_q35_wbf16[0];
+        }
+        gemm_bf16(eng, wbf, eng->d_q35_xbf16, dst, in_dim, out_dim, T);
         return;
     }
     bool packed = use_packed_q4k(eng, fmt, w);
