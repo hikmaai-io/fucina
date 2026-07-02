@@ -3774,6 +3774,19 @@ struct gemma4_engine {
     float          *d_moe_q8d;       // [(H/32)·assign] per-block scale
     int            *d_moe_q8s;       // [(H/32)·assign] per-block Σ
 
+    // ─── Qwen3.5-MoE FP8 extras (FORMAT_FP8_BLOCK; qwen3_5_moe safetensors) ──
+    // Expert weights reuse moe_{gate,up,down}_exps as FP8 slab offsets (moe_*_slab = bytes/expert);
+    // the per-128×128 BF16 block-scales live in d_weights as parallel per-expert slabs.
+    uint64_t        moe_gate_scales[GEMMA4_CAP_LAYERS]; // BF16 scale slab (per-expert stride below)
+    uint64_t        moe_up_scales[GEMMA4_CAP_LAYERS];
+    uint64_t        moe_down_scales[GEMMA4_CAP_LAYERS];
+    uint64_t        moe_sh_gate[GEMMA4_CAP_LAYERS];     // shared_expert.{gate,up,down}_proj (FP8,
+    uint64_t        moe_sh_up[GEMMA4_CAP_LAYERS];       //   scale via fp8_scale_tab like dense projs)
+    uint64_t        moe_sh_down[GEMMA4_CAP_LAYERS];
+    uint64_t        moe_sh_gatevec[GEMMA4_CAP_LAYERS];  // mlp.shared_expert_gate [H] f32 (sigmoid gate)
+    int             moe_shared_inter;                   // shared_expert_intermediate (0 = no shared expert)
+    float          *d_moe_shlog;     // [TMAX] shared-expert gate logits (per token)
+
     // ─── LoRA adapter support ───────────────────────────────────────────
 };
 
@@ -4311,6 +4324,7 @@ static int nvfp4_load_from_safetensors(gemma4_engine_t *eng, const char *path,
 // Bodies far below (near the FP8 oracle). Forward-declared so create can call them.
 static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO);
 static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO);
+static std::string q35moe_resolve_dir(const char *path);   // HF-cache root → snapshots/<hash>/ dir
 
 // Build a proxy hidden state from a real embedding row: out[h] = emb[tok][h] · w_out_norm[h] / rms.
 // The trained embedding rows live in the head's input space, and the final RMSNorm is exactly what
@@ -4757,11 +4771,13 @@ gemma4_engine_t* gemma4_engine_create(
 
     // ── Qwen3.5 block-FP8 checkpoint? (model_type qwen3_5 + quant_method fp8). Serve it through the
     // real batched engine — fill d_weights/tensors with FORMAT_FP8_BLOCK + the scale table — instead
-    // of the B=1 qwen35_fp8_forward_greedy oracle. is_fp8 then skips every NVFP4/GGUF weight block. ──
+    // of the B=1 qwen35_fp8_forward_greedy oracle. is_fp8 then skips every NVFP4/GGUF weight block.
+    // The path may be an HF-cache root (models--Org--Name/ with snapshots/<hash>/) — resolve first. ──
     bool is_fp8 = false;
     if (is_nvfp4) {
         std::string ferr;
-        if (fp8_model.open(model_path, ferr) && qwen35fp8::detect(fp8_model, fp8_layout, ferr)) {
+        std::string fp8_dir = q35moe_resolve_dir(model_path);
+        if (fp8_model.open(fp8_dir.c_str(), ferr) && qwen35fp8::detect(fp8_model, fp8_layout, ferr)) {
             if (qwen35_fp8_setup_cfg(eng, fp8_model, fp8_layout) != 0) {
                 fprintf(stderr, "fucina: Qwen3.5 FP8 cfg setup failed\n");
                 gemma4_engine_destroy(eng); return NULL;
@@ -6197,7 +6213,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_moe_eidx);    CUDA_FREE(eng->d_moe_ecs);  CUDA_FREE(eng->d_moe_count);
     CUDA_FREE(eng->d_moe_coloff);  CUDA_FREE(eng->d_moe_cursor); CUDA_FREE(eng->d_moe_ones);
     CUDA_FREE(eng->d_moe_xe);      CUDA_FREE(eng->d_moe_gate);  CUDA_FREE(eng->d_moe_up);
-    CUDA_FREE(eng->d_moe_act);     CUDA_FREE(eng->d_moe_oe);
+    CUDA_FREE(eng->d_moe_act);     CUDA_FREE(eng->d_moe_oe);    CUDA_FREE(eng->d_moe_shlog);
     CUDA_FREE(eng->d_moe_q8);      CUDA_FREE(eng->d_moe_q8d);   CUDA_FREE(eng->d_moe_q8s);
     CUDA_FREE(eng->d_norm);
     CUDA_FREE(eng->d_norm_w);
@@ -8445,6 +8461,7 @@ static int moe_alloc_scratch(gemma4_engine_t *eng) {
     MOE_A(eng->d_moe_q8,      (size_t)H * A * sizeof(int8_t));
     MOE_A(eng->d_moe_q8d,     (size_t)(H / 32) * A * sizeof(float));
     MOE_A(eng->d_moe_q8s,     (size_t)(H / 32) * A * sizeof(int));
+    MOE_A(eng->d_moe_shlog,   (size_t)T * sizeof(float));
     #undef MOE_A
     if (!ok) { fprintf(stderr, "fucina: MoE scratch alloc failed\n"); return -1; }
     float *ones = (float*)malloc((size_t)E * sizeof(float));
@@ -8456,53 +8473,112 @@ static int moe_alloc_scratch(gemma4_engine_t *eng) {
     return 0;
 }
 
-// Qwen3-MoE FFN. h_f32 [H·n] = ffn_norm(x) (token-major FP32). Writes out_f32 [H·n] (zeroed inside)
-// = Σ_k router_w_k · down_k(silu(gate_k(h))·up_k(h)). Processes ≤ GEMMA4_MOE_TMAX tokens per chunk
-// (each token routes independently → chunking is bit-identical). Caller adds out_f32 to the residual.
+// out[t][i] += sigmoid(shlog[t]) · v[t][i] — the Qwen3.5-MoE shared-expert add (per-token
+// sigmoid-gated) into the MoE block output. One thread per element, token = blockIdx.y.
+__global__ void q35moe_b_shared_axpy_kernel(float *out, const float *v, const float *shlog, int H) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (i >= H) return;
+    float sg = 1.f / (1.f + expf(-shlog[t]));
+    out[(size_t)t * H + i] += sg * v[(size_t)t * H + i];
+}
+
+static void m2_gemm(float *out, const float *x, const float *w, int T, int in_dim, int out_dim,
+                    cudaStream_t stream);   // defined with the M2 kernels below (default stream=0 there)
+
+// Sparse-MoE FFN (Qwen3-MoE GGUF/Q4_K and Qwen3.5-MoE safetensors/FP8-block).
+// h_f32 [H·n] = ffn_norm(x) (token-major FP32). Writes out_f32 [H·n] (fully written inside)
+// = Σ_k router_w_k · down_k(silu(gate_k(h))·up_k(h))  [+ sigmoid-gated shared expert on FP8].
+// Processes ≤ GEMMA4_MOE_TMAX tokens per chunk (each token routes independently → chunking is
+// bit-identical). Caller adds out_f32 to the residual. All-device (CUDA-graph-capturable).
 static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_f32, int n,
                     cudaStream_t stream) {
     const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn;
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
+    const int fp8 = (eng->format == FORMAT_FP8_BLOCK);
     const float *router_w = (const float*)weight_fp8(eng, eng->moe_router[l]);
     const void  *gate_w   = (const void*)weight_fp8(eng, eng->moe_gate_exps[l]);
     const void  *up_w     = (const void*)weight_fp8(eng, eng->moe_up_exps[l]);
+    // FP8: every expert proj is EFFN×H (or H×EFFN) E4M3 = the same bytes/expert; the BF16 block
+    // scales sit in parallel per-expert slabs of (EFFN/128)·(H/128) elements (ceil for EFFN<128).
+    const int64_t fp8_wslab = (int64_t)EFFN * H;
+    const int64_t fp8_sslab = (int64_t)((EFFN + 127) / 128) * (H / 128);
     for (int t0 = 0; t0 < n; t0 += GEMMA4_MOE_TMAX) {
         int cn = n - t0; if (cn > GEMMA4_MOE_TMAX) cn = GEMMA4_MOE_TMAX;
         const float *h = h_f32 + (size_t)t0 * H;
         float *out = out_f32 + (size_t)t0 * H;
         int total = cn * U;
-        // Router → softmax-128 → top-8 → renorm-to-sum-1 → counting-sort route (pes = ones[E]).
+        // Router → softmax-E → top-U → renorm-to-sum-1 → counting-sort route (pes = ones[E]).
         moe_router_gemv_kernel<<<dim3(E, cn), 256, 0, stream>>>(router_w, h, eng->d_moe_rlogits, H, E);
         dg_softmax_topk(eng->d_moe_rlogits, E, cn, U, eng->d_moe_tki, eng->d_moe_tkw, stream);
         dg_moe_route_inv(eng->d_moe_tki, eng->d_moe_tkw, eng->d_moe_ones, cn, U, E,
                          eng->d_moe_count, eng->d_moe_coloff, eng->d_moe_cursor,
                          eng->d_moe_eidx, eng->d_moe_ecs, eng->d_moe_invpos, stream);
-        // Gather expert inputs → quantize → grouped gate + up (Q4_K, SAME quantized acts).
+        // Gather expert inputs → grouped gate/up/down. FP8 keeps FLOAT activations (no Q8_1).
         dg_gather_cols(eng->d_moe_xe, h, eng->d_moe_eidx, H, total, stream);
-        dg_quantize_q8_1(eng->d_moe_xe, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, H, total, stream);
-        dg_mmq_q4_K_grouped(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
-                            eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
-                            eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
-        dg_mmq_q4_K_grouped(eng->d_moe_up, up_w, eng->moe_up_slab,
-                            eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
-                            eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
-        // SiLU-GLU → quantize → grouped down (Q4_K native or Q8_0 requant).
-        dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
-        dg_quantize_q8_1(eng->d_moe_act, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, EFFN, total, stream);
-        if (eng->moe_down_q8[l]) {
-            dg_mmq_q8_0_grouped(eng->d_moe_oe, eng->moe_down_q8[l], eng->moe_down_slab_q8,
-                                eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
-                                eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
+        if (fp8) {
+            const __nv_bfloat16 *gs = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_gate_scales[l]);
+            const __nv_bfloat16 *us = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_up_scales[l]);
+            const __nv_bfloat16 *ds = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_down_scales[l]);
+            const uint8_t *down_w = weight_fp8(eng, eng->moe_down_exps[l]);
+            fp8_block_gemm_grouped_launch(eng->d_moe_gate, (const uint8_t*)gate_w, fp8_wslab, gs, fp8_sslab,
+                                          eng->d_moe_xe, eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
+            fp8_block_gemm_grouped_launch(eng->d_moe_up, (const uint8_t*)up_w, fp8_wslab, us, fp8_sslab,
+                                          eng->d_moe_xe, eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
+            dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
+            fp8_block_gemm_grouped_launch(eng->d_moe_oe, down_w, fp8_wslab, ds, fp8_sslab,
+                                          eng->d_moe_act, eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
         } else {
-            const void *down_w = (const void*)weight_fp8(eng, eng->moe_down_exps[l]);
-            dg_mmq_q4_K_grouped(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
+            dg_quantize_q8_1(eng->d_moe_xe, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, H, total, stream);
+            dg_mmq_q4_K_grouped(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
-                                eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
+                                eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
+            dg_mmq_q4_K_grouped(eng->d_moe_up, up_w, eng->moe_up_slab,
+                                eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
+                                eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
+            // SiLU-GLU → quantize → grouped down (Q4_K native or Q8_0 requant).
+            dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
+            dg_quantize_q8_1(eng->d_moe_act, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, EFFN, total, stream);
+            if (eng->moe_down_q8[l]) {
+                dg_mmq_q8_0_grouped(eng->d_moe_oe, eng->moe_down_q8[l], eng->moe_down_slab_q8,
+                                    eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
+                                    eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
+            } else {
+                const void *down_w = (const void*)weight_fp8(eng, eng->moe_down_exps[l]);
+                dg_mmq_q4_K_grouped(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
+                                    eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
+                                    eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
+            }
         }
         // Combine expert outputs back to tokens, weighted by router prob (d_moe_ecs). Deterministic
         // per-token reduce (fixed k order via d_moe_invpos) — no atomicAdd, so bit-identical
         // run-to-run (was nondeterministic atomic scatter-add). out is fully written (no memset).
         dg_moe_reduce(out, eng->d_moe_oe, eng->d_moe_invpos, eng->d_moe_ecs, H, cn, U, stream);
+        // Qwen3.5-MoE shared expert: out += sigmoid(h·shared_expert_gate) · down_s(silu(gate_s(h))·up_s(h)).
+        // Runs on the cn TOKENS (not assignments); reuses the grouped scratch, all consumed above.
+        if (eng->moe_shared_inter > 0) {
+            const int SI = eng->moe_shared_inter;
+            const uint8_t *swg = weight_fp8(eng, eng->moe_sh_gate[l]);
+            const uint8_t *swu = weight_fp8(eng, eng->moe_sh_up[l]);
+            const uint8_t *swd = weight_fp8(eng, eng->moe_sh_down[l]);
+            for (int b0 = 0; b0 < cn; b0 += FP8_MAXB) {
+                int bb = (cn - b0 < FP8_MAXB) ? (cn - b0) : FP8_MAXB;
+                fp8_block_gemm_launch(eng->d_moe_gate + (size_t)b0 * SI, swg, wscale_fp8(eng, swg),
+                                      h + (size_t)b0 * H, H, SI, bb, stream);
+                fp8_block_gemm_launch(eng->d_moe_up + (size_t)b0 * SI, swu, wscale_fp8(eng, swu),
+                                      h + (size_t)b0 * H, H, SI, bb, stream);
+            }
+            dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)SI * cn, stream);
+            for (int b0 = 0; b0 < cn; b0 += FP8_MAXB) {
+                int bb = (cn - b0 < FP8_MAXB) ? (cn - b0) : FP8_MAXB;
+                fp8_block_gemm_launch(eng->d_moe_xe + (size_t)b0 * H, swd, wscale_fp8(eng, swd),
+                                      eng->d_moe_act + (size_t)b0 * SI, SI, H, bb, stream);
+            }
+            m2_gemm(eng->d_moe_shlog, h, (const float*)weight_fp8(eng, eng->moe_sh_gatevec[l]),
+                    cn, H, 1, stream);
+            q35moe_b_shared_axpy_kernel<<<dim3((unsigned)((H + 255) / 256), cn), 256, 0, stream>>>(
+                out, eng->d_moe_xe, eng->d_moe_shlog, H);
+        }
     }
 }
 
@@ -15097,18 +15173,19 @@ __global__ void qwen35_rope_pos_kernel(float *x, int n_heads, int pos) {
 }
 
 // Single-query causal GQA softmax against the KV cache: query head hd at position `pos`
-// attends cached keys 0..pos. Kc/Vc are [pos+1][NKV][HEAD] (current pos already written).
+// attends cached keys 0..pos. Kc/Vc are [pos+1][nkv][HEAD] (current pos already written).
 // One block per query head; scores in dynamic shared (pos+1 floats). Mirrors m2_gqa_attn.
+// nkv is RUNTIME: 4 on the 9B, 2 on the 35B-A3B MoE (all other dims shared).
 __global__ void qwen35_attn_step_kernel(float *out, const float *q,
-                                        const float *Kc, const float *Vc, int pos) {
+                                        const float *Kc, const float *Vc, int pos, int nkv) {
     int hd  = blockIdx.x;            // query head 0..NQ-1
     int tid = threadIdx.x;
-    int kv  = hd / (M2_NQ / M2_NKV);
+    int kv  = hd / (M2_NQ / nkv);
     extern __shared__ float sc[];    // [pos+1] scores
     const float *qr = q + (size_t)hd * M2_HEAD;
     float scale = rsqrtf((float)M2_HEAD);
     for (int j = tid; j <= pos; j += blockDim.x) {
-        const float *kr = Kc + ((size_t)j * M2_NKV + kv) * M2_HEAD;
+        const float *kr = Kc + ((size_t)j * nkv + kv) * M2_HEAD;
         float acc = 0.f;
         for (int d = 0; d < M2_HEAD; d++) acc += qr[d] * kr[d];
         sc[j] = acc * scale;
@@ -15127,7 +15204,7 @@ __global__ void qwen35_attn_step_kernel(float *out, const float *q,
     for (int d = tid; d < M2_HEAD; d += blockDim.x) {
         float acc = 0.f;
         for (int j = 0; j <= pos; j++)
-            acc += sc[j] * Vc[((size_t)j * M2_NKV + kv) * M2_HEAD + d];
+            acc += sc[j] * Vc[((size_t)j * nkv + kv) * M2_HEAD + d];
         out[(size_t)hd * M2_HEAD + d] = acc * inv;
     }
 }
@@ -15239,9 +15316,9 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
         fprintf(stderr, "qwen35_forward_greedy: engine is not a qwen35 arch\n"); return -1;
     }
     const gemma4_model_config_t *c = &eng->cfg;
-    // The M2/M3 mixer kernels bake the qwen35-9B geometry as #defines; refuse a mismatch.
-    if (c->hidden_size != M2_H || c->head_dim != M2_HEAD || c->n_heads != M2_NQ ||
-        c->n_kv_global != M2_NKV || c->ssm_state_size != M2_SD ||
+    // The M2/M3 mixer kernels bake the shared qwen35 geometry (head/GDN dims) as #defines;
+    // H and NKV are RUNTIME (9B: 4096/4, 35B-A3B MoE: 2048/2). Refuse a baked-dim mismatch.
+    if (c->head_dim != M2_HEAD || c->n_heads != M2_NQ || c->ssm_state_size != M2_SD ||
         c->ssm_group_count != M2_NKH || c->ssm_time_step_rank != M2_NVH ||
         c->ssm_conv_kernel != M2_CK || c->rotary_dim != M2_ROT) {
         fprintf(stderr, "qwen35_forward_greedy: geometry mismatch vs M2 constants\n"); return -2;
@@ -15251,7 +15328,7 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
     }
     cudaStream_t st = eng->stream;
     const float eps = 1e-6f;
-    const int H = M2_H, HD = M2_HEAD, NQ = M2_NQ, NKV = M2_NKV;
+    const int H = c->hidden_size, HD = M2_HEAD, NQ = M2_NQ, NKV = c->n_kv_global;
     const int INNER = M2_VALD, CONVD = M2_CONVDIM, KEYD = M2_KEYD;
     const int NKH = M2_NKH, NVH = M2_NVH, SD = M2_SD, TSR = M2_TSR, ROT = M2_ROT;
     const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
@@ -15339,7 +15416,7 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                 qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NKV),32,0,st>>>(kb, NKV, p);
                 cudaMemcpyAsync(Kc[l]+(size_t)p*NKV*HD, kb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
                 cudaMemcpyAsync(Vc[l]+(size_t)p*NKV*HD, vb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
-                qwen35_attn_step_kernel<<<NQ,256,(size_t)(p+1)*sizeof(float),st>>>(attn, qb, Kc[l], Vc[l], p);
+                qwen35_attn_step_kernel<<<NQ,256,(size_t)(p+1)*sizeof(float),st>>>(attn, qb, Kc[l], Vc[l], p, NKV);
                 m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(attn, gate, NQ*HD);
                 gemv_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, st, T.fmt_o);
             } else {
@@ -15372,12 +15449,16 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                 gemv_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, st, T.ssm.fmt_out);
             }
             qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(x, mix, H);
-            // pre-FFN RMSNorm (post_attention_norm loaded into the ffn_norm slot) + SwiGLU
+            // pre-FFN RMSNorm (post_attention_norm loaded into the ffn_norm slot) + FFN
             rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(xn, x, Wf(T.ffn_norm), H, 1, eps);
-            gemv_w(eng, ffn_g, Wq(T.ffn_gate), xn, H, I, st, T.fmt_gate);
-            gemv_w(eng, ffn_u, Wq(T.ffn_up),   xn, H, I, st, T.fmt_up);
-            silu_glu_kernel<<<(I+255)/256,256,0,st>>>(ffn_a, ffn_g, ffn_u, I);
-            gemv_w(eng, mix, Wq(T.ffn_down), ffn_a, I, H, st, T.fmt_down);
+            if (c->n_experts > 0) {   // Qwen3.5-MoE sparse block (experts + shared) → mix
+                moe_ffn(eng, l, xn, mix, 1, st);
+            } else {
+                gemv_w(eng, ffn_g, Wq(T.ffn_gate), xn, H, I, st, T.fmt_gate);
+                gemv_w(eng, ffn_u, Wq(T.ffn_up),   xn, H, I, st, T.fmt_up);
+                silu_glu_kernel<<<(I+255)/256,256,0,st>>>(ffn_a, ffn_g, ffn_u, I);
+                gemv_w(eng, mix, Wq(T.ffn_down), ffn_a, I, H, st, T.fmt_down);
+            }
             qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(x, mix, H);
         }
 
@@ -15452,13 +15533,14 @@ __global__ void qwen35_b_rope_kernel(float *x, int n_heads, const int *pos, int 
 // Write each row's current K/V (kb/vb [B][NKV*HD]) into the per-slot FULL-layer K/V cache
 // at (slot=rowslot[r], pos=pos[r]). Cache base = slot*maxctx*NKV*HD; token offset = pos*NKV*HD.
 __global__ void qwen35_b_kv_write_kernel(float *Kc, float *Vc, const float *kb, const float *vb,
-                                         const int *pos, const int *rowslot, int maxctx, int B) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over NKV*HD
+                                         const int *pos, const int *rowslot, int maxctx, int B,
+                                         int nkv) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over nkv*HD
     int r   = blockIdx.y;
-    if (r >= B || idx >= M2_NKV * M2_HEAD) return;
+    if (r >= B || idx >= nkv * M2_HEAD) return;
     int slot = rowslot[r], p = pos[r];
-    size_t base = ((size_t)slot * maxctx + p) * M2_NKV * M2_HEAD;
-    size_t src  = (size_t)r * M2_NKV * M2_HEAD + idx;
+    size_t base = ((size_t)slot * maxctx + p) * nkv * M2_HEAD;
+    size_t src  = (size_t)r * nkv * M2_HEAD + idx;
     Kc[base + idx] = kb[src];
     Vc[base + idx] = vb[src];
 }
@@ -15467,20 +15549,21 @@ __global__ void qwen35_b_kv_write_kernel(float *Kc, float *Vc, const float *kb, 
 // One block per (query-head, row); reads pos[r]/slot=rowslot[r]; scores in dynamic shared
 // (maxctx floats; only [0..pos] touched). Arithmetic bit-identical to M3 qwen35_attn_step.
 __global__ void qwen35_b_attn_kernel(float *out, const float *q, const float *Kc, const float *Vc,
-                                     const int *pos, const int *rowslot, int maxctx, int B) {
+                                     const int *pos, const int *rowslot, int maxctx, int B,
+                                     int nkv) {
     int hd = blockIdx.x;   // query head 0..NQ-1
     int r  = blockIdx.y;   // row
     if (hd >= M2_NQ || r >= B) return;
     int slot = rowslot[r], p = pos[r];
-    int kv  = hd / (M2_NQ / M2_NKV);
+    int kv  = hd / (M2_NQ / nkv);
     int tid = threadIdx.x;
     extern __shared__ float sc[];   // [maxctx]
     const float *qr = q + ((size_t)r * M2_NQ + hd) * M2_HEAD;
-    const float *Kb = Kc + (size_t)slot * maxctx * M2_NKV * M2_HEAD;
-    const float *Vb = Vc + (size_t)slot * maxctx * M2_NKV * M2_HEAD;
+    const float *Kb = Kc + (size_t)slot * maxctx * nkv * M2_HEAD;
+    const float *Vb = Vc + (size_t)slot * maxctx * nkv * M2_HEAD;
     float scale = rsqrtf((float)M2_HEAD);
     for (int j = tid; j <= p; j += blockDim.x) {
-        const float *kr = Kb + ((size_t)j * M2_NKV + kv) * M2_HEAD;
+        const float *kr = Kb + ((size_t)j * nkv + kv) * M2_HEAD;
         float acc = 0.f;
         for (int d = 0; d < M2_HEAD; d++) acc += qr[d] * kr[d];
         sc[j] = acc * scale;
@@ -15499,7 +15582,7 @@ __global__ void qwen35_b_attn_kernel(float *out, const float *q, const float *Kc
     for (int d = tid; d < M2_HEAD; d += blockDim.x) {
         float acc = 0.f;
         for (int j = 0; j <= p; j++)
-            acc += sc[j] * Vb[((size_t)j * M2_NKV + kv) * M2_HEAD + d];
+            acc += sc[j] * Vb[((size_t)j * nkv + kv) * M2_HEAD + d];
         out[((size_t)r * M2_NQ + hd) * M2_HEAD + d] = acc * inv;
     }
 }
@@ -15830,11 +15913,12 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     }
     const gemma4_model_config_t *c = &eng->cfg;
     const int MS = GEMMA4_MAX_SEQS, L = c->n_layers;
-    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV, INNER=M2_VALD, CONVD=M2_CONVDIM;
+    const int H=c->hidden_size, HD=M2_HEAD, NQ=M2_NQ, NKV=c->n_kv_global, INNER=M2_VALD, CONVD=M2_CONVDIM;
     const int KEYD=M2_KEYD, VALD=M2_VALD, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, CK=M2_CK;
     const int I = c->intermediate;
-    // geometry must match the M2/M3 #defines (the mixer kernels bake them).
-    if (c->hidden_size != H || c->head_dim != HD || c->n_heads != NQ || c->n_kv_global != NKV ||
+    // baked geometry must match the M2/M3 #defines (the mixer kernels bake head/GDN dims);
+    // H and NKV are runtime (9B: 4096/4, 35B-A3B MoE: 2048/2).
+    if (c->head_dim != HD || c->n_heads != NQ ||
         c->ssm_state_size != SD || c->ssm_group_count != M2_NKH || c->ssm_time_step_rank != NVH ||
         c->ssm_conv_kernel != CK || c->rotary_dim != M2_ROT) {
         fprintf(stderr, "fucina: qwen35 M4: geometry mismatch vs M2 constants\n"); return -1;
@@ -15922,7 +16006,7 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
 // d_sb[11]; when want_argmax, appends the per-row greedy argmax into d_ms_outtok.
 static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_argmax, cudaStream_t st) {
     const gemma4_model_config_t *c = &eng->cfg;
-    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV;
+    const int H=c->hidden_size, HD=M2_HEAD, NQ=M2_NQ, NKV=c->n_kv_global;
     const int INNER=M2_VALD, CONVD=M2_CONVDIM, NKH=M2_NKH, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, ROT=M2_ROT;
     const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
     const int maxctx = eng->q35_maxctx;
@@ -15960,9 +16044,9 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NQ,B),32,0,st>>>(qb, NQ, d_pos, B);
             qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NKV,B),32,0,st>>>(kb, NKV, d_pos, B);
             qwen35_b_kv_write_kernel<<<dim3(grid1d((size_t)NKV*HD),B),256,0,st>>>(
-                eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, B);
+                eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, B, NKV);
             qwen35_b_attn_kernel<<<dim3(NQ,B),256,smATT,st>>>(
-                attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, B);
+                attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, B, NKV);
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(attn, gate, B*NQ*HD);
             gemv_batched_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, B, st, T.fmt_o);
         } else {
@@ -15988,10 +16072,14 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
         }
         residual_add_kernel<<<grid1d((size_t)B*H),256,0,st>>>(x, mix, B*H);
         rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(T.ffn_norm), H, B, eps);
-        gemv_batched_w(eng, fg, Wq(T.ffn_gate), xn, H, I, B, st, T.fmt_gate);
-        gemv_batched_w(eng, fu, Wq(T.ffn_up),   xn, H, I, B, st, T.fmt_up);
-        silu_glu_kernel<<<grid1d((size_t)B*I),256,0,st>>>(fa, fg, fu, B*I);
-        gemv_batched_w(eng, mix, Wq(T.ffn_down), fa, I, H, B, st, T.fmt_down);
+        if (c->n_experts > 0) {   // Qwen3.5-MoE sparse block (experts + shared) → mix
+            moe_ffn(eng, l, xn, mix, B, st);
+        } else {
+            gemv_batched_w(eng, fg, Wq(T.ffn_gate), xn, H, I, B, st, T.fmt_gate);
+            gemv_batched_w(eng, fu, Wq(T.ffn_up),   xn, H, I, B, st, T.fmt_up);
+            silu_glu_kernel<<<grid1d((size_t)B*I),256,0,st>>>(fa, fg, fu, B*I);
+            gemv_batched_w(eng, mix, Wq(T.ffn_down), fa, I, H, B, st, T.fmt_down);
+        }
         residual_add_kernel<<<grid1d((size_t)B*H),256,0,st>>>(x, mix, B*H);
     }
 
@@ -16062,7 +16150,7 @@ static bool ensure_q35_attn_scratch(gemma4_engine_t *eng, int N) {
     Q35_FREE(eng->d_q35_kbx); Q35_FREE(eng->d_q35_vbx); Q35_FREE(eng->d_q35_pb);
     Q35_FREE(eng->d_q35_scores);
     eng->d_q35_attn_cap = 0;
-    const int NQ = M2_NQ, NKV = M2_NKV, HD = M2_HEAD;
+    const int NQ = M2_NQ, NKV = eng->cfg.n_kv_global, HD = M2_HEAD;
     const size_t oq = (size_t)NQ * HD, okv = (size_t)NKV * HD, nn = (size_t)NQ * N * N;
     bool ok = true;
     ok &= cudaMalloc(&eng->d_q35_qb,  (size_t)N*oq*sizeof(__nv_bfloat16)) == cudaSuccess;
@@ -16089,7 +16177,7 @@ static bool ensure_q35_attn_scratch(gemma4_engine_t *eng, int N) {
 // Writes attn[N][NQ*HD]. Scale rsqrt(HD), causal, no softcap — identical math to the scalar path.
 static void q35_full_attn_tc(gemma4_engine_t *eng, float *attn, const float *qb,
                              const float *kb, const float *vb, int N, cudaStream_t st) {
-    const int NQ = M2_NQ, NKV = M2_NKV, HD = M2_HEAD;
+    const int NQ = M2_NQ, NKV = eng->cfg.n_kv_global, HD = M2_HEAD;
     const size_t oq = (size_t)NQ * HD, okv = (size_t)NKV * HD;
     auto g1 = [](size_t n){ return (unsigned)((n + 255) / 256); };
     f32_to_bf16_kernel<<<g1((size_t)N*oq),256,0,st>>>(eng->d_q35_qb, qb, (size_t)N*oq);
@@ -16264,7 +16352,7 @@ static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
 static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, int T,
                                       int want_logits, cudaStream_t st) {
     const gemma4_model_config_t *c = &eng->cfg;
-    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV;
+    const int H=c->hidden_size, HD=M2_HEAD, NQ=M2_NQ, NKV=c->n_kv_global;
     const int INNER=M2_VALD, CONVD=M2_CONVDIM, NKH=M2_NKH, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, ROT=M2_ROT;
     const int KEYD=M2_KEYD, VALD=M2_VALD;
     const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
@@ -16304,14 +16392,14 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NQ,T),32,0,st>>>(qb, NQ, d_pos, T);
             qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NKV,T),32,0,st>>>(kb, NKV, d_pos, T);
             qwen35_b_kv_write_kernel<<<dim3(grid1d((size_t)NKV*HD),T),256,0,st>>>(
-                eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, T);
+                eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, T, NKV);
             // base==0: the whole causal prompt is this tile → tensor-core GEMM attention (reads
             // kb/vb directly). base>0 (chunked continuation): scalar kernel over the full cache.
             if (base == 0 && T <= 8192 && ensure_q35_attn_scratch(eng, T))
                 q35_full_attn_tc(eng, attn, qb, kb, vb, T, st);
             else
                 qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
-                    attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T);
+                    attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T, NKV);
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
             q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st, l, WC_O);
         } else {
@@ -16347,10 +16435,14 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
         }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.ffn_norm), H, T, eps);
-        q35_proj_gemm(eng, fg, Tn.ffn_gate, Tn.fmt_gate, xn, H, I, T, st, l, WC_GATE);
-        q35_proj_gemm(eng, fu, Tn.ffn_up,   Tn.fmt_up,   xn, H, I, T, st, l, WC_UP);
-        silu_glu_kernel<<<grid1d((size_t)T*I),256,0,st>>>(fa, fg, fu, T*I);
-        q35_proj_gemm(eng, mix, Tn.ffn_down, Tn.fmt_down, fa, I, H, T, st, l, WC_DOWN);
+        if (c->n_experts > 0) {   // Qwen3.5-MoE sparse block (experts + shared) → mix
+            moe_ffn(eng, l, xn, mix, T, st);
+        } else {
+            q35_proj_gemm(eng, fg, Tn.ffn_gate, Tn.fmt_gate, xn, H, I, T, st, l, WC_GATE);
+            q35_proj_gemm(eng, fu, Tn.ffn_up,   Tn.fmt_up,   xn, H, I, T, st, l, WC_UP);
+            silu_glu_kernel<<<grid1d((size_t)T*I),256,0,st>>>(fa, fg, fu, T*I);
+            q35_proj_gemm(eng, mix, Tn.ffn_down, Tn.fmt_down, fa, I, H, T, st, l, WC_DOWN);
+        }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
     }
 
@@ -16818,19 +16910,40 @@ static unsigned char *q35_bf16_to_q8_0_host(const uint16_t *src, int64_t n_elem)
 // One descriptor per tensor placed into eng->d_weights.
 struct q35fp8_desc { uint64_t *off; uint8_t *fmtp; const void *host; size_t bytes; int fmt; const void *scale_host; size_t scale_bytes; };
 
-// Set eng->cfg from the FP8 checkpoint (dims from M2_* + embed/gate shapes). Called EARLY (before the
-// cfg-dependent scratch allocations); the weight fill runs later, after create's d_weights=NULL reset.
+// A qwen3_5_moe FP8 checkpoint iff the per-layer sparse experts are present (dense has mlp.gate_proj).
+static inline bool qwen35_fp8_is_moe(st::Model &M, qwen35fp8::Layout &LO) {
+    return M.has(qwen35fp8::lkey(LO, 0, "mlp.experts.0.gate_proj.weight"));
+}
+
+// Set eng->cfg from the FP8 checkpoint. H / NKV / vocab / FFN dims come from the tensor shapes
+// (9B dense: H=4096 NKV=4; 35B-A3B MoE: H=2048 NKV=2 E=256 top-8 MI=SI=512); the head/GDN geometry
+// is the shared M2_* baked set. Called EARLY (before the cfg-dependent scratch allocations); the
+// weight fill runs later, after create's d_weights=NULL reset.
 static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
-    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV, CONVD=M2_CONVDIM, INNER=M2_VALD, TSR=M2_TSR, SD=M2_SD, CK=M2_CK;
-    (void)CONVD;(void)INNER;
-    const st::Tensor *embT=M.find(LO.embed_key), *gateT=M.find(qwen35fp8::lkey(LO,0,"mlp.gate_proj.weight"));
-    if(!embT||!gateT){ fprintf(stderr,"qwen35_fp8_engine: missing embed/gate\n"); return -1; }
-    const int VOC=(int)embT->shape[0], I=(int)gateT->shape[0], L=LO.n_layers;
+    const int HD=M2_HEAD, NQ=M2_NQ, INNER=M2_VALD, TSR=M2_TSR, SD=M2_SD, CK=M2_CK;
+    const bool moe = qwen35_fp8_is_moe(M, LO);
+    const st::Tensor *embT=M.find(LO.embed_key);
+    // NKV from a FULL layer's k_proj rows (layer full_attention_interval-1 is always FULL).
+    const st::Tensor *kT=M.find(qwen35fp8::lkey(LO,LO.full_attention_interval-1,"self_attn.k_proj.weight"));
+    const st::Tensor *gateT=M.find(qwen35fp8::lkey(LO,0, moe ? "mlp.shared_expert.gate_proj.weight"
+                                                            : "mlp.gate_proj.weight"));
+    if(!embT||!kT||!gateT){ fprintf(stderr,"qwen35_fp8_engine: missing embed/k_proj/gate\n"); return -1; }
+    const int VOC=(int)embT->shape[0], H=(int)embT->shape[1], NKV=(int)kT->shape[0]/HD;
+    const int I=(int)gateT->shape[0], L=LO.n_layers;
     gemma4_model_config_t *c=&eng->cfg;
     c->arch=GEMMA4_ARCH_QWEN3_5; c->n_layers=L; c->hidden_size=H; c->head_dim=HD; c->n_heads=NQ;
     c->n_kv_global=NKV; c->n_kv_sliding=NKV;
     c->intermediate=I; c->vocab_size=VOC; c->rotary_dim=M2_ROT; c->full_attention_interval=LO.full_attention_interval;
     c->ssm_state_size=SD; c->ssm_conv_kernel=CK; c->ssm_inner_size=INNER; c->ssm_group_count=M2_NKH; c->ssm_time_step_rank=TSR;
+    if (moe) {
+        const st::Tensor *rgT=M.find(qwen35fp8::lkey(LO,0,"mlp.gate.weight"));
+        const st::Tensor *egT=M.find(qwen35fp8::lkey(LO,0,"mlp.experts.0.gate_proj.weight"));
+        if(!rgT||!egT){ fprintf(stderr,"qwen35_fp8_engine: missing router/expert tensors\n"); return -1; }
+        c->n_experts=(int)rgT->shape[0]; c->expert_ffn=(int)egT->shape[0];
+        long tk=8; qwen35fp8::cfg_int(M.config_json(),"\"num_experts_per_tok\"",tk);
+        c->n_experts_used=(tk>0)?(int)tk:8;
+        eng->moe_shared_inter=I;      // I above = shared_expert_intermediate for MoE
+    }
     int nfull=0;
     for(int l=0;l<L;l++){ bool full=qwen35fp8::is_full(LO,l);
         c->attn_kind[l]=full?GEMMA4_ATTN_FULL:GEMMA4_ATTN_LINEAR; c->is_global[l]=full?1:0; nfull+=full?1:0; }
@@ -16842,7 +16955,8 @@ static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::L
 }
 
 static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
-    const int H=M2_H, HD=M2_HEAD, NQ=M2_NQ, NKV=M2_NKV, CONVD=M2_CONVDIM, INNER=M2_VALD, TSR=M2_TSR;
+    const int H=eng->cfg.hidden_size, HD=M2_HEAD, NQ=M2_NQ, NKV=eng->cfg.n_kv_global;
+    const int CONVD=M2_CONVDIM, INNER=M2_VALD;
     const int VOC=eng->cfg.vocab_size, I=eng->cfg.intermediate, L=LO.n_layers;
 
     std::vector<q35fp8_desc> D;
@@ -16879,15 +16993,52 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         if(!q8) return false; tofree.push_back(q8); D.push_back({off,fmtp,q8,(size_t)(n/32)*34,FORMAT_Q8_0,nullptr,0}); return true;
     };
 
+    // Raw-bytes descriptor (no format tag, no scale-table entry): builds the CONTIGUOUS per-layer
+    // MoE expert slabs — E consecutive FP8 weight blocks (EFFN·H each, 32-aligned by size) and E
+    // consecutive BF16 scale blocks. `off` records only the slab base (expert 0).
+    static uint64_t q35moe_off_sink;
+    auto put_raw=[&](uint64_t*off,const std::string&key,size_t bytes)->bool{
+        const st::Tensor*t=find(key);
+        if(!t||(size_t)t->nbytes!=bytes){ fprintf(stderr,"qwen35_fp8_engine: missing/size %s\n",key.c_str()); return false; }
+        D.push_back({off,nullptr,t->data,bytes,-1,nullptr,0}); return true;
+    };
+    const bool moe = qwen35_fp8_is_moe(M, LO);
+    const int E = eng->cfg.n_experts, MI = eng->cfg.expert_ffn, SI = eng->moe_shared_inter;
+
     bool ok=true;
     auto &TS=eng->tensors;
     for(int l=0; ok && l<L; l++){
         auto &T=TS.layers[l];
         ok=ok && put_f32_from_bf16(&T.attn_norm, lk(l,"input_layernorm.weight"), 1.0f,false);
         ok=ok && put_f32_from_bf16(&T.ffn_norm,  lk(l,"post_attention_layernorm.weight"), 1.0f,false);
-        ok=ok && put_fp8(&T.ffn_gate,&T.fmt_gate, lk(l,"mlp.gate_proj.weight"), I, H);
-        ok=ok && put_fp8(&T.ffn_up,  &T.fmt_up,   lk(l,"mlp.up_proj.weight"),   I, H);
-        ok=ok && put_fp8(&T.ffn_down,&T.fmt_down, lk(l,"mlp.down_proj.weight"), H, I);
+        if(moe){
+            // ── Qwen3_5MoeSparseMoeBlock: router (f32) + E-expert FP8 slabs + shared expert ──
+            ok=ok && put_f32_from_bf16(&eng->moe_router[l],     lk(l,"mlp.gate.weight"), 0.0f,false);          // [E×H]
+            ok=ok && put_f32_from_bf16(&eng->moe_sh_gatevec[l], lk(l,"mlp.shared_expert_gate.weight"), 0.0f,false); // [H]
+            ok=ok && put_fp8(&eng->moe_sh_gate[l],nullptr, lk(l,"mlp.shared_expert.gate_proj.weight"), SI, H);
+            ok=ok && put_fp8(&eng->moe_sh_up[l],  nullptr, lk(l,"mlp.shared_expert.up_proj.weight"),   SI, H);
+            ok=ok && put_fp8(&eng->moe_sh_down[l],nullptr, lk(l,"mlp.shared_expert.down_proj.weight"), H, SI);
+            const size_t wb=(size_t)MI*H, sb=(size_t)((MI+127)/128)*(H/128)*2;   // bytes/expert: FP8 w, BF16 scale
+            struct { const char *proj; uint64_t *woff, *soff; } EX[3] = {
+                {"gate_proj", &eng->moe_gate_exps[l], &eng->moe_gate_scales[l]},
+                {"up_proj",   &eng->moe_up_exps[l],   &eng->moe_up_scales[l]},
+                {"down_proj", &eng->moe_down_exps[l], &eng->moe_down_scales[l]},
+            };
+            for(int p=0; p<3 && ok; p++){
+                for(int e=0; e<E && ok; e++){
+                    char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);
+                    ok=ok && put_raw(e==0?EX[p].woff:&q35moe_off_sink, lk(l,buf), wb);
+                }
+                for(int e=0; e<E && ok; e++){
+                    char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight_scale_inv",e,EX[p].proj);
+                    ok=ok && put_raw(e==0?EX[p].soff:&q35moe_off_sink, lk(l,buf), sb);
+                }
+            }
+        } else {
+            ok=ok && put_fp8(&T.ffn_gate,&T.fmt_gate, lk(l,"mlp.gate_proj.weight"), I, H);
+            ok=ok && put_fp8(&T.ffn_up,  &T.fmt_up,   lk(l,"mlp.up_proj.weight"),   I, H);
+            ok=ok && put_fp8(&T.ffn_down,&T.fmt_down, lk(l,"mlp.down_proj.weight"), H, I);
+        }
         if(qwen35fp8::is_full(LO,l)){
             ok=ok && put_fp8(&T.attn_q,&T.fmt_q, lk(l,"self_attn.q_proj.weight"), 2*NQ*HD, H);
             ok=ok && put_fp8(&T.attn_k,&T.fmt_k, lk(l,"self_attn.k_proj.weight"), NKV*HD, H);
@@ -16963,10 +17114,12 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
       eng->d_lmhead_bf16=(__nv_bfloat16*)q35fp8_up_bytes(lmT->data, lmT->nbytes);
       if(!eng->d_lmhead_bf16) return -5; }
     if(cudaMalloc(&eng->d_logits,(size_t)VOC*sizeof(float))!=cudaSuccess) return -6;
+    if(moe && moe_alloc_scratch(eng)!=0) return -6;
     cudaDeviceSynchronize();
     if(cudaGetLastError()!=cudaSuccess){ fprintf(stderr,"qwen35_fp8_engine: upload error\n"); return -7; }
-    fprintf(stderr,"fucina: qwen35 FP8-9B served via batched engine (%d layers, vocab %d, inter %d, %.2f GiB)\n",
-            L, VOC, I, total/(1024.0*1024*1024));
+    fprintf(stderr,"fucina: qwen35 FP8%s served via batched engine (%d layers, vocab %d, H %d, NKV %d%s, %.2f GiB)\n",
+            moe?"-MoE":"-dense", L, VOC, H, NKV,
+            moe?", E-experts slabbed":"", total/(1024.0*1024*1024));
     return 0;
 }
 
@@ -17144,7 +17297,7 @@ extern "C" int qwen35_fp8_forward_greedy(void *model, const int32_t *in_ids, int
                 qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NKV),32,0,st>>>(kb, NKV, p);
                 cudaMemcpyAsync(Kc[l]+(size_t)p*NKV*HD, kb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
                 cudaMemcpyAsync(Vc[l]+(size_t)p*NKV*HD, vb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
-                qwen35_attn_step_kernel<<<NQ,256,(size_t)(p+1)*sizeof(float),st>>>(attn, qb, Kc[l], Vc[l], p);
+                qwen35_attn_step_kernel<<<NQ,256,(size_t)(p+1)*sizeof(float),st>>>(attn, qb, Kc[l], Vc[l], p, M2_NKV);
                 m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(attn, gate, NQ*HD);
                 fp8_block_gemv_launch(mix, T.o.w, T.o.s, attn, NQ*HD, H, st);
             } else {
@@ -17338,7 +17491,7 @@ static int q35fp8_main_step(q35fp8_ctx *c, int32_t token, int pos, int want_hidd
             qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NKV),32,0,st>>>(c->kb, NKV, pos);
             cudaMemcpyAsync(c->Kc[l]+(size_t)pos*NKV*HD, c->kb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
             cudaMemcpyAsync(c->Vc[l]+(size_t)pos*NKV*HD, c->vb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
-            qwen35_attn_step_kernel<<<NQ,256,(size_t)(pos+1)*sizeof(float),st>>>(c->attn, c->qb, c->Kc[l], c->Vc[l], pos);
+            qwen35_attn_step_kernel<<<NQ,256,(size_t)(pos+1)*sizeof(float),st>>>(c->attn, c->qb, c->Kc[l], c->Vc[l], pos, M2_NKV);
             m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->attn, c->gate, NQ*HD);
             fp8_block_gemv_launch(c->mix, T.o.w, T.o.s, c->attn, NQ*HD, H, st);
         } else {
@@ -17405,7 +17558,7 @@ static int q35fp8_mtp_step(q35fp8_ctx *c, int32_t in_tok, const float *h_prev, i
     qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NKV),32,0,st>>>(c->mkb, NKV, pos);
     cudaMemcpyAsync(c->mKc+(size_t)idx*NKV*HD, c->mkb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
     cudaMemcpyAsync(c->mVc+(size_t)idx*NKV*HD, c->mvb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
-    qwen35_attn_step_kernel<<<NQ,256,(size_t)(idx+1)*sizeof(float),st>>>(c->mattn, c->mqb, c->mKc, c->mVc, idx);
+    qwen35_attn_step_kernel<<<NQ,256,(size_t)(idx+1)*sizeof(float),st>>>(c->mattn, c->mqb, c->mKc, c->mVc, idx, M2_NKV);
     m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->mattn, c->mgate, NQ*HD);
     fp8_block_gemv_launch(c->mmix, P.o.w, P.o.s, c->mattn, NQ*HD, H, st);
     cudaMemcpyAsync(c->mr2, c->mxfc, (size_t)H*sizeof(float), cudaMemcpyDeviceToDevice, st);
@@ -17518,41 +17671,6 @@ done:
 // only the FULL-attn KV stride (NKV=2) needs an nkv-parameterized step kernel (q35moe_attn_step),
 // and the FFN site is the new MoE block. Weights via the validated fp8_block_gemv (no dequant); the
 // router gate + shared_expert_gate stay BF16 (modules_to_not_convert) → m2_gemm in F32.
-
-// Single-query causal GQA softmax step with a RUNTIME kv-head count (the 9B kernel bakes M2_NKV=4;
-// the 35B is NKV=2). Otherwise identical to qwen35_attn_step_kernel.
-__global__ void q35moe_attn_step_kernel(float *out, const float *q,
-                                        const float *Kc, const float *Vc, int pos, int nkv) {
-    int hd  = blockIdx.x;                 // query head 0..NQ-1
-    int tid = threadIdx.x;
-    int kv  = hd / (M2_NQ / nkv);         // GQA group
-    extern __shared__ float sc[];         // [pos+1] scores
-    const float *qr = q + (size_t)hd * M2_HEAD;
-    float scale = rsqrtf((float)M2_HEAD);
-    for (int j = tid; j <= pos; j += blockDim.x) {
-        const float *kr = Kc + ((size_t)j * nkv + kv) * M2_HEAD;
-        float acc = 0.f;
-        for (int d = 0; d < M2_HEAD; d++) acc += qr[d] * kr[d];
-        sc[j] = acc * scale;
-    }
-    __syncthreads();
-    __shared__ float red[32];
-    float m = -1e30f;
-    for (int j = tid; j <= pos; j += blockDim.x) m = fmaxf(m, sc[j]);
-    m = block_reduce_max(m, red);
-    __shared__ float msh; if (tid == 0) msh = m; __syncthreads(); m = msh;
-    float ssum = 0.f;
-    for (int j = tid; j <= pos; j += blockDim.x) { float e = __expf(sc[j] - m); sc[j] = e; ssum += e; }
-    ssum = block_reduce_sum(ssum, red);
-    __shared__ float ssh; if (tid == 0) ssh = ssum; __syncthreads();
-    float inv = 1.f / ssh;
-    for (int d = tid; d < M2_HEAD; d += blockDim.x) {
-        float acc = 0.f;
-        for (int j = 0; j <= pos; j++)
-            acc += sc[j] * Vc[((size_t)j * nkv + kv) * M2_HEAD + d];
-        out[(size_t)hd * M2_HEAD + d] = acc * inv;
-    }
-}
 
 // out[i] += scale * v[i]  (expert/shared accumulation into the MoE residual).
 __global__ void q35moe_axpy_kernel(float *out, const float *v, float scale, int n) {
@@ -17815,7 +17933,7 @@ extern "C" int qwen35_moe_fp8_forward_greedy(void *model, const int32_t *in_ids,
                 qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NKV),32,0,st>>>(kb, NKV, p);
                 cudaMemcpyAsync(Kc[l]+(size_t)p*NKV*HD, kb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
                 cudaMemcpyAsync(Vc[l]+(size_t)p*NKV*HD, vb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
-                q35moe_attn_step_kernel<<<NQ,256,(size_t)(p+1)*sizeof(float),st>>>(attn, qb, Kc[l], Vc[l], p, NKV);
+                qwen35_attn_step_kernel<<<NQ,256,(size_t)(p+1)*sizeof(float),st>>>(attn, qb, Kc[l], Vc[l], p, NKV);
                 m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(attn, gate, NQ*HD);
                 fp8_block_gemv_launch(mix, T.o.w, T.o.s, attn, NQ*HD, H, st);
             } else {

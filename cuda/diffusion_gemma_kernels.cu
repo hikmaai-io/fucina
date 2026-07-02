@@ -310,10 +310,10 @@ __global__ void dg_softmax_topk_kernel(const float *logits, int ne, int topk, in
     sm[threadIdx.x] = se; __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s]; __syncthreads(); }
     float denom = sm[0];
-    // thread 0 does top-k selection on probs (ne=128, topk<=8 — cheap)
+    // thread 0 does top-k selection on probs (ne<=256: DG 128, Qwen3.5-MoE 256; topk<=8 — cheap)
     if (threadIdx.x == 0) {
         float probs_sum = 0.f;
-        bool used[DG_N_EXPERTS]; for (int i = 0; i < ne; i++) used[i] = false;
+        bool used[256]; for (int i = 0; i < ne; i++) used[i] = false;
         for (int k = 0; k < topk; k++) {
             float best = -1.f; int bi = -1;
             for (int i = 0; i < ne; i++) { if (!used[i]) { float p = expf(L[i] - gmax) / denom; if (p > best) { best = p; bi = i; } } }
