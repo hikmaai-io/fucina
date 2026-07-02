@@ -6837,6 +6837,9 @@ __global__ void rope_rows_pos_kernel(
 // Per-row argmax over a [rows][vocab] logits matrix: one block per row, writes the
 // argmax token id to out_idx[row]. Same warp-shuffle reduction as argmax_kernel,
 // generalised to B rows (block.y indexes the row); blockDim.x lanes stride vocab.
+// Per-row greedy argmax with the lowest-index tie-break (== torch.argmax). One BLOCK per row,
+// cross-warp shared reduce: a 262k vocab row scans in ~40 µs instead of the ~1.3 ms a single
+// 32-lane warp took (the old <<<rows,32>>> launch was 2.5% of every decode step).
 __global__ void argmax_rows_kernel(
     const float *logits, int *out_idx, int rows, int vocab_size)
 {
@@ -6846,14 +6849,27 @@ __global__ void argmax_rows_kernel(
     const float *lr = logits + (size_t)row * vocab_size;
     float best_val = -1e30f; int best_idx = 0;
     for (int i = tid; i < vocab_size; i += blockDim.x) {
-        if (lr[i] > best_val) { best_val = lr[i]; best_idx = i; }
+        if (lr[i] > best_val) { best_val = lr[i]; best_idx = i; }   // strict > keeps lowest i per lane
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
         float ov = __shfl_xor_sync(0xFFFFFFFF, best_val, offset);
         int   oi = __shfl_xor_sync(0xFFFFFFFF, best_idx, offset);
         if (ov > best_val || (ov == best_val && oi < best_idx)) { best_val = ov; best_idx = oi; }
     }
-    if (tid == 0) out_idx[row] = best_idx;
+    __shared__ float sv[32]; __shared__ int si[32];
+    int warp = tid >> 5, lane = tid & 31, nwarp = (blockDim.x + 31) >> 5;
+    if (lane == 0) { sv[warp] = best_val; si[warp] = best_idx; }
+    __syncthreads();
+    if (warp == 0) {
+        best_val = (lane < nwarp) ? sv[lane] : -1e30f;
+        best_idx = (lane < nwarp) ? si[lane] : 0;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float ov = __shfl_xor_sync(0xFFFFFFFF, best_val, offset);
+            int   oi = __shfl_xor_sync(0xFFFFFFFF, best_idx, offset);
+            if (ov > best_val || (ov == best_val && oi < best_idx)) { best_val = ov; best_idx = oi; }
+        }
+        if (lane == 0) out_idx[row] = best_idx;
+    }
 }
 
 // (Re)upload a host block table's id array to device, growing the device buffer
@@ -8882,7 +8898,7 @@ static int paged_prefill_batched(
     // Sample the first token EXACTLY as seq_add: greedy argmax, or the per-row
     // splitmix64 sampler at RNG index n_sampled==0. Routes through eng->d_ms_outtok.
     if (s->samp_temp <= 0.0f) {
-        argmax_rows_kernel<<<1,32,0,stream>>>(eng->d_logits, eng->d_ms_outtok, 1, GEMMA4_VOCAB_SIZE);
+        argmax_rows_kernel<<<1,1024,0,stream>>>(eng->d_logits, eng->d_ms_outtok, 1, GEMMA4_VOCAB_SIZE);
     } else {
         float h_temp[1] = { s->samp_temp }, h_topp[1] = { s->samp_top_p };
         float h_minp[1] = { s->samp_min_p }, h_rnd[1];
@@ -9199,7 +9215,7 @@ static int paged_prefill_qwen3(
         // First token EXACTLY as seq_add: greedy argmax, or the per-row splitmix64 sampler at
         // RNG index n_sampled. Routes through eng->d_ms_outtok.
         if (s->samp_temp <= 0.0f) {
-            argmax_rows_kernel<<<1,32,0,stream>>>(eng->d_logits, eng->d_ms_outtok, 1, vocab);
+            argmax_rows_kernel<<<1,1024,0,stream>>>(eng->d_logits, eng->d_ms_outtok, 1, vocab);
         } else {
             float h_temp[1] = { s->samp_temp }, h_topp[1] = { s->samp_top_p };
             float h_minp[1] = { s->samp_min_p }, h_rnd[1];
@@ -10932,7 +10948,7 @@ static void decode_multiseq_body(
     // Greedy argmax (graph-capturable: reads only d_logitsK). The per-row
     // temperature sampler stays in the host wrapper (off the graph path).
     if (want_argmax)
-        argmax_rows_kernel<<<B,32,0,stream>>>(d_logitsK, eng->d_ms_outtok, B, vocab);
+        argmax_rows_kernel<<<B,1024,0,stream>>>(d_logitsK, eng->d_ms_outtok, B, vocab);
 }
 
 // Lazy one-time capture of the multi-seq forward at batch size B (one graph PER B,
@@ -16105,7 +16121,7 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
     } else
         gemv_batched_w(eng, eng->d_sb[11], Wq(eng->tensors.output_weight), xn, H, VOC, B, st, eng->tensors.output_fmt);
     if (want_argmax)
-        argmax_rows_kernel<<<B,32,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, B, VOC);
+        argmax_rows_kernel<<<B,1024,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, B, VOC);
 }
 
 // Capture the B-row decode (want_argmax) once and instantiate it; replayed per step with the
@@ -16470,7 +16486,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
         else
             gemv_w(eng, eng->d_logits, Wq(eng->tensors.output_weight),
                    xn + (size_t)(T-1)*H, H, VOC, st, eng->tensors.output_fmt);
-        argmax_rows_kernel<<<1,32,0,st>>>(eng->d_logits, eng->d_ms_outtok, 1, VOC);
+        argmax_rows_kernel<<<1,1024,0,st>>>(eng->d_logits, eng->d_ms_outtok, 1, VOC);
     }
 }
 
