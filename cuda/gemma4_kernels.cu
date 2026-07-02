@@ -3804,6 +3804,8 @@ struct gemma4_engine {
     int            *d_moe_active;    // [TMAX·n_used] compacted active-expert ids (-1 padded)
     __nv_bfloat16  *d_moe_wbf[3];    // per-layer BF16 dequant of the gate/up/down expert slabs
     __nv_bfloat16  *d_moe_xbf;       // [TMAX·n_used × max(H,EFFN)] BF16 grouped activations
+    __nv_bfloat16  *d_moe_shbf;      // PERSISTENT BF16 shared-expert projs [L][3][SI·H] (~240 MB)
+    int             moe_shbf_ready[GEMMA4_CAP_LAYERS]; // per-layer first-touch dequant done
     int             moe_tc_off;      // 1 = tensor-core expert prefill unavailable (alloc failed)
 
     // ─── LoRA adapter support ───────────────────────────────────────────
@@ -6235,7 +6237,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_moe_act);     CUDA_FREE(eng->d_moe_oe);    CUDA_FREE(eng->d_moe_shlog);
     CUDA_FREE(eng->d_moe_active);
     for (int i = 0; i < 3; i++) CUDA_FREE(eng->d_moe_wbf[i]);
-    CUDA_FREE(eng->d_moe_xbf);
+    CUDA_FREE(eng->d_moe_xbf);     CUDA_FREE(eng->d_moe_shbf);
     CUDA_FREE(eng->d_moe_q8);      CUDA_FREE(eng->d_moe_q8d);   CUDA_FREE(eng->d_moe_q8s);
     CUDA_FREE(eng->d_norm);
     CUDA_FREE(eng->d_norm_w);
@@ -8678,18 +8680,55 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             const uint8_t *swg = weight_fp8(eng, eng->moe_sh_gate[l]);
             const uint8_t *swu = weight_fp8(eng, eng->moe_sh_up[l]);
             const uint8_t *swd = weight_fp8(eng, eng->moe_sh_down[l]);
-            for (int b0 = 0; b0 < cn; b0 += FP8_MAXB) {
-                int bb = (cn - b0 < FP8_MAXB) ? (cn - b0) : FP8_MAXB;
-                fp8_block_gemm_launch(eng->d_moe_gate + (size_t)b0 * SI, swg, wscale_fp8(eng, swg),
-                                      h + (size_t)b0 * H, H, SI, bb, stream);
-                fp8_block_gemm_launch(eng->d_moe_up + (size_t)b0 * SI, swu, wscale_fp8(eng, swu),
-                                      h + (size_t)b0 * H, H, SI, bb, stream);
+            if (tc) {
+                // Tensor-core shared expert: the 3 projections are tiny (SI×H FP8 ≈ 1 MB each),
+                // so their BF16 forms PERSIST across the whole serve (L×3×SI×H BF16 ≈ 240 MB)
+                // — dequant once per layer on first touch, then plain BF16 GEMMs. Replaces the
+                // FP8_MAXB chunk loops that were 12.3% of a 2k-token prefill (15k launches).
+                const size_t per = (size_t)SI * H;
+                if (!eng->d_moe_shbf) {
+                    if (cudaMalloc(&eng->d_moe_shbf, (size_t)eng->cfg.n_layers * 3 * per *
+                                   sizeof(__nv_bfloat16)) != cudaSuccess) {
+                        cudaGetLastError(); eng->moe_tc_off = 1; eng->d_moe_shbf = NULL;
+                    } else {
+                        memset(eng->moe_shbf_ready, 0, sizeof(eng->moe_shbf_ready));
+                    }
+                }
+                __nv_bfloat16 *shbf = eng->d_moe_shbf ? eng->d_moe_shbf + (size_t)l * 3 * per : NULL;
+                if (shbf && !eng->moe_shbf_ready[l]) {
+                    dequant_fp8_block_to_bf16_kernel<<<(unsigned)((per + 255)/256),256,0,stream>>>(
+                        shbf,           swg, wscale_fp8(eng, swg), H,  per);
+                    dequant_fp8_block_to_bf16_kernel<<<(unsigned)((per + 255)/256),256,0,stream>>>(
+                        shbf + per,     swu, wscale_fp8(eng, swu), H,  per);
+                    dequant_fp8_block_to_bf16_kernel<<<(unsigned)((per + 255)/256),256,0,stream>>>(
+                        shbf + 2*per,   swd, wscale_fp8(eng, swd), SI, per);
+                    eng->moe_shbf_ready[l] = 1;
+                }
+                if (shbf) {
+                    f32_to_bf16_kernel<<<(unsigned)(((size_t)cn * H + 255)/256),256,0,stream>>>(
+                        eng->d_moe_xbf, h, (uint64_t)cn * H);
+                    gemm_bf16(eng, shbf,       eng->d_moe_xbf, eng->d_moe_gate, H, SI, cn);
+                    gemm_bf16(eng, shbf + per, eng->d_moe_xbf, eng->d_moe_up,   H, SI, cn);
+                    dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)SI * cn, stream);
+                    f32_to_bf16_kernel<<<(unsigned)(((size_t)cn * SI + 255)/256),256,0,stream>>>(
+                        eng->d_moe_xbf, eng->d_moe_act, (uint64_t)cn * SI);
+                    gemm_bf16(eng, shbf + 2*per, eng->d_moe_xbf, eng->d_moe_xe, SI, H, cn);
+                }
             }
-            dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)SI * cn, stream);
-            for (int b0 = 0; b0 < cn; b0 += FP8_MAXB) {
-                int bb = (cn - b0 < FP8_MAXB) ? (cn - b0) : FP8_MAXB;
-                fp8_block_gemm_launch(eng->d_moe_xe + (size_t)b0 * H, swd, wscale_fp8(eng, swd),
-                                      eng->d_moe_act + (size_t)b0 * SI, SI, H, bb, stream);
+            if (!tc || !eng->d_moe_shbf) {
+                for (int b0 = 0; b0 < cn; b0 += FP8_MAXB) {
+                    int bb = (cn - b0 < FP8_MAXB) ? (cn - b0) : FP8_MAXB;
+                    fp8_block_gemm_launch(eng->d_moe_gate + (size_t)b0 * SI, swg, wscale_fp8(eng, swg),
+                                          h + (size_t)b0 * H, H, SI, bb, stream);
+                    fp8_block_gemm_launch(eng->d_moe_up + (size_t)b0 * SI, swu, wscale_fp8(eng, swu),
+                                          h + (size_t)b0 * H, H, SI, bb, stream);
+                }
+                dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)SI * cn, stream);
+                for (int b0 = 0; b0 < cn; b0 += FP8_MAXB) {
+                    int bb = (cn - b0 < FP8_MAXB) ? (cn - b0) : FP8_MAXB;
+                    fp8_block_gemm_launch(eng->d_moe_xe + (size_t)b0 * H, swd, wscale_fp8(eng, swd),
+                                          eng->d_moe_act + (size_t)b0 * SI, SI, H, bb, stream);
+                }
             }
             m2_gemm(eng->d_moe_shlog, h, (const float*)weight_fp8(eng, eng->moe_sh_gatevec[l]),
                     cn, H, 1, stream);
