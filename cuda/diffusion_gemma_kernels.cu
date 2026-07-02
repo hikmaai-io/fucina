@@ -793,13 +793,30 @@ __global__ void dg_moe_scatter_inv_kernel(const int* tki, const float* tkw, cons
     int ex=tki[i]; int pos=atomicAdd(&cursor[ex],1);
     src[pos]=i/n_used; csc[pos]=tkw[i]*pes[ex]; invpos[i]=pos;
 }
+// Scan variant that ALSO compacts the ids of experts with count>0 into active[0..], padding -1 up
+// to n_slot. Lets a grouped expert GEMM launch a grid of n_slot=min(n_assign,n_expert) blocks
+// (STATIC per batch size → CUDA-graph-safe) instead of all n_expert — at decode B·topk ≪ n_expert
+// that removes thousands of early-return blocks per launch.
+__global__ void dg_moe_scan_active_kernel(const int* count, int* coloff, int* cursor,
+        int n_expert, int* active, int n_slot){
+    if(threadIdx.x==0){
+        int a=0, na=0;
+        for(int e=0;e<n_expert;e++){
+            coloff[e]=a; cursor[e]=a; a+=count[e];
+            if(count[e]>0 && na<n_slot) active[na++]=e;
+        }
+        for(int j=na;j<n_slot;j++) active[j]=-1;
+    }
+}
+// active/n_slot: optional (active=NULL skips) compacted active-expert list, see scan_active above.
 extern "C" void dg_moe_route_inv(const int* tki, const float* tkw, const float* pes,
         int n_tokens, int n_used, int n_expert, int* count, int* coloff, int* cursor,
-        int* src, float* csc, int* invpos, cudaStream_t s){
+        int* src, float* csc, int* invpos, int* active, int n_slot, cudaStream_t s){
     int n_assign=n_tokens*n_used;
     cudaMemsetAsync(count,0,(size_t)n_expert*4,s);
     dg_moe_count_kernel<<<(n_assign+255)/256,256,0,s>>>(tki,n_assign,count);
-    dg_moe_scan_kernel<<<1,32,0,s>>>(count,coloff,cursor,n_expert);
+    if(active) dg_moe_scan_active_kernel<<<1,32,0,s>>>(count,coloff,cursor,n_expert,active,n_slot);
+    else       dg_moe_scan_kernel<<<1,32,0,s>>>(count,coloff,cursor,n_expert);
     dg_moe_scatter_inv_kernel<<<(n_assign+255)/256,256,0,s>>>(tki,tkw,pes,n_assign,n_used,cursor,src,csc,invpos);
 }
 

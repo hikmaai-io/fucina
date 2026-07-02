@@ -43,7 +43,7 @@ extern "C" {
                       cudaStream_t s);
     void dg_moe_route_inv(const int *tki, const float *tkw, const float *pes, int n_tokens, int n_used,
                           int n_expert, int *count, int *coloff, int *cursor, int *src, float *csc,
-                          int *invpos, cudaStream_t s);
+                          int *invpos, int *active, int n_slot, cudaStream_t s);
     void dg_moe_reduce(float *out, const float *oe, const int *invpos, const float *csc,
                        int feat, int n_tokens, int n_used, cudaStream_t s);
     void dg_gather_cols(float *dst, const float *src, const int *idx, int feat, int ncols, cudaStream_t s);
@@ -3786,6 +3786,7 @@ struct gemma4_engine {
     uint64_t        moe_sh_gatevec[GEMMA4_CAP_LAYERS];  // mlp.shared_expert_gate [H] f32 (sigmoid gate)
     int             moe_shared_inter;                   // shared_expert_intermediate (0 = no shared expert)
     float          *d_moe_shlog;     // [TMAX] shared-expert gate logits (per token)
+    int            *d_moe_active;    // [TMAX·n_used] compacted active-expert ids (-1 padded)
 
     // ─── LoRA adapter support ───────────────────────────────────────────
 };
@@ -6214,6 +6215,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_moe_coloff);  CUDA_FREE(eng->d_moe_cursor); CUDA_FREE(eng->d_moe_ones);
     CUDA_FREE(eng->d_moe_xe);      CUDA_FREE(eng->d_moe_gate);  CUDA_FREE(eng->d_moe_up);
     CUDA_FREE(eng->d_moe_act);     CUDA_FREE(eng->d_moe_oe);    CUDA_FREE(eng->d_moe_shlog);
+    CUDA_FREE(eng->d_moe_active);
     CUDA_FREE(eng->d_moe_q8);      CUDA_FREE(eng->d_moe_q8d);   CUDA_FREE(eng->d_moe_q8s);
     CUDA_FREE(eng->d_norm);
     CUDA_FREE(eng->d_norm_w);
@@ -8462,6 +8464,7 @@ static int moe_alloc_scratch(gemma4_engine_t *eng) {
     MOE_A(eng->d_moe_q8d,     (size_t)(H / 32) * A * sizeof(float));
     MOE_A(eng->d_moe_q8s,     (size_t)(H / 32) * A * sizeof(int));
     MOE_A(eng->d_moe_shlog,   (size_t)T * sizeof(float));
+    MOE_A(eng->d_moe_active,  (size_t)A * sizeof(int));
     #undef MOE_A
     if (!ok) { fprintf(stderr, "fucina: MoE scratch alloc failed\n"); return -1; }
     float *ones = (float*)malloc((size_t)E * sizeof(float));
@@ -8511,9 +8514,11 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         // Router → softmax-E → top-U → renorm-to-sum-1 → counting-sort route (pes = ones[E]).
         moe_router_gemv_kernel<<<dim3(E, cn), 256, 0, stream>>>(router_w, h, eng->d_moe_rlogits, H, E);
         dg_softmax_topk(eng->d_moe_rlogits, E, cn, U, eng->d_moe_tki, eng->d_moe_tkw, stream);
+        int n_slot = (total < E) ? total : E;   // grid.y for active-expert grouped GEMMs
         dg_moe_route_inv(eng->d_moe_tki, eng->d_moe_tkw, eng->d_moe_ones, cn, U, E,
                          eng->d_moe_count, eng->d_moe_coloff, eng->d_moe_cursor,
-                         eng->d_moe_eidx, eng->d_moe_ecs, eng->d_moe_invpos, stream);
+                         eng->d_moe_eidx, eng->d_moe_ecs, eng->d_moe_invpos,
+                         fp8 ? eng->d_moe_active : NULL, n_slot, stream);
         // Gather expert inputs → grouped gate/up/down. FP8 keeps FLOAT activations (no Q8_1).
         dg_gather_cols(eng->d_moe_xe, h, eng->d_moe_eidx, H, total, stream);
         if (fp8) {
@@ -8522,12 +8527,15 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             const __nv_bfloat16 *ds = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_down_scales[l]);
             const uint8_t *down_w = weight_fp8(eng, eng->moe_down_exps[l]);
             fp8_block_gemm_grouped_launch(eng->d_moe_gate, (const uint8_t*)gate_w, fp8_wslab, gs, fp8_sslab,
-                                          eng->d_moe_xe, eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
+                                          eng->d_moe_xe, eng->d_moe_coloff, eng->d_moe_count,
+                                          eng->d_moe_active, n_slot, E, H, EFFN, stream);
             fp8_block_gemm_grouped_launch(eng->d_moe_up, (const uint8_t*)up_w, fp8_wslab, us, fp8_sslab,
-                                          eng->d_moe_xe, eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
+                                          eng->d_moe_xe, eng->d_moe_coloff, eng->d_moe_count,
+                                          eng->d_moe_active, n_slot, E, H, EFFN, stream);
             dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
             fp8_block_gemm_grouped_launch(eng->d_moe_oe, down_w, fp8_wslab, ds, fp8_sslab,
-                                          eng->d_moe_act, eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
+                                          eng->d_moe_act, eng->d_moe_coloff, eng->d_moe_count,
+                                          eng->d_moe_active, n_slot, E, EFFN, H, stream);
         } else {
             dg_quantize_q8_1(eng->d_moe_xe, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, H, total, stream);
             dg_mmq_q4_K_grouped(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
@@ -16084,10 +16092,17 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
     }
 
     rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, B, eps);
-    if (eng->format == FORMAT_FP8_BLOCK)   // BF16 untied head per row (Q8_0 flips the 248320 argmax)
-        for (int rr = 0; rr < B; rr++)
-            bf16_head_gemv_launch(eng->d_sb[11]+(size_t)rr*VOC, eng->d_lmhead_bf16, xn+(size_t)rr*H, H, VOC, st);
-    else
+    if (eng->format == FORMAT_FP8_BLOCK) {  // BF16 untied head (Q8_0 flips the 248320 argmax);
+        // weight-read-ONCE batched GEMV in ≤8-row chunks: the 1 GB head is read ceil(B/8)× per
+        // step instead of B× (the per-row loop cost 16 GB/step at B=16 — the batched-decode wall).
+        float *xt = eng->d_q35_sb[Q35_QG];   // per-layer scratch, free at head time; ≥ H·8 floats
+        for (int r0 = 0; r0 < B; r0 += 8) {
+            int K = (B - r0 < 8) ? (B - r0) : 8;
+            nvfp4_xT_launch(xt, xn + (size_t)r0 * H, H, K, st);
+            bf16_head_gemv_batched_launch(eng->d_sb[11] + (size_t)r0 * VOC,
+                                          eng->d_lmhead_bf16, xt, H, VOC, K, st);
+        }
+    } else
         gemv_batched_w(eng, eng->d_sb[11], Wq(eng->tensors.output_weight), xn, H, VOC, B, st, eng->tensors.output_fmt);
     if (want_argmax)
         argmax_rows_kernel<<<B,32,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, B, VOC);

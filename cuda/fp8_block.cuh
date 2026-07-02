@@ -102,13 +102,16 @@ static inline void fp8_block_gemm_launch(
 // expert-contiguously — expert e owns rows [coloff[e], coloff[e]+count[e]) and uses the FP8 weight
 // slab wbase + e*w_stride with block-scale sbase + e*s_stride. Mirrors dg_mmq_*_grouped but the
 // activation is FLOAT (no Q8_1 quant) and the weight is block-FP8. One block per (out-row-tile,
-// expert); the expert's tokens are processed in FP8_MAXB-row chunks (weight read once per chunk).
-// Static grid (n_expert known) → CUDA-graph-capturable. in_dim/out_dim multiples of 128.
+// active-expert slot); the expert's tokens are processed in FP8_MAXB-row chunks (weight read once
+// per chunk). `active` (optional) maps grid slot → expert id (-1 pads) so a decode-sized grid of
+// n_slot=B·topk blocks replaces the full-E grid (E=256 → 32× fewer blocks at B=1). Static grid
+// (n_slot known per B) → CUDA-graph-capturable. in_dim/out_dim multiples of 128.
 static __global__ void fp8_block_gemm_grouped_kernel(
     float *out, const uint8_t *wbase, int64_t w_stride, const __nv_bfloat16 *sbase, int64_t s_stride,
-    const float *x, const int *coloff, const int *count, int in_dim, int out_dim)
+    const float *x, const int *coloff, const int *count, const int *active, int in_dim, int out_dim)
 {
-    int e = blockIdx.y;
+    int e = active ? active[blockIdx.y] : (int)blockIdx.y;
+    if (e < 0) return;
     int cnt = count[e];
     if (cnt <= 0) return;
     int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -148,15 +151,17 @@ static __global__ void fp8_block_gemm_grouped_kernel(
     }
 }
 
+// active/n_slot: optional compacted active-expert list (grid.y = n_slot); active=NULL → grid.y =
+// n_expert with slot==expert (the full-E reference behavior, bitwise-identical per expert).
 static inline void fp8_block_gemm_grouped_launch(
     float *out, const uint8_t *wbase, int64_t w_stride, const __nv_bfloat16 *sbase, int64_t s_stride,
-    const float *x, const int *coloff, const int *count, int n_expert, int in_dim, int out_dim,
-    cudaStream_t stream)
+    const float *x, const int *coloff, const int *count, const int *active, int n_slot,
+    int n_expert, int in_dim, int out_dim, cudaStream_t stream)
 {
     const int WPB = 4;
-    dim3 grid((out_dim + WPB - 1) / WPB, n_expert);
+    dim3 grid((out_dim + WPB - 1) / WPB, active ? n_slot : n_expert);
     fp8_block_gemm_grouped_kernel<<<grid, WPB * 32, 0, stream>>>(
-        out, wbase, w_stride, sbase, s_stride, x, coloff, count, in_dim, out_dim);
+        out, wbase, w_stride, sbase, s_stride, x, coloff, count, active, in_dim, out_dim);
 }
 
 #endif // FUCINA_FP8_BLOCK_CUH

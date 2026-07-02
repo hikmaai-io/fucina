@@ -203,7 +203,7 @@ void dg_moe_route(const int *tki, const float *tkw, const float *pes, int n_toke
 // dg_moe_reduce for a deterministic (atomic-free) per-token expert combine.
 void dg_moe_route_inv(const int *tki, const float *tkw, const float *pes, int n_tokens, int n_used,
                       int n_expert, int *count, int *coloff, int *cursor, int *src, float *csc,
-                      int *invpos, cudaStream_t s);
+                      int *invpos, int *active, int n_slot, cudaStream_t s);
 // Deterministic per-token expert reduce: out[t] = Σ_k oe[invpos[t*n_used+k]]·csc[...] in fixed k
 // order. Replaces the nondeterministic atomicAdd dg_scatteradd_cols. out is fully written.
 void dg_moe_reduce(float *out, const float *oe, const int *invpos, const float *csc,

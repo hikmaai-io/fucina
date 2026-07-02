@@ -110,7 +110,7 @@ int main() {
         CK(cudaMemcpy(d_coloff,coloff,E*sizeof(int),cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_count,cnt,E*sizeof(int),cudaMemcpyHostToDevice));
         fp8_block_gemm_grouped_launch(d_gout, d_gw, (int64_t)OUT*IN, d_gs, (int64_t)gOB*gSB,
-                                      d_gx, d_coloff, d_count, E, IN, OUT, 0);
+                                      d_gx, d_coloff, d_count, NULL, 0, E, IN, OUT, 0);
         CK(cudaDeviceSynchronize());
         std::vector<float> gout((size_t)total*OUT), g1(OUT);
         CK(cudaMemcpy(gout.data(),d_gout,(size_t)total*OUT*sizeof(float),cudaMemcpyDeviceToHost));
@@ -125,6 +125,29 @@ int main() {
         printf("fp8_block_gemm_grouped (E=%d, tokens=%d) == per-expert B=1 : %s (%d mismatches)\n",
                E, total, gmism==0?"PASS":"FAIL", gmism);
         ok = ok && (gmism==0);
+
+        // active-expert-list variant (decode-sized grid.y with -1 padding) must be BITWISE == full-E
+        {
+            const int NSLOT = E + 2;                 // active ids + -1 pads
+            int h_active[NSLOT];
+            for (int e=0;e<E;e++) h_active[e]=e;
+            h_active[E]=-1; h_active[E+1]=-1;
+            int *d_active; float *d_gout2;
+            CK(cudaMalloc(&d_active,NSLOT*sizeof(int)));
+            CK(cudaMalloc(&d_gout2,(size_t)total*OUT*sizeof(float)));
+            CK(cudaMemcpy(d_active,h_active,NSLOT*sizeof(int),cudaMemcpyHostToDevice));
+            fp8_block_gemm_grouped_launch(d_gout2, d_gw, (int64_t)OUT*IN, d_gs, (int64_t)gOB*gSB,
+                                          d_gx, d_coloff, d_count, d_active, NSLOT, E, IN, OUT, 0);
+            CK(cudaDeviceSynchronize());
+            std::vector<float> gout2((size_t)total*OUT);
+            CK(cudaMemcpy(gout2.data(),d_gout2,(size_t)total*OUT*sizeof(float),cudaMemcpyDeviceToHost));
+            int amism=0;
+            for (size_t i=0;i<gout2.size();i++) if (gout2[i]!=gout[i]) amism++;
+            printf("fp8_block_gemm_grouped active-list == full-E : %s (%d mismatches)\n",
+                   amism==0?"PASS":"FAIL", amism);
+            ok = ok && (amism==0);
+            cudaFree(d_active); cudaFree(d_gout2);
+        }
     }
 
     printf("%s\n", ok?"PASS":"FAIL");
