@@ -337,6 +337,7 @@ type Scheduler struct {
 	chunk     ChunkPrefillEngine
 	chunkSize int
 	chunkMin  int
+	chunkAdaptive bool // one-shot long prompts when the batch is idle (chunk-hinting engines)
 
 	// prefixStats is the cross-request prefix-cache observability hook: non-nil when
 	// the engine implements PrefixCacheStatsEngine. The run loop (the sole engine
@@ -412,6 +413,7 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 		if h, ok := engine.(PrefillChunkHinter); ok {
 			if size, min := h.PrefillChunkHint(); size > 0 {
 				s.chunkSize, s.chunkMin = size, min
+				s.chunkAdaptive = true // hinting engines pay per-pass fixed costs → one-shot when idle
 			}
 		}
 		// Overrides: some engines (e.g. the Qwen3.5 hybrid, whose prefill GEMM dequantizes
@@ -696,7 +698,12 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		// cached prefix) and prefilled in pieces interleaved with decode, so it never
 		// blocks the batch. Opening is cheap (no prefill), so it is NOT subject to the
 		// one-shot admit cap below. Very short prompts fall through to the one-shot path.
-		if s.chunk != nil && len(req.Tokens) > s.chunkMin {
+		// ADAPTIVE (chunk-hinting engines only): chunking exists to avoid blocking OTHER
+		// sequences — when the batch is idle (nothing decoding, nothing mid-prefill) there
+		// is nothing to block, and the one-shot prefill is strictly faster (each chunk
+		// re-pays per-pass fixed costs: MoE expert-slab dequants, GDN chunk-scan restarts,
+		// scalar attention for base>0 tiles). Busy batch → chunk; idle → one-shot TTFT.
+		if s.chunk != nil && len(req.Tokens) > s.chunkMin && (!s.chunkAdaptive || held() > 0) {
 			slot, nShared, err := s.chunk.OpenSeq(req.Tokens, req.Params)
 			if err != nil {
 				log.Printf("batch: OpenSeq failed: %v", err)
