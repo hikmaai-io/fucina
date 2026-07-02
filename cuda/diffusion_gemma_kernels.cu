@@ -295,11 +295,16 @@ extern "C" void dg_embed_gather(float *dst, const float *tok, const int *ids, in
 }
 
 // per-token softmax over n_expert → top-k (selection sort) → normalize. One block per token.
+// Probs are computed ONCE in parallel into shared memory; the thread-0 selection then scans
+// smem (the old form recomputed expf inside the k×ne selection loop — 2048 SERIAL expf per
+// token, measured 178 µs/call = 21% of a B=1 MoE-35B decode step). Same expf(L-gmax)/denom
+// values and the same strict-> lowest-index tie-break → bit-identical selection and weights.
 __global__ void dg_softmax_topk_kernel(const float *logits, int ne, int topk, int *oidx, float *ow) {
     int t = blockIdx.x;
     const float *L = logits + (size_t)t * ne;
     __shared__ float sm[256];
     __shared__ float mx[256];
+    __shared__ float pr[256];   // per-expert probs (ne <= 256: DG 128, Qwen3.5-MoE 256)
     float m = -1e30f;
     for (int i = threadIdx.x; i < ne; i += blockDim.x) m = fmaxf(m, L[i]);
     mx[threadIdx.x] = m; __syncthreads();
@@ -310,13 +315,14 @@ __global__ void dg_softmax_topk_kernel(const float *logits, int ne, int topk, in
     sm[threadIdx.x] = se; __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s]; __syncthreads(); }
     float denom = sm[0];
-    // thread 0 does top-k selection on probs (ne<=256: DG 128, Qwen3.5-MoE 256; topk<=8 — cheap)
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) pr[i] = expf(L[i] - gmax) / denom;
+    __syncthreads();
     if (threadIdx.x == 0) {
         float probs_sum = 0.f;
         bool used[256]; for (int i = 0; i < ne; i++) used[i] = false;
         for (int k = 0; k < topk; k++) {
             float best = -1.f; int bi = -1;
-            for (int i = 0; i < ne; i++) { if (!used[i]) { float p = expf(L[i] - gmax) / denom; if (p > best) { best = p; bi = i; } } }
+            for (int i = 0; i < ne; i++) { if (!used[i] && pr[i] > best) { best = pr[i]; bi = i; } }
             used[bi] = true; oidx[t * topk + k] = bi; ow[t * topk + k] = best; probs_sum += best;
         }
         for (int k = 0; k < topk; k++) ow[t * topk + k] /= probs_sum;  // normalize top-k
