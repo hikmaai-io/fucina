@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"os"
 	"sort"
 )
@@ -27,10 +28,39 @@ type hfTokenizer struct {
 	Model struct {
 		Type         string           `json:"type"`
 		Vocab        map[string]int32 `json:"vocab"`
-		Merges       [][]string       `json:"merges"` // ordered [left, right] pairs
+		Merges       []hfMerge        `json:"merges"` // ordered [left, right] pairs
 		ByteFallback bool             `json:"byte_fallback"`
 		UnkToken     string           `json:"unk_token"`
 	} `json:"model"`
+}
+
+// hfMerge accepts BOTH on-disk merge encodings tokenizers emits: the legacy space-joined
+// string "le ft" and the newer ["le","ft"] pair (Qwen3.5 checkpoints use the former, Gemma
+// NVFP4 exports the latter). Always normalized to the [left, right] pair.
+type hfMerge [2]string
+
+func (m *hfMerge) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '[' {
+		var pair []string
+		if err := json.Unmarshal(b, &pair); err != nil {
+			return err
+		}
+		if len(pair) != 2 {
+			return fmt.Errorf("merge pair has %d elements", len(pair))
+		}
+		m[0], m[1] = pair[0], pair[1]
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	sp := strings.IndexByte(s, ' ')
+	if sp < 0 {
+		return fmt.Errorf("merge %q has no space separator", s)
+	}
+	m[0], m[1] = s[:sp], s[sp+1:]
+	return nil
 }
 
 // NewFromHFJSON builds a BPE tokenizer from a HuggingFace tokenizer.json file (the format the
@@ -82,9 +112,6 @@ func NewFromHFJSON(path string) (*Tokenizer, error) {
 	// merges → rank table (index in the list = priority; lower merges first).
 	t.bpeMerges = make(map[mergePair]int32, len(hf.Model.Merges))
 	for rank, m := range hf.Model.Merges {
-		if len(m) != 2 {
-			return nil, fmt.Errorf("tokenizer: malformed merge %d in %s", rank, path)
-		}
 		// First rank wins if a pair somehow repeats (it shouldn't).
 		if _, dup := t.bpeMerges[mergePair{m[0], m[1]}]; !dup {
 			t.bpeMerges[mergePair{m[0], m[1]}] = int32(rank)

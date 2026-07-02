@@ -109,6 +109,16 @@ type SpecBatchEngine interface {
 	StepBatchSpec(reqs []SpecReq) (out [][]int32, err error)
 }
 
+// SpecGater is the optional per-model gate on speculative decoding. An engine that
+// implements it can decline speculation for models where a batched verify does not
+// pay for itself — sparse/MoE models are the canonical case: every drafted token
+// routes to its OWN top-k experts, so the dominant expert weight reads scale with
+// the draft length instead of amortizing like a dense model's single weight pass.
+// Engines that don't implement SpecGater keep speculation default-on.
+type SpecGater interface {
+	SpecWorthwhile() bool
+}
+
 // ChunkPrefillEngine is the optional CHUNKED-PREFILL extension of BatchEngine. When
 // the concrete engine implements it, the scheduler prefills LONG prompts in bounded
 // chunks INTERLEAVED with decode steps of the already-active sequences, instead of
@@ -367,12 +377,17 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 		quit:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
-	// Speculative decoding is a DEFAULT-on capability: if the engine can verify a
-	// batched draft step, use it. The drafter is model-agnostic (prompt-lookup), so
-	// it works for every arch (Qwen3, Gemma) with no extra weights. draftK is the
-	// max per-slot draft length, kept under the verify-row budget so a full draft plus
-	// its anchor fits.
-	if se, ok := engine.(SpecBatchEngine); ok && os.Getenv("FUCINA_NO_BATCH_SPEC") == "" {
+	// Speculative decoding is a DEFAULT-on capability for DENSE models: if the engine
+	// can verify a batched draft step, use it. The drafter is model-agnostic
+	// (prompt-lookup), so it works for every dense arch (Qwen3, Gemma) with no extra
+	// weights. draftK is the max per-slot draft length, kept under the verify-row
+	// budget so a full draft plus its anchor fits. SPARSE/MoE engines decline via
+	// SpecGater (expert reads scale with draft length — spec doesn't bring value there).
+	specOK := true
+	if g, ok := engine.(SpecGater); ok {
+		specOK = g.SpecWorthwhile()
+	}
+	if se, ok := engine.(SpecBatchEngine); ok && specOK && os.Getenv("FUCINA_NO_BATCH_SPEC") == "" {
 		s.spec = se
 		s.draftK = 6
 	}

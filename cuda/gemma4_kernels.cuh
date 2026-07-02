@@ -319,6 +319,7 @@ void gemma4_engine_print_timing(const gemma4_engine_t *eng);
 int  gemma4_engine_get_n_layers(const gemma4_engine_t *eng);
 int  gemma4_engine_get_context_size(const gemma4_engine_t *eng);
 int  gemma4_engine_is_qwen3_family(const gemma4_engine_t *eng);  // 1 for Qwen3 / Qwen3-MoE
+int  gemma4_engine_n_experts(const gemma4_engine_t *eng);        // >0 for sparse/MoE (spec gate)
 
 // Timing accessors for speed logging
 float gemma4_engine_prefill_ms(const gemma4_engine_t *eng);

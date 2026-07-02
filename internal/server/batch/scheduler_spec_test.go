@@ -164,3 +164,43 @@ func TestSpecBudgetNeverExceedsVerifyRows(t *testing.T) {
 		t.Errorf("max verify rows in a step = %d, exceeds budget %d", got, MaxVerifyRows)
 	}
 }
+
+// sparseSpecEngine is a SpecBatchEngine that declines speculation via SpecGater —
+// the sparse/MoE case (expert reads scale with draft length, spec brings no value).
+type sparseSpecEngine struct{ *specEngine }
+
+func (s *sparseSpecEngine) SpecWorthwhile() bool { return false }
+
+// A sparse (MoE) engine implements SpecBatchEngine but declines via SpecGater:
+// the scheduler must leave the spec path OFF and serve plain batched decode.
+func TestSpecGaterDisablesSpecForSparse(t *testing.T) {
+	eng := &sparseSpecEngine{specEngine: &specEngine{mockEngine: newMockEngine(1), accept: 3}}
+	sched := New(eng, 16)
+	if sched.spec != nil {
+		t.Fatal("scheduler enabled speculation for an engine whose SpecGater declined")
+	}
+	sched.Start()
+	defer sched.Shutdown()
+
+	col := &collector{}
+	done := make(chan Result, 1)
+	if err := sched.Submit(Request{
+		Tokens: repeatingPrompt(),
+		MaxNew: 8,
+		Ctx:    context.Background(),
+		Emit:   col.emit,
+		Done:   done,
+	}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	res := waitResult(t, done)
+	if res.Reason != FinishLength {
+		t.Errorf("reason = %q want %q", res.Reason, FinishLength)
+	}
+	if res.Generated != 8 {
+		t.Errorf("generated = %d want 8", res.Generated)
+	}
+	if eng.sawAnyDraft() {
+		t.Error("drafts were verified on a sparse-gated engine — spec path should be off")
+	}
+}

@@ -14130,6 +14130,15 @@ int gemma4_engine_get_n_layers(const gemma4_engine_t *eng) {
     return eng ? eng->cfg.n_layers : 0;
 }
 
+// Detected expert count (0 = dense). The Go scheduler uses this to gate speculative
+// decoding OFF for sparse models: a K-token verify re-reads each drafted token's OWN
+// top-k experts (the dominant weight bytes do NOT amortize across draft rows, unlike a
+// dense model's single weight pass), so spec costs ~K× expert bandwidth for <K accepted
+// tokens — it doesn't bring value on MoE, exactly the case the goal says to avoid.
+int gemma4_engine_n_experts(const gemma4_engine_t *eng) {
+    return (eng && eng->loaded) ? eng->cfg.n_experts : 0;
+}
+
 // Detected architecture family. The Qwen3/Qwen3-MoE forward is served ONLY through
 // the paged multiseq + continuous-batching path (single-flight prefill declines),
 // so the Go server uses this to auto-enable the batch scheduler for those models.

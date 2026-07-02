@@ -167,6 +167,17 @@ func (e *Engine) IsQwen3Family() bool {
 	return C.gemma4_engine_is_qwen3_family(e.ptr) == 1
 }
 
+// NExperts reports the detected sparse-MoE expert count (0 for dense models). The
+// batch scheduler gates speculative decoding OFF when this is >0: a K-token verify
+// re-reads each drafted token's own top-k experts (the dominant weight bytes do not
+// amortize across draft rows like a dense model's single weight pass), so spec does
+// not bring value on sparse models.
+func (e *Engine) NExperts() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return int(C.gemma4_engine_n_experts(e.ptr))
+}
+
 // PrintInfo prints engine configuration to stderr.
 func (e *Engine) PrintInfo() {
 	e.mu.Lock()
@@ -941,6 +952,11 @@ func (a *BatchAdapter) StepBatch(active []int32, inputs []int32) ([][]int32, err
 // MTP verify path is used. Otherwise (any arch, no assistant) the external prompt-lookup
 // drafts are verified via StepBatchSpecExt. Both paths are LOSSLESS: the committed run equals
 // a plain greedy step's output (the C verify enforces it).
+// SpecWorthwhile implements batch.SpecGater: speculation is default-on for dense
+// models and OFF for sparse/MoE, where a verify's expert reads scale with the draft
+// length instead of amortizing (see Engine.NExperts).
+func (a *BatchAdapter) SpecWorthwhile() bool { return a.eng.NExperts() == 0 }
+
 func (a *BatchAdapter) StepBatchSpec(reqs []batch.SpecReq) ([][]int32, error) {
 	if len(reqs) == 0 {
 		return nil, nil
