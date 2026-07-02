@@ -957,6 +957,18 @@ func (a *BatchAdapter) StepBatch(active []int32, inputs []int32) ([][]int32, err
 // length instead of amortizing (see Engine.NExperts).
 func (a *BatchAdapter) SpecWorthwhile() bool { return a.eng.NExperts() == 0 }
 
+// PrefillChunkHint implements batch.PrefillChunkHinter: sparse/MoE engines want
+// FEWER, WIDER prefill passes — every pass dequants the per-layer expert slabs to
+// BF16 for the tensor-core grouped GEMMs, so a 2k prompt in 256-token chunks paid
+// that fixed cost 8x. chunkMin 8192 routes prompts up to the engine prefill tile
+// through the one-shot path (one dequant); longer prompts chunk at 2048.
+func (a *BatchAdapter) PrefillChunkHint() (int, int) {
+	if a.eng.NExperts() > 0 {
+		return 2048, 8192
+	}
+	return 0, 0
+}
+
 func (a *BatchAdapter) StepBatchSpec(reqs []batch.SpecReq) ([][]int32, error) {
 	if len(reqs) == 0 {
 		return nil, nil

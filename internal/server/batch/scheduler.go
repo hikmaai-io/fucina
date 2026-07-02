@@ -119,6 +119,14 @@ type SpecGater interface {
 	SpecWorthwhile() bool
 }
 
+// PrefillChunkHinter is the optional engine-declared prefill-chunking preference.
+// Returns (chunkSize, chunkMin); size <= 0 keeps the scheduler defaults. Sparse/MoE
+// FP8 engines return wide values: each prefill pass pays a per-layer expert-slab
+// dequant, so wide passes amortize it (a 2k prompt in 256-token chunks paid it 8x).
+type PrefillChunkHinter interface {
+	PrefillChunkHint() (size, min int)
+}
+
 // ChunkPrefillEngine is the optional CHUNKED-PREFILL extension of BatchEngine. When
 // the concrete engine implements it, the scheduler prefills LONG prompts in bounded
 // chunks INTERLEAVED with decode steps of the already-active sequences, instead of
@@ -398,6 +406,14 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 		s.chunk = ce
 		s.chunkSize = defaultPrefillChunk
 		s.chunkMin = defaultPrefillChunkMin
+		// Engine-declared chunking preference (batch.PrefillChunkHinter): sparse/MoE FP8
+		// engines dequant per-layer expert slabs per prefill pass, so FEWER, WIDER passes
+		// amortize that fixed cost (256-token chunks repeated it 8x on a 2k prompt).
+		if h, ok := engine.(PrefillChunkHinter); ok {
+			if size, min := h.PrefillChunkHint(); size > 0 {
+				s.chunkSize, s.chunkMin = size, min
+			}
+		}
 		// Overrides: some engines (e.g. the Qwen3.5 hybrid, whose prefill GEMM dequantizes
 		// weights per tile) prefer FEWER, WIDER prefill passes — a large chunkMin routes a
 		// long prompt through the one-shot prefill (one dequant) instead of many 256-token
