@@ -27,13 +27,13 @@ static __global__ void fp8_block_gemv_kernel(
     float acc = 0.0f;
     for (int ib = 0; ib < nblk; ib++) {
         float bs = __bfloat162float(wscale[(size_t)srow * sstride + ib]);
-        float p = 0.0f;                             // Σ fp8(W)·x within this 128-block
-        #pragma unroll
-        for (int t = 0; t < FP8BLK; t += 32) {
-            int i = ib * FP8BLK + lane + t;         // 4 strided elems per lane per block
-            __nv_fp8_e4m3 wb; wb.__x = wrow[i];
-            p += float(wb) * x[i];
-        }
+        // lane owns 4 CONTIGUOUS elems: one uchar4 weight load + one float4 activation load
+        // (4x fewer load instrs than the byte-strided form; wrow is 32B-aligned and in_dim a
+        // multiple of 128, so both vector loads are aligned).
+        uchar4 wq = *((const uchar4 *)(wrow + ib * FP8BLK) + lane);
+        float4 xv = *((const float4 *)(x + ib * FP8BLK) + lane);
+        __nv_fp8_e4m3 w0, w1, w2, w3; w0.__x = wq.x; w1.__x = wq.y; w2.__x = wq.z; w3.__x = wq.w;
+        float p = float(w0)*xv.x + float(w1)*xv.y + float(w2)*xv.z + float(w3)*xv.w;
         acc += bs * p;                              // apply the block scale, accumulate
     }
     #pragma unroll
@@ -70,15 +70,13 @@ static __global__ void fp8_block_gemm_kernel(
     for (int b = 0; b < FP8_MAXB; b++) acc[b] = 0.0f;
     for (int ib = 0; ib < nblk; ib++) {
         float bs = __bfloat162float(wscale[(size_t)srow * sstride + ib]);
-        float wv[4];                               // this lane's 4 fp8 weights for the block
-        #pragma unroll
-        for (int t = 0; t < 4; t++) { __nv_fp8_e4m3 wb; wb.__x = wrow[ib*FP8BLK + lane + t*32]; wv[t] = float(wb); }
+        uchar4 wq = *((const uchar4 *)(wrow + ib * FP8BLK) + lane);   // 4 contiguous elems/lane
+        float wv[4];
+        { __nv_fp8_e4m3 w0, w1, w2, w3; w0.__x = wq.x; w1.__x = wq.y; w2.__x = wq.z; w3.__x = wq.w;
+          wv[0] = float(w0); wv[1] = float(w1); wv[2] = float(w2); wv[3] = float(w3); }
         for (int b = 0; b < B; b++) {
-            const float *xb = x + (size_t)b * in_dim;
-            float p = 0.0f;
-            #pragma unroll
-            for (int t = 0; t < 4; t++) p += wv[t] * xb[ib*FP8BLK + lane + t*32];
-            acc[b] += bs * p;
+            float4 xv = *((const float4 *)(x + (size_t)b * in_dim + ib * FP8BLK) + lane);
+            acc[b] += bs * (wv[0]*xv.x + wv[1]*xv.y + wv[2]*xv.z + wv[3]*xv.w);
         }
     }
     for (int b = 0; b < B; b++) {
@@ -131,15 +129,13 @@ static __global__ void fp8_block_gemm_grouped_kernel(
         for (int b = 0; b < FP8_MAXB; b++) acc[b] = 0.0f;
         for (int ib = 0; ib < nblk; ib++) {
             float bs = __bfloat162float(sc[(size_t)srow * sstride + ib]);
+            uchar4 wq = *((const uchar4 *)(wrow + ib * FP8BLK) + lane);   // 4 contiguous elems/lane
             float wv[4];
-            #pragma unroll
-            for (int t = 0; t < 4; t++) { __nv_fp8_e4m3 wb; wb.__x = wrow[ib*FP8BLK + lane + t*32]; wv[t] = float(wb); }
+            { __nv_fp8_e4m3 w0, w1, w2, w3; w0.__x = wq.x; w1.__x = wq.y; w2.__x = wq.z; w3.__x = wq.w;
+              wv[0] = float(w0); wv[1] = float(w1); wv[2] = float(w2); wv[3] = float(w3); }
             for (int b = 0; b < B; b++) {
-                const float *xb = xe + (size_t)(b0 + b) * in_dim;
-                float p = 0.0f;
-                #pragma unroll
-                for (int t = 0; t < 4; t++) p += wv[t] * xb[ib*FP8BLK + lane + t*32];
-                acc[b] += bs * p;
+                float4 xv = *((const float4 *)(xe + (size_t)(b0 + b) * in_dim + ib * FP8BLK) + lane);
+                acc[b] += bs * (wv[0]*xv.x + wv[1]*xv.y + wv[2]*xv.z + wv[3]*xv.w);
             }
         }
         for (int b = 0; b < B; b++) {
