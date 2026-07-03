@@ -1826,9 +1826,11 @@ static void mmvq_q4_k_packed_batched_launch(
         case 7: LPP_Q4K(7,0); return; case 8: LPP_Q4K(8,0); return;
         default: break;
     }
-    // K>8: 32-row groups (32x weight-read amortization for prefill), then 8-row, then remainder.
+    // K>8: 32-row groups (32x weight-read amortization for prefill), then 16 (B=16 decode reads
+    // the mixer weights ONCE per step instead of twice — 22% of the step was these GEMVs), then 8.
     int o = 0;
     for (; o + 32 <= K; o += 32) LPP_Q4K(32, o);
+    for (; o + 16 <= K; o += 16) LPP_Q4K(16, o);
     for (; o + 8  <= K; o += 8)  LPP_Q4K(8,  o);
     int rem = K - o;
     switch (rem) {
