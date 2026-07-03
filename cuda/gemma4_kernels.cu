@@ -8702,6 +8702,27 @@ static int moe_alloc_scratch(gemma4_engine_t *eng) {
     return 0;
 }
 
+// Element-parallel natural-layout Q4_K → BF16 (the superblock-serial dequant_q4_k_to_bf16
+// kernel runs ONE thread per 256-elem superblock — measured 24 ms per 268M-elem expert slab,
+// 65% of a Q4K-mode MoE prefill). One thread per element; the 16-B headers are L2-hot.
+__global__ void dequant_q4_k_slab_bf16_fast_kernel(
+    __nv_bfloat16 *__restrict__ dst, const uint8_t *__restrict__ src, uint64_t n)
+{
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint64_t sb = i >> 8;
+    int r = (int)(i & 255), j = r >> 5, k = r & 31;
+    const uint8_t *blk = src + sb * 144;
+    __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+    __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+    float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+    int sV, mV; q4k_scale_min(blk + 4, j, &sV, &mV);
+    const uint8_t *qbase = blk + 16 + (size_t)(j >> 1) * 32;
+    int shift = (j & 1) ? 4 : 0;
+    int q = (qbase[k] >> shift) & 0xF;
+    dst[i] = __float2bfloat16(d * (float)sV * (float)q - dmin * (float)mV);
+}
+
 // Dequant a CONTIGUOUS FP8 expert slab (E consecutive [out×in] E4M3 experts, per-expert BF16
 // block-scale slabs) → BF16. Feeds the tensor-core expert prefill GEMMs: the scalar-float
 // grouped FP8 kernel measured 71.6% of a 2k-token MoE prefill (ALU-bound at 16 tok/expert).
@@ -8746,6 +8767,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
     // Q4_K-requantized experts route through the GGUF Q4_K grouped branch below (and skip the
     // FP8 tc-prefill dequant, which reads FP8 slabs). Router/shared expert stay on their paths.
     const int fp8 = (eng->format == FORMAT_FP8_BLOCK) && !eng->moe_experts_q4k;
+    const int tc_ok = (eng->format == FORMAT_FP8_BLOCK);   // tc prefill works for FP8 AND Q4_K slabs
     const float *router_w = (const float*)weight_fp8(eng, eng->moe_router[l]);
     const void  *gate_w   = (const void*)weight_fp8(eng, eng->moe_gate_exps[l]);
     const void  *up_w     = (const void*)weight_fp8(eng, eng->moe_up_exps[l]);
@@ -8757,7 +8779,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
     // LAYER, then per-group cublas GEMMs replace the scalar-float grouped kernel (measured 71.6%
     // of a 2k-token prefill, ALU-bound at ~16 tok/expert). Decode-sized calls keep the FP8 kernel.
     int tc = 0;
-    if (fp8 && n > 2 * FP8_MAXB && E <= 256 && !eng->moe_tc_off) {
+    if (tc_ok && n > 2 * FP8_MAXB && E <= 256 && !eng->moe_tc_off) {
         if (!eng->d_moe_xbf) {
             int xmax = (H > EFFN) ? H : EFFN;
             size_t wb = (size_t)E * EFFN * H * sizeof(__nv_bfloat16);
@@ -8776,10 +8798,15 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             const uint8_t *ws[3] = { (const uint8_t*)gate_w, (const uint8_t*)up_w,
                                      weight_fp8(eng, eng->moe_down_exps[l]) };
             const uint64_t so[3] = { eng->moe_gate_scales[l], eng->moe_up_scales[l], eng->moe_down_scales[l] };
-            for (int p = 0; p < 3; p++)
-                dequant_fp8_expert_slab_bf16_kernel<<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(
-                    eng->d_moe_wbf[p], ws[p], (const __nv_bfloat16*)weight_fp8(eng, so[p]),
-                    (p == 2) ? EFFN : H, (p == 2) ? H : EFFN, ne);
+            for (int p = 0; p < 3; p++) {
+                if (eng->moe_experts_q4k)   // Q4_K slabs: element-parallel natural-layout dequant
+                    dequant_q4_k_slab_bf16_fast_kernel<<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(
+                        eng->d_moe_wbf[p], ws[p], ne);
+                else
+                    dequant_fp8_expert_slab_bf16_kernel<<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(
+                        eng->d_moe_wbf[p], ws[p], (const __nv_bfloat16*)weight_fp8(eng, so[p]),
+                        (p == 2) ? EFFN : H, (p == 2) ? H : EFFN, ne);
+            }
             tc = 1;
         }
     }
