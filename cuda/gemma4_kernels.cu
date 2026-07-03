@@ -8816,6 +8816,13 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         float *out = out_f32 + (size_t)t0 * H;
         int total = cn * U;
         // Router → softmax-E → top-U → renorm-to-sum-1 → counting-sort route (pes = ones[E]).
+        // Wide (prefill) calls ride a cublas SGEMM — the block-per-(expert,token) GEMV re-walks
+        // the router per token and measured 314 ms per 2.9k-token pass (11.6% of prefill).
+        if (cn > 2 * FP8_MAXB) {
+            const float alf = 1.0f, bet = 0.0f;
+            cublasSgemm(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, E, cn, H,
+                        &alf, router_w, H, h, H, &bet, eng->d_moe_rlogits, E);
+        } else
         moe_router_gemv_kernel<<<dim3(E, cn), 256, 0, stream>>>(router_w, h, eng->d_moe_rlogits, H, E);
         dg_softmax_topk(eng->d_moe_rlogits, E, cn, U, eng->d_moe_tki, eng->d_moe_tkw, stream);
         int n_slot = (total < E) ? total : E;   // grid.y for active-expert grouped GEMMs
