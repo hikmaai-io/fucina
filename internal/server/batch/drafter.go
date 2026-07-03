@@ -92,3 +92,71 @@ func promptLookupDraftConf(hist []int32, maxD, minNG, maxNG int) ([]int32, []flo
 	}
 	return nil, nil
 }
+
+// promptLookupDraftInConf is promptLookupDraftConf searching an EXTERNAL corpus: the last
+// ngram of hist is matched against `corpus` (the server-global ring of recently finished
+// sequences' tokens) and the corpus continuations are proposed. This is the cross-request
+// half of suffix decoding (Arctic-Inference-style): agentic loops re-emit each other's
+// prompts and outputs across requests, which a per-sequence history can never see. Same
+// consensus gating; lossless regardless (the engine verify commits only correct tokens).
+func promptLookupDraftInConf(corpus, hist []int32, maxD, minNG, maxNG int) ([]int32, []float32) {
+	if maxD <= 0 || len(corpus) == 0 {
+		return nil, nil
+	}
+	n := len(hist)
+	cn := len(corpus)
+	const maxOcc = 16
+	var occ [maxOcc]int
+	for ng := maxNG; ng >= minNG; ng-- {
+		if n < ng || cn < ng+1 {
+			continue
+		}
+		suf := hist[n-ng:]
+		nocc := 0
+		for i := cn - ng - 1; i >= 0 && nocc < maxOcc; i-- {
+			match := true
+			for j := 0; j < ng; j++ {
+				if corpus[i+j] != suf[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				occ[nocc] = i + ng
+				nocc++
+			}
+		}
+		if nocc == 0 {
+			continue
+		}
+		thresh := nocc/2 + 1
+		cap := maxD
+		if nocc <= 2 && cap > ng {
+			cap = ng
+		}
+		var draft []int32
+		var conf []float32
+		for dd := 0; dd < cap; dd++ {
+			p0 := occ[0] + dd
+			if p0 >= cn {
+				break
+			}
+			cand := corpus[p0]
+			agree := 0
+			for k := 0; k < nocc; k++ {
+				if p := occ[k] + dd; p < cn && corpus[p] == cand {
+					agree++
+				}
+			}
+			if agree < thresh {
+				break
+			}
+			draft = append(draft, cand)
+			conf = append(conf, float32(agree)/float32(nocc))
+		}
+		if len(draft) > 0 {
+			return draft, conf
+		}
+	}
+	return nil, nil
+}

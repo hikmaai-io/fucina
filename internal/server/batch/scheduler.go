@@ -339,6 +339,13 @@ type Scheduler struct {
 	chunkMin  int
 	chunkAdaptive bool // one-shot long prompts when the batch is idle (chunk-hinting engines)
 
+	// corpus is the server-global suffix-decoding ring: the token streams (prompt+output)
+	// of recently finished sequences, capped at specCorpusCap. The drafter falls back to it
+	// when a sequence's own history has no match — the cross-request half of suffix decoding
+	// (agentic loops re-emit each other's text across requests). Speculation-gated engines
+	// (sparse/MoE) never populate it. Lossless: drafts only ever reach the verified path.
+	corpus []int32
+
 	// prefixStats is the cross-request prefix-cache observability hook: non-nil when
 	// the engine implements PrefixCacheStatsEngine. The run loop (the sole engine
 	// caller) snapshots the engine counters into the atomics below each pass so
@@ -961,6 +968,9 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 	for i, slot := range slots {
 		sq := active[slot]
 		d, c := promptLookupDraftConf(sq.hist, s.draftK, 2, s.draftK)
+		if len(d) == 0 && len(s.corpus) > 0 {
+			d, c = promptLookupDraftInConf(s.corpus, sq.hist, s.draftK, 3, s.draftK)
+		}
 		drafts[i] = d
 		if len(c) > 0 {
 			a := make([]float32, len(c))
@@ -1102,11 +1112,21 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 
 // evict frees a sequence's engine slot, removes it from the active set, and
 // delivers its terminal Result. It is safe to call at most once per sequence.
+const specCorpusCap = 1 << 16 // tokens kept in the cross-request suffix-decoding ring
+
 func (s *Scheduler) evict(active map[int]*seq, sq *seq, res Result) {
 	if err := s.engine.RemoveSeq(sq.slot); err != nil {
 		log.Printf("batch: RemoveSeq(%d): %v", sq.slot, err)
 	}
 	delete(active, sq.slot)
+	// Feed the finished sequence's tokens to the cross-request drafter corpus (spec engines
+	// only). Trim from the FRONT so the ring keeps the most recent traffic.
+	if s.spec != nil && len(sq.hist) > 0 {
+		s.corpus = append(s.corpus, sq.hist...)
+		if over := len(s.corpus) - specCorpusCap; over > 0 {
+			s.corpus = append(s.corpus[:0], s.corpus[over:]...)
+		}
+	}
 	reply(sq.req, res)
 }
 

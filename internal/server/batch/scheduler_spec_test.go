@@ -204,3 +204,27 @@ func TestSpecGaterDisablesSpecForSparse(t *testing.T) {
 		t.Error("drafts were verified on a sparse-gated engine — spec path should be off")
 	}
 }
+
+// The cross-request suffix corpus drafts continuations for a NEW sequence whose own
+// history has no repeats, by matching its tail against a finished sequence's tokens.
+func TestCorpusDraftCrossRequest(t *testing.T) {
+	corpus := []int32{7, 8, 9, 1, 2, 3, 4, 5, 6, 42}
+	hist := []int32{100, 101, 1, 2, 3} // tail [1 2 3] occurs in corpus, followed by 4 5 6 42
+	d, c := promptLookupDraftInConf(corpus, hist, 4, 3, 4)
+	if len(d) == 0 {
+		t.Fatal("corpus lookup proposed nothing")
+	}
+	want := []int32{4, 5, 6}
+	for i := range want {
+		if i >= len(d) || d[i] != want[i] {
+			t.Fatalf("draft = %v want prefix %v", d, want)
+		}
+	}
+	if len(c) != len(d) {
+		t.Fatalf("conf len %d != draft len %d", len(c), len(d))
+	}
+	// own-history lookup on the same hist proposes nothing (no internal repeat)
+	if d2, _ := promptLookupDraftConf(hist, 4, 2, 4); len(d2) != 0 {
+		t.Fatalf("own-history draft should be empty, got %v", d2)
+	}
+}
