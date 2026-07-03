@@ -5322,7 +5322,10 @@ gemma4_engine_t* gemma4_engine_create(
 
     // dp4a MMVQ activation-quant scratch (widest in_dim = intermediate).
     // M0: widest projection in_dim is the runtime FFN intermediate.
-    const int q_in = eng->cfg.intermediate;
+    int q_in = eng->cfg.intermediate;   // max dp4a GEMV in_dim: FFN I, GDN inner, attn o-proj, hidden
+    if (eng->cfg.ssm_inner_size > q_in) q_in = eng->cfg.ssm_inner_size;
+    if (eng->cfg.n_heads * eng->cfg.head_dim > q_in) q_in = eng->cfg.n_heads * eng->cfg.head_dim;
+    if (eng->cfg.hidden_size > q_in) q_in = eng->cfg.hidden_size;
     eng->d_qx = NULL; eng->d_dx = NULL; eng->d_sx = NULL;
     cudaMalloc(&eng->d_qx, (size_t)q_in * sizeof(int8_t));
     cudaMalloc(&eng->d_dx, (size_t)(q_in/32) * sizeof(float));
@@ -17443,6 +17446,19 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         else D.push_back({off,nullptr,t->data,(size_t)n*4,-1,nullptr,0});
         return true;
     };
+    // FP8 proj → Q4_K in d_weights (FUCINA_MOE_Q4K mixer requant: 8 → 4.5 bpw; served by the
+    // existing dp4a Q4_K batched GEMV + BF16-dequant prefill). Uses the expert requantizer with E=1.
+    auto put_q4k_from_fp8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int out_dim,int in_dim)->bool{
+        const st::Tensor*w=find(key), *sc=find(key+"_scale_inv");
+        if(!w||!sc){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
+        const uint8_t  *wp=(const uint8_t*)w->data;
+        const uint16_t *sp=(const uint16_t*)sc->data;
+        unsigned char *q4=q35_fp8_experts_to_q4k(&wp,&sp,1,out_dim,in_dim);
+        if(!q4) return false;
+        tofree.push_back(q4);
+        D.push_back({off,fmtp,q4,(size_t)((size_t)out_dim*in_dim/256)*144,FORMAT_Q4_K,nullptr,0});
+        return true;
+    };
     // BF16 tensor → Q8_0 in d_weights (in_a/in_b + lm_head).
     auto put_q8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key)->bool{
         const st::Tensor*t=find(key); if(!t){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
@@ -17461,6 +17477,12 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     };
     const bool moe = qwen35_fp8_is_moe(M, LO);
     const int E = eng->cfg.n_experts, MI = eng->cfg.expert_ffn, SI = eng->moe_shared_inter;
+    // FUCINA_MOE_Q4K also requants the MIXER + SHARED-EXPERT projections (the B=1 bytes lever:
+    // 1.27+0.12 GB FP8 → ~0.72+0.07 GB Q4_K); in_a/in_b/norms/embed/head paths are unchanged.
+    const bool q4k_mode = moe && getenv("FUCINA_MOE_Q4K");
+    auto put_w=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int od,int idm)->bool{
+        return q4k_mode ? put_q4k_from_fp8(off,fmtp,key,od,idm) : put_fp8(off,fmtp,key,od,idm);
+    };
 
     bool ok=true;
     auto &TS=eng->tensors;
@@ -17475,6 +17497,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             ok=ok && put_fp8(&eng->moe_sh_gate[l],nullptr, lk(l,"mlp.shared_expert.gate_proj.weight"), SI, H);
             ok=ok && put_fp8(&eng->moe_sh_up[l],  nullptr, lk(l,"mlp.shared_expert.up_proj.weight"),   SI, H);
             ok=ok && put_fp8(&eng->moe_sh_down[l],nullptr, lk(l,"mlp.shared_expert.down_proj.weight"), H, SI);
+            // (shared expert stays FP8: its GEMMs read wscale_fp8 by pointer — small bytes anyway)
             const size_t wb=(size_t)MI*H, sb=(size_t)((MI+127)/128)*(H/128)*2;   // bytes/expert: FP8 w, BF16 scale
             struct { const char *proj; uint64_t *woff, *soff; } EX[3] = {
                 {"gate_proj", &eng->moe_gate_exps[l], &eng->moe_gate_scales[l]},
@@ -17528,16 +17551,16 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             ok=ok && put_fp8(&T.ffn_down,&T.fmt_down, lk(l,"mlp.down_proj.weight"), H, I);
         }
         if(qwen35fp8::is_full(LO,l)){
-            ok=ok && put_fp8(&T.attn_q,&T.fmt_q, lk(l,"self_attn.q_proj.weight"), 2*NQ*HD, H);
-            ok=ok && put_fp8(&T.attn_k,&T.fmt_k, lk(l,"self_attn.k_proj.weight"), NKV*HD, H);
-            ok=ok && put_fp8(&T.attn_v,&T.fmt_v, lk(l,"self_attn.v_proj.weight"), NKV*HD, H);
-            ok=ok && put_fp8(&T.attn_output,&T.fmt_o, lk(l,"self_attn.o_proj.weight"), H, NQ*HD);
+            ok=ok && put_w(&T.attn_q,&T.fmt_q, lk(l,"self_attn.q_proj.weight"), 2*NQ*HD, H);
+            ok=ok && put_w(&T.attn_k,&T.fmt_k, lk(l,"self_attn.k_proj.weight"), NKV*HD, H);
+            ok=ok && put_w(&T.attn_v,&T.fmt_v, lk(l,"self_attn.v_proj.weight"), NKV*HD, H);
+            ok=ok && put_w(&T.attn_output,&T.fmt_o, lk(l,"self_attn.o_proj.weight"), H, NQ*HD);
             ok=ok && put_f32_from_bf16(&T.attn_q_norm, lk(l,"self_attn.q_norm.weight"), 1.0f,false);
             ok=ok && put_f32_from_bf16(&T.attn_k_norm, lk(l,"self_attn.k_norm.weight"), 1.0f,false);
         } else {
-            ok=ok && put_fp8(&T.ssm.in_qkv,&T.ssm.fmt_in_qkv, lk(l,"linear_attn.in_proj_qkv.weight"), CONVD, H);
-            ok=ok && put_fp8(&T.ssm.in_z,  &T.ssm.fmt_in_z,   lk(l,"linear_attn.in_proj_z.weight"),   INNER, H);
-            ok=ok && put_fp8(&T.ssm.out,   &T.ssm.fmt_out,    lk(l,"linear_attn.out_proj.weight"),    H, INNER);
+            ok=ok && put_w(&T.ssm.in_qkv,&T.ssm.fmt_in_qkv, lk(l,"linear_attn.in_proj_qkv.weight"), CONVD, H);
+            ok=ok && put_w(&T.ssm.in_z,  &T.ssm.fmt_in_z,   lk(l,"linear_attn.in_proj_z.weight"),   INNER, H);
+            ok=ok && put_w(&T.ssm.out,   &T.ssm.fmt_out,    lk(l,"linear_attn.out_proj.weight"),    H, INNER);
             // in_a/in_b (alpha/beta, out=32) stay f32 like the torch oracle (m2_gemm): they feed the
             // GDN decay/beta and the recurrent state compounds Q8_0 error over decode steps.
             ok=ok && put_f32_from_bf16(&T.ssm.in_a, lk(l,"linear_attn.in_proj_a.weight"), 0.0f,false);
