@@ -8751,13 +8751,14 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             const __nv_bfloat16 *us = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_up_scales[l]);
             const __nv_bfloat16 *ds = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_down_scales[l]);
             const uint8_t *down_w = weight_fp8(eng, eng->moe_down_exps[l]);
-            fp8_block_gemm_grouped_launch(eng->d_moe_gate, (const uint8_t*)gate_w, fp8_wslab, gs, fp8_sslab,
+            // FUSED gate+up+SiLU: one launch shares the x reads and routing lookups and writes
+            // silu(gate)*up directly (no gate/up round-trip, no dg_silu_mul launch). Same math
+            // order and __expf as the unfused trio → bit-identical.
+            fp8_block_gemm_grouped_gateup_silu_launch(eng->d_moe_act,
+                                          (const uint8_t*)gate_w, (const uint8_t*)up_w, fp8_wslab,
+                                          gs, us, fp8_sslab,
                                           eng->d_moe_xe, eng->d_moe_coloff, eng->d_moe_count,
                                           eng->d_moe_active, n_slot, E, H, EFFN, stream);
-            fp8_block_gemm_grouped_launch(eng->d_moe_up, (const uint8_t*)up_w, fp8_wslab, us, fp8_sslab,
-                                          eng->d_moe_xe, eng->d_moe_coloff, eng->d_moe_count,
-                                          eng->d_moe_active, n_slot, E, H, EFFN, stream);
-            dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
             fp8_block_gemm_grouped_launch(eng->d_moe_oe, down_w, fp8_wslab, ds, fp8_sslab,
                                           eng->d_moe_act, eng->d_moe_coloff, eng->d_moe_count,
                                           eng->d_moe_active, n_slot, E, EFFN, H, stream);

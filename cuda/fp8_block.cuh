@@ -161,3 +161,79 @@ static inline void fp8_block_gemm_grouped_launch(
 }
 
 #endif // FUCINA_FP8_BLOCK_CUH
+
+// FUSED grouped gate+up+SiLU (MoE decode slice 1): one launch computes act = silu(gate(x))*up(x)
+// for every (expert, token) assignment — the gate and up slabs are indexed identically, so one
+// block computes BOTH projections for its (out-tile, active-expert slot), reading the activation
+// row once and writing silu(g)*u directly (no d_moe_gate/d_moe_up round-trip, no dg_silu_mul).
+// Same math order per projection as fp8_block_gemm_grouped_kernel. Static grid → graph-safe.
+static __global__ void fp8_block_gemm_grouped_gateup_silu_kernel(
+    float *act, const uint8_t *gbase, const uint8_t *ubase, int64_t w_stride,
+    const __nv_bfloat16 *gsbase, const __nv_bfloat16 *usbase, int64_t s_stride,
+    const float *x, const int *coloff, const int *count, const int *active,
+    int in_dim, int out_dim)
+{
+    int e = active ? active[blockIdx.y] : (int)blockIdx.y;
+    if (e < 0) return;
+    int cnt = count[e];
+    if (cnt <= 0) return;
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.x * nwarps + warp;
+    if (idx >= out_dim) return;
+    int off = coloff[e];
+    const uint8_t *gw = gbase + (size_t)e * w_stride;
+    const uint8_t *uw = ubase + (size_t)e * w_stride;
+    const __nv_bfloat16 *gs = gsbase + (size_t)e * s_stride;
+    const __nv_bfloat16 *us = usbase + (size_t)e * s_stride;
+    const float *xe = x + (size_t)off * in_dim;
+    float *ae = act + (size_t)off * out_dim;
+    int nblk = in_dim / FP8BLK, sstride = in_dim / FP8BLK, srow = idx / FP8BLK;
+    const uint8_t *grow = gw + (size_t)idx * in_dim, *urow = uw + (size_t)idx * in_dim;
+    for (int b0 = 0; b0 < cnt; b0 += FP8_MAXB) {
+        int B = (cnt - b0 < FP8_MAXB) ? (cnt - b0) : FP8_MAXB;
+        float gacc[FP8_MAXB], uacc[FP8_MAXB];
+        #pragma unroll
+        for (int b = 0; b < FP8_MAXB; b++) { gacc[b] = 0.0f; uacc[b] = 0.0f; }
+        for (int ib = 0; ib < nblk; ib++) {
+            float gbs = __bfloat162float(gs[(size_t)srow * sstride + ib]);
+            float ubs = __bfloat162float(us[(size_t)srow * sstride + ib]);
+            uchar4 gq = *((const uchar4 *)(grow + ib * FP8BLK) + lane);
+            uchar4 uq = *((const uchar4 *)(urow + ib * FP8BLK) + lane);
+            float gv[4], uv[4];
+            { __nv_fp8_e4m3 a0,a1,a2,a3; a0.__x=gq.x; a1.__x=gq.y; a2.__x=gq.z; a3.__x=gq.w;
+              gv[0]=float(a0); gv[1]=float(a1); gv[2]=float(a2); gv[3]=float(a3); }
+            { __nv_fp8_e4m3 a0,a1,a2,a3; a0.__x=uq.x; a1.__x=uq.y; a2.__x=uq.z; a3.__x=uq.w;
+              uv[0]=float(a0); uv[1]=float(a1); uv[2]=float(a2); uv[3]=float(a3); }
+            for (int b = 0; b < B; b++) {
+                float4 xv = *((const float4 *)(xe + (size_t)(b0 + b) * in_dim + ib * FP8BLK) + lane);
+                gacc[b] += gbs * (gv[0]*xv.x + gv[1]*xv.y + gv[2]*xv.z + gv[3]*xv.w);
+                uacc[b] += ubs * (uv[0]*xv.x + uv[1]*xv.y + uv[2]*xv.z + uv[3]*xv.w);
+            }
+        }
+        for (int b = 0; b < B; b++) {
+            float g = gacc[b], u = uacc[b];
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                g += __shfl_xor_sync(0xFFFFFFFFu, g, o);
+                u += __shfl_xor_sync(0xFFFFFFFFu, u, o);
+            }
+            if (lane == 0) {
+                float sg = g / (1.0f + __expf(-g));   // SiLU, same form as dg_silu_mul
+                ae[(size_t)(b0 + b) * out_dim + idx] = sg * u;
+            }
+        }
+    }
+}
+
+static inline void fp8_block_gemm_grouped_gateup_silu_launch(
+    float *act, const uint8_t *gbase, const uint8_t *ubase, int64_t w_stride,
+    const __nv_bfloat16 *gsbase, const __nv_bfloat16 *usbase, int64_t s_stride,
+    const float *x, const int *coloff, const int *count, const int *active, int n_slot,
+    int n_expert, int in_dim, int out_dim, cudaStream_t stream)
+{
+    const int WPB = 4;
+    dim3 grid((out_dim + WPB - 1) / WPB, active ? n_slot : n_expert);
+    fp8_block_gemm_grouped_gateup_silu_kernel<<<grid, WPB * 32, 0, stream>>>(
+        act, gbase, ubase, w_stride, gsbase, usbase, s_stride, x, coloff, count, active,
+        in_dim, out_dim);
+}
