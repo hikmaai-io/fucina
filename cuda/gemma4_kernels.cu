@@ -16693,11 +16693,11 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             eng->d_head_cand, eng->d_head_cnt, H, eng->d_ms_outtok);
         return;
     } else if (eng->format == FORMAT_FP8_BLOCK) {  // BF16 untied head (lossy heads flip the argmax);
-        // weight-read-ONCE batched GEMV in ≤8-row chunks: the 1 GB head is read ceil(B/8)× per
-        // step instead of B× (the per-row loop cost 16 GB/step at B=16 — the batched-decode wall).
-        float *xt = eng->d_q35_sb[Q35_QG];   // per-layer scratch, free at head time; ≥ H·8 floats
-        for (int r0 = 0; r0 < B; r0 += 8) {
-            int K = (B - r0 < 8) ? (B - r0) : 8;
+        // weight-read-ONCE batched GEMV in ≤16-row chunks: the 1 GB head is read ceil(B/16)× per
+        // step instead of B× (2 passes at B=16 measured 10.5 ms/step — 17% of the decode step).
+        float *xt = eng->d_q35_sb[Q35_QG];   // per-layer scratch, free at head time; ≥ H·16 floats
+        for (int r0 = 0; r0 < B; r0 += 16) {
+            int K = (B - r0 < 16) ? (B - r0) : 16;
             nvfp4_xT_launch(xt, xn + (size_t)r0 * H, H, K, st);
             bf16_head_gemv_batched_launch(eng->d_sb[11] + (size_t)r0 * VOC,
                                           eng->d_lmhead_bf16, xt, H, VOC, K, st);

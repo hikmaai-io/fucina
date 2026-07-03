@@ -13,12 +13,13 @@ int main(int argc, char **argv) {
         : "/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8";
     int NSTEP = (argc > 2) ? atoi(argv[2]) : 96;
     int BMAX  = (argc > 3) ? atoi(argv[3]) : 16;
+    int BMIN  = (argc > 4) ? atoi(argv[4]) : 1;   // single-B profiling: pass BMIN==BMAX
     const int WARM = 6;
 
     gemma4_engine_t *eng = gemma4_engine_create(path, FORMAT_Q4_0, 4096, 0, 0.90);
     if (!eng) { fprintf(stderr, "create failed\n"); return 2; }
 
-    for (int B = 1; B <= BMAX; B <<= 1) {
+    for (int B = BMIN; B <= BMAX; B <<= 1) {
         int slot[64]; int32_t cur[64];
         for (int q = 0; q < B; q++) {
             // distinct short prompts (in-vocab ids) so rows sit at slightly different states
