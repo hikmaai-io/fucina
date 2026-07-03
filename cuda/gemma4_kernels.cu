@@ -3990,6 +3990,22 @@ struct gemma4_engine {
     int             moe_tc_off;      // 1 = tensor-core expert prefill unavailable (alloc failed)
     int             moe_experts_q4k; // 1 = experts requantized FP8→Q4_K at load (fewer decode bytes)
 
+    // NVFP4 grouped-CUTLASS experts (qwen3_5_moe DEFAULT): fused gate|up (N=2·EFFN) + down slabs
+    // per layer, E2M1 packed + per-expert swizzled ue4m3 SF, consumed by dg_fp4_moe_grouped.
+    int             moe_experts_fp4;                 // 1 = experts requantized FP8→NVFP4 at load
+    uint8_t        *d_fp4m_gu[GEMMA4_CAP_LAYERS];    // [E][2·EFFN][H/2] packed E2M1
+    uint8_t        *d_fp4m_gusf[GEMMA4_CAP_LAYERS];  // [E][fp4m_gu_sfB] swizzled ue4m3
+    uint8_t        *d_fp4m_dn[GEMMA4_CAP_LAYERS];    // [E][H][EFFN/2]
+    uint8_t        *d_fp4m_dnsf[GEMMA4_CAP_LAYERS];  // [E][fp4m_dn_sfB]
+    float          *d_fp4m_gsw;                      // device [L·2] per-(layer,proj) global scales
+    unsigned long long fp4m_gu_sfB, fp4m_dn_sfB;     // per-expert SF strides (SF elements)
+    uint8_t        *d_fp4m_a,  *d_fp4m_asf;          // per-step activation E2M1 + padded SF (K=H)
+    uint8_t        *d_fp4m_a2, *d_fp4m_a2sf;         //   " for the down proj (K=EFFN)
+    __nv_bfloat16  *d_fp4m_gu_out;                   // [A][2·EFFN] grouped-GEMM output
+    __nv_bfloat16  *d_fp4m_dn_out;                   // [A][H]
+    int            *d_fp4m_indptr, *d_fp4m_t2e;      // [E+1] prefix / [A] assignment→expert
+    float          *d_fp4m_gsrow;                    // [A] per-row activation global scales
+
     // ─── LoRA adapter support ───────────────────────────────────────────
 };
 
@@ -6422,6 +6438,16 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_moe_act);     CUDA_FREE(eng->d_moe_oe);    CUDA_FREE(eng->d_moe_shlog);
     CUDA_FREE(eng->d_moe_active);
     for (int i = 0; i < 3; i++) CUDA_FREE(eng->d_moe_wbf[i]);
+    for (int i = 0; i < GEMMA4_CAP_LAYERS; i++) {
+        CUDA_FREE(eng->d_fp4m_gu[i]); CUDA_FREE(eng->d_fp4m_gusf[i]);
+        CUDA_FREE(eng->d_fp4m_dn[i]); CUDA_FREE(eng->d_fp4m_dnsf[i]);
+    }
+    CUDA_FREE(eng->d_fp4m_gsw);
+    CUDA_FREE(eng->d_fp4m_a);      CUDA_FREE(eng->d_fp4m_asf);
+    CUDA_FREE(eng->d_fp4m_a2);     CUDA_FREE(eng->d_fp4m_a2sf);
+    CUDA_FREE(eng->d_fp4m_gu_out); CUDA_FREE(eng->d_fp4m_dn_out);
+    CUDA_FREE(eng->d_fp4m_indptr); CUDA_FREE(eng->d_fp4m_t2e);
+    CUDA_FREE(eng->d_fp4m_gsrow);
     CUDA_FREE(eng->d_moe_xbf);     CUDA_FREE(eng->d_moe_shbf);
     CUDA_FREE(eng->d_moe_q8);      CUDA_FREE(eng->d_moe_q8d);   CUDA_FREE(eng->d_moe_q8s);
     CUDA_FREE(eng->d_norm);
@@ -7851,6 +7877,96 @@ static void nvfp4_quantize(const __nv_bfloat16 *X, int rows, int k,
     nvfp4_swizzle_kernel<<<g2,b2,0,st>>>(lin_sc, sw_sc, rows, nblk, kp);
 }
 
+// ── CUTLASS grouped block-scaled NVFP4 experts (qwen3_5_moe) ────────────────────────────────
+// The sm120 ptr-array grouped GEMM in dg_fp4_moe.cu (libdg.a): D bf16 = (A·Bᵀ)·alpha per expert,
+// A/B packed E2M1, SF swizzled ue4m3 with per-expert padded strides. Measured on GB10 vs the
+// dp4a Q4_K grouped GEMV at the 35B expert shapes: 242 GB/s weight-read at 1 tok/expert
+// (dp4a: 114) and 11.7 TFLOP/s at 16 tok/expert — the aggregate-decode AND prefill expert path.
+extern "C" int dg_fp4_moe_grouped(
+    void* D, const void* A, const void* A_sf, const void* B, const void* B_sf,
+    const int* m_indptr, int num_groups, int N, int K,
+    unsigned long long sfA_stride, unsigned long long sfB_stride,
+    const float* alpha, cudaStream_t stream);
+extern "C" void dg_fp4_sf_strides(int M_max, int N, int K,
+    unsigned long long* sfA_stride, unsigned long long* sfB_stride);
+
+// PER-ROW activation global scale: gsrow[t] = amax(X[t])/(6·448). Row-local by construction —
+// a token's quantization must not depend on its batchmates (a batch-global amax made B=3 decode
+// diverge from B=1 on the same rows; the batch self-test's row-independence gate caught it).
+// The row scale is applied OUTSIDE the GEMM (alpha carries only the weight scale): scaling
+// after the silu inputs / down output keeps the math per-row exact.
+__global__ void q35fp4_row_gs_kernel(const float *__restrict__ X, int k, int total, float *gsrow) {
+    int t = blockIdx.x;
+    if (t >= total) return;
+    const float *xr = X + (size_t)t * k;
+    float m = 0.f;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) m = fmaxf(m, fabsf(xr[i]));
+    for (int o=16;o>0;o>>=1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    __shared__ float s[32];
+    int lane = threadIdx.x&31, wid = threadIdx.x>>5;
+    if (lane==0) s[wid]=m;
+    __syncthreads();
+    if (wid==0){ m = (lane < (blockDim.x+31)/32) ? s[lane] : 0.f;
+        for(int o=16;o>0;o>>=1) m=fmaxf(m,__shfl_xor_sync(0xffffffff,m,o));
+        if(lane==0) gsrow[t] = (m>0.f) ? m/(6.0f*448.0f) : 1e-30f; }
+}
+// counting-sort outputs (coloff/count) → m_indptr[E+1] + assignment→expert map [total].
+__global__ void q35fp4_grp_idx_kernel(const int *coloff, const int *count, int E, int total,
+        int *indptr, int *t2e) {
+    int ex = blockIdx.x*blockDim.x + threadIdx.x;
+    if (ex < E) { int off = coloff[ex], c = count[ex]; indptr[ex] = off; for (int j=0;j<c;j++) t2e[off+j]=ex; }
+    if (ex == 0) indptr[E] = total;
+}
+// Fused per-expert activation NVFP4 quant: X[total][k] f32 (expert-contiguous) → packed E2M1
+// [total][k/2] + per-expert PADDED swizzled ue4m3 SF (offset math = nvfp4_swizzle_kernel's
+// layout with the M-tile (row>>7) term, exactly what the CUTLASS grouped mainloop reads).
+__global__ void q35fp4_quant_grp_kernel(const float *__restrict__ X, const int *__restrict__ t2e,
+        const int *__restrict__ indptr, int k, int total, const float *__restrict__ gsrow,
+        uint8_t *__restrict__ A_fp4, uint8_t *__restrict__ A_sf,
+        unsigned long long sfAstride, int nKvec_pad) {
+    int t = blockIdx.y, blk = blockIdx.x*blockDim.x + threadIdx.x, nblk = k/NVFP4_BLK;
+    if (t >= total || blk >= nblk) return;
+    float gs = gsrow[t];
+    const float *xr = X + (size_t)t*k + blk*NVFP4_BLK;
+    float v[NVFP4_BLK], amax = 0.f;
+    #pragma unroll
+    for (int i=0;i<NVFP4_BLK;i++){ v[i]=xr[i]; amax=fmaxf(amax,fabsf(v[i])); }
+    float bs = (amax>0.f) ? amax/6.0f/gs : 0.f;
+    __nv_fp8_storage_t e8 = __nv_cvt_float_to_fp8(bs, __NV_SATFINITE, __NV_E4M3);
+    float div = gs*__half2float(__half(__nv_cvt_fp8_to_halfraw(e8, __NV_E4M3)));
+    if (div <= 0.f) div = 1e30f;
+    uint8_t *o = A_fp4 + (size_t)t*(k/2) + blk*(NVFP4_BLK/2);
+    #pragma unroll
+    for (int i=0;i<NVFP4_BLK;i+=2){
+        float2 p = make_float2(v[i]/div, v[i+1]/div);
+        o[i/2] = (uint8_t)__nv_cvt_float2_to_fp4x2(p, __NV_E2M1, cudaRoundNearest);
+    }
+    int ex = t2e[t], row = t - indptr[ex];
+    int so = blk>>2, si = blk&3, om = row&31, im = (row&127)>>5, mt = row>>7, nKtiles = nKvec_pad>>2;
+    size_t off = (size_t)ex*sfAstride + (size_t)mt*nKtiles*512 + (size_t)so*512 + (size_t)om*16 + im*4 + si;
+    A_sf[off] = (uint8_t)e8;
+}
+// silu(gate)·up from the FUSED [total][2·effn] bf16 grouped-GEMM output (cols 0..effn = gate,
+// effn..2effn = up) → f32, applying the per-row activation scale the GEMM's alpha did not carry.
+// Same x/(1+__expf(-x)) as dg_silu_mul (oracle-parity form).
+__global__ void q35fp4_gu_silu_mul_kernel(float *out, const __nv_bfloat16 *gu,
+        const float *__restrict__ gsrow, int effn, int64_t n) {
+    int64_t i = blockIdx.x*(int64_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int64_t t = i/effn, j = i - t*effn;
+    float gs = gsrow[t];
+    float x = __bfloat162float(gu[t*2*effn + j]) * gs;
+    float u = __bfloat162float(gu[t*2*effn + effn + j]) * gs;
+    out[i] = (x / (1.0f + __expf(-x))) * u;
+}
+// down-proj bf16 output → f32 with the per-row activation scale (K=EFFN quant pass).
+__global__ void q35fp4_dn_scale_kernel(float *out, const __nv_bfloat16 *D,
+        const float *__restrict__ gsrow, int hdim, uint64_t n) {
+    uint64_t i = blockIdx.x*(uint64_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __bfloat162float(D[i]) * gsrow[i / hdim];
+}
+
 // Build persistent NVFP4 weights for every (layer,proj). Dequants each projection
 // (Q4_0/Q8_0 → bf16 in a temp buffer) then NVFP4-quantizes it. Returns 0 / -1.
 static int build_fp4_weights(gemma4_engine_t *eng) {
@@ -8691,6 +8807,24 @@ static int moe_alloc_scratch(gemma4_engine_t *eng) {
     MOE_A(eng->d_moe_q8s,     (size_t)(H / 32) * A * sizeof(int));
     MOE_A(eng->d_moe_shlog,   (size_t)T * sizeof(float));
     MOE_A(eng->d_moe_active,  (size_t)A * sizeof(int));
+    if (eng->moe_experts_fp4) {
+        // CUTLASS grouped NVFP4 per-step scratch. SF buffers sized for the widest per-call
+        // stride (cn = T): pad(T,128) M-rows × pad(K/16,4) K-vecs per expert. Zeroed ONCE —
+        // per-step writes cover every row < M_g, and rows ≥ M_g are only read for the padded
+        // tail of each expert's M-tile, whose outputs the epilogue never stores.
+        const size_t sf1 = (size_t)E * nvfp4_pad(T, 128) * nvfp4_pad(H / NVFP4_BLK, 4);
+        const size_t sf2 = (size_t)E * nvfp4_pad(T, 128) * nvfp4_pad(EFFN / NVFP4_BLK, 4);
+        MOE_A(eng->d_fp4m_a,      (size_t)A * (H / 2));
+        MOE_A(eng->d_fp4m_asf,    sf1);
+        MOE_A(eng->d_fp4m_a2,     (size_t)A * (EFFN / 2));
+        MOE_A(eng->d_fp4m_a2sf,   sf2);
+        MOE_A(eng->d_fp4m_gu_out, (size_t)A * 2 * EFFN * sizeof(__nv_bfloat16));
+        MOE_A(eng->d_fp4m_dn_out, (size_t)A * H * sizeof(__nv_bfloat16));
+        MOE_A(eng->d_fp4m_indptr, (size_t)(E + 1) * sizeof(int));
+        MOE_A(eng->d_fp4m_t2e,    (size_t)A * sizeof(int));
+        MOE_A(eng->d_fp4m_gsrow,  (size_t)A * sizeof(float));
+        if (ok) { cudaMemset(eng->d_fp4m_asf, 0, sf1); cudaMemset(eng->d_fp4m_a2sf, 0, sf2); }
+    }
     #undef MOE_A
     if (!ok) { fprintf(stderr, "fucina: MoE scratch alloc failed\n"); return -1; }
     float *ones = (float*)malloc((size_t)E * sizeof(float));
@@ -8766,8 +8900,10 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
     // Q4_K-requantized experts route through the GGUF Q4_K grouped branch below (and skip the
     // FP8 tc-prefill dequant, which reads FP8 slabs). Router/shared expert stay on their paths.
-    const int fp8 = (eng->format == FORMAT_FP8_BLOCK) && !eng->moe_experts_q4k;
-    const int tc_ok = (eng->format == FORMAT_FP8_BLOCK);   // tc prefill works for FP8 AND Q4_K slabs
+    const int fp8 = (eng->format == FORMAT_FP8_BLOCK) && !eng->moe_experts_q4k && !eng->moe_experts_fp4;
+    // tc prefill works for FP8 AND Q4_K slabs; NVFP4 experts have no dequantable slab (and the
+    // grouped CUTLASS GEMM IS the tensor-core path at every width).
+    const int tc_ok = (eng->format == FORMAT_FP8_BLOCK) && !eng->moe_experts_fp4;
     const float *router_w = (const float*)weight_fp8(eng, eng->moe_router[l]);
     const void  *gate_w   = (const void*)weight_fp8(eng, eng->moe_gate_exps[l]);
     const void  *up_w     = (const void*)weight_fp8(eng, eng->moe_up_exps[l]);
@@ -8832,7 +8968,47 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                          (fp8 || eng->moe_experts_q4k) ? eng->d_moe_active : NULL, n_slot, stream);
         // Gather expert inputs → grouped gate/up/down. FP8 keeps FLOAT activations (no Q8_1).
         dg_gather_cols(eng->d_moe_xe, h, eng->d_moe_eidx, H, total, stream);
-        if (tc) {
+        if (eng->moe_experts_fp4) {
+            // CUTLASS grouped block-scaled NVFP4 experts: quantize the gathered activations per
+            // expert group to E2M1 + swizzled ue4m3 SF, then ONE ptr-array tensor-core GEMM per
+            // projection covers every expert (fused gate|up, then down). Serves decode AND
+            // prefill — 2.1× the dp4a grouped GEMV weight bandwidth at 1 tok/expert, 11+ TFLOP/s
+            // at prefill widths (test_dg_fp4_grouped on GB10).
+            const int GU = 2 * EFFN;
+            auto g1 = [](size_t n){ return (unsigned)((n + 255) / 256); };
+            const int nbH = H / NVFP4_BLK,    nbHp = nvfp4_pad(nbH, 4);
+            const int nbF = EFFN / NVFP4_BLK, nbFp = nvfp4_pad(nbF, 4);
+            const unsigned long long sfA1 = (unsigned long long)nvfp4_pad(cn, 128) * nbHp;
+            const unsigned long long sfA2 = (unsigned long long)nvfp4_pad(cn, 128) * nbFp;
+            q35fp4_grp_idx_kernel<<<(E + 255) / 256, 256, 0, stream>>>(
+                eng->d_moe_coloff, eng->d_moe_count, E, total, eng->d_fp4m_indptr, eng->d_fp4m_t2e);
+            // PER-ROW activation scales (row-independence gate); GEMM alpha carries the weight
+            // global scale only, the row scale is applied in the silu / output-scale kernels.
+            q35fp4_row_gs_kernel<<<total, 256, 0, stream>>>(eng->d_moe_xe, H, total, eng->d_fp4m_gsrow);
+            { dim3 b(256), g((nbH + 255) / 256, total);
+              q35fp4_quant_grp_kernel<<<g, b, 0, stream>>>(eng->d_moe_xe, eng->d_fp4m_t2e,
+                  eng->d_fp4m_indptr, H, total, eng->d_fp4m_gsrow, eng->d_fp4m_a, eng->d_fp4m_asf,
+                  sfA1, nbHp); }
+            int rc = dg_fp4_moe_grouped(eng->d_fp4m_gu_out, eng->d_fp4m_a, eng->d_fp4m_asf,
+                eng->d_fp4m_gu[l], eng->d_fp4m_gusf[l], eng->d_fp4m_indptr,
+                E, GU, H, sfA1, eng->fp4m_gu_sfB, eng->d_fp4m_gsw + 2 * l, stream);
+            q35fp4_gu_silu_mul_kernel<<<g1((size_t)total * EFFN), 256, 0, stream>>>(
+                eng->d_moe_act, eng->d_fp4m_gu_out, eng->d_fp4m_gsrow, EFFN, (int64_t)total * EFFN);
+            q35fp4_row_gs_kernel<<<total, 256, 0, stream>>>(eng->d_moe_act, EFFN, total, eng->d_fp4m_gsrow);
+            { dim3 b(256), g((nbF + 255) / 256, total);
+              q35fp4_quant_grp_kernel<<<g, b, 0, stream>>>(eng->d_moe_act, eng->d_fp4m_t2e,
+                  eng->d_fp4m_indptr, EFFN, total, eng->d_fp4m_gsrow, eng->d_fp4m_a2, eng->d_fp4m_a2sf,
+                  sfA2, nbFp); }
+            rc |= dg_fp4_moe_grouped(eng->d_fp4m_dn_out, eng->d_fp4m_a2, eng->d_fp4m_a2sf,
+                eng->d_fp4m_dn[l], eng->d_fp4m_dnsf[l], eng->d_fp4m_indptr,
+                E, H, EFFN, sfA2, eng->fp4m_dn_sfB, eng->d_fp4m_gsw + 2 * l + 1, stream);
+            q35fp4_dn_scale_kernel<<<g1((size_t)total * H), 256, 0, stream>>>(
+                eng->d_moe_oe, eng->d_fp4m_dn_out, eng->d_fp4m_gsrow, H, (uint64_t)total * H);
+            if (rc) {   // never expected after a successful load-time build + warmup
+                static int warned = 0;
+                if (!warned) { warned = 1; fprintf(stderr, "fucina: dg_fp4_moe_grouped rc=%d — MoE output invalid\n", rc); }
+            }
+        } else if (tc) {
             // Tensor-core grouped expert FFN: ragged per-expert cublas GEMMs over the BF16 slabs.
             // count/coloff come to the host (prefill path — never graph-captured, sync is fine).
             int hc[256], ho[256];
@@ -17448,6 +17624,100 @@ static float q35_fp8_lut_val(int v) {
     return sign * (1.0f + m / 8.0f) * exp2f((float)(e - 7));
 }
 
+// Build the NVFP4 expert slabs for ONE layer from the host FP8 checkpoint tensors: upload each
+// proj's FP8+scales, dequant to BF16 on device, per-(layer,proj) global scale over ALL experts,
+// then per-expert E2M1 quant + 128x4-swizzled ue4m3 SF in exactly the layout dg_fp4_moe_grouped
+// consumes. gate|up are FUSED into one [2*MI][H] group per expert (gate rows 0..MI). 4.5 bpw —
+// same bytes as the Q4_K requant it replaces, but tensor-core-consumable. Returns 0 / -1.
+static int q35_fp4_expert_slabs(gemma4_engine_t *eng, int l, int L,
+        const uint8_t **wg, const uint16_t **sg, const uint8_t **wu, const uint16_t **su,
+        const uint8_t **wd, const uint16_t **sd, int E, int MI, int H) {
+    const int GU = 2 * MI;
+    const size_t wb = (size_t)MI * H;                    // FP8 bytes / expert (all 3 projs)
+    const int sper = ((MI + 127) / 128) * (H / 128);     // BF16 scale elems / expert (all projs)
+    if (!eng->d_fp4m_gsw &&
+        cudaMalloc(&eng->d_fp4m_gsw, (size_t)L * 2 * sizeof(float)) != cudaSuccess) return -1;
+    { unsigned long long a, b;
+      dg_fp4_sf_strides(0, GU, H, &a, &b); eng->fp4m_gu_sfB = b;
+      dg_fp4_sf_strides(0, H, MI, &a, &b); eng->fp4m_dn_sfB = b; }
+    uint8_t *d8 = NULL, *tlin = NULL;
+    __nv_bfloat16 *dsc = NULL, *gbf = NULL, *ubf = NULL;
+    float *amax = NULL;
+    int ok = 1;
+    ok &= cudaMalloc(&d8,   (size_t)E * wb) == cudaSuccess;
+    ok &= cudaMalloc(&dsc,  (size_t)E * sper * sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok &= cudaMalloc(&gbf,  (size_t)E * wb * sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok &= cudaMalloc(&ubf,  (size_t)E * wb * sizeof(__nv_bfloat16)) == cudaSuccess;
+    ok &= cudaMalloc(&tlin, (size_t)GU * (H / NVFP4_BLK)) == cudaSuccess;  // ≥ H*(MI/16) too
+    ok &= cudaMalloc(&amax, sizeof(float)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_fp4m_gu[l],   (size_t)E * GU * (H / 2)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_fp4m_gusf[l], (size_t)E * eng->fp4m_gu_sfB) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_fp4m_dn[l],   (size_t)E * H * (MI / 2)) == cudaSuccess;
+    ok &= cudaMalloc(&eng->d_fp4m_dnsf[l], (size_t)E * eng->fp4m_dn_sfB) == cudaSuccess;
+    if (ok) {
+        cudaMemset(eng->d_fp4m_gusf[l], 0, (size_t)E * eng->fp4m_gu_sfB);
+        cudaMemset(eng->d_fp4m_dnsf[l], 0, (size_t)E * eng->fp4m_dn_sfB);
+    }
+    // upload one proj's E experts + scales, dequant the whole slab to BF16
+    auto dq = [&](const uint8_t **w, const uint16_t **s, int ind, int outd, __nv_bfloat16 *dst) {
+        for (int e = 0; e < E && ok; e++) {
+            ok &= cudaMemcpy(d8 + (size_t)e * wb, w[e], wb, cudaMemcpyHostToDevice) == cudaSuccess;
+            ok &= cudaMemcpy((uint8_t*)dsc + (size_t)e * sper * 2, s[e], (size_t)sper * 2,
+                             cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        uint64_t n = (uint64_t)E * wb;
+        if (ok) dequant_fp8_expert_slab_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
+                    dst, d8, dsc, ind, outd, n);
+    };
+    if (ok) {   // ── fused gate|up: global scale over BOTH tensors, one SF block per expert ──
+        dq(wg, sg, H, MI, gbf);
+        dq(wu, su, H, MI, ubf);
+        cudaMemset(amax, 0, sizeof(float));
+        const uint64_t n = (uint64_t)E * wb;
+        nvfp4_amax_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(gbf, n, amax);
+        nvfp4_amax_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(ubf, n, amax);
+        nvfp4_gs_kernel<<<1, 1>>>(amax, eng->d_fp4m_gsw + 2 * l);
+        const int nb = H / NVFP4_BLK, nbp = nvfp4_pad(nb, 4);
+        for (int e = 0; e < E; e++) {
+            dim3 b(256), g((nb + 255) / 256, MI);
+            uint8_t *fp4 = eng->d_fp4m_gu[l] + (size_t)e * GU * (H / 2);
+            nvfp4_quant_bf16_kernel<<<g, b>>>(gbf + (size_t)e * wb, fp4, tlin,
+                                              MI, H, eng->d_fp4m_gsw + 2 * l);
+            nvfp4_quant_bf16_kernel<<<g, b>>>(ubf + (size_t)e * wb, fp4 + (size_t)MI * (H / 2),
+                                              tlin + (size_t)MI * nb, MI, H, eng->d_fp4m_gsw + 2 * l);
+            dim3 b2(32, 8), g2((nb + 31) / 32, (GU + 7) / 8);
+            nvfp4_swizzle_kernel<<<g2, b2>>>(tlin, eng->d_fp4m_gusf[l] + (size_t)e * eng->fp4m_gu_sfB,
+                                             GU, nb, nbp);
+        }
+    }
+    if (ok) {   // ── down [H][MI] ──
+        dq(wd, sd, MI, H, gbf);
+        cudaMemset(amax, 0, sizeof(float));
+        const uint64_t n = (uint64_t)E * wb;
+        nvfp4_amax_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(gbf, n, amax);
+        nvfp4_gs_kernel<<<1, 1>>>(amax, eng->d_fp4m_gsw + 2 * l + 1);
+        const int nb = MI / NVFP4_BLK, nbp = nvfp4_pad(nb, 4);
+        for (int e = 0; e < E; e++) {
+            dim3 b(256), g((nb + 255) / 256, H);
+            nvfp4_quant_bf16_kernel<<<g, b>>>(gbf + (size_t)e * wb,
+                                              eng->d_fp4m_dn[l] + (size_t)e * H * (MI / 2),
+                                              tlin, H, MI, eng->d_fp4m_gsw + 2 * l + 1);
+            dim3 b2(32, 8), g2((nb + 31) / 32, (H + 7) / 8);
+            nvfp4_swizzle_kernel<<<g2, b2>>>(tlin, eng->d_fp4m_dnsf[l] + (size_t)e * eng->fp4m_dn_sfB,
+                                             H, nb, nbp);
+        }
+    }
+    cudaDeviceSynchronize();
+    if (cudaGetLastError() != cudaSuccess) ok = 0;
+    if (d8) cudaFree(d8);   if (dsc) cudaFree(dsc); if (gbf) cudaFree(gbf);
+    if (ubf) cudaFree(ubf); if (tlin) cudaFree(tlin); if (amax) cudaFree(amax);
+    if (!ok) {
+        auto FR = [](uint8_t *&p){ if (p) { cudaFree(p); p = NULL; } };
+        FR(eng->d_fp4m_gu[l]); FR(eng->d_fp4m_gusf[l]); FR(eng->d_fp4m_dn[l]); FR(eng->d_fp4m_dnsf[l]);
+    }
+    return ok ? 0 : -1;
+}
+
 // Requantize E consecutive FP8 experts (per-expert BF16 128x128 block scales) into ONE contiguous
 // Q4_K slab (E x (out*in/256) x 144 B), threaded across experts. The dominant decode bytes drop
 // 8 -> 4.5 bpw; quality is gated by greedy-match tests, not bitwise parity (double quantization).
@@ -17603,6 +17873,10 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // 8/8 and every self-test bitwise across a full day of gates. FUCINA_MOE_FP8=1 restores the
     // pure-FP8 serving as the escape hatch.
     const bool q4k_mode = moe && !getenv("FUCINA_MOE_FP8");
+    // Experts default to NVFP4 (CUTLASS grouped tensor-core serving, same 4.5 bpw as Q4_K but
+    // 2.1× the grouped weight bandwidth at decode and a no-dequant tensor-core prefill).
+    // FUCINA_MOE_Q4K=1 restores the dp4a Q4_K-requant expert serving; FUCINA_MOE_FP8=1 raw FP8.
+    bool fp4_mode = q4k_mode && !getenv("FUCINA_MOE_Q4K");
     auto put_w=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int od,int idm)->bool{
         return q4k_mode ? put_q4k_from_fp8(off,fmtp,key,od,idm) : put_fp8(off,fmtp,key,od,idm);
     };
@@ -17632,7 +17906,35 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             // machinery (dg_quantize_q8_1 + dg_mmq_q4_K_grouped). Opt-in until the greedy-match
             // quality gate flips it default. All decode-kernel knobs measured flat — fewer bytes
             // is the only remaining decode lever (see moe35b-vllm-headtohead).
-            if(q4k_mode){
+            if(fp4_mode){
+                // NVFP4 experts: gather the 3 projs' host FP8+scale pointers, build the fused
+                // gate|up + down E2M1 slabs on device. Failure on layer 0 falls back to Q4_K;
+                // failure after layer 0 aborts the load (mixed expert formats are not servable).
+                std::vector<const uint8_t*>  w3[3]; std::vector<const uint16_t*> s3[3];
+                bool got=true;
+                for(int p=0; p<3 && got; p++){
+                    w3[p].assign(E,nullptr); s3[p].assign(E,nullptr);
+                    for(int e=0; e<E && got; e++){
+                        char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);
+                        const st::Tensor *w=find(lk(l,buf));
+                        snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight_scale_inv",e,EX[p].proj);
+                        const st::Tensor *sct=find(lk(l,buf));
+                        if(!w||!sct){ got=false; break; }
+                        w3[p][e]=(const uint8_t*)w->data; s3[p][e]=(const uint16_t*)sct->data;
+                    }
+                }
+                if(got && q35_fp4_expert_slabs(eng,l,L,w3[0].data(),s3[0].data(),
+                        w3[1].data(),s3[1].data(),w3[2].data(),s3[2].data(),E,MI,H)==0){
+                    eng->moe_experts_fp4 = 1;
+                } else if(eng->moe_experts_fp4){
+                    fprintf(stderr,"fucina: NVFP4 expert build failed at layer %d — aborting load\n",l);
+                    ok=false;
+                } else {
+                    fprintf(stderr,"fucina: NVFP4 expert build failed — Q4_K expert fallback\n");
+                    fp4_mode=false;
+                }
+            }
+            if(!fp4_mode && q4k_mode){
                 for(int p=0; p<3 && ok; p++){
                     int od = (p==2)? H : MI, idm = (p==2)? MI : H;
                     std::vector<const uint8_t*>  wpv(E, nullptr);
@@ -17657,7 +17959,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     eng->moe_up_slab       = eng->moe_gate_slab;
                     eng->moe_down_slab_q4k = (int64_t)((size_t)H*MI/256)*144;
                 }
-            } else
+            } else if(!fp4_mode)
             for(int p=0; p<3 && ok; p++){
                 for(int e=0; e<E && ok; e++){
                     char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);
