@@ -814,11 +814,50 @@ __global__ void dg_moe_scan_active_kernel(const int* count, int* coloff, int* cu
         for(int j=na;j<n_slot;j++) active[j]=-1;
     }
 }
+// FUSED single-block route (decode/prefill-chunk sizes: n_assign<=4096, n_expert<=1024): one
+// kernel does zero+count (smem atomics), the exclusive scan + active compaction (thread 0 over
+// n_expert — cheap in smem), and the scatter — replacing memset+count+scan+scatter (4 launches,
+// and the single-thread GLOBAL-memory scan that measured 14.8 us/call). Outputs are identical:
+// count/coloff/active are deterministic; the scatter column order comes from atomicAdd cursors
+// exactly as before (nondeterministic order, invpos-compensated — see dg_moe_reduce).
+__global__ void dg_moe_route_inv_fused_kernel(const int* tki, const float* tkw, const float* pes,
+        int n_assign, int n_used, int n_expert, int* count, int* coloff, int* cursor,
+        int* src, float* csc, int* invpos, int* active, int n_slot){
+    extern __shared__ float dgri_sm[];       // raw dynamic smem (typed float TU-wide)
+    int *scount = (int *)dgri_sm, *scur = (int *)dgri_sm + n_expert;   // [n_expert] each
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) scount[e] = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_assign; i += blockDim.x) atomicAdd(&scount[tki[i]], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int a = 0, na = 0;
+        for (int e = 0; e < n_expert; e++) {
+            int c = scount[e];
+            coloff[e] = a; scur[e] = a; count[e] = c; a += c;
+            if (active && c > 0 && na < n_slot) active[na++] = e;
+        }
+        if (active) for (int j = na; j < n_slot; j++) active[j] = -1;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_assign; i += blockDim.x) {
+        int ex = tki[i]; int pos = atomicAdd(&scur[ex], 1);
+        src[pos] = i / n_used; csc[pos] = tkw[i] * pes[ex]; invpos[i] = pos;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) cursor[e] = scur[e];
+}
+
 // active/n_slot: optional (active=NULL skips) compacted active-expert list, see scan_active above.
 extern "C" void dg_moe_route_inv(const int* tki, const float* tkw, const float* pes,
         int n_tokens, int n_used, int n_expert, int* count, int* coloff, int* cursor,
         int* src, float* csc, int* invpos, int* active, int n_slot, cudaStream_t s){
     int n_assign=n_tokens*n_used;
+    if (n_assign <= 4096 && n_expert <= 1024) {
+        dg_moe_route_inv_fused_kernel<<<1, 256, (size_t)2*n_expert*sizeof(int), s>>>(
+            tki, tkw, pes, n_assign, n_used, n_expert, count, coloff, cursor,
+            src, csc, invpos, active, n_slot);
+        return;
+    }
     cudaMemsetAsync(count,0,(size_t)n_expert*4,s);
     dg_moe_count_kernel<<<(n_assign+255)/256,256,0,s>>>(tki,n_assign,count);
     if(active) dg_moe_scan_active_kernel<<<1,32,0,s>>>(count,coloff,cursor,n_expert,active,n_slot);
