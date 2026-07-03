@@ -52,6 +52,8 @@ static inline void fp8_block_gemv_launch(
 }
 
 #define FP8_MAXB 16   // GEMMA4_MAX_SEQS — max rows a batched decode/prefill-chunk step carries
+#define FP8_GMAXB 8   // grouped-kernel chunk: decode has ~1-2 tokens/expert, so 8 covers them
+                      // in one pass at half the acc-register pressure of FP8_MAXB (occupancy)
 
 // BATCHED: out[B][out_dim] = W[out_dim,in_dim] · X[B][in_dim], W FP8 block-scaled. Warp-per-row;
 // the weight bytes are read ONCE per 128-block and reused across the B activation rows (the
@@ -122,11 +124,11 @@ static __global__ void fp8_block_gemm_grouped_kernel(
     float       *oe = out + (size_t)off * out_dim;
     int nblk = in_dim / FP8BLK, sstride = in_dim / FP8BLK, srow = idx / FP8BLK;
     const uint8_t *wrow = w + (size_t)idx * in_dim;
-    for (int b0 = 0; b0 < cnt; b0 += FP8_MAXB) {
-        int B = (cnt - b0 < FP8_MAXB) ? (cnt - b0) : FP8_MAXB;
-        float acc[FP8_MAXB];
+    for (int b0 = 0; b0 < cnt; b0 += FP8_GMAXB) {
+        int B = (cnt - b0 < FP8_GMAXB) ? (cnt - b0) : FP8_GMAXB;
+        float acc[FP8_GMAXB];
         #pragma unroll
-        for (int b = 0; b < FP8_MAXB; b++) acc[b] = 0.0f;
+        for (int b = 0; b < FP8_GMAXB; b++) acc[b] = 0.0f;
         for (int ib = 0; ib < nblk; ib++) {
             float bs = __bfloat162float(sc[(size_t)srow * sstride + ib]);
             uchar4 wq = *((const uchar4 *)(wrow + ib * FP8BLK) + lane);   // 4 contiguous elems/lane
@@ -189,11 +191,11 @@ static __global__ void fp8_block_gemm_grouped_gateup_silu_kernel(
     float *ae = act + (size_t)off * out_dim;
     int nblk = in_dim / FP8BLK, sstride = in_dim / FP8BLK, srow = idx / FP8BLK;
     const uint8_t *grow = gw + (size_t)idx * in_dim, *urow = uw + (size_t)idx * in_dim;
-    for (int b0 = 0; b0 < cnt; b0 += FP8_MAXB) {
-        int B = (cnt - b0 < FP8_MAXB) ? (cnt - b0) : FP8_MAXB;
-        float gacc[FP8_MAXB], uacc[FP8_MAXB];
+    for (int b0 = 0; b0 < cnt; b0 += FP8_GMAXB) {
+        int B = (cnt - b0 < FP8_GMAXB) ? (cnt - b0) : FP8_GMAXB;
+        float gacc[FP8_GMAXB], uacc[FP8_GMAXB];
         #pragma unroll
-        for (int b = 0; b < FP8_MAXB; b++) { gacc[b] = 0.0f; uacc[b] = 0.0f; }
+        for (int b = 0; b < FP8_GMAXB; b++) { gacc[b] = 0.0f; uacc[b] = 0.0f; }
         for (int ib = 0; ib < nblk; ib++) {
             float gbs = __bfloat162float(gs[(size_t)srow * sstride + ib]);
             float ubs = __bfloat162float(us[(size_t)srow * sstride + ib]);
