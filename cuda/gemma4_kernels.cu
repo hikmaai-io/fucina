@@ -53,6 +53,7 @@ extern "C" {
                           cudaStream_t s);
     void dg_mmq_q4_K_grouped(float *out, const void *wbase, int64_t slab_stride, const int8_t *qx,
                              const float *dx, const int *sx, const int *coloff, const int *count,
+                             const int *active, int n_slot,
                              int n_expert, int in_dim, int out_dim, cudaStream_t s);
     void dg_mmq_q8_0_grouped(float *out, const void *wbase, int64_t slab_stride, const int8_t *qx,
                              const float *dx, const int *sx, const int *coloff, const int *count,
@@ -77,6 +78,8 @@ static int moe_alloc_scratch(gemma4_engine_t *eng);          // defined with the
 #include "nvfp4.h"
 #include "nvfp4_loader.h"
 #include "nvfp4_gemv.cuh"
+#include <thread>
+#include <atomic>
 #include "fp8_block.cuh"          // M5: DeepSeek block-fp8 decode GEMV (Qwen3.5-9B FP8)
 #include "qwen35_fp8_loader.h"    // M5: qwen35 FP8 safetensors → engine key mapping
 // =========================================================================
@@ -3918,6 +3921,7 @@ struct gemma4_engine {
     __nv_bfloat16  *d_moe_shbf;      // PERSISTENT BF16 shared-expert projs [L][3][SI·H] (~240 MB)
     int             moe_shbf_ready[GEMMA4_CAP_LAYERS]; // per-layer first-touch dequant done
     int             moe_tc_off;      // 1 = tensor-core expert prefill unavailable (alloc failed)
+    int             moe_experts_q4k; // 1 = experts requantized FP8→Q4_K at load (fewer decode bytes)
 
     // ─── LoRA adapter support ───────────────────────────────────────────
 };
@@ -8669,7 +8673,9 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                     cudaStream_t stream) {
     const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn;
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
-    const int fp8 = (eng->format == FORMAT_FP8_BLOCK);
+    // Q4_K-requantized experts route through the GGUF Q4_K grouped branch below (and skip the
+    // FP8 tc-prefill dequant, which reads FP8 slabs). Router/shared expert stay on their paths.
+    const int fp8 = (eng->format == FORMAT_FP8_BLOCK) && !eng->moe_experts_q4k;
     const float *router_w = (const float*)weight_fp8(eng, eng->moe_router[l]);
     const void  *gate_w   = (const void*)weight_fp8(eng, eng->moe_gate_exps[l]);
     const void  *up_w     = (const void*)weight_fp8(eng, eng->moe_up_exps[l]);
@@ -8719,7 +8725,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         dg_moe_route_inv(eng->d_moe_tki, eng->d_moe_tkw, eng->d_moe_ones, cn, U, E,
                          eng->d_moe_count, eng->d_moe_coloff, eng->d_moe_cursor,
                          eng->d_moe_eidx, eng->d_moe_ecs, eng->d_moe_invpos,
-                         fp8 ? eng->d_moe_active : NULL, n_slot, stream);
+                         (fp8 || eng->moe_experts_q4k) ? eng->d_moe_active : NULL, n_slot, stream);
         // Gather expert inputs → grouped gate/up/down. FP8 keeps FLOAT activations (no Q8_1).
         dg_gather_cols(eng->d_moe_xe, h, eng->d_moe_eidx, H, total, stream);
         if (tc) {
@@ -8764,12 +8770,13 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                                           eng->d_moe_active, n_slot, E, EFFN, H, stream);
         } else {
             dg_quantize_q8_1(eng->d_moe_xe, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, H, total, stream);
+            const int *q4act = eng->moe_experts_q4k ? eng->d_moe_active : NULL;
             dg_mmq_q4_K_grouped(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
-                                eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
+                                eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
             dg_mmq_q4_K_grouped(eng->d_moe_up, up_w, eng->moe_up_slab,
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
-                                eng->d_moe_coloff, eng->d_moe_count, E, H, EFFN, stream);
+                                eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
             // SiLU-GLU → quantize → grouped down (Q4_K native or Q8_0 requant).
             dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
             dg_quantize_q8_1(eng->d_moe_act, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, EFFN, total, stream);
@@ -8781,7 +8788,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                 const void *down_w = (const void*)weight_fp8(eng, eng->moe_down_exps[l]);
                 dg_mmq_q4_K_grouped(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
-                                    eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
+                                    eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, EFFN, H, stream);
             }
         }
         // Combine expert outputs back to tokens, weighted by router prob (d_moe_ecs). Deterministic
@@ -17248,6 +17255,115 @@ static unsigned char *q35_bf16_to_q8_0_host(const uint16_t *src, int64_t n_elem)
     return dst;
 }
 
+// float[256·n_super] → Q4_K superblocks (ggml block_q4_K, 144 B: fp16 d,dmin + 12 B packed
+// 6-bit (scale,min)×8 + 128 B nibbles). Exact inverse of q4k_scale_min + the dequant kernels'
+// element order. Simple one-pass per-sub-block scale/min fit (llama.cpp's make_qkx2 iterative
+// refinement would squeeze ~1% more SQNR; acceptable for the FP8→Q4_K requant path whose gate
+// is a greedy-match quality test, not bitwise parity).
+static void q35_f32_to_q4_K_host(const float *src, unsigned char *dst, int64_t n_super) {
+    for (int64_t sb = 0; sb < n_super; sb++) {
+        const float *w = src + sb * 256;
+        unsigned char *blk = dst + sb * 144;
+        float scales[8], mins[8];
+        for (int j = 0; j < 8; j++) {
+            const float *v = w + j * 32;
+            float lo = v[0], hi = v[0];
+            for (int k = 1; k < 32; k++) { lo = fminf(lo, v[k]); hi = fmaxf(hi, v[k]); }
+            float mn = fmaxf(0.0f, -lo);              // dequant is d·s·q − dmin·m with m ≥ 0
+            float sc = (hi + mn) / 15.0f;
+            scales[j] = fmaxf(sc, 0.0f); mins[j] = mn;
+        }
+        float dmax = 0.0f, mmax = 0.0f;
+        for (int j = 0; j < 8; j++) { dmax = fmaxf(dmax, scales[j]); mmax = fmaxf(mmax, mins[j]); }
+        float d = dmax / 63.0f, dm = mmax / 63.0f;
+        float id = d > 0 ? 1.0f / d : 0.0f, im = dm > 0 ? 1.0f / dm : 0.0f;
+        uint8_t ls6[8], lm6[8];
+        for (int j = 0; j < 8; j++) {
+            int ls = (int)lrintf(scales[j] * id); ls6[j] = (uint8_t)(ls < 0 ? 0 : ls > 63 ? 63 : ls);
+            int lm = (int)lrintf(mins[j]  * im); lm6[j] = (uint8_t)(lm < 0 ? 0 : lm > 63 ? 63 : lm);
+        }
+        uint16_t hd = f2h_host(d), hm = f2h_host(dm);
+        blk[0] = (uint8_t)(hd & 0xFF); blk[1] = (uint8_t)(hd >> 8);
+        blk[2] = (uint8_t)(hm & 0xFF); blk[3] = (uint8_t)(hm >> 8);
+        uint8_t *sc8 = blk + 4;
+        for (int j = 0; j < 12; j++) sc8[j] = 0;
+        for (int j = 0; j < 8; j++) {              // llama.cpp packing (inverse of get_scale_min_k4)
+            if (j < 4) { sc8[j] |= ls6[j]; sc8[j + 4] |= lm6[j]; }
+            else {
+                sc8[j + 4]  = (uint8_t)((ls6[j] & 0xF) | ((lm6[j] & 0xF) << 4));
+                sc8[j - 4] |= (uint8_t)((ls6[j] >> 4) << 6);
+                sc8[j]     |= (uint8_t)((lm6[j] >> 4) << 6);
+            }
+        }
+        uint8_t *qs = blk + 16;
+        for (int g = 0; g < 4; g++) {              // byte m of group g: sub 2g low nibble, 2g+1 high
+            for (int m = 0; m < 32; m++) {
+                int qlo, qhi;
+                {
+                    int j = 2 * g; float ds = d * (float)ls6[j], dmn = dm * (float)lm6[j];
+                    float x = w[j * 32 + m];
+                    qlo = ds > 0 ? (int)lrintf((x + dmn) / ds) : 0;
+                    qlo = qlo < 0 ? 0 : qlo > 15 ? 15 : qlo;
+                }
+                {
+                    int j = 2 * g + 1; float ds = d * (float)ls6[j], dmn = dm * (float)lm6[j];
+                    float x = w[j * 32 + m];
+                    qhi = ds > 0 ? (int)lrintf((x + dmn) / ds) : 0;
+                    qhi = qhi < 0 ? 0 : qhi > 15 ? 15 : qhi;
+                }
+                qs[g * 32 + m] = (uint8_t)(qlo | (qhi << 4));
+            }
+        }
+    }
+}
+
+// Host FP8-E4M3 → float (1s4e3m, bias 7, no inf; S.1111.111 = NaN), via a 256-entry LUT.
+static float q35_fp8_lut_val(int v) {
+    int sg = v >> 7, e = (v >> 3) & 0xF, m = v & 7;
+    float sign = sg ? -1.0f : 1.0f;
+    if (e == 0) return sign * (m / 8.0f) * (1.0f / 64.0f);
+    if (e == 15 && m == 7) return 0.0f;   // NaN encoding never appears in real weights
+    return sign * (1.0f + m / 8.0f) * exp2f((float)(e - 7));
+}
+
+// Requantize E consecutive FP8 experts (per-expert BF16 128x128 block scales) into ONE contiguous
+// Q4_K slab (E x (out*in/256) x 144 B), threaded across experts. The dominant decode bytes drop
+// 8 -> 4.5 bpw; quality is gated by greedy-match tests, not bitwise parity (double quantization).
+static unsigned char *q35_fp8_experts_to_q4k(
+    const uint8_t *const *wp, const uint16_t *const *sp, int E, int out_dim, int in_dim)
+{
+    static float lut[256]; static bool lut_init = false;
+    if (!lut_init) { for (int i = 0; i < 256; i++) lut[i] = q35_fp8_lut_val(i); lut_init = true; }
+    const size_t per_w = (size_t)out_dim * in_dim;
+    const int    sper  = ((out_dim + 127) / 128) * (in_dim / 128);
+    const size_t per_q = per_w / 256 * 144;
+    unsigned char *slab = (unsigned char *)malloc((size_t)E * per_q);
+    if (!slab) return nullptr;
+    std::atomic<int> next(0);
+    std::atomic<bool> fail(false);
+    auto worker = [&]() {
+        std::vector<float> f(per_w);
+        for (;;) {
+            int e = next.fetch_add(1);
+            if (e >= E) break;
+            const uint8_t  *we = wp[e];
+            const uint16_t *se = sp[e];
+            if (!we || !se) { fail = true; break; }
+            for (size_t i = 0; i < per_w; i++) {
+                int row = (int)(i / in_dim), col = (int)(i % in_dim);
+                float bs = q35_bf16_to_f32_host(se[(size_t)(row >> 7) * (in_dim >> 7) + (col >> 7)]);
+                f[i] = lut[we[i]] * bs;
+            }
+            q35_f32_to_q4_K_host(f.data(), slab + (size_t)e * per_q, (int64_t)(per_w / 256));
+        }
+    };
+    std::vector<std::thread> th;
+    for (int t = 0; t < 12; t++) th.emplace_back(worker);
+    for (auto &x : th) x.join();
+    if (fail) { free(slab); return nullptr; }
+    return slab;
+}
+
 // One descriptor per tensor placed into eng->d_weights.
 struct q35fp8_desc { uint64_t *off; uint8_t *fmtp; const void *host; size_t bytes; int fmt; const void *scale_host; size_t scale_bytes; };
 
@@ -17365,6 +17481,37 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                 {"up_proj",   &eng->moe_up_exps[l],   &eng->moe_up_scales[l]},
                 {"down_proj", &eng->moe_down_exps[l], &eng->moe_down_scales[l]},
             };
+            // FUCINA_MOE_Q4K=1: requantize the experts FP8→Q4_K at load (8 → 4.5 bpw on the
+            // dominant decode bytes) and serve them through the EXISTING GGUF Q4_K grouped
+            // machinery (dg_quantize_q8_1 + dg_mmq_q4_K_grouped). Opt-in until the greedy-match
+            // quality gate flips it default. All decode-kernel knobs measured flat — fewer bytes
+            // is the only remaining decode lever (see moe35b-vllm-headtohead).
+            if(getenv("FUCINA_MOE_Q4K")){
+                for(int p=0; p<3 && ok; p++){
+                    int od = (p==2)? H : MI, idm = (p==2)? MI : H;
+                    std::vector<const uint8_t*>  wpv(E, nullptr);
+                    std::vector<const uint16_t*> spv(E, nullptr);
+                    for(int e=0; e<E && ok; e++){
+                        char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);
+                        const st::Tensor *w=find(lk(l,buf));
+                        snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight_scale_inv",e,EX[p].proj);
+                        const st::Tensor *sct=find(lk(l,buf));
+                        if(!w||!sct){ ok=false; break; }
+                        wpv[e]=(const uint8_t*)w->data; spv[e]=(const uint16_t*)sct->data;
+                    }
+                    if(!ok) break;
+                    unsigned char *slab=q35_fp8_experts_to_q4k(wpv.data(), spv.data(), E, od, idm);
+                    if(!slab){ ok=false; break; }
+                    tofree.push_back(slab);
+                    D.push_back({EX[p].woff,nullptr,slab,(size_t)E*((size_t)od*idm/256)*144,-1,nullptr,0});
+                }
+                if(ok){
+                    eng->moe_experts_q4k = 1;
+                    eng->moe_gate_slab     = (int64_t)((size_t)MI*H/256)*144;
+                    eng->moe_up_slab       = eng->moe_gate_slab;
+                    eng->moe_down_slab_q4k = (int64_t)((size_t)H*MI/256)*144;
+                }
+            } else
             for(int p=0; p<3 && ok; p++){
                 for(int e=0; e<E && ok; e++){
                     char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);

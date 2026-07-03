@@ -974,19 +974,24 @@ __device__ __forceinline__ void dg_mmq16_q4_K_tile(
 }
 __global__ void __launch_bounds__(256,6) dg_mmq_q4_K_grouped_kernel(float* out, const uint8_t* wbase, int64_t slab_stride,
         const int8_t* qx, const float* dx, const int* sx,
-        const int* coloff, const int* count, int in_dim, int out_dim){
-    int e=blockIdx.y; int ne=count[e]; if(ne==0) return; int co=coloff[e];
+        const int* coloff, const int* count, const int* active, int in_dim, int out_dim){
+    // active (optional): compacted active-expert list so a DECODE-sized grid.y = B·topk replaces
+    // the full-E grid (E=256 → ~248 early-return blocks per launch at B=1). Same as the FP8
+    // grouped kernel's indirection; -1 pads return immediately.
+    int e = active ? active[blockIdx.y] : (int)blockIdx.y;
+    if(e<0) return;
+    int ne=count[e]; if(ne==0) return; int co=coloff[e];
     const uint8_t* weight=wbase+(size_t)e*slab_stride; int rb=blockIdx.x*DG_GBM;
     for(int cb=0; cb<ne; cb+=DG_GBN){ int nc=ne-cb; if(nc>DG_GBN) nc=DG_GBN;
         dg_mmq16_q4_K_tile(out,weight,qx,dx,sx,in_dim,out_dim,rb,co+cb,nc); __syncthreads(); }
 }
 extern "C" void dg_mmq_q4_K_grouped(float* out, const void* wbase, int64_t slab_stride,
         const int8_t* qx, const float* dx, const int* sx,
-        const int* coloff, const int* count, int n_expert,
+        const int* coloff, const int* count, const int* active, int n_slot, int n_expert,
         int in_dim, int out_dim, cudaStream_t s){
-    dim3 g((unsigned)((out_dim+DG_GBM-1)/DG_GBM), (unsigned)n_expert);
+    dim3 g((unsigned)((out_dim+DG_GBM-1)/DG_GBM), (unsigned)(active ? n_slot : n_expert));
     dg_mmq_q4_K_grouped_kernel<<<g,256,0,s>>>(
-        out,(const uint8_t*)wbase,slab_stride,qx,dx,sx,coloff,count,in_dim,out_dim);
+        out,(const uint8_t*)wbase,slab_stride,qx,dx,sx,coloff,count,active,in_dim,out_dim);
 }
 
 // ── 32-block formats (Q8_0, Q5_0) — the expert/dense `down` projection ───────────────────

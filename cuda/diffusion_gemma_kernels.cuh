@@ -214,7 +214,7 @@ void dg_moe_reduce(float *out, const float *oe, const int *invpos, const float *
 // assignments [in_dim × total] grouped per expert. Q4_K=gate_up; Q8_0/Q5_0=down.
 void dg_mmq_q4_K_grouped(float *out, const void *wbase, int64_t slab_stride,
                          const int8_t *qx, const float *dx, const int *sx,
-                         const int *coloff, const int *count, int n_expert,
+                         const int *coloff, const int *count, const int *active, int n_slot, int n_expert,
                          int in_dim, int out_dim, cudaStream_t s);
 void dg_mmq_q8_0_grouped(float *out, const void *wbase, int64_t slab_stride,
                          const int8_t *qx, const float *dx, const int *sx,
