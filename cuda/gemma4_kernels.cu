@@ -1640,6 +1640,73 @@ __global__ void mmvq_q4_k_batched_kernel(
     for (int n = 0; n < NK; n++) { float v = warp_reduce_sum_all(acc[n]); if (lane==0) out[(size_t)n*out_dim+idx] = v; }
 }
 
+// GROUPED Q4_K decode GEMV (MoE experts, ~1-2 tokens/expert): warp-per-out-row like the FP8
+// grouped kernel, but Q4_K superblocks via dp4a over the Q8_1-quantized gathered activations.
+// The tiled dg_mmq_q4_K_grouped is prefill-shaped (16-column tiles) and measured 49 GB/s at
+// B=1 (94% wasted dp4a on 1-token experts); this GEMV form matches the ~74%-BW mmvq family.
+// grid (out_dim/nwarps, n_slot) with the active-expert indirection; static → graph-safe.
+__global__ void mmvq_q4_k_grouped_gemv_kernel(
+    float *out, const uint8_t *wbase, int64_t slab_stride,
+    const int8_t *qx, const float *dx, const int *sx,
+    const int *coloff, const int *count, const int *active, int in_dim, int out_dim)
+{
+    int e = active ? active[blockIdx.y] : (int)blockIdx.y;
+    if (e < 0) return;
+    int cnt = count[e];
+    if (cnt <= 0) return;
+    int off = coloff[e];
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.x * nwarps + warp;
+    if (idx >= out_dim) return;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    const uint8_t *wrow = wbase + (size_t)e * slab_stride + (size_t)idx * (size_t)n_super * 144;
+    for (int c0 = 0; c0 < cnt; c0 += 8) {          // 8-token chunks (weight re-read per chunk;
+        int cc = (cnt - c0 < 8) ? (cnt - c0) : 8;  //  decode experts hold ~1-2 tokens)
+        float acc[8];
+        #pragma unroll
+        for (int n = 0; n < 8; n++) acc[n] = 0.0f;
+        for (int b = lane; b < nb32; b += 32) {
+            const uint8_t *blk = wrow + (size_t)(b >> 3) * 144;
+            int j = b & 7;
+            __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+            __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+            float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+            int sV, mV; q4k_scale_min(blk + 4, j, &sV, &mV);
+            const uint8_t *qbase = blk + 16 + (size_t)(j >> 1) * 32;
+            int shift = (j & 1) ? 4 : 0;
+            for (int n = 0; n < cc; n++) {
+                const int8_t *qrow = qx + (size_t)(off + c0 + n) * in_dim;
+                int sumi = 0;
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    int qw  = q8_get_int_b2(qbase, k);
+                    int nib = (shift ? (qw >> 4) : qw) & 0x0F0F0F0F;
+                    int xv  = *(const int *)(qrow + (size_t)b * 32 + k * 4);
+                    sumi = __dp4a(nib, xv, sumi);
+                }
+                acc[n] += dx[(size_t)(off + c0 + n) * nb32 + b] *
+                          (d * (float)sV * (float)sumi - dmin * (float)mV * (float)sx[(size_t)(off + c0 + n) * nb32 + b]);
+            }
+        }
+        for (int n = 0; n < cc; n++) {
+            float v = warp_reduce_sum_all(acc[n]);
+            if (lane == 0) out[(size_t)(off + c0 + n) * out_dim + idx] = v;
+        }
+    }
+}
+
+static inline void mmvq_q4_k_grouped_gemv_launch(
+    float *out, const void *wbase, int64_t slab_stride,
+    const int8_t *qx, const float *dx, const int *sx,
+    const int *coloff, const int *count, const int *active, int n_slot, int n_expert,
+    int in_dim, int out_dim, cudaStream_t stream)
+{
+    const int NWARPS = 8; int b = NWARPS * 32;
+    dim3 g((out_dim + NWARPS - 1) / NWARPS, active ? n_slot : n_expert);
+    mmvq_q4_k_grouped_gemv_kernel<<<g, b, 0, stream>>>(
+        out, (const uint8_t *)wbase, slab_stride, qx, dx, sx, coloff, count, active, in_dim, out_dim);
+}
+
 static inline void mmvq_q4_k_launch(
     float *out, const uint8_t *w, const int8_t *qx, const float *dx, const int *sx,
     int in_dim, int out_dim, cudaStream_t stream)
@@ -8774,12 +8841,25 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         } else {
             dg_quantize_q8_1(eng->d_moe_xe, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, H, total, stream);
             const int *q4act = eng->moe_experts_q4k ? eng->d_moe_active : NULL;
+            // Decode-sized calls (<=32 tokens): the warp-per-row grouped GEMV — the tiled MMQ is
+            // prefill-shaped (16-col tiles) and measured 49 GB/s on 1-token experts. Wide calls
+            // (prefill chunks) keep the tile.
+            const bool q4gemv = eng->moe_experts_q4k && cn <= 2 * FP8_MAXB;
+            if (q4gemv) {
+                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
+                                    eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
+                                    eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
+                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_up, up_w, eng->moe_up_slab,
+                                    eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
+                                    eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
+            } else {
             dg_mmq_q4_K_grouped(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                 eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
             dg_mmq_q4_K_grouped(eng->d_moe_up, up_w, eng->moe_up_slab,
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                 eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
+            }
             // SiLU-GLU → quantize → grouped down (Q4_K native or Q8_0 requant).
             dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
             dg_quantize_q8_1(eng->d_moe_act, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, EFFN, total, stream);
@@ -8789,7 +8869,12 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                                     eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
             } else {
                 const void *down_w = (const void*)weight_fp8(eng, eng->moe_down_exps[l]);
-                dg_mmq_q4_K_grouped(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
+                if (q4gemv)
+                    mmvq_q4_k_grouped_gemv_launch(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
+                                        eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
+                                        eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, EFFN, H, stream);
+                else
+                    dg_mmq_q4_K_grouped(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                     eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, EFFN, H, stream);
             }
