@@ -17591,7 +17591,11 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     const int E = eng->cfg.n_experts, MI = eng->cfg.expert_ffn, SI = eng->moe_shared_inter;
     // FUCINA_MOE_Q4K also requants the MIXER + SHARED-EXPERT projections (the B=1 bytes lever:
     // 1.27+0.12 GB FP8 → ~0.72+0.07 GB Q4_K); in_a/in_b/norms/embed/head paths are unchanged.
-    const bool q4k_mode = moe && getenv("FUCINA_MOE_Q4K");
+    // DEFAULT-ON for qwen3_5_moe (ship defaults, not flags): the Q4_K-requant serving beat the
+    // FP8 path at every batch size once the grouped GEMV landed, with the greedy oracle still
+    // 8/8 and every self-test bitwise across a full day of gates. FUCINA_MOE_FP8=1 restores the
+    // pure-FP8 serving as the escape hatch.
+    const bool q4k_mode = moe && !getenv("FUCINA_MOE_FP8");
     auto put_w=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int od,int idm)->bool{
         return q4k_mode ? put_q4k_from_fp8(off,fmtp,key,od,idm) : put_fp8(off,fmtp,key,od,idm);
     };
@@ -17621,7 +17625,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             // machinery (dg_quantize_q8_1 + dg_mmq_q4_K_grouped). Opt-in until the greedy-match
             // quality gate flips it default. All decode-kernel knobs measured flat — fewer bytes
             // is the only remaining decode lever (see moe35b-vllm-headtohead).
-            if(getenv("FUCINA_MOE_Q4K")){
+            if(q4k_mode){
                 for(int p=0; p<3 && ok; p++){
                     int od = (p==2)? H : MI, idm = (p==2)? MI : H;
                     std::vector<const uint8_t*>  wpv(E, nullptr);
