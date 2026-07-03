@@ -17606,6 +17606,31 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         eng->fp8_scale_tab[j+1]=key; }
     for(void*p:tofree) free(p);
 
+    // FUCINA_MOE_Q4K: repack the requanted Q4_K mixer projections in place (de-interleaved
+    // superblocks → the coalesced-uint4 mmvq_q4_k_packed kernels, ~74% of BW on the GGUF path
+    // vs the natural-layout GEMV this mode ran at). gemv_w / gemv_batched_w / the prefill
+    // dequant all branch on use_packed_q4k, which checks the PER-TENSOR fmt — the Q4_K expert
+    // slabs (fmt=-1 raw, consumed natural by dg_mmq + the tc-prefill dequant) are excluded.
+    if(q4k_mode){
+        size_t maxb=0; int nq4=0;
+        for(auto&d:D) if(d.fmt==FORMAT_Q4_K){ if(d.bytes>maxb) maxb=d.bytes; nq4++; }
+        uint8_t *tmp=NULL;
+        if(nq4>0 && cudaMalloc(&tmp,maxb)==cudaSuccess){
+            for(auto&d:D) if(d.fmt==FORMAT_Q4_K){
+                uint64_t ns=d.bytes/144;
+                uint8_t *dst=eng->d_weights + *d.off;   // tdata_start == 0
+                repack_q4_k_kernel<<<(unsigned)((ns+255)/256),256>>>(dst,tmp,ns);
+                cudaMemcpy(dst,tmp,d.bytes,cudaMemcpyDeviceToDevice);
+            }
+            cudaDeviceSynchronize();
+            if(cudaGetLastError()==cudaSuccess){
+                eng->q4k_packed=1;
+                fprintf(stderr,"fucina: qwen35-Q4K mixer repacked in place (%d tensors → packed dp4a GEMV)\n",nq4);
+            } else fprintf(stderr,"fucina: qwen35-Q4K repack error — natural-layout Q4_K kept\n");
+            cudaFree(tmp);
+        }
+    }
+
     // token_embd → Q8_0 (separate d_token_embd; embed_w reads it).
     const st::Tensor *embT=M.find(LO.embed_key);
     if(!embT){ return -5; }
