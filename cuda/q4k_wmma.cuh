@@ -64,21 +64,30 @@ __global__ void q4k_wmma_grouped_kernel(
                 sA[m][k] = (m < nreal) ? __float2bfloat16(xg[(size_t)m * in_dim + k0 + k])
                                        : __float2bfloat16(0.0f);
             }
-            // stage B: warp w decodes its 16 weight rows for k [k0, k0+16)
+            // stage B: lane<16 stages ONE weight row's 16-elem k-segment — a 16-step always sits
+            // inside a single 32-elem sub-block, so the header/scale decode happens ONCE per
+            // (row, k-step) instead of per element (the naive form measured ~58 GB/s; this is
+            // the dp4a kernels' vectorized-staging trick).
             int rbase = n0 + warp * 16;
-            for (int t = lane; t < 16 * 16; t += 32) {
-                int r = t >> 4, k = t & 15;
-                int row = rbase + r, kk = k0 + k;
+            if (lane < 16) {
+                int row = rbase + lane, kk = k0;
                 const uint8_t *blk = wslab + ((size_t)row * n_super_row + (kk >> 8)) * 144;
-                int r256 = kk & 255, j = r256 >> 5, kin = r256 & 31;
+                int r256 = kk & 255, j = r256 >> 5, kin0 = r256 & 31;
                 __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
                 __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
                 float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
                 int sV, mV; q4kw_scale_min(blk + 4, j, &sV, &mV);
-                const uint8_t *qbase = blk + 16 + (size_t)(j >> 1) * 32;
+                float ds = d * (float)sV, dm2 = dmin * (float)mV;
+                const uint8_t *qbase = blk + 16 + (size_t)(j >> 1) * 32 + kin0;
                 int shift = (j & 1) ? 4 : 0;
-                int q = (qbase[kin] >> shift) & 0xF;
-                sB[warp][r][k] = __float2bfloat16(d * (float)sV * (float)q - dmin * (float)mV);
+                uint32_t qw[4];
+                #pragma unroll
+                for (int u = 0; u < 4; u++) qw[u] = *(const uint32_t *)(qbase + 4 * u);
+                #pragma unroll
+                for (int k = 0; k < 16; k++) {
+                    int q = (int)((qw[k >> 2] >> ((k & 3) * 8 + shift)) & 0xF);
+                    sB[warp][lane][k] = __float2bfloat16(ds * (float)q - dm2);
+                }
             }
             __syncthreads();
 
