@@ -46,8 +46,11 @@ __global__ void q4k_wmma_grouped_kernel(
     const uint8_t *wslab = wbase + (size_t)e * slab_stride;
     int n_super_row = in_dim >> 8;
 
-    __shared__ __nv_bfloat16 sA[Q4KW_MTILE][24];             // A tile (stride 24: bank-friendly)
-    __shared__ __nv_bfloat16 sB[4][16][24];                  // per-warp W subtile
+    // 64-wide k-tiles: ONE staging round + sync feeds FOUR mma_sync steps (the 16-wide form
+    // paid 2 block-syncs per 256 B of weights per warp — structurally sync-bound at 68 GB/s).
+    #define Q4KW_KTILE 64
+    __shared__ __nv_bfloat16 sA[Q4KW_MTILE][Q4KW_KTILE + 8];
+    __shared__ __nv_bfloat16 sB[4][16][Q4KW_KTILE + 8];
     __shared__ float sC[4][16][16];
 
     for (int g0 = 0; g0 < cnt; g0 += Q4KW_MTILE) {
@@ -57,36 +60,36 @@ __global__ void q4k_wmma_grouped_kernel(
         nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> c;
         nvcuda::wmma::fill_fragment(c, 0.0f);
 
-        for (int k0 = 0; k0 < in_dim; k0 += 16) {
-            // stage A: whole block fills the 16x16 token tile (rows >= nreal are zero)
-            for (int t = threadIdx.x; t < Q4KW_MTILE * 16; t += blockDim.x) {
-                int m = t >> 4, k = t & 15;
+        int rbase = n0 + warp * 16;
+        for (int k0 = 0; k0 < in_dim; k0 += Q4KW_KTILE) {
+            // stage A: 16 tok × 64 k (1024 elems / 128 threads = 8 each)
+            for (int t = threadIdx.x; t < Q4KW_MTILE * Q4KW_KTILE; t += blockDim.x) {
+                int m = t / Q4KW_KTILE, k = t % Q4KW_KTILE;
                 sA[m][k] = (m < nreal) ? __float2bfloat16(xg[(size_t)m * in_dim + k0 + k])
                                        : __float2bfloat16(0.0f);
             }
-            // stage B: lane<16 stages ONE weight row's 16-elem k-segment — a 16-step always sits
-            // inside a single 32-elem sub-block, so the header/scale decode happens ONCE per
-            // (row, k-step) instead of per element (the naive form measured ~58 GB/s; this is
-            // the dp4a kernels' vectorized-staging trick).
-            int rbase = n0 + warp * 16;
-            if (lane < 16) {
-                int row = rbase + lane, kk = k0;
+            // stage B: each lane owns (row = lane&15, 32-elem sub-block = lane>>4) — one header
+            // decode + eight uint32 quant loads per FULL sub-block, all 32 lanes busy.
+            for (int task = lane; task < 16 * (Q4KW_KTILE / 32); task += 32) {
+                int r = task & 15, half = task >> 4;           // sub-block index within the k-tile
+                int row = rbase + r, kk = k0 + half * 32;
                 const uint8_t *blk = wslab + ((size_t)row * n_super_row + (kk >> 8)) * 144;
-                int r256 = kk & 255, j = r256 >> 5, kin0 = r256 & 31;
+                int r256 = kk & 255, j = r256 >> 5;
                 __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
                 __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
                 float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
                 int sV, mV; q4kw_scale_min(blk + 4, j, &sV, &mV);
                 float ds = d * (float)sV, dm2 = dmin * (float)mV;
-                const uint8_t *qbase = blk + 16 + (size_t)(j >> 1) * 32 + kin0;
+                const uint8_t *qbase = blk + 16 + (size_t)(j >> 1) * 32;
                 int shift = (j & 1) ? 4 : 0;
-                uint32_t qw[4];
                 #pragma unroll
-                for (int u = 0; u < 4; u++) qw[u] = *(const uint32_t *)(qbase + 4 * u);
-                #pragma unroll
-                for (int k = 0; k < 16; k++) {
-                    int q = (int)((qw[k >> 2] >> ((k & 3) * 8 + shift)) & 0xF);
-                    sB[warp][lane][k] = __float2bfloat16(ds * (float)q - dm2);
+                for (int u = 0; u < 8; u++) {
+                    uint32_t qw = *(const uint32_t *)(qbase + 4 * u);
+                    #pragma unroll
+                    for (int b4 = 0; b4 < 4; b4++) {
+                        int q = (int)((qw >> (b4 * 8 + shift)) & 0xF);
+                        sB[warp][r][half * 32 + u * 4 + b4] = __float2bfloat16(ds * (float)q - dm2);
+                    }
                 }
             }
             __syncthreads();
@@ -95,9 +98,12 @@ __global__ void q4k_wmma_grouped_kernel(
                                    nvcuda::wmma::row_major> a;
             nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
                                    nvcuda::wmma::col_major> b;
-            nvcuda::wmma::load_matrix_sync(a, &sA[0][0], 24);
-            nvcuda::wmma::load_matrix_sync(b, &sB[warp][0][0], 24);   // W[n][k] rows = kxn col-major
-            nvcuda::wmma::mma_sync(c, a, b, c);
+            #pragma unroll
+            for (int kt = 0; kt < Q4KW_KTILE; kt += 16) {
+                nvcuda::wmma::load_matrix_sync(a, &sA[0][kt], Q4KW_KTILE + 8);
+                nvcuda::wmma::load_matrix_sync(b, &sB[warp][0][kt], Q4KW_KTILE + 8);
+                nvcuda::wmma::mma_sync(c, a, b, c);
+            }
             __syncthreads();
         }
 
