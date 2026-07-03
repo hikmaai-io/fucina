@@ -317,14 +317,39 @@ __global__ void dg_softmax_topk_kernel(const float *logits, int ne, int topk, in
     float denom = sm[0];
     for (int i = threadIdx.x; i < ne; i += blockDim.x) pr[i] = expf(L[i] - gmax) / denom;
     __syncthreads();
+    // PARALLEL top-k selection: topk iterative block-wide argmax reductions (each thread scans its
+    // strided share, then a tree reduce picks the global max with LOWEST-index tie-break) instead of
+    // the old 2048 serial comparisons on thread 0 — the grid is only `tokens` blocks, so that serial
+    // tail dominated (~76 us/call = 7% of a B=8 MoE decode step). Result is bit-identical: strict '>'
+    // keeps the lowest index on ties, same probs, same renormalization.
+    __shared__ float rv[128];
+    __shared__ int   ri[128];
+    __shared__ int   chosen[64];   // topk <= 64
+    for (int k = 0; k < topk; k++) {
+        float bv = -1.f; int bi = 0x7fffffff;
+        for (int i = threadIdx.x; i < ne; i += blockDim.x) {
+            float p = pr[i];
+            if (p > bv || (p == bv && i < bi)) { bv = p; bi = i; }   // p==-1 sentinel for used (set below)
+        }
+        rv[threadIdx.x] = bv; ri[threadIdx.x] = bi; __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                float ov = rv[threadIdx.x + s]; int oi = ri[threadIdx.x + s];
+                if (ov > rv[threadIdx.x] || (ov == rv[threadIdx.x] && oi < ri[threadIdx.x])) {
+                    rv[threadIdx.x] = ov; ri[threadIdx.x] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        int bidx = ri[0];
+        if (threadIdx.x == 0) { chosen[k] = bidx; oidx[t * topk + k] = bidx; ow[t * topk + k] = rv[0]; }
+        __syncthreads();
+        if (threadIdx.x == 0) pr[bidx] = -1.f;   // mask the selected expert for the next iteration
+        __syncthreads();
+    }
     if (threadIdx.x == 0) {
         float probs_sum = 0.f;
-        bool used[256]; for (int i = 0; i < ne; i++) used[i] = false;
-        for (int k = 0; k < topk; k++) {
-            float best = -1.f; int bi = -1;
-            for (int i = 0; i < ne; i++) { if (!used[i] && pr[i] > best) { best = pr[i]; bi = i; } }
-            used[bi] = true; oidx[t * topk + k] = bi; ow[t * topk + k] = best; probs_sum += best;
-        }
+        for (int k = 0; k < topk; k++) probs_sum += ow[t * topk + k];
         for (int k = 0; k < topk; k++) ow[t * topk + k] /= probs_sum;  // normalize top-k
     }
 }
