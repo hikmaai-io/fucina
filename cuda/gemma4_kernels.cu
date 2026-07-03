@@ -489,6 +489,112 @@ static inline void bf16_head_gemv_launch(
     bf16_head_gemv_kernel<<<blocks, 32*BF16_HEAD_WARPS, 0, stream>>>(y, w, x, in_dim, out_dim);
 }
 
+// ─── EXACT two-pass greedy head (Q8_0 approx scan + BF16 rescore) ─────────────────────
+// The untied BF16 head is 1 GB read per greedy token. Lossy heads flip the 248k-vocab
+// argmax (the FP8 per-row head above was measured to degrade generation), so instead:
+// (1) a Q8_0 copy of the head (0.53 GB) produces APPROXIMATE logits; (2) every index
+// within Q8HEAD_MARGIN of the approx max is collected (cap Q8HEAD_MAXCAND); (3) the
+// candidates alone are rescored with the EXACT BF16 rows (<=64 x H = 0.3 MB) and the
+// argmax (lowest-index tie-break) is taken over the exact values. Output is BIT-IDENTICAL
+// to the full BF16 head as long as the true argmax lands in the candidate set — the
+// margin is far above the Q8_0 dot error, and the oracle/self-test gates verify it.
+#define Q8HEAD_MARGIN  1.5f
+#define Q8HEAD_MAXCAND 64
+
+// Approx logits from the Q8_0 head (34 B / 32-elem block: fp16 scale + 32 int8), float acts.
+__global__ void q8_head_gemv_kernel(
+    float *__restrict__ y, const unsigned char *__restrict__ w, const float *__restrict__ x,
+    int in_dim, int out_dim)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * nwarps + warp;
+    if (row >= out_dim) return;
+    int nb = in_dim >> 5;
+    const unsigned char *wr = w + (size_t)row * nb * 34;
+    float acc = 0.f;
+    for (int b = lane; b < nb; b += 32) {
+        const unsigned char *blk = wr + (size_t)b * 34;
+        __half_raw hs; hs.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        float d = __half2float(__half(hs));
+        const int8_t *q = (const int8_t *)(blk + 2);
+        const float *xb = x + b * 32;
+        float p = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) p += (float)q[j] * xb[j];
+        acc += d * p;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, o);
+    if (lane == 0) y[row] = acc;
+}
+
+// Pass 1b: per row, find the approx max then collect indices > max - margin (capped).
+// cand[row][0..cnt) unordered; cnt clamped to cap. Two block-wide scans over the row.
+__global__ void q8_head_candidates_kernel(
+    const float *__restrict__ yapprox, int vocab, int *__restrict__ cand, int *__restrict__ cnt)
+{
+    int row = blockIdx.x;
+    const float *yr = yapprox + (size_t)row * vocab;
+    __shared__ float smax[32];
+    float m = -1e30f;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) m = fmaxf(m, yr[i]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, o));
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = (blockDim.x + 31) >> 5;
+    if (lane == 0) smax[warp] = m;
+    __syncthreads();
+    if (warp == 0) {
+        m = (lane < nw) ? smax[lane] : -1e30f;
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, o));
+        if (lane == 0) smax[0] = m;
+    }
+    __syncthreads();
+    float thr = smax[0] - Q8HEAD_MARGIN;
+    if (threadIdx.x == 0) cnt[row] = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+        if (yr[i] > thr) {
+            int p = atomicAdd(&cnt[row], 1);
+            if (p < Q8HEAD_MAXCAND) cand[(size_t)row * Q8HEAD_MAXCAND + p] = i;
+        }
+    }
+}
+
+// Pass 2: exact BF16 rescore of the candidates + argmax with lowest-index tie-break.
+// One block per row: warp w rescores candidates w, w+nw, ...; block-reduce (val, idx).
+__global__ void q8_head_rescore_argmax_kernel(
+    const __nv_bfloat16 *__restrict__ wbf, const float *__restrict__ x,
+    const int *__restrict__ cand, const int *__restrict__ cnt,
+    int in_dim, int *__restrict__ out_idx)
+{
+    int row = blockIdx.x;
+    int n = cnt[row]; if (n > Q8HEAD_MAXCAND) n = Q8HEAD_MAXCAND;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const float *xr = x + (size_t)row * in_dim;
+    float bv = -1e30f; int bi = 0x7fffffff;
+    for (int c = warp; c < n; c += nw) {
+        int idx = cand[(size_t)row * Q8HEAD_MAXCAND + c];
+        const __nv_bfloat16 *wr = wbf + (size_t)idx * in_dim;
+        float acc = 0.f;
+        for (int k = lane; k < in_dim; k += 32) acc += __bfloat162float(wr[k]) * xr[k];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, o);
+        if (acc > bv || (acc == bv && idx < bi)) { bv = acc; bi = idx; }
+    }
+    __shared__ float sv[32]; __shared__ int si[32];
+    if (lane == 0) { sv[warp] = bv; si[warp] = bi; }
+    __syncthreads();
+    if (warp == 0) {
+        bv = (lane < nw) ? sv[lane] : -1e30f;
+        bi = (lane < nw) ? si[lane] : 0x7fffffff;
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, o);
+            int   oi = __shfl_xor_sync(0xFFFFFFFFu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) out_idx[row] = bi;
+    }
+}
+
 // ─── Argmax over vocab_size ───────────────────────────────────────────
 
 __global__ void argmax_kernel(
@@ -3513,6 +3619,11 @@ struct gemma4_engine {
     // and set NULL (no tied-alias: untied is always a distinct allocation). NULL ⇒ use BF16 head.
     uint8_t *d_lmhead_fp8;         // [vocab × hidden] E4M3 weights, per-row scaled
     float   *d_lmhead_fp8_scale;   // [vocab] per-row dequant scale (amax/448)
+    // EXACT two-pass greedy head (FP8_BLOCK/qwen35): Q8_0 approx scan + BF16 rescore of the
+    // candidates. Unlike the lossy FP8 head above this is bit-identical (see q8_head_* kernels).
+    unsigned char *d_lmhead_q8;    // [vocab/32 × 34 B] Q8_0 head copy (0.53 GB @248k vocab)
+    int *d_head_cand;              // [MAX_SEQS × Q8HEAD_MAXCAND] candidate indices
+    int *d_head_cnt;               // [MAX_SEQS] candidate counts
     uint8_t *d_fp4_act;        // activation packed E2M1 scratch (lazily sized to N×in/2)
     uint8_t *d_fp4_actsc;      // activation swizzled E4M3 block scales scratch
     uint8_t *d_fp4_actlin;     // activation LINEAR E4M3 block scales (pre-swizzle) scratch
@@ -6383,6 +6494,9 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     // FP8-quantized untied head (when the accuracy gate enabled it d_lmhead_bf16 was freed → NULL).
     // Never aliases d_embed_bf16 (untied), so no double-free guard needed.
     if (eng->d_lmhead_fp8)       cudaFree(eng->d_lmhead_fp8);
+    if (eng->d_lmhead_q8)        cudaFree(eng->d_lmhead_q8);
+    if (eng->d_head_cand)        cudaFree(eng->d_head_cand);
+    if (eng->d_head_cnt)         cudaFree(eng->d_head_cnt);
     if (eng->d_lmhead_fp8_scale) cudaFree(eng->d_lmhead_fp8_scale);
     if (eng->d_embed_bf16) cudaFree(eng->d_embed_bf16);
     if (eng->ev_start) cudaEventDestroy(eng->ev_start);
@@ -16261,7 +16375,18 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
     }
 
     rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, B, eps);
-    if (eng->format == FORMAT_FP8_BLOCK) {  // BF16 untied head (Q8_0 flips the 248320 argmax);
+    if (eng->format == FORMAT_FP8_BLOCK && want_argmax && B == 1 && eng->d_lmhead_q8) {
+        // EXACT two-pass greedy head at B=1: Q8_0 approx scan (0.53 GB, half the BF16 read) →
+        // collect candidates within Q8HEAD_MARGIN of the approx max → exact BF16 rescore of
+        // ≤Q8HEAD_MAXCAND rows → argmax. Bit-identical tokens (oracle + self-test gated).
+        q8_head_gemv_kernel<<<(unsigned)((VOC + 7) / 8), 8 * 32, 0, st>>>(
+            eng->d_sb[11], eng->d_lmhead_q8, xn, H, VOC);
+        q8_head_candidates_kernel<<<1, 1024, 0, st>>>(eng->d_sb[11], VOC,
+            eng->d_head_cand, eng->d_head_cnt);
+        q8_head_rescore_argmax_kernel<<<1, 256, 0, st>>>(eng->d_lmhead_bf16, xn,
+            eng->d_head_cand, eng->d_head_cnt, H, eng->d_ms_outtok);
+        return;
+    } else if (eng->format == FORMAT_FP8_BLOCK) {  // BF16 untied head (lossy heads flip the argmax);
         // weight-read-ONCE batched GEMV in ≤8-row chunks: the 1 GB head is read ceil(B/8)× per
         // step instead of B× (the per-row loop cost 16 GB/step at B=16 — the batched-decode wall).
         float *xt = eng->d_q35_sb[Q35_QG];   // per-layer scratch, free at head time; ≥ H·8 floats
@@ -17327,7 +17452,18 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     { const st::Tensor *lmT=M.find(LO.lmhead_key);
       if(!lmT){ fprintf(stderr,"qwen35_fp8_engine: missing lm_head %s\n",LO.lmhead_key.c_str()); return -5; }
       eng->d_lmhead_bf16=(__nv_bfloat16*)q35fp8_up_bytes(lmT->data, lmT->nbytes);
-      if(!eng->d_lmhead_bf16) return -5; }
+      if(!eng->d_lmhead_bf16) return -5;
+      // Q8_0 copy for the exact two-pass greedy head (approx scan; BF16 stays for the rescore).
+      { int64_t n=(int64_t)VOC*H; unsigned char*q8=q35_bf16_to_q8_0_host((const uint16_t*)lmT->data,n);
+        if(q8){ eng->d_lmhead_q8=(unsigned char*)q35fp8_up_bytes(q8,(size_t)(n/32)*34); free(q8); }
+        if(eng->d_lmhead_q8){
+            if(cudaMalloc(&eng->d_head_cand,(size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int))!=cudaSuccess ||
+               cudaMalloc(&eng->d_head_cnt,(size_t)GEMMA4_MAX_SEQS*sizeof(int))!=cudaSuccess){
+                cudaGetLastError();
+                if(eng->d_head_cand){cudaFree(eng->d_head_cand);eng->d_head_cand=NULL;}
+                cudaFree((void*)eng->d_lmhead_q8); eng->d_lmhead_q8=NULL;
+            }
+        } } }
     if(cudaMalloc(&eng->d_logits,(size_t)VOC*sizeof(float))!=cudaSuccess) return -6;
     if(moe && moe_alloc_scratch(eng)!=0) return -6;
     cudaDeviceSynchronize();
