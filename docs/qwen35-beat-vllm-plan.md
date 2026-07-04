@@ -29,28 +29,29 @@ tokenizer newline fix · scheduler phase telemetry · fp16 FULL-layer KV (memory
 **flash-decoding attention (long-ctx decode 33→49 tok/s)** · oracle opt-in for long-ctx gates.
 Validated: MoE oracle 8/8, 9B batch-test, llama.cpp long-ctx parity 40/40 @1k+4k.
 
-## Ranked remaining plan
+## Ranked remaining plan — EXECUTED (Jul 4, this session)
 
-| # | Item | Effort | Risk | Gain | Call |
-|---|---|---|---|---|---|
-| 1 | **json_schema / response_format** (cross-branch merge of `978d91d`+`6ef429b` from `feat/e4b-gguf`, then extend to json_schema + sampler bind) | M | Low–Med | capability (not tok/s) | **GO — #1** |
-| 2 | **Grouped-expert NVFP4 GEMM tuning** (`dg_fp4_moe.cu`; tile/cluster/stage/split-K past 68–78% of BW-ideal) | M–L | Med | ~10–15% aggregate (only lever that scales with concurrency) | GO |
-| 3 | **LM head quant** BF16→Q6_K/Q8 (keep BF16 for `want_argmax==0`) | S–M | Low–Med | ~5–7% single decode | GO (cheap) |
-| 4 | **GDN bf16 arena** (halve state traffic; FIX the OOB memset byte-length; fp32 shared math) | S | Med | ~3–5% step | GO — needs the ≥2k drift gate (now runnable via the oracle opt-in) |
+| # | Item | Outcome |
+|---|---|---|
+| 1 | **json_schema / response_format** | ✅ **SHIPPED** (commits `e9e45d7`+`46612cd`). Ported the JSON grammar core + response_format; extended to real `json_schema` (OpenAI Structured-Outputs subset: typed props, required, additionalProperties:false, arrays, nested, enums, primitives) via a bitmask-cloneable schema automaton. Constrained requests forced onto the host-sampling path; route-guarded off the batch path (501). Full unit + server tests. |
+| 4 | **GDN bf16 arena** | ✅ **SHIPPED** (commit `6fd8b5e`) — the one perf lever that survived. Decode **+5.8% @B=16**, +4.3% @B=8 (scales with B); halves the GDN arena memory. Fixed the OOB memset. Gated: MoE oracle 8/8 + graph-on==off + long-ctx **40/40 @1k & 4k** (delta-rule decay bounds bf16 rounding → no drift). |
+| 3 | **LM head quant** | ❌ **DEAD (measured).** Single-stream already uses the exact two-pass Q8 head. Extending the two-pass to batched greedy stayed bit-identical (8/8) but **regressed 2.2× @B=16** (275→126 tok/s): the per-row candidate scan (`<<<B,1024>>>`) underutilizes the 48-SM GB10. The BF16 batched GEMV is already the right kernel. Reverted. |
+| 2 | **Grouped-expert NVFP4 GEMM tuning** | ❌ **DEAD (measured).** Already ~81% of the GB10's ~273 GB/s LPDDR5X peak — bandwidth-saturated, not 68–78% of a higher ideal. The NVFP4 SF swizzle forces BM/BN to 128-multiples (no small-M decode tile compiles). Full buildable sweep: BK=256 gives ~2–3% on `down` only, ~0% on the dominant `gate\|up` → <1% aggregate + risks the shared ALU-bound prefill. |
 | 5 | **Full ctx-cap lift** (stream the base>0 prefill-continuation attn off shared-scores + stream the fp32 oracle) → serve >25k | S–M | Low | reach, not speed | GO (measure-first) |
 | 6 | Long-prompt **prefill** (GDN-chunk occupancy + TC-attn past base==0) | L | Med–High | cold TTFT 2.6→~1.5 s | **DEFER** (state cache already frees turn-2+) |
 | 7 | Shared-expert quant FP8→Q4_K | M | Med–High | ~+3% decode | **DEFER** (tc-prefill reads Q4_K as FP8 → corruption footgun) |
 | 8 | **spec-on-MoE** (per-slot GDN/conv chunk-scan SANDBOX; single-token-kernel mechanism is non-lossless) | L | High | 2–4× low-conc, +4% @conc-8 | **DEFER** (gate on measured acceptance first) |
 | 9 | Mixer IMMA / tensor-core Q4_K GEMV | — | — | — | **DROP** (measured slower; Q4_K scales force per-weight dequant = the ALU cost) |
 
-## Highest-value next action
+## Outcome (this session)
 
-**Merge json_schema/response_format across from `feat/e4b-gguf` (#1).** The two things a kernel push
-can win here are already won; every remaining perf lever is sub-15% against floors three independent
-debunks confirmed (mixer, WMMA, expert-smem), and the flagship 449 aggregate target is a bench
-artifact. Meanwhile this branch has **zero** structured-output capability (verified: the grammar core
-is unreachable from `qwen35-hybrid`) while vLLM ships guided decoding — a missing capability the
-agentic workload depends on has unbounded relative cost. Sequence: ship json_schema (#1), bank the two
-cheap decode wins (LM head quant #3 + GDN bf16 #4, ~8–12% at S effort, low risk), then grouped-expert
-tuning (#2) as the one perf lever with real concurrency headroom. Defer prefill/shared-expert/spec —
-the state cache and the physics floor have blunted their upside.
+Roadmap executed. **Shipped: json_schema/response_format (#1) — the capability gap vs vLLM is
+closed — and the GDN bf16 arena (#4, decode +5.8% @B=16).** The two perf tuning levers were
+measured and **debunked**: LM-head quant (#3) regresses the batched path 2.2× (per-row candidate
+scan underutilizes the 48-SM GB10), and grouped-expert GEMM tuning (#2) has no headroom — the
+kernel is already ~81% of the GB10's ~273 GB/s LPDDR5X peak and the NVFP4 SF swizzle forbids a
+decode-shaped tile. **Net confirmation of the branch's thesis:** GB10 decode is bandwidth-saturated,
+so schedule/tile levers are dead; the only wins left are *fewer bytes moved* (#4 halved the GDN
+state traffic → the last decode lever) and *capability* (#1). Remaining perf upside is <5% against
+physics floors; the two decode-kernel-winnable regimes stay won. Next real gains would need a
+different weight quant (symmetric int8-friendly) or the deferred spec-on-MoE — not tuning.
