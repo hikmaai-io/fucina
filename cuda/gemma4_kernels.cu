@@ -3802,6 +3802,11 @@ struct gemma4_engine {
     float   *d_q35_chunk_scr;                 // GDN chunk-scan per-v-head WY/UT scratch [NVH*M2_SCR_PER]
     int     *d_q35_pf_pos;                    // [PF_TILE] prefill per-row absolute position
     int32_t *d_q35_pf_tok;                    // [PF_TILE] prefill per-row token id
+    // Flash-decoding (split-KV) FULL-layer attention partials: NQ*S blocks at B=1 fill the SMs.
+    int     q35_attn_splits;                  // S: position splits per (head,row) (from q35_maxctx)
+    int     q35_attn_tile;                    // ceil(maxctx/S): positions per split (shared-score size)
+    float   *d_q35_part_m, *d_q35_part_l;     // [MAX_SEQS*NQ*S] per-split online-softmax max / sum
+    float   *d_q35_part_o;                    // [MAX_SEQS*NQ*S*HD] per-split UNNORMALIZED weighted-V
     __nv_bfloat16 *d_q35_wbf16[2];            // prefill weight dequant ping-pong [max(in*out)] BF16
     __nv_bfloat16 *d_q35_xbf16;               // prefill activation BF16 [PF_TILE * max_in_dim]
     // FULL-layer one-shot prefill attention via tensor-core GEMMs (base==0 only).
@@ -4907,6 +4912,8 @@ gemma4_engine_t* gemma4_engine_create(
     eng->q35_ready = 0; eng->q35_maxctx = 0; eng->q35_graph_enabled = 1;
     eng->d_q35_rowslot = NULL; eng->d_q35_chunk_scr = NULL;
     eng->d_q35_pf_pos = NULL; eng->d_q35_pf_tok = NULL;
+    eng->q35_attn_splits = 0; eng->q35_attn_tile = 0;
+    eng->d_q35_part_m = NULL; eng->d_q35_part_l = NULL; eng->d_q35_part_o = NULL;
     eng->d_q35_wbf16[0] = NULL; eng->d_q35_wbf16[1] = NULL; eng->d_q35_xbf16 = NULL;
     eng->d_q35_qb = NULL; eng->d_q35_kb = NULL; eng->d_q35_vb = NULL;
     eng->d_q35_kbx = NULL; eng->d_q35_vbx = NULL; eng->d_q35_pb = NULL;
@@ -6503,6 +6510,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     for (int i = 0; i < 24; i++) CUDA_FREE(eng->d_q35_sb[i]);
     CUDA_FREE(eng->d_q35_rowslot);
     CUDA_FREE(eng->d_q35_chunk_scr);
+    CUDA_FREE(eng->d_q35_part_m); CUDA_FREE(eng->d_q35_part_l); CUDA_FREE(eng->d_q35_part_o);
     CUDA_FREE(eng->d_q35_pf_pos);
     CUDA_FREE(eng->d_q35_pf_tok);
     CUDA_FREE(eng->d_q35_wbf16[0]);
@@ -16177,6 +16185,95 @@ __global__ void qwen35_b_attn_kernel(float *out, const float *q, const __half *K
     }
 }
 
+// ── Flash-decoding (split-KV) FULL-layer attention: raise decode occupancy ────────────────────────
+// The kernel above is ONE block per (head,row) → only NQ=16 blocks at B=1, on a 48-SM GB10, each
+// looping ALL positions serially: the long-context single-stream decode bottleneck. Flash-decoding
+// adds a SPLIT dimension so B=1 launches NQ*S blocks (fills the SMs) and each block's serial loop is
+// ~S× shorter. Each PARTIAL block runs the SAME score-parallel body over its position slice and
+// writes an UNNORMALIZED online-softmax partial (m_i, l_i, o_i[HD]); the COMBINE kernel flash-merges
+// the S partials per (head,row). Graph-safe: S is a setup constant (q35_attn_splits from q35_maxctx),
+// never runtime p (p only bounds the intra-block loop / idle-exits empty splits). NOT bit-identical
+// to the fp32 oracle (reduction reordered) — argmax-identical is the bar (gated by part-D).
+//
+// This is DECODE-ONLY: the prefill-continuation path (base>0 / T>tile) keeps qwen35_b_attn_kernel,
+// so the maxctx-score-in-shared context cap stays until that path is converted too (a follow-up).
+__global__ void qwen35_flash_partial_kernel(
+    const float *q, const __half *Kc, const __half *Vc, const int *pos, const int *rowslot,
+    int maxctx, int B, int nkv, int S,
+    float *part_m, float *part_l, float *part_o) {   // [B*NQ*S], [B*NQ*S], [B*NQ*S*HD]
+    int hd = blockIdx.x, r = blockIdx.y, s = blockIdx.z;
+    if (hd >= M2_NQ || r >= B) return;
+    int slot = rowslot[r], p = pos[r];
+    int tile = (maxctx + S - 1) / S;
+    int lo = s * tile, hi = lo + tile - 1; if (hi > p) hi = p;
+    size_t pidx = (((size_t)r * M2_NQ + hd) * S + s);
+    int tid = threadIdx.x;
+    if (lo > p) {                          // empty split → sentinel (combine drops it, NaN-safe)
+        if (tid == 0) { part_m[pidx] = -1e30f; part_l[pidx] = 0.f; }
+        for (int d = tid; d < M2_HEAD; d += blockDim.x) part_o[pidx * M2_HEAD + d] = 0.f;
+        return;
+    }
+    int kv = hd / (M2_NQ / nkv);           // runtime nkv (MoE 2 → hd/8, 9B 4 → hd/4)
+    extern __shared__ float sc[];          // [tile] — bounded, ctx-independent (~2 KB)
+    const float *qr = q + ((size_t)r * M2_NQ + hd) * M2_HEAD;
+    const __half *Kb = Kc + (size_t)slot * maxctx * nkv * M2_HEAD;
+    const __half *Vb = Vc + (size_t)slot * maxctx * nkv * M2_HEAD;
+    float scale = rsqrtf((float)M2_HEAD);
+    int n = hi - lo + 1;
+    for (int jj = tid; jj < n; jj += blockDim.x) {
+        const __half *kr = Kb + ((size_t)(lo + jj) * nkv + kv) * M2_HEAD;
+        float acc = 0.f;
+        for (int d = 0; d < M2_HEAD; d++) acc += qr[d] * __half2float(kr[d]);
+        sc[jj] = acc * scale;
+    }
+    __syncthreads();
+    __shared__ float red[32];
+    float m = -1e30f;
+    for (int jj = tid; jj < n; jj += blockDim.x) m = fmaxf(m, sc[jj]);
+    m = block_reduce_max(m, red);
+    __shared__ float msh; if (tid == 0) msh = m; __syncthreads(); m = msh;
+    float ssum = 0.f;
+    for (int jj = tid; jj < n; jj += blockDim.x) { float e = __expf(sc[jj] - m); sc[jj] = e; ssum += e; }
+    ssum = block_reduce_sum(ssum, red);
+    __shared__ float ssh; if (tid == 0) ssh = ssum; __syncthreads();
+    if (tid == 0) { part_m[pidx] = m; part_l[pidx] = ssh; }
+    for (int d = tid; d < M2_HEAD; d += blockDim.x) {
+        float acc = 0.f;
+        for (int jj = 0; jj < n; jj++)
+            acc += sc[jj] * __half2float(Vb[((size_t)(lo + jj) * nkv + kv) * M2_HEAD + d]);
+        part_o[pidx * M2_HEAD + d] = acc;   // UNNORMALIZED (combine divides by the merged sum)
+    }
+}
+
+// Flash-decoding COMBINE: merge the S per-(head,row) partials with the online-softmax rescale
+// (m = max_s m_s; out = Σ_s e^{m_s-m}·o_s / Σ_s e^{m_s-m}·l_s). Grid dim3(NQ,B), thread d owns out
+// dim d. Empty splits (m_s == -1e30) are skipped — never multiply 0·Inf.
+__global__ void qwen35_flash_combine_kernel(
+    float *out, const float *part_m, const float *part_l, const float *part_o, int B, int S) {
+    int hd = blockIdx.x, r = blockIdx.y;
+    if (hd >= M2_NQ || r >= B) return;
+    int tid = threadIdx.x;
+    size_t base = ((size_t)r * M2_NQ + hd) * S;
+    float m = -1e30f;
+    for (int s = 0; s < S; s++) { float ms = part_m[base + s]; if (ms > m) m = ms; }
+    float l = 0.f;
+    for (int s = 0; s < S; s++) {
+        float ms = part_m[base + s];
+        if (ms <= -1e30f) continue;
+        l += __expf(ms - m) * part_l[base + s];
+    }
+    float inv = 1.f / fmaxf(l, 1e-20f);
+    for (int d = tid; d < M2_HEAD; d += blockDim.x) {
+        float od = 0.f;
+        for (int s = 0; s < S; s++) {
+            float ms = part_m[base + s];
+            if (ms <= -1e30f) continue;
+            od += __expf(ms - m) * part_o[(base + s) * M2_HEAD + d];
+        }
+        out[((size_t)r * M2_NQ + hd) * M2_HEAD + d] = od * inv;
+    }
+}
+
 // Stateful causal depthwise conv1d (k=CK) + SiLU for B rows over conv_dim channels; each row's
 // CK-1 history lives in its per-slot ring [conv_dim][CK-1]. Bit-identical to M3 qwen35_conv_step.
 __global__ void qwen35_b_conv_kernel(float *conv_out, const float *qkv, float *ring,
@@ -16545,6 +16642,19 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     ok = ok && cudaMalloc(&eng->d_q35_chunk_scr, (size_t)NVH * Q35_GDN_SCR * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->d_q35_pf_pos, (size_t)PF * sizeof(int)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->d_q35_pf_tok, (size_t)PF * sizeof(int32_t)) == cudaSuccess;
+    // Flash-decoding attention split count S: capture-stable, derived from q35_maxctx only (target
+    // ~512 positions/split so each block's serial loop is short and NQ*S fills the 48 SMs at B=1).
+    {
+        const int TILE_POS = 512, S_MAX = 64;
+        int S = (maxctx + TILE_POS - 1) / TILE_POS;
+        if (S < 1) S = 1; if (S > S_MAX) S = S_MAX;
+        eng->q35_attn_splits = S;
+        eng->q35_attn_tile = (maxctx + S - 1) / S;   // positions per split → shared-score floats
+        const size_t np = (size_t)MS * M2_NQ * S;
+        ok = ok && cudaMalloc(&eng->d_q35_part_m, np * sizeof(float)) == cudaSuccess;
+        ok = ok && cudaMalloc(&eng->d_q35_part_l, np * sizeof(float)) == cudaSuccess;
+        ok = ok && cudaMalloc(&eng->d_q35_part_o, np * M2_HEAD * sizeof(float)) == cudaSuccess;
+    }
     // Tensor-core prefill GEMM scratch: dequant each projection weight → BF16 (ping-pong for
     // dequant/compute overlap), and the per-tile activation → BF16. Sized by the largest qwen35
     // projection and the widest GEMM in_dim ACROSS ALL variants (9B dense: FFN I×H dominates;
@@ -16614,7 +16724,7 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
     const int maxctx = eng->q35_maxctx;
     const float eps = 1e-6f;
     const size_t smGDN = ((size_t)SD * SD + 3 * SD) * sizeof(float);
-    const size_t smATT = (size_t)maxctx * sizeof(float);
+    // (decode attention is flash-decoding now — partial+combine, no maxctx-score shared store)
     auto Wq = [&](uint64_t off) -> const uint8_t* { return weight_fp8(eng, off); };
     auto Wf = [&](uint64_t off) -> const float*   {
         return (const float*)(eng->d_weights + (off - eng->tdata_start)); };
@@ -16647,8 +16757,17 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NKV,B),32,0,st>>>(kb, NKV, d_pos, B);
             qwen35_b_kv_write_kernel<<<dim3(grid1d((size_t)NKV*HD),B),256,0,st>>>(
                 eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, B, NKV);
-            qwen35_b_attn_kernel<<<dim3(NQ,B),256,smATT,st>>>(
-                attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, B, NKV);
+            // Flash-decoding: NQ*S partial blocks (fill the 48 SMs at B=1) → combine. The old
+            // single-block qwen35_b_attn_kernel remains only on the prefill-continuation path (T rows).
+            {
+                int S = eng->q35_attn_splits;
+                size_t smP = (size_t)eng->q35_attn_tile * sizeof(float);
+                qwen35_flash_partial_kernel<<<dim3(NQ,B,S),256,smP,st>>>(
+                    qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, B, NKV, S,
+                    eng->d_q35_part_m, eng->d_q35_part_l, eng->d_q35_part_o);
+                qwen35_flash_combine_kernel<<<dim3(NQ,B),256,0,st>>>(
+                    attn, eng->d_q35_part_m, eng->d_q35_part_l, eng->d_q35_part_o, B, S);
+            }
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(attn, gate, B*NQ*HD);
             gemv_batched_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, B, st, T.fmt_o);
         } else {
