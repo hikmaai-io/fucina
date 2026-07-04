@@ -3790,7 +3790,9 @@ struct gemma4_engine {
     int      q35_ready;                       // 1 once arenas + scratch allocated
     int      q35_maxctx;                      // FULL-layer K/V cache capacity (positions)
     int      q35_graph_enabled;               // run-time graph toggle (1 default; test flips it)
-    float   *d_q35_S[GEMMA4_CAP_LAYERS];      // LINEAR l: [MAX_SEQS][NVH*SD*SD]   fp32 GDN state
+    __nv_bfloat16 *d_q35_S[GEMMA4_CAP_LAYERS]; // LINEAR l: [MAX_SEQS][NVH*SD*SD] bf16 GDN state (memory-
+                                              // bound arena at ~0.5 FLOP/B: bf16 halves its read+write
+                                              // traffic; the recurrence math stays fp32 in shared memory)
     float   *d_q35_ring[GEMMA4_CAP_LAYERS];   // LINEAR l: [MAX_SEQS][CONVD*(CK-1)] fp32 conv ring
     __half  *d_q35_Kc[GEMMA4_CAP_LAYERS];     // FULL l: [MAX_SEQS][maxctx*NKV*HD] fp16 K — the
     __half  *d_q35_Vc[GEMMA4_CAP_LAYERS];     // FULL l: [MAX_SEQS][maxctx*NKV*HD] fp16 V. Halves the
@@ -16321,7 +16323,7 @@ __global__ void qwen35_b_split_qkv_kernel(float *qh, float *kh, float *vh, const
 // GDN single-step delta-rule recurrence for B rows; each (v-head,row) block loads/stores the
 // carried fp32 state S[SD×SD] from the per-slot arena. Bit-identical to M3 qwen35_gdn_step.
 __global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k, const float *v,
-                                    const float *g, const float *beta, float *S_arena,
+                                    const float *g, const float *beta, __nv_bfloat16 *S_arena,
                                     const int *rowslot, int B, int interleave) {
     int vh = blockIdx.x;
     int r  = blockIdx.y;
@@ -16336,8 +16338,8 @@ __global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k,
     float *kt  = S + M2_SD * M2_SD;  // [SD]
     float *qt  = kt + M2_SD;         // [SD]
     float *dlt = qt + M2_SD;         // [SD]
-    float *Sg  = S_arena + ((size_t)slot * M2_NVH + vh) * M2_SD * M2_SD;
-    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] = Sg[idx];
+    __nv_bfloat16 *Sg = S_arena + ((size_t)slot * M2_NVH + vh) * M2_SD * M2_SD;
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] = __bfloat162float(Sg[idx]);
     __syncthreads();
     float scale = rsqrtf((float)M2_SD);
     const float *qr = q + (size_t)r * M2_NKH * M2_SD;
@@ -16370,7 +16372,7 @@ __global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k,
         core[((size_t)r * M2_NVH + vh) * M2_SD + tid] = acc;
     }
     __syncthreads();
-    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) Sg[idx] = S[idx];
+    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) Sg[idx] = __float2bfloat16(S[idx]);
 }
 
 // ── PREFILL chunked GDN/conv (P-perf): replace the per-token recurrence launches ────────────
@@ -16463,7 +16465,7 @@ __device__ inline void wmma_gemm_tf32(float *C, const float *A, const float *B,
 // so the T-row scratch needs no NPAD zero-padding. NPAD = roundup(T,CHUNK) drives the chunk count.
 __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const float *k,
                                           const float *v, const float *g, const float *beta,
-                                          float *S_arena, float *scratch, int slot, int N, int NPAD,
+                                          __nv_bfloat16 *S_arena, float *scratch, int slot, int N, int NPAD,
                                           int interleave) {
     int vh  = blockIdx.x;
     // TILE (GGUF) vs repeat-INTERLEAVE (FP8/safetensors). See [[qwen35-fp8-engine-serving]].
@@ -16485,10 +16487,10 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
     float *kchsT = qgs + CS * SD;        // [SD*CS] (k·decay)^T for the state-update GEMM
     float *ctmp  = kchsT + SD * CS;      // [CS*SD] core tile (before N-guarded copy-out)
     float *Stmp  = ctmp + CS * SD;       // [SD*SD] state-update GEMM result
-    float *Sg   = S_arena + ((size_t)slot * M2_NVH + vh) * SD * SD;
+    __nv_bfloat16 *Sg = S_arena + ((size_t)slot * M2_NVH + vh) * SD * SD;
     float scale = rsqrtf((float)SD);
     int warp = tid >> 5, n_warps = blockDim.x >> 5;
-    for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = Sg[idx];   // carry-in
+    for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = __bfloat162float(Sg[idx]);   // carry-in
     __syncthreads();
 
     int n_chunks = NPAD / CS;
@@ -16593,7 +16595,7 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
         for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = S[idx] * __expf(glast) + Stmp[idx];
         __syncthreads();
     }
-    for (int idx = tid; idx < SD * SD; idx += blockDim.x) Sg[idx] = S[idx];   // carry-out
+    for (int idx = tid; idx < SD * SD; idx += blockDim.x) Sg[idx] = __float2bfloat16(S[idx]);   // carry-out
 }
 
 static int q35_fp4_setup(gemma4_engine_t *eng);   // fwd decl (defined after q35_proj_gemm)
@@ -16687,7 +16689,7 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
             ok &= cudaMalloc(&eng->d_q35_Kc[l], (size_t)MS*maxctx*NKV*HD*sizeof(__half)) == cudaSuccess;
             ok &= cudaMalloc(&eng->d_q35_Vc[l], (size_t)MS*maxctx*NKV*HD*sizeof(__half)) == cudaSuccess;
         } else {
-            ok &= cudaMalloc(&eng->d_q35_S[l],  (size_t)MS*NVH*SD*SD*sizeof(float)) == cudaSuccess;
+            ok &= cudaMalloc(&eng->d_q35_S[l],  (size_t)MS*NVH*SD*SD*sizeof(__nv_bfloat16)) == cudaSuccess;
             ok &= cudaMalloc(&eng->d_q35_ring[l],(size_t)MS*CONVD*(CK-1)*sizeof(float)) == cudaSuccess;
         }
     }
@@ -17103,7 +17105,7 @@ static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
     const gemma4_model_config_t *c = &eng->cfg;
     const int NVH=M2_NVH, SD=M2_SD, CONVD=M2_CONVDIM, CK=M2_CK;
     for (int l = 0; l < c->n_layers; l++) if (c->attn_kind[l] != GEMMA4_ATTN_FULL) {
-        cudaMemsetAsync(eng->d_q35_S[l]   + (size_t)slot*NVH*SD*SD, 0, (size_t)NVH*SD*SD*sizeof(float), st);
+        cudaMemsetAsync(eng->d_q35_S[l]   + (size_t)slot*NVH*SD*SD, 0, (size_t)NVH*SD*SD*sizeof(__nv_bfloat16), st);  // bf16 arena: byte length halved (0.0f is bf16 0)
         cudaMemsetAsync(eng->d_q35_ring[l]+ (size_t)slot*CONVD*(CK-1), 0, (size_t)CONVD*(CK-1)*sizeof(float), st);
     }
 }
@@ -17381,8 +17383,8 @@ static size_t q35_state_size_bytes(const gemma4_engine_t *eng, int n_tokens) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL)
             bytes += 2ull * (size_t)n_tokens * NKV * HD * sizeof(__half);   // fp16 K + V
         else
-            bytes += ((size_t)M2_NVH * M2_SD * M2_SD +
-                      (size_t)M2_CONVDIM * (M2_CK - 1)) * sizeof(float);
+            bytes += (size_t)M2_NVH * M2_SD * M2_SD * sizeof(__nv_bfloat16)   // bf16 GDN state
+                   + (size_t)M2_CONVDIM * (M2_CK - 1) * sizeof(float);        // fp32 conv ring
     }
     return bytes;
 }
@@ -17402,7 +17404,7 @@ static int q35_state_copy(gemma4_engine_t *eng, int slot, char *h, int n_tokens,
     const gemma4_model_config_t *c = &eng->cfg;
     const int NKV = c->n_kv_global, HD = M2_HEAD, maxctx = eng->q35_maxctx;
     const size_t kv = (size_t)n_tokens * NKV * HD * sizeof(__half);   // fp16 K/V slice
-    const size_t s_sz = (size_t)M2_NVH * M2_SD * M2_SD * sizeof(float);
+    const size_t s_sz = (size_t)M2_NVH * M2_SD * M2_SD * sizeof(__nv_bfloat16);  // bf16 GDN state arena
     const size_t r_sz = (size_t)M2_CONVDIM * (M2_CK - 1) * sizeof(float);
     cudaStream_t st = eng->stream;
     for (int l = 0; l < c->n_layers; l++) {
@@ -17417,7 +17419,7 @@ static int q35_state_copy(gemma4_engine_t *eng, int slot, char *h, int n_tokens,
                 cudaMemcpyAsync(Vb, h, kv, cudaMemcpyHostToDevice, st); h += kv;
             }
         } else {
-            float *S = eng->d_q35_S[l] + (size_t)slot * M2_NVH * M2_SD * M2_SD;
+            __nv_bfloat16 *S = eng->d_q35_S[l] + (size_t)slot * M2_NVH * M2_SD * M2_SD;  // bf16 arena
             float *R = eng->d_q35_ring[l] + (size_t)slot * M2_CONVDIM * (M2_CK - 1);
             if (to_host) {
                 cudaMemcpyAsync(h, S, s_sz, cudaMemcpyDeviceToHost, st); h += s_sz;
