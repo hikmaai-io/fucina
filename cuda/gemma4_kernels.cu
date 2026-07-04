@@ -15949,6 +15949,18 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
         fprintf(stderr, "qwen35_forward_greedy: FP8 GDN shared-mem opt-in failed (%zu B)\n", smGDN);
         return -4;
     }
+    // Opt the fp32 attention ORACLE (qwen35_attn_step_kernel, (pos+1)*4 dynamic scores) into the
+    // full per-block shared limit. Without this the oracle caps at the 48 KB default (~pos 12287),
+    // so a long-context argmax-parity gate that reaches the real deploy context (up to q35_maxctx
+    // ~25 k) is not runnable — exactly the missing gate the shipped flash-decoding + fp16-KV decode
+    // (and any future recurrent-state precision change) needs to validate drift against. Test-only
+    // path; the opt-in is free when the kernel requests less.
+    {
+        int optinMax = 49152, dev = 0; cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&optinMax, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        cudaFuncSetAttribute(qwen35_attn_step_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, optinMax);  // best-effort; oracle only
+    }
 
     auto Wq  = [&](uint64_t off) -> const uint8_t* { return weight_fp8(eng, off); };
     auto Wf  = [&](uint64_t off) -> const float*   {
