@@ -347,9 +347,9 @@ type Scheduler struct {
 	// step per scheduler pass), so a long prefill no longer blocks the whole batch.
 	// Shorter prompts use the one-shot AddSeq fast path. nil → every prompt uses
 	// the one-shot path (the original behavior).
-	chunk     ChunkPrefillEngine
-	chunkSize int
-	chunkMin  int
+	chunk         ChunkPrefillEngine
+	chunkSize     int
+	chunkMin      int
 	chunkAdaptive bool // one-shot long prompts when the batch is idle (chunk-hinting engines)
 
 	// corpus is the server-global suffix-decoding ring: the token streams (prompt+output)
@@ -377,6 +377,19 @@ type Scheduler struct {
 	// stateSaver, when non-nil, snapshots a finishing sequence's slot state
 	// keyed by its token history (hybrid engines' conversation cache).
 	stateSaver StateSaverEngine
+
+	// Per-pass phase telemetry (owner-goroutine only, no locks): where does a
+	// scheduler pass spend its time — the engine step (cgo forward), token
+	// delivery, admission/prefill, or loop overhead. Logged every telemetryEvery
+	// steps so the served-vs-engine throughput gap is attributable at a glance.
+	telSteps   int64
+	telTokens  int64
+	telBatch   int64         // Σ batch size over steps (avg B = telBatch/telSteps)
+	telEngine  time.Duration // inside the engine step call
+	telDeliver time.Duration // scattering tokens to sequences
+	telAdmit   time.Duration // drain+admit+prefill-advance section
+	telPass    time.Duration // whole pass wall (engine+deliver+admit+loop rest)
+	telMark    time.Time     // start of the current telemetry window
 
 	// submit carries new requests to the owner goroutine. It is bounded; a full
 	// channel is backpressure (Submit returns ErrQueueFull) rather than
@@ -572,7 +585,9 @@ func (s *Scheduler) run() {
 		}
 	}()
 
+	s.telMark = time.Now()
 	for {
+		passStart := time.Now()
 		// 1. Pull newly submitted requests into the waiting backlog without
 		//    blocking, so admission can consider them this pass. The backlog is
 		//    bounded: overflow stays in the channel buffer, so Submit observes a
@@ -598,6 +613,7 @@ func (s *Scheduler) run() {
 		//    long prompt's prefill never blocks the active sequences. A sequence
 		//    whose prompt finished prefilling is promoted to active here.
 		s.advancePrefill(active, &prefill)
+		s.telAdmit += time.Since(passStart)
 
 		// If there is nothing to do, block instead of spinning. The scheduler is
 		// idle only when there is no active decode, no prefill in flight, and we
@@ -631,6 +647,8 @@ func (s *Scheduler) run() {
 			// Fatal engine error already handled inside step (all sequences
 			// evicted); fall through to re-check shutdown / new work.
 		}
+		s.telPass += time.Since(passStart)
+		s.maybeLogTelemetry()
 
 		// 6. Publish prefix-cache counters lock-free for /metrics. Done once per pass
 		//    (not just on admit) so decode-time changes — generated-block registration
@@ -651,6 +669,26 @@ func (s *Scheduler) run() {
 		default:
 		}
 	}
+}
+
+// maybeLogTelemetry emits one phase-breakdown line per telemetry window
+// (≥64 steps AND ≥5s) and resets the accumulators. This is the first tool for
+// attributing a served-vs-engine throughput gap: engine ms/step vs the Go-side
+// admit/deliver/loop cost, at the actual serving batch size.
+func (s *Scheduler) maybeLogTelemetry() {
+	if s.telSteps < 64 || time.Since(s.telMark) < 5*time.Second {
+		return
+	}
+	win := time.Since(s.telMark)
+	st := s.telSteps
+	ms := func(d time.Duration) float64 { return d.Seconds() * 1000 / float64(st) }
+	log.Printf("batch: telemetry: %d steps / %.1fs — avgB %.1f, engine %.2f ms/step, deliver %.3f, admit %.3f, pass %.2f — %d tok (%.0f tok/s)",
+		st, win.Seconds(), float64(s.telBatch)/float64(st),
+		ms(s.telEngine), ms(s.telDeliver), ms(s.telAdmit), ms(s.telPass),
+		s.telTokens, float64(s.telTokens)/win.Seconds())
+	s.telSteps, s.telTokens, s.telBatch = 0, 0, 0
+	s.telEngine, s.telDeliver, s.telAdmit, s.telPass = 0, 0, 0, 0
+	s.telMark = time.Now()
 }
 
 // maxBacklog bounds the in-loop waiting slice so a saturated engine cannot make
@@ -1031,7 +1069,11 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 		return s.stepPlain(active)
 	}
 
+	t0 := time.Now()
 	out, err := s.spec.StepBatchSpec(reqs)
+	s.telEngine += time.Since(t0)
+	s.telSteps++
+	s.telBatch += int64(len(slots))
 	if err != nil {
 		log.Printf("batch: StepBatchSpec failed (%d active): %v", len(slots), err)
 		for _, slot := range slots {
@@ -1055,17 +1097,20 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 	// Scatter each committed run to its slot; deliver walks the run token-by-token and
 	// stops emitting the moment a token evicts the sequence (stop/budget/cancel or the
 	// -1 KV-exhausted sentinel) — the rest of that run is then dropped.
+	t1 := time.Now()
 	for i, slot := range slots {
 		sq := active[slot]
 		if sq == nil {
 			continue // evicted earlier this pass (defensive)
 		}
 		for _, tok := range out[i] {
+			s.telTokens++
 			if !s.deliver(active, sq, tok) {
 				break
 			}
 		}
 	}
+	s.telDeliver += time.Since(t1)
 	return true
 }
 
@@ -1082,7 +1127,11 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 		inputs = append(inputs, sq.next)
 	}
 
+	t0 := time.Now()
 	out, err := s.engine.StepBatch(slots, inputs)
+	s.telEngine += time.Since(t0)
+	s.telSteps++
+	s.telBatch += int64(len(slots))
 	if err != nil {
 		// A batched step failed for the whole batch: there is no per-row error
 		// signal, so fail every active sequence rather than silently dropping
@@ -1117,17 +1166,20 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 	// run are past the stop/budget boundary and must not be emitted. A finished
 	// sequence frees its slot now, making room for a queued request on the next
 	// admission pass.
+	t1 := time.Now()
 	for i, slot := range slots {
 		sq := active[int(slot)]
 		if sq == nil {
 			continue // already evicted this pass (defensive)
 		}
 		for _, tok := range out[i] {
+			s.telTokens++
 			if !s.deliver(active, sq, tok) {
 				break // evicted mid-run: drop the rest of this row's run
 			}
 		}
 	}
+	s.telDeliver += time.Since(t1)
 	return true
 }
 
