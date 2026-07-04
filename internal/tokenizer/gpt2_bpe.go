@@ -190,13 +190,35 @@ func pretokenizeGPT2(text string) []string {
 				continue
 			}
 		}
-		// 5/6/7. whitespace: \s*[\r\n]+ | \s+(?!\S) | \s+ . Take the maximal run, but
-		//        when it is followed by a non-space, leave the LAST whitespace char for
-		//        the next clause (so it can become the following word's "Ġ" prefix).
+		// 5/6/7. whitespace: \s*[\r\n]+ | \s+(?!\S) | \s+ .
+		//
+		// The newline clause `\s*[\r\n]+` has PRIORITY and is greedy: a run that
+		// contains newlines is consumed through its LAST newline in one piece —
+		// newlines never become a following word's prefix (the word clause
+		// excludes \r\n from its optional prefix). Getting this wrong split
+		// "\n\nWord" into ["\n","\n","Word"] (198,198) instead of ["\n\n","Word"]
+		// (271 "ĊĊ"), diverging from HF/llama.cpp on every multi-line prompt and
+		// breaking token-exact re-render of ChatML turns (prefix-cache misses).
+		//
+		// A pure space/tab run followed by a non-space leaves its LAST char for
+		// the next clause (the `(?!\S)` lookahead), so it becomes the following
+		// word's "Ġ" prefix.
 		if isWS(c) {
 			k := i
 			for k < n && isWS(r[k]) {
 				k++
+			}
+			lastNL := -1
+			for j := k - 1; j >= i; j-- {
+				if r[j] == '\n' || r[j] == '\r' {
+					lastNL = j
+					break
+				}
+			}
+			if lastNL >= 0 {
+				out = append(out, string(r[i:lastNL+1]))
+				i = lastNL + 1
+				continue
 			}
 			if k < n && k-1 > i {
 				k-- // leave the last whitespace for the following word/punct

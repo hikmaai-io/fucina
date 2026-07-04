@@ -62,6 +62,22 @@ func TestQwen35_HFJSONServedTokenizer(t *testing.T) {
 	if got := tk.DecodeRaw(ids); got != prompt {
 		t.Errorf("DecodeRaw round-trip:\n got %q\nwant %q", got, prompt)
 	}
+
+	// Newline-run pre-tokenization (the `\s*[\r\n]+` clause): "\n\n" is ONE
+	// token (271 "ĊĊ") even when followed by text. The old approximation left
+	// the last newline as a word prefix, splitting it into 198,198 — which
+	// diverged from HF/llama.cpp on every multi-line prompt and broke the
+	// token-exact ChatML re-render (state/prefix cache misses on every turn).
+	ids = tk.Encode("<think>\n\n</think>\n\nHello", false, false)
+	want := []int32{248068, 271, 248069, 271}
+	for i, w := range want {
+		if i >= len(ids) || ids[i] != w {
+			t.Fatalf("newline-run encode = %v, want prefix %v", ids, want)
+		}
+	}
+	if ids3 := tk.Encode("a\n\n\nb", false, false); len(ids3) != 3 || ids3[1] != 1358 {
+		t.Errorf("triple-newline encode = %v, want [a 1358 b]", ids3)
+	}
 }
 
 func min(a, b int) int {
