@@ -1,8 +1,9 @@
 package server
 
-// The gemma-4 tool types + render/parse logic now live in internal/chat so the AR server
-// and the diffusion server share one implementation (no duplication). These aliases + thin
-// wrappers keep the rest of this package's call sites unchanged.
+// Tool render/parse logic lives in internal/chat behind the chat.Dialect
+// interface (gemma-4 turn/tool markers vs Qwen ChatML + XML tool calls). The
+// server picks s.dialect at startup from the loaded vocabulary; these thin
+// wrappers keep call sites terse.
 
 import "github.com/hikmaai-io/fucina/internal/chat"
 
@@ -13,11 +14,34 @@ type (
 	ToolCallFunction = chat.ToolCallFunction
 )
 
-func renderToolDeclarations(t []Tool) string         { return chat.RenderToolDeclarations(t) }
-func renderToolResponse(name, content string) string { return chat.RenderToolResponse(name, content) }
-func renderAssistantToolCalls(c []ToolCall) string   { return chat.RenderAssistantToolCalls(c) }
-func parseToolCalls(raw string) (string, []ToolCall) { return chat.ParseToolCalls(raw) }
-func isToolChoiceNone(tc interface{}) bool           { return chat.IsToolChoiceNone(tc) }
+func isToolChoiceNone(tc interface{}) bool { return chat.IsToolChoiceNone(tc) }
+
+// forcedToolChoice interprets the OpenAI tool_choice forms that FORCE a call:
+// "required" (any function) and {"type":"function","function":{"name":X}}.
+// Returns the forced function name ("" for "required") and whether forcing is
+// requested at all. "auto"/"none"/absent return forced=false.
+func forcedToolChoice(tc interface{}) (name string, forced bool) {
+	switch v := tc.(type) {
+	case string:
+		return "", v == "required"
+	case map[string]interface{}:
+		fn, _ := v["function"].(map[string]interface{})
+		if fn == nil {
+			return "", false
+		}
+		n, _ := fn["name"].(string)
+		return n, n != ""
+	}
+	return "", false
+}
+
+func (s *Server) parseToolCalls(raw string, tools []Tool) (string, []ToolCall) {
+	return s.dialect.ParseToolCalls(raw, tools)
+}
+func (s *Server) splitReasoning(raw string, thinking bool) (string, string) {
+	return s.dialect.SplitReasoning(raw, thinking)
+}
+func (s *Server) stripMarkers(x string) string { return s.dialect.StripMarkers(x) }
 
 // validateToolCalls drops calls that violate their tool's required-parameter
 // schema (missing or empty required arg) and returns a clarification string when
@@ -32,5 +56,3 @@ func validateToolCalls(calls []ToolCall, tools []Tool) (valid []ToolCall, clar s
 	}
 	return valid, clar
 }
-func splitReasoning(s string) (string, string) { return chat.SplitReasoning(s) }
-func stripMarkers(s string) string             { return chat.StripMarkers(s) }

@@ -13,9 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"strings"
 	"os"
 	"sort"
+	"strings"
 )
 
 // hfTokenizer is the subset of tokenizer.json we consume (BPE model + added tokens).
@@ -82,14 +82,22 @@ func NewFromHFJSON(path string) (*Tokenizer, error) {
 		return nil, fmt.Errorf("tokenizer: %s has empty vocab", path)
 	}
 
-	t := &Tokenizer{BOS: 2, EOS: 1, PAD: 0, bpe: true, byteFallback: hf.Model.ByteFallback,
+	t := &Tokenizer{BOS: 2, EOS: 1, EOS2: -1, PAD: 0, bpe: true, byteFallback: hf.Model.ByteFallback,
 		addBOS: true, addEOS: true}
 
-	// vocab[id] = token string; ids are dense 0..N-1.
+	// vocab[id] = token string; ids are dense 0..N-1. Added tokens can sit
+	// ABOVE the model vocab (Qwen3.5 appends its 26 ChatML specials at
+	// 248044+); size the table over both, or Decode/DecodeRaw silently drops
+	// every special marker.
 	maxID := int32(-1)
 	for _, id := range hf.Model.Vocab {
 		if id > maxID {
 			maxID = id
+		}
+	}
+	for _, a := range hf.AddedTokens {
+		if a.ID > maxID {
+			maxID = a.ID
 		}
 	}
 	t.vocabSize = int(maxID) + 1
@@ -149,6 +157,20 @@ func NewFromHFJSON(path string) (*Tokenizer, error) {
 	t.ToolRespOpen = lookup("<|tool_response>", -1)
 	t.ToolRespEnd = lookup("<tool_response|>", -1)
 	t.StringDelim = lookup(`<|"|>`, -1)
+
+	// ChatML vocab (Qwen3.5 safetensors + tokenizer.json): the Gemma defaults
+	// above are meaningless ids in this vocab (EOS=1, BOS=2, <turn|>=106 are
+	// random tokens that made IsStop fire spuriously and prepended a junk BOS
+	// to every prompt). Map the real ChatML control tokens and disable BOS —
+	// Qwen has no bos_token (tokenizer_config: bos_token null, add_bos false).
+	if _, chatml := t.tokenToID["<|im_start|>"]; chatml {
+		t.mapChatMLMarkers()
+		t.BOS = -1
+		t.addBOS, t.addEOS = false, false
+		if id, ok := t.tokenToID["<|endoftext|>"]; ok {
+			t.PAD = id
+		}
+	}
 
 	// Encode pre-split set: every added token (HF always matches these before the model) plus the
 	// GGUF-style control markers if present, deduped, longest-first (so no marker shadows a longer

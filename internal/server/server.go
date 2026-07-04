@@ -53,6 +53,7 @@ type Server struct {
 	engine          serverEngine
 	tokenizer       *tokenizer.Tokenizer
 	kv              *KVCache
+	dialect         chat.Dialect // per-model chat wire format, detected from the vocab
 	modelName       string
 	genParams       GenerationParams
 	thinkingDefault bool         // startup default for the gemma-4 reasoning channel
@@ -143,6 +144,9 @@ type GenerationParams struct {
 	Stream           bool     `json:"stream"`
 	Stop             []string `json:"stop,omitempty"`
 	Tools            []Tool   `json:"-"` // request tool schemas, for required-param validation
+	Thinking         bool     `json:"-"` // resolved per-request reasoning flag (dialect parsing needs it)
+	ParsePrefix      string   `json:"-"` // forced tool-call prefix appended to the prompt (tool_choice);
+	// prepended to raw output before parsing so the parser sees the complete call
 }
 
 type ChatMessage struct {
@@ -495,10 +499,17 @@ func New(eng serverEngine, tok *tokenizer.Tokenizer) *Server {
 		engine:    eng,
 		tokenizer: tok,
 		kv:        NewKVCache(eng),
+		dialect:   chat.Gemma,
 		modelName: "gemma-4-12b-it",
 		genParams: DefaultParams(),
 		draftK:    6,
 		inflight:  make(chan struct{}, defaultInflight),
+	}
+	// Runtime dialect detection — from the artifact's vocabulary, never a flag:
+	// a ChatML vocab (<|im_start|>) means the Qwen template + XML tool calls.
+	if tok != nil && tok.HasToken("<|im_start|>") {
+		s.dialect = chat.Qwen
+		log.Printf("fucina: ChatML vocab detected — using the Qwen chat dialect (template + tool calls)")
 	}
 	s.logLevel.Store(int32(logLevelInfo))
 	return s
@@ -891,13 +902,27 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	if t := req.resolveThinking(); t != nil {
 		enableThinking = *t
 	}
+	// tool_choice forcing ("required" / a specific function): supported dialects
+	// open the call in the PROMPT so the model completes it — no grammar needed.
+	// The forced prefix is re-prepended to raw output before parsing. Thinking is
+	// disabled for the turn (the forced call replaces the reasoning opener).
+	forcedPrefix := ""
+	if wantTools {
+		if name, forced := forcedToolChoice(req.ToolChoice); forced {
+			if pfx := s.dialect.ForcedCallPrefix(name); pfx != "" {
+				forcedPrefix = pfx
+				enableThinking = false
+			}
+		}
+	}
 	var prompt string
 	if lp := req.legacyPrompt(); lp != "" {
 		prompt = lp
 		legacy = true     // a `prompt` field forces legacy text_completion output
 		wantTools = false // raw-completions mode never emits structured tool calls
+		forcedPrefix = ""
 	} else {
-		prompt = s.renderChatTemplate(req.Messages, req.Tools, enableThinking)
+		prompt = s.renderChatTemplate(req.Messages, req.Tools, enableThinking) + forcedPrefix
 	}
 	if prompt == "" {
 		http.Error(w, "empty prompt", http.StatusBadRequest)
@@ -929,6 +954,8 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 
 	params := s.genParams
 	params.Tools = req.Tools // for required-parameter validation of emitted calls
+	params.Thinking = enableThinking
+	params.ParsePrefix = forcedPrefix
 	if req.Temperature != nil {
 		params.Temperature = *req.Temperature
 	}
@@ -1183,7 +1210,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 // of SeqParams. The params are still forwarded so the contract is stable for when
 // the kernels grow temperature/top-k support.
 func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params GenerationParams, tokens []int32, wantTools, legacy bool) {
-	stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
+	stops := s.tokenizer.StopIDs()
 
 	seed := uint64(params.Seed)
 	if params.Seed < 0 {
@@ -1206,12 +1233,18 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 	tokCh := make(chan int32, 1024)
 	done := make(chan batch.Result, 1)
 
+	// cancel lets the handler end its OWN sequence early (tool calls captured
+	// and the model moving on) without waiting for a natural stop; the
+	// scheduler evicts at the next step boundary.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
 	req := batch.Request{
 		Tokens: tokens,
 		Params: sp,
 		Stops:  stops,
 		MaxNew: params.MaxTokens,
-		Ctx:    r.Context(),
+		Ctx:    ctx,
 		Emit: func(t int32) bool {
 			select {
 			case tokCh <- t:
@@ -1234,9 +1267,9 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 	}
 
 	if params.Stream {
-		s.streamBatch(w, r, tokCh, done, legacy)
+		s.streamBatch(w, r, cancel, tokCh, done, params, wantTools, legacy)
 	} else {
-		s.collectBatch(w, r, tokCh, done, wantTools, legacy, len(tokens), params.Tools)
+		s.collectBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, len(tokens))
 	}
 }
 
@@ -1263,10 +1296,17 @@ func drainTokens(tokCh <-chan int32, done <-chan batch.Result, onTok func(int32)
 	}
 }
 
-// streamBatch streams a batched sequence's tokens to an SSE client. It decodes
-// incrementally (decode the whole id slice each step and emit only the new text)
-// so multi-byte UTF-8 / SentencePiece pieces are never split mid-character.
-func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, tokCh <-chan int32, done <-chan batch.Result, legacy bool) {
+// streamBatch streams a batched sequence to an SSE client with full dialect
+// handling, mirroring the single-flight streamResponse machine: reasoning
+// spans stream as reasoning_content deltas, tool-call spans are buffered and
+// emitted as structured tool_calls deltas the moment each span CLOSES (true
+// incremental multi-call streaming), and once the model moves past its calls
+// the sequence is cancelled instead of burning tokens on a hallucinated tool
+// response. Text decodes incrementally (whole-slice decode, emit the new
+// suffix) so multi-byte UTF-8 pieces are never split mid-character.
+func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc,
+	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool) {
+
 	sse, ok := newSSEWriter(w, legacy, s.modelName)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -1274,69 +1314,259 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, tokCh <-cha
 	}
 	sse.begin()
 
-	var ids []int32
-	var emitted string
+	tcOpen, tcEnd := s.tokenizer.ToolCallOpen, s.tokenizer.ToolCallEnd
+	chOpen, chEnd := s.tokenizer.ChannelOpen, s.tokenizer.ChannelEnd
+	openLit, closeLit := s.dialect.ToolCallLits()
+
+	// Same runaway bounds as streamResponse (the Req3 incident).
+	const maxToolToks = 2048
+	const maxToolCalls = 8
+
 	generated := 0
 	genStart := time.Now()
+	inTool := wantTools && params.ParsePrefix != "" // forced tool_choice opens mid-call
+	forcedFirstSpan := inTool
+	var toolSpan []int32
+	toolToks := 0
+	// Qwen renders the reasoning opener INTO the prompt (<think>\n), so with
+	// thinking on the stream starts inside the reasoning block; Gemma opens
+	// its channel with a generated marker token.
+	inChannel := s.dialect.StartsInReasoning(params.Thinking)
+	labelPending := false
+	var contentIDs, reasonIDs []int32
+	emittedContent, emittedReason := "", ""
+	callIdx := 0
+	pendingClar := ""
+	stopped := false // we cancelled the sequence ourselves
+	stopReason := "" // finish_reason override for a self-initiated stop
+
+	emitContentDelta := func(text string) {
+		if legacy {
+			sse.event(CompletionStreamResponse{
+				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
+				Choices: []CompletionStreamChoice{{Index: 0, Text: text}},
+			})
+		} else {
+			sse.event(StreamResponse{
+				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
+				Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: text}}},
+			})
+		}
+	}
+	emitReasonDelta := func(text string) {
+		if legacy { // legacy text_completion has no reasoning channel; fold it in
+			emitContentDelta(text)
+			return
+		}
+		sse.event(StreamResponse{
+			ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
+			Choices: []StreamChoice{{Index: 0, Delta: Delta{ReasoningContent: text}}},
+		})
+	}
+	selfStop := func(reason string) {
+		stopped = true
+		stopReason = reason
+		cancel()
+	}
+	// flushCall parses ONE closed tool-call span and streams it as a delta.
+	flushCall := func() {
+		raw := openLit + s.tokenizer.DecodeRaw(toolSpan) + closeLit
+		if forcedFirstSpan {
+			raw = params.ParsePrefix + s.tokenizer.DecodeRaw(toolSpan) + closeLit
+			forcedFirstSpan = false
+		}
+		toolSpan = nil
+		_, calls := s.parseToolCalls(raw, params.Tools)
+		calls, clar := validateToolCalls(calls, params.Tools)
+		if clar != "" && pendingClar == "" {
+			pendingClar = clar
+		}
+		for _, c := range calls {
+			c.ID = fmt.Sprintf("call_%s_%d", c.Function.Name, callIdx)
+			sse.event(StreamResponse{
+				ID: sse.id, Object: "chat.completion.chunk", Created: sse.created, Model: s.modelName,
+				Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: []DeltaToolCall{{
+					Index: callIdx, ID: c.ID, Type: c.Type, Function: c.Function,
+				}}}}},
+			})
+			callIdx++
+		}
+	}
 
 	res := drainTokens(tokCh, done, func(t int32) {
-		generated++
-		if s.tokenizer.IsStop(t) {
-			return // never render stop markers
+		if stopped || s.tokenizer.IsStop(t) {
+			return
 		}
-		ids = append(ids, t)
-		full := stripMarkers(s.tokenizer.DecodeRaw(ids))
-		if len(full) > len(emitted) {
-			delta := full[len(emitted):]
-			emitted = full
-			if legacy {
-				sse.event(CompletionStreamResponse{
-					ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
-					Choices: []CompletionStreamChoice{{Index: 0, Text: delta}},
-				})
-			} else {
-				sse.event(StreamResponse{
-					ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
-					Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: delta}}},
-				})
+		generated++
+
+		if wantTools && tcOpen >= 0 && t == tcOpen && !inTool {
+			inTool = true
+			toolSpan, toolToks = nil, 0
+			return
+		}
+		if inTool {
+			toolToks++
+			if tcEnd >= 0 && t == tcEnd {
+				inTool = false
+				flushCall()
+				if callIdx >= maxToolCalls {
+					selfStop("tool_calls")
+				}
+				return
 			}
+			if toolToks > maxToolToks {
+				log.Printf("fucina: WARNING: unterminated tool call exceeded %d buffered tokens — cutting generation (runaway inside a tool-call span)", maxToolToks)
+				selfStop("length")
+				return
+			}
+			toolSpan = append(toolSpan, t)
+			return
+		}
+
+		if chOpen >= 0 && t == chOpen {
+			if callIdx > 0 {
+				selfStop("tool_calls") // calls captured; model is moving on
+				return
+			}
+			inChannel = true
+			labelPending = s.dialect.HasReasoningLabel()
+			return
+		}
+		if inChannel {
+			if chEnd >= 0 && t == chEnd {
+				inChannel = false
+				return
+			}
+			reasonIDs = append(reasonIDs, t)
+			full := s.tokenizer.Decode(reasonIDs)
+			if labelPending { // gemma's "thought\n" label line — never emitted
+				nl := strings.IndexByte(full, '\n')
+				if nl < 0 {
+					return
+				}
+				labelPending = false
+				emittedReason = full[:nl+1]
+			}
+			if len(full) > len(emittedReason) {
+				emitReasonDelta(full[len(emittedReason):])
+				emittedReason = full
+			}
+			return
+		}
+
+		if s.tokenizer.IsToolMarker(t) {
+			if callIdx > 0 {
+				selfStop("tool_calls") // hallucinating the tool response
+			}
+			return
+		}
+		if callIdx > 0 {
+			// Whitespace between calls is swallowed; first prose dispatches.
+			if strings.TrimSpace(s.tokenizer.DecodeRaw([]int32{t})) != "" {
+				selfStop("tool_calls")
+			}
+			return
+		}
+
+		// Swallow leading whitespace (e.g. the "\n\n" the qwen template puts
+		// between </think> and the answer/calls) — mirrors the collect paths'
+		// left TrimSpace so streamed and collected content match.
+		if len(contentIDs) == 0 && strings.TrimSpace(s.tokenizer.Decode([]int32{t})) == "" {
+			return
+		}
+		contentIDs = append(contentIDs, t)
+		full := s.tokenizer.Decode(contentIDs)
+		if len(full) > len(emittedContent) {
+			emitContentDelta(full[len(emittedContent):])
+			emittedContent = full
 		}
 	})
 
 	s.logGenSpeed(genStart, generated)
 	finish := batchFinish(res, r.Context())
+	if stopped && r.Context().Err() == nil {
+		finish = stopReason // self-initiated cancel, not a client disconnect
+	}
+	if callIdx > 0 && finish != "cancelled" {
+		finish = "tool_calls"
+	}
+	if callIdx == 0 && pendingClar != "" {
+		emitContentDelta(pendingClar) // every call was schema-invalid
+	}
+	if inTool && callIdx == 0 {
+		log.Printf("fucina: WARNING: generation ended inside an unterminated tool call (%d tokens buffered, finish=%s) — no tool_calls emitted", toolToks, finish)
+	}
 	s.finishStream(sse, finish, 0, generated)
 }
 
 // collectBatch accumulates a non-streaming batched sequence and writes the full
 // response (with reasoning split + tool-call parsing, mirroring generateResponse).
-func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, tokCh <-chan int32, done <-chan batch.Result, wantTools, legacy bool, promptTokens int, tools []Tool) {
+// Once ≥1 tool call has closed, the first prose or tool marker after it cancels
+// the sequence — the calls are complete and anything further is the model
+// hallucinating the tool response (same cutoff as the streaming paths).
+func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc,
+	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool, promptTokens int) {
+
 	var ids []int32
 	genStart := time.Now()
+	tcOpen, tcEnd := s.tokenizer.ToolCallOpen, s.tokenizer.ToolCallEnd
+	inTool := wantTools && params.ParsePrefix != ""
+	completed, lastCallEnd := 0, -1
+	stopped := false
+
 	res := drainTokens(tokCh, done, func(t int32) {
-		if s.tokenizer.IsStop(t) {
+		if stopped || s.tokenizer.IsStop(t) {
 			return
 		}
 		ids = append(ids, t)
+		if !wantTools || tcOpen < 0 {
+			return
+		}
+		switch {
+		case t == tcOpen && !inTool:
+			inTool = true
+		case inTool && tcEnd >= 0 && t == tcEnd:
+			inTool = false
+			completed++
+			lastCallEnd = len(ids) - 1
+		case !inTool && completed > 0:
+			if s.tokenizer.IsToolMarker(t) ||
+				strings.TrimSpace(s.tokenizer.DecodeRaw([]int32{t})) != "" {
+				stopped = true
+				cancel()
+			}
+		}
 	})
+	if stopped && lastCallEnd >= 0 {
+		ids = ids[:lastCallEnd+1] // drop the hallucination that triggered the cutoff
+	}
 	generated := len(ids)
 	s.logGenSpeed(genStart, generated)
 	finish := batchFinish(res, r.Context())
+	if stopped && r.Context().Err() == nil {
+		finish = "stop" // self-initiated cutoff, refined to tool_calls below
+	}
 
 	msg := ChatMessage{Role: "assistant"}
-	reasoning, rest := splitReasoning(s.tokenizer.DecodeRaw(ids))
+	raw := params.ParsePrefix + s.tokenizer.DecodeRaw(ids)
+	reasoning, rest := s.splitReasoning(raw, params.Thinking)
 	msg.ReasoningContent = reasoning
 	if wantTools {
 		if finish == "length" || finish == "cancelled" {
-			if o := strings.LastIndex(rest, "<|tool_call>"); o > strings.LastIndex(rest, "<tool_call|>") {
-				rest = rest[:o]
+			o, c := s.dialect.ToolCallLits()
+			if i := strings.LastIndex(rest, o); i > strings.LastIndex(rest, c) {
+				rest = rest[:i]
 			}
 		}
-		content, calls := parseToolCalls(rest)
+		content, calls := s.parseToolCalls(rest, params.Tools)
+		var clar string
 		if len(calls) > 0 {
-			calls, _ = validateToolCalls(calls, tools)
+			calls, clar = validateToolCalls(calls, params.Tools)
 		}
-		msg.Content = strings.TrimSpace(stripMarkers(content))
+		msg.Content = strings.TrimSpace(s.stripMarkers(content))
+		if msg.Content == "" && clar != "" {
+			msg.Content = clar
+		}
 		if len(calls) > 0 {
 			msg.ToolCalls = calls
 			if finish != "cancelled" {
@@ -1344,7 +1574,7 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, tokCh <-ch
 			}
 		}
 	} else {
-		msg.Content = strings.TrimSpace(stripMarkers(rest))
+		msg.Content = strings.TrimSpace(s.stripMarkers(rest))
 	}
 
 	if legacy {
@@ -1480,43 +1710,23 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 }
 
-// renderChatTemplate builds the gemma-4 prompt. The real vocab uses <|turn> /
-// <turn|> delimiters (NOT <start_of_turn>/<end_of_turn>, which are not tokens).
-// When tools are present they are declared in the (forced) system turn as
-// <|tool>…<tool|> blocks; role:tool messages render as <|tool_response>… blocks.
-// enableThinking gates the gemma-4 reasoning channel (see ChatRequest.resolveThinking).
-//
-// The turn structure lives in internal/chat; this method only injects the
-// tool-specific syntax (declarations, tool_calls re-rendering, tool responses)
-// through the chat.Renderer hooks, keeping all tool logic in this package.
+// renderChatTemplate builds the prompt through the active chat dialect
+// (gemma-4 turn/tool markers or Qwen ChatML + XML tool calls — detected from
+// the vocab at startup). The dialect owns the whole wire format: turn
+// structure, tool declarations, historical tool_calls re-rendering, tool
+// responses, and the reasoning block gated by enableThinking.
 func (s *Server) renderChatTemplate(messages []ChatMessage, tools []Tool, enableThinking bool) string {
-	msgs := make([]chat.Message, len(messages))
+	msgs := make([]chat.RichMessage, len(messages))
 	for i, m := range messages {
-		msgs[i] = chat.Message{Role: m.Role, Content: m.Content, Reasoning: m.ReasoningContent}
+		msgs[i] = chat.RichMessage{
+			Role:      m.Role,
+			Content:   m.Content,
+			Reasoning: m.ReasoningContent,
+			Name:      m.Name,
+			ToolCalls: m.ToolCalls,
+		}
 	}
-
-	// Tool declarations go inside the forced system turn.
-	sysExtra := ""
-	if len(tools) > 0 {
-		sysExtra = renderToolDeclarations(tools)
-	}
-
-	r := chat.Renderer{
-		EnableThinking: enableThinking,
-		SystemExtra:    sysExtra,
-		// Assistant tool_calls are re-rendered inside the model turn.
-		TurnExtra: func(i int) string {
-			if len(messages[i].ToolCalls) > 0 {
-				return renderAssistantToolCalls(messages[i].ToolCalls)
-			}
-			return ""
-		},
-		// role:"tool" messages render as <|tool_response>… blocks.
-		ToolResponse: func(i int) string {
-			return renderToolResponse(messages[i].Name, messages[i].Content)
-		},
-	}
-	return r.Render(msgs)
+	return s.dialect.Render(msgs, tools, enableThinking)
 }
 
 // runSpec drives the speculative generation engine with the server-side guards
@@ -1561,7 +1771,11 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 	)
 	var all []int32
 	detector := &cycleDetector{}
-	thinkToks, inCh, inTC, thinkClosed := 0, false, false, false
+	// Qwen's <think> opener is rendered into the PROMPT, so with thinking on
+	// generation starts inside the reasoning span and the budget must count
+	// from token 0 (no open marker will ever arrive).
+	thinkToks, inTC, thinkClosed := 0, false, false
+	inCh := s.dialect.StartsInReasoning(params.Thinking)
 	remaining := params.MaxTokens
 
 	for remaining > 0 {
@@ -1716,7 +1930,7 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 		var emit func(int32) bool
 		tcOpen := s.tokenizer.ToolCallOpen
 		if wantTools && tcOpen >= 0 {
-			inTool, completed := false, 0
+			inTool, completed := params.ParsePrefix != "", 0
 			emit = func(t int32) bool {
 				if t == tcOpen {
 					inTool = true
@@ -1738,7 +1952,7 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 				return false
 			}
 		}
-		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
+		stops := s.tokenizer.StopIDs()
 		var err error
 		var specFinish string
 		toks, specFinish, err = s.runSpec(ctx, params, logits, stops, emit)
@@ -1824,21 +2038,22 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 	s.logGenSpeed(genStart, generated)
 
 	msg := ChatMessage{Role: "assistant"}
-	// Separate the gemma-4 thought channel into reasoning_content; the rest is the
+	// Separate the reasoning block into reasoning_content; the rest is the
 	// answer (and any tool-call markers). Done for BOTH paths so reasoning never
 	// leaks into content when thinking is enabled.
-	reasoning, rest := splitReasoning(s.tokenizer.DecodeRaw(toks))
+	reasoning, rest := s.splitReasoning(params.ParsePrefix+s.tokenizer.DecodeRaw(toks), params.Thinking)
 	msg.ReasoningContent = reasoning
 	if wantTools {
 		if finish == "length" || finish == "cancelled" {
 			// Truncated turn: never dispatch a trailing UNTERMINATED call whose
 			// arguments were cut at an arbitrary token (mirror of the streaming
 			// path's guard); complete earlier calls still parse.
-			if o := strings.LastIndex(rest, "<|tool_call>"); o > strings.LastIndex(rest, "<tool_call|>") {
-				rest = rest[:o]
+			o, c := s.dialect.ToolCallLits()
+			if i := strings.LastIndex(rest, o); i > strings.LastIndex(rest, c) {
+				rest = rest[:i]
 			}
 		}
-		content, calls := parseToolCalls(rest)
+		content, calls := s.parseToolCalls(rest, params.Tools)
 		// Refuse to dispatch a call that violates its required-parameter schema
 		// (e.g. web_search{"query":""}); answer with a clarification instead.
 		var clar string
@@ -1846,9 +2061,9 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			calls, clar = validateToolCalls(calls, params.Tools)
 		}
 		// parseToolCalls leaves non-call text as-is; with generation running to
-		// end-of-turn the literal "<turn|>" marker would otherwise leak into
+		// end-of-turn a literal turn marker would otherwise leak into
 		// message.content (streaming never emits markers — keep parity).
-		msg.Content = strings.TrimSpace(stripMarkers(content))
+		msg.Content = strings.TrimSpace(s.stripMarkers(content))
 		if msg.Content == "" && clar != "" {
 			msg.Content = clar
 		}
@@ -1861,7 +2076,7 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 	} else {
 		// rest still carries control markers as literal strings (DecodeRaw); strip
 		// them to plain text the way Decode would.
-		msg.Content = strings.TrimSpace(stripMarkers(rest))
+		msg.Content = strings.TrimSpace(s.stripMarkers(rest))
 	}
 
 	if legacy {
@@ -1942,11 +2157,13 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	finish := "stop"
 	var emitted strings.Builder // accumulated visible text, for stop-string detection
 	var rawToks []int32         // ALL generated ids (markers included) for tool parsing
-	inTool := false             // currently inside a <|tool_call> … <tool_call|> span
-	inChannel := false          // currently inside a <|channel> … <channel|> reasoning span
-	channelLabel := false       // still skipping the "thought" label at a channel's start
-	completedCalls := 0         // tool calls fully captured this turn (multi-call support)
-	toolToks := 0               // tokens buffered inside the CURRENT tool-call span
+	// Forced tool_choice opens the call in the PROMPT; Qwen's thinking opener
+	// also lives in the prompt — both make the stream start mid-span.
+	inTool := wantTools && params.ParsePrefix != ""
+	inChannel := s.dialect.StartsInReasoning(params.Thinking)
+	channelLabel := false // still skipping the "thought" label at a channel's start
+	completedCalls := 0   // tool calls fully captured this turn (multi-call support)
+	toolToks := 0         // tokens buffered inside the CURRENT tool-call span
 
 	// Bounds for the tool-call buffer. The Req3 incident: a repetition loop
 	// INSIDE an unterminated tool call silently swallowed ~7950 of 8192 tokens —
@@ -2023,7 +2240,9 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 				return true // calls captured and the model is moving on — dispatch them
 			}
 			inChannel = true
-			channelLabel = true // next text token is the "thought" label — skip it
+			// gemma's channel opens with a "thought\n" label line to skip;
+			// qwen's <think> block has no label.
+			channelLabel = s.dialect.HasReasoningLabel()
 			return false
 		}
 		if inChannel {
@@ -2103,7 +2322,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 		// Repeat-penalty is applied on-GPU inside the engine's spec sampler, so
 		// repeat_penalty != 1.0 no longer drops to a per-token CPU decode loop
 		// (1 MB logits D2H + host top-k per token, and no drafting).
-		stops := []int32{s.tokenizer.EOS, s.tokenizer.EndOfTurn}
+		stops := s.tokenizer.StopIDs()
 		_, specFinish, err := s.runSpec(ctx, params, logits, stops, processToken)
 		if err != nil {
 			log.Printf("fucina: generation error after %d tokens: %v", generated, err)
@@ -2115,17 +2334,18 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 
 	// Emit any captured tool call(s) as a structured delta before the final chunk.
 	if wantTools {
-		raw := s.tokenizer.DecodeRaw(rawToks)
+		raw := params.ParsePrefix + s.tokenizer.DecodeRaw(rawToks)
 		if inTool && (finish == "length" || finish == "cancelled") {
 			// The turn was TRUNCATED inside an unterminated call: its arguments
 			// are arbitrarily-cut text (often the repetition cycle itself). The
 			// lenient recovery in parseToolCalls must not dispatch it — drop the
 			// trailing unterminated span; complete earlier calls still go out.
-			if i := strings.LastIndex(raw, "<|tool_call>"); i >= 0 {
+			openLit, _ := s.dialect.ToolCallLits()
+			if i := strings.LastIndex(raw, openLit); i >= 0 {
 				raw = raw[:i]
 			}
 		}
-		if _, calls := parseToolCalls(raw); len(calls) > 0 {
+		if _, calls := s.parseToolCalls(raw, params.Tools); len(calls) > 0 {
 			// Drop calls that violate their required-parameter schema; if every
 			// call is dropped, stream a clarification instead of a malformed call.
 			calls, clar := validateToolCalls(calls, params.Tools)

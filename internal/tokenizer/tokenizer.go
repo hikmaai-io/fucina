@@ -37,6 +37,11 @@ type Tokenizer struct {
 	EOS int32
 	PAD int32
 
+	// EOS2 is a secondary end-of-sequence id (-1 if absent). ChatML vocabs
+	// (Qwen3/Qwen3.5) declare TWO terminators — <|im_end|> and <|endoftext|>
+	// (generation_config eos_token_id lists both); IsStop honours either.
+	EOS2 int32
+
 	// Gemma-4 turn / channel control tokens. EndOfTurn (<turn|>) terminates an
 	// assistant turn and must be treated as a stop token alongside EOS.
 	StartOfTurn int32 // <|turn>   = 105
@@ -86,6 +91,46 @@ type Tokenizer struct {
 	// add_bos_token=0) never gets a spurious leading <|endoftext|>.
 	addBOS bool
 	addEOS bool
+}
+
+// chatMLMarkers are the ChatML/Qwen control-token literals (Qwen3, Qwen3-MoE,
+// Qwen3.5). Registered for Encode's pre-split scan and mapped onto the
+// dialect-neutral marker fields by mapChatMLMarkers.
+var chatMLMarkers = []string{
+	"<|im_start|>", "<|im_end|>", "<|endoftext|>",
+	"<think>", "</think>", "<tool_call>", "</tool_call>",
+	"<tool_response>", "</tool_response>",
+}
+
+// mapChatMLMarkers detects a ChatML vocabulary (<|im_start|> present — the
+// Qwen family) and maps its control tokens onto the marker fields the server
+// keys on: <think>/</think> are the reasoning span (ChannelOpen/End),
+// <tool_call>/</tool_call> the tool-call span, <|im_end|> ends the turn.
+// No-op on Gemma vocabs. EOS from GGUF metadata is preserved when it already
+// names a ChatML terminator; the loader defaults (Gemma ids meaningless in a
+// Qwen vocab) are replaced by <|im_end|>, with <|endoftext|> as the secondary
+// stop (generation_config lists both).
+func (t *Tokenizer) mapChatMLMarkers() {
+	imStart, ok := t.tokenToID["<|im_start|>"]
+	if !ok {
+		return
+	}
+	lk := func(s string) int32 {
+		if id, ok := t.tokenToID[s]; ok {
+			return id
+		}
+		return -1
+	}
+	imEnd, eot := lk("<|im_end|>"), lk("<|endoftext|>")
+	t.StartOfTurn, t.EndOfTurn = imStart, imEnd
+	if imEnd >= 0 && t.EOS != imEnd && t.EOS != eot {
+		t.EOS = imEnd
+	}
+	t.EOS2 = eot
+	t.ChannelOpen, t.ChannelEnd = lk("<think>"), lk("</think>")
+	t.ToolCallOpen, t.ToolCallEnd = lk("<tool_call>"), lk("</tool_call>")
+	t.ToolRespOpen, t.ToolRespEnd = lk("<tool_response>"), lk("</tool_response>")
+	t.ToolOpen, t.ToolEnd, t.StringDelim = -1, -1, -1
 }
 
 // mergePair keys the BPE merge table: the adjacent (left,right) symbol pair.
@@ -282,6 +327,7 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 	t := &Tokenizer{
 		BOS:    2,
 		EOS:    1,
+		EOS2:   -1,
 		PAD:    0,
 		addBOS: true, // default-true preserves Gemma behaviour when the key is absent
 		addEOS: true,
@@ -490,15 +536,18 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 	t.ToolRespOpen = lookup("<|tool_response>", -1)
 	t.ToolRespEnd = lookup("<tool_response|>", -1)
 	t.StringDelim = lookup(`<|"|>`, -1)
+	t.mapChatMLMarkers()
 
 	// Register the marker literals for Encode's pre-split scan (longest-first
 	// so no marker can shadow a longer one sharing its prefix). <|think|> has
-	// no dedicated struct field but appears in rendered prompts.
-	for _, s := range []string{
+	// no dedicated struct field but appears in rendered prompts. The ChatML
+	// set covers Qwen-family GGUFs (only literals present in the vocab
+	// register, so this is a no-op for Gemma).
+	for _, s := range append([]string{
 		"<|turn>", "<turn|>", "<|channel>", "<channel|>",
 		"<|tool>", "<tool|>", "<|tool_call>", "<tool_call|>",
 		"<|tool_response>", "<tool_response|>", `<|"|>`, "<|think|>",
-	} {
+	}, chatMLMarkers...) {
 		if id, ok := t.tokenToID[s]; ok {
 			t.specials = append(t.specials, specialToken{str: s, id: id})
 		}
@@ -544,9 +593,31 @@ func (t *Tokenizer) DecodeRaw(tokens []int32) string {
 	return string(buf)
 }
 
-// IsStop reports whether a token id terminates generation (EOS or end-of-turn).
+// IsStop reports whether a token id terminates generation (EOS, end-of-turn,
+// or the secondary EOS on ChatML vocabs).
 func (t *Tokenizer) IsStop(id int32) bool {
-	return id == t.EOS || id == t.EndOfTurn
+	return id == t.EOS || id == t.EndOfTurn || (t.EOS2 >= 0 && id == t.EOS2)
+}
+
+// StopIDs returns the deduplicated list of generation-terminating token ids —
+// the single source for every engine/scheduler stop list.
+func (t *Tokenizer) StopIDs() []int32 {
+	ids := []int32{t.EOS}
+	if t.EndOfTurn >= 0 && t.EndOfTurn != t.EOS {
+		ids = append(ids, t.EndOfTurn)
+	}
+	if t.EOS2 >= 0 && t.EOS2 != t.EOS && t.EOS2 != t.EndOfTurn {
+		ids = append(ids, t.EOS2)
+	}
+	return ids
+}
+
+// HasToken reports whether the literal string resolves to a vocab id. The
+// server uses it for runtime dialect detection (ChatML's <|im_start|> marks
+// the Qwen family) — model identity always comes from the artifact, not flags.
+func (t *Tokenizer) HasToken(s string) bool {
+	_, ok := t.tokenToID[s]
+	return ok
 }
 
 // IsToolMarker reports whether an id is one of the gemma-4 tool-protocol markers
@@ -567,6 +638,7 @@ func (t *Tokenizer) IsToolMarker(id int32) bool {
 // rendered into user-visible text.
 func (t *Tokenizer) isControl(id int32) bool {
 	return id == t.BOS || id == t.EOS || id == t.PAD ||
+		(t.EOS2 >= 0 && id == t.EOS2) ||
 		id == t.StartOfTurn || id == t.EndOfTurn ||
 		id == t.ChannelOpen || id == t.ChannelEnd
 }

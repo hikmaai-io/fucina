@@ -64,20 +64,40 @@ func TestQwen35_ServedTokenizer(t *testing.T) {
 		t.Errorf("Encode(addBos=true):\n  got  %v\n  want %v", got, want)
 	}
 
-	// The gemma turn markers are absent from the gpt2 vocab; they must resolve to
-	// -1, NOT the gemma default ids (which collide with byte tokens). Otherwise
-	// IsStop(106) would terminate generation on a "®".
+	// The gemma turn markers must never fall back to their gemma default ids
+	// (which collide with byte tokens — id 106 is "®"); the ChatML mapping
+	// resolves the REAL turn markers instead: <|im_start|>/<|im_end|>, the
+	// <think>/<tool_call> spans, and <|endoftext|> as the secondary stop.
 	if tk.EndOfTurn == 106 {
 		t.Error("EndOfTurn resolved to 106 (== \"®\" byte token) — spurious-stop bug")
 	}
-	if tk.EndOfTurn != -1 {
-		t.Errorf("EndOfTurn=%d, want -1 (marker absent in gpt2 vocab)", tk.EndOfTurn)
+	if tk.EndOfTurn != 248046 {
+		t.Errorf("EndOfTurn=%d, want 248046 (<|im_end|>)", tk.EndOfTurn)
+	}
+	if tk.StartOfTurn != 248045 {
+		t.Errorf("StartOfTurn=%d, want 248045 (<|im_start|>)", tk.StartOfTurn)
+	}
+	if tk.EOS2 != 248044 {
+		t.Errorf("EOS2=%d, want 248044 (<|endoftext|>)", tk.EOS2)
+	}
+	if tk.ChannelOpen != 248068 || tk.ChannelEnd != 248069 {
+		t.Errorf("think span = %d/%d, want 248068/248069", tk.ChannelOpen, tk.ChannelEnd)
+	}
+	if tk.ToolCallOpen != 248058 || tk.ToolCallEnd != 248059 {
+		t.Errorf("tool_call span = %d/%d, want 248058/248059", tk.ToolCallOpen, tk.ToolCallEnd)
 	}
 	if tk.IsStop(106) {
 		t.Error("IsStop(106)=true — would stop generation on a real byte token")
 	}
-	if !tk.IsStop(tk.EOS) {
-		t.Error("IsStop(EOS)=false, want true")
+	if !tk.IsStop(tk.EOS) || !tk.IsStop(248044) {
+		t.Error("IsStop must fire on <|im_end|> and <|endoftext|>")
+	}
+
+	// ChatML markers must encode as single tokens (pre-split registration) —
+	// the rendered chat template depends on it.
+	mids := tk.Encode("<|im_start|>user\nhi<|im_end|>\n", false, false)
+	if len(mids) < 2 || mids[0] != 248045 || mids[len(mids)-2] != 248046 {
+		t.Errorf("ChatML markers did not encode as single tokens: %v", mids)
 	}
 
 	// Round-trip: decode(encode(s)) reproduces s.
