@@ -94,6 +94,81 @@ func TestResponseFormatForceCloseAtCap(t *testing.T) {
 	}
 }
 
+// TestResponseFormatJSONSchema drives response_format {type:"json_schema"} with a schema
+// requiring an integer property "a". The scripted engine peaks at the bytes of {"a":1};
+// the schema constraint keeps exactly those legal, so the output matches the schema.
+func TestResponseFormatJSONSchema(t *testing.T) {
+	tk, idx := newServerTokenizer(t)
+	b := func(c byte) int32 { return idx["<0x"+string([]byte{"0123456789ABCDEF"[(c>>4)&0xF], "0123456789ABCDEF"[c&0xF]})+">"] }
+	script := []int32{b('{'), b('"'), b('a'), b('"'), b(':'), b('1'), b('}')}
+	f := &fakeServerEngine{ctxSize: 8192, vocab: tk.NumTokens(), eos: tk.EOS, script: script}
+	srv := New(f, tk)
+	srv.SetLogLevel("warn")
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages":    []map[string]string{{"role": "user", "content": "hi"}},
+		"max_tokens":  32,
+		"temperature": 0,
+		"response_format": map[string]interface{}{
+			"type": "json_schema",
+			"json_schema": map[string]interface{}{
+				"name":   "answer",
+				"strict": true,
+				"schema": map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{"a": map[string]interface{}{"type": "integer"}},
+					"required":   []string{"a"},
+				},
+			},
+		},
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var resp ChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	var obj struct {
+		A int `json:"a"`
+	}
+	got := resp.Choices[0].Message.Content
+	if err := json.Unmarshal([]byte(got), &obj); err != nil {
+		t.Fatalf("schema-constrained output not valid JSON: %v (%q)", err, got)
+	}
+	if obj.A != 1 {
+		t.Errorf("content=%q want {\"a\":1}", got)
+	}
+	if f.specCalls != 0 {
+		t.Errorf("spec path used %d times under json_schema; want 0", f.specCalls)
+	}
+}
+
+// TestResponseFormatBadSchema asserts a malformed json_schema is rejected up front (400)
+// rather than silently ignored.
+func TestResponseFormatBadSchema(t *testing.T) {
+	srv, _ := newTestServer(t, 8192, nil)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+		"max_tokens": 16,
+		"response_format": map[string]interface{}{
+			"type": "json_schema",
+			"json_schema": map[string]interface{}{
+				"name":   "bad",
+				"schema": map[string]interface{}{"type": "object", "required": []string{"missing"}},
+			},
+		},
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
 // TestResponseFormatRejectedUnderBatching asserts the route-guard: response_format
 // cannot be honored by the on-device batch sampler, so under continuous batching the
 // server returns 501 (rather than silently producing unconstrained output).

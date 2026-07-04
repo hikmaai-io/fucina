@@ -2505,8 +2505,7 @@ func (s *Server) schemaConstraint(spec *JSONSchemaSpec) (grammar.Constraint, err
 		// No schema payload: fall back to plain json_object structure.
 		return s.jsonConstraint(), nil
 	}
-	// TODO(#1b): enforce the schema (keys/types/enums) via grammar.NewJSONSchema.
-	return s.jsonConstraint(), nil
+	return grammar.NewJSONSchema(s.jsonPiecesCached(), s.tokenizer.EOS, spec.Schema)
 }
 
 // runConstrained generates under a grammar constraint via host sampling (the on-device
