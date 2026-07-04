@@ -3792,8 +3792,11 @@ struct gemma4_engine {
     int      q35_graph_enabled;               // run-time graph toggle (1 default; test flips it)
     float   *d_q35_S[GEMMA4_CAP_LAYERS];      // LINEAR l: [MAX_SEQS][NVH*SD*SD]   fp32 GDN state
     float   *d_q35_ring[GEMMA4_CAP_LAYERS];   // LINEAR l: [MAX_SEQS][CONVD*(CK-1)] fp32 conv ring
-    float   *d_q35_Kc[GEMMA4_CAP_LAYERS];     // FULL   l: [MAX_SEQS][maxctx*NKV*HD] fp32 K
-    float   *d_q35_Vc[GEMMA4_CAP_LAYERS];     // FULL   l: [MAX_SEQS][maxctx*NKV*HD] fp32 V
+    __half  *d_q35_Kc[GEMMA4_CAP_LAYERS];     // FULL l: [MAX_SEQS][maxctx*NKV*HD] fp16 K — the
+    __half  *d_q35_Vc[GEMMA4_CAP_LAYERS];     // FULL l: [MAX_SEQS][maxctx*NKV*HD] fp16 V. Halves the
+    // position-linear attention read (the decode step grows with context) vs fp32; fp16 is
+    // near-lossless for K/V (K is k-norm+RoPE-bounded, V's projection range fits fp16's ±65504),
+    // so greedy argmax matches the fp32 oracle (gated by the batch self-test's part-D).
     int     *d_q35_rowslot;                   // [PF_TILE] per-row slot id (state-arena index)
     float   *d_q35_sb[24];                    // [PF_TILE rows] batched compute scratch (Q35_* enum)
     float   *d_q35_chunk_scr;                 // GDN chunk-scan per-v-head WY/UT scratch [NVH*M2_SCR_PER]
@@ -16119,7 +16122,7 @@ __global__ void qwen35_b_rope_kernel(float *x, int n_heads, const int *pos, int 
 
 // Write each row's current K/V (kb/vb [B][NKV*HD]) into the per-slot FULL-layer K/V cache
 // at (slot=rowslot[r], pos=pos[r]). Cache base = slot*maxctx*NKV*HD; token offset = pos*NKV*HD.
-__global__ void qwen35_b_kv_write_kernel(float *Kc, float *Vc, const float *kb, const float *vb,
+__global__ void qwen35_b_kv_write_kernel(__half *Kc, __half *Vc, const float *kb, const float *vb,
                                          const int *pos, const int *rowslot, int maxctx, int B,
                                          int nkv) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over nkv*HD
@@ -16128,14 +16131,14 @@ __global__ void qwen35_b_kv_write_kernel(float *Kc, float *Vc, const float *kb, 
     int slot = rowslot[r], p = pos[r];
     size_t base = ((size_t)slot * maxctx + p) * nkv * M2_HEAD;
     size_t src  = (size_t)r * nkv * M2_HEAD + idx;
-    Kc[base + idx] = kb[src];
-    Vc[base + idx] = vb[src];
+    Kc[base + idx] = __float2half(kb[src]);            // fp16 store: halves the per-position read
+    Vc[base + idx] = __float2half(vb[src]);
 }
 
 // Single-query causal GQA softmax for B rows against the per-slot FULL-layer K/V cache.
 // One block per (query-head, row); reads pos[r]/slot=rowslot[r]; scores in dynamic shared
 // (maxctx floats; only [0..pos] touched). Arithmetic bit-identical to M3 qwen35_attn_step.
-__global__ void qwen35_b_attn_kernel(float *out, const float *q, const float *Kc, const float *Vc,
+__global__ void qwen35_b_attn_kernel(float *out, const float *q, const __half *Kc, const __half *Vc,
                                      const int *pos, const int *rowslot, int maxctx, int B,
                                      int nkv) {
     int hd = blockIdx.x;   // query head 0..NQ-1
@@ -16146,13 +16149,13 @@ __global__ void qwen35_b_attn_kernel(float *out, const float *q, const float *Kc
     int tid = threadIdx.x;
     extern __shared__ float sc[];   // [maxctx]
     const float *qr = q + ((size_t)r * M2_NQ + hd) * M2_HEAD;
-    const float *Kb = Kc + (size_t)slot * maxctx * nkv * M2_HEAD;
-    const float *Vb = Vc + (size_t)slot * maxctx * nkv * M2_HEAD;
+    const __half *Kb = Kc + (size_t)slot * maxctx * nkv * M2_HEAD;   // fp16 cache: convert on read
+    const __half *Vb = Vc + (size_t)slot * maxctx * nkv * M2_HEAD;
     float scale = rsqrtf((float)M2_HEAD);
     for (int j = tid; j <= p; j += blockDim.x) {
-        const float *kr = Kb + ((size_t)j * nkv + kv) * M2_HEAD;
+        const __half *kr = Kb + ((size_t)j * nkv + kv) * M2_HEAD;
         float acc = 0.f;
-        for (int d = 0; d < M2_HEAD; d++) acc += qr[d] * kr[d];
+        for (int d = 0; d < M2_HEAD; d++) acc += qr[d] * __half2float(kr[d]);
         sc[j] = acc * scale;
     }
     __syncthreads();
@@ -16169,7 +16172,7 @@ __global__ void qwen35_b_attn_kernel(float *out, const float *q, const float *Kc
     for (int d = tid; d < M2_HEAD; d += blockDim.x) {
         float acc = 0.f;
         for (int j = 0; j <= p; j++)
-            acc += sc[j] * Vb[((size_t)j * nkv + kv) * M2_HEAD + d];
+            acc += sc[j] * __half2float(Vb[((size_t)j * nkv + kv) * M2_HEAD + d]);
         out[((size_t)r * M2_NQ + hd) * M2_HEAD + d] = acc * inv;
     }
 }
@@ -16559,8 +16562,8 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     ok = ok && cudaMalloc(&eng->d_q35_xbf16,    xbf_max * sizeof(__nv_bfloat16)) == cudaSuccess;
     for (int l = 0; l < L && ok; l++) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
-            ok &= cudaMalloc(&eng->d_q35_Kc[l], (size_t)MS*maxctx*NKV*HD*sizeof(float)) == cudaSuccess;
-            ok &= cudaMalloc(&eng->d_q35_Vc[l], (size_t)MS*maxctx*NKV*HD*sizeof(float)) == cudaSuccess;
+            ok &= cudaMalloc(&eng->d_q35_Kc[l], (size_t)MS*maxctx*NKV*HD*sizeof(__half)) == cudaSuccess;
+            ok &= cudaMalloc(&eng->d_q35_Vc[l], (size_t)MS*maxctx*NKV*HD*sizeof(__half)) == cudaSuccess;
         } else {
             ok &= cudaMalloc(&eng->d_q35_S[l],  (size_t)MS*NVH*SD*SD*sizeof(float)) == cudaSuccess;
             ok &= cudaMalloc(&eng->d_q35_ring[l],(size_t)MS*CONVD*(CK-1)*sizeof(float)) == cudaSuccess;
@@ -17245,7 +17248,7 @@ static size_t q35_state_size_bytes(const gemma4_engine_t *eng, int n_tokens) {
     size_t bytes = 0;
     for (int l = 0; l < c->n_layers; l++) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL)
-            bytes += 2ull * (size_t)n_tokens * NKV * HD * sizeof(float);
+            bytes += 2ull * (size_t)n_tokens * NKV * HD * sizeof(__half);   // fp16 K + V
         else
             bytes += ((size_t)M2_NVH * M2_SD * M2_SD +
                       (size_t)M2_CONVDIM * (M2_CK - 1)) * sizeof(float);
@@ -17267,14 +17270,14 @@ extern "C" size_t gemma4_engine_q35_state_size(gemma4_engine_t *eng, int n_token
 static int q35_state_copy(gemma4_engine_t *eng, int slot, char *h, int n_tokens, int to_host) {
     const gemma4_model_config_t *c = &eng->cfg;
     const int NKV = c->n_kv_global, HD = M2_HEAD, maxctx = eng->q35_maxctx;
-    const size_t kv = (size_t)n_tokens * NKV * HD * sizeof(float);
+    const size_t kv = (size_t)n_tokens * NKV * HD * sizeof(__half);   // fp16 K/V slice
     const size_t s_sz = (size_t)M2_NVH * M2_SD * M2_SD * sizeof(float);
     const size_t r_sz = (size_t)M2_CONVDIM * (M2_CK - 1) * sizeof(float);
     cudaStream_t st = eng->stream;
     for (int l = 0; l < c->n_layers; l++) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
-            float *Kb = eng->d_q35_Kc[l] + (size_t)slot * maxctx * NKV * HD;
-            float *Vb = eng->d_q35_Vc[l] + (size_t)slot * maxctx * NKV * HD;
+            __half *Kb = eng->d_q35_Kc[l] + (size_t)slot * maxctx * NKV * HD;
+            __half *Vb = eng->d_q35_Vc[l] + (size_t)slot * maxctx * NKV * HD;
             if (to_host) {
                 cudaMemcpyAsync(h, Kb, kv, cudaMemcpyDeviceToHost, st); h += kv;
                 cudaMemcpyAsync(h, Vb, kv, cudaMemcpyDeviceToHost, st); h += kv;
