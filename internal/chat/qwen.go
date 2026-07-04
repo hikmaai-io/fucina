@@ -193,7 +193,19 @@ func (qwenDialect) Render(msgs []RichMessage, tools []Tool, enableThinking bool)
 				sb.WriteString("\n</think>\n\n")
 				sb.WriteString(content)
 			} else {
-				sb.WriteString("<|im_start|>assistant\n")
+				// DELIBERATE deviation from the checkpoint template (which
+				// renders old assistant turns bare): keep the EMPTY think
+				// block. A thinking-off generation committed exactly
+				// "<think>\n\n</think>\n\n"+content to the KV (the pre-closed
+				// opener was part of its prompt), so this re-render stays
+				// byte-identical to the committed sequence and the per-
+				// conversation state/prefix cache keeps matching across
+				// turns. Thinking-ON old turns still break the prefix when
+				// their reasoning is dropped — unavoidable (and identical to
+				// the official template's behavior). The empty block is
+				// distribution-neutral: it is precisely what the model sees
+				// in every non-thinking exchange.
+				sb.WriteString("<|im_start|>assistant\n<think>\n\n</think>\n\n")
 				sb.WriteString(content)
 			}
 			for j, tc := range msg.ToolCalls {

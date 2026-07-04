@@ -17224,6 +17224,111 @@ static int qwen35_seq_prefill_chunk(gemma4_engine_t *eng, int slot, const int32_
     return 0;
 }
 
+// ─── Qwen3.5 hybrid per-slot state snapshot (conversation/state cache) ──────
+//
+// A hybrid slot's state is (a) a FIXED-size recurrent part per LINEAR layer —
+// GDN delta-rule state S [NVH*SD*SD] + causal-conv ring [CONVD*(CK-1)] — and
+// (b) a length-proportional FULL-layer K/V prefix [n_tokens*NKV*HD] each (K
+// and V, position-major, so the prefix is the leading contiguous slice).
+//
+// The GDN state is a recurrence at EXACTLY n_tokens: unlike attention KV it
+// cannot be truncated to an arbitrary shorter prefix. A snapshot is therefore
+// restorable ONLY into a prompt that EXTENDS its token sequence — which is
+// precisely the agentic multi-turn case (conversation + new turn appended).
+//
+// Buffer layout: layers in order; FULL → K slice then V slice; LINEAR → S
+// then ring. All fp32 device bytes.
+
+static size_t q35_state_size_bytes(const gemma4_engine_t *eng, int n_tokens) {
+    const gemma4_model_config_t *c = &eng->cfg;
+    const int NKV = c->n_kv_global, HD = M2_HEAD;
+    size_t bytes = 0;
+    for (int l = 0; l < c->n_layers; l++) {
+        if (c->attn_kind[l] == GEMMA4_ATTN_FULL)
+            bytes += 2ull * (size_t)n_tokens * NKV * HD * sizeof(float);
+        else
+            bytes += ((size_t)M2_NVH * M2_SD * M2_SD +
+                      (size_t)M2_CONVDIM * (M2_CK - 1)) * sizeof(float);
+    }
+    return bytes;
+}
+
+extern "C" size_t gemma4_engine_q35_state_size(gemma4_engine_t *eng, int n_tokens) {
+    if (!eng || !eng->loaded || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5 || n_tokens <= 0) return 0;
+    if (ensure_q35_scratch(eng) != 0) return 0;
+    if (n_tokens > eng->q35_maxctx) return 0;
+    return q35_state_size_bytes(eng, n_tokens);
+}
+
+// q35_state_copy moves one slot's state (at n_tokens) between the device
+// arenas and a host buffer. to_host=1 → save, 0 → restore. Synchronous on the
+// engine stream (pageable host memory serializes the copies anyway; on the
+// GB10's unified memory this is a plain memcpy at full bandwidth).
+static int q35_state_copy(gemma4_engine_t *eng, int slot, char *h, int n_tokens, int to_host) {
+    const gemma4_model_config_t *c = &eng->cfg;
+    const int NKV = c->n_kv_global, HD = M2_HEAD, maxctx = eng->q35_maxctx;
+    const size_t kv = (size_t)n_tokens * NKV * HD * sizeof(float);
+    const size_t s_sz = (size_t)M2_NVH * M2_SD * M2_SD * sizeof(float);
+    const size_t r_sz = (size_t)M2_CONVDIM * (M2_CK - 1) * sizeof(float);
+    cudaStream_t st = eng->stream;
+    for (int l = 0; l < c->n_layers; l++) {
+        if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
+            float *Kb = eng->d_q35_Kc[l] + (size_t)slot * maxctx * NKV * HD;
+            float *Vb = eng->d_q35_Vc[l] + (size_t)slot * maxctx * NKV * HD;
+            if (to_host) {
+                cudaMemcpyAsync(h, Kb, kv, cudaMemcpyDeviceToHost, st); h += kv;
+                cudaMemcpyAsync(h, Vb, kv, cudaMemcpyDeviceToHost, st); h += kv;
+            } else {
+                cudaMemcpyAsync(Kb, h, kv, cudaMemcpyHostToDevice, st); h += kv;
+                cudaMemcpyAsync(Vb, h, kv, cudaMemcpyHostToDevice, st); h += kv;
+            }
+        } else {
+            float *S = eng->d_q35_S[l] + (size_t)slot * M2_NVH * M2_SD * M2_SD;
+            float *R = eng->d_q35_ring[l] + (size_t)slot * M2_CONVDIM * (M2_CK - 1);
+            if (to_host) {
+                cudaMemcpyAsync(h, S, s_sz, cudaMemcpyDeviceToHost, st); h += s_sz;
+                cudaMemcpyAsync(h, R, r_sz, cudaMemcpyDeviceToHost, st); h += r_sz;
+            } else {
+                cudaMemcpyAsync(S, h, s_sz, cudaMemcpyHostToDevice, st); h += s_sz;
+                cudaMemcpyAsync(R, h, r_sz, cudaMemcpyHostToDevice, st); h += r_sz;
+            }
+        }
+    }
+    cudaStreamSynchronize(st);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+extern "C" int gemma4_engine_q35_state_save(gemma4_engine_t *eng, int slot,
+                                            void *buf, int n_tokens) {
+    if (!eng || !eng->loaded || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5 || !buf) return -1;
+    if (slot < 0 || slot >= GEMMA4_MAX_SEQS || !eng->slots[slot].used) return -1;
+    if (!eng->q35_ready || eng->slots[slot].n_tokens != n_tokens) return -1;
+    return q35_state_copy(eng, slot, (char *)buf, n_tokens, 1);
+}
+
+extern "C" int gemma4_engine_q35_state_restore(gemma4_engine_t *eng, int slot,
+                                               const void *buf, int n_tokens) {
+    if (!eng || !eng->loaded || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5 || !buf) return -1;
+    if (slot < 0 || slot >= GEMMA4_MAX_SEQS || !eng->slots[slot].used) return -1;
+    if (ensure_q35_scratch(eng) != 0) return -1;
+    if (n_tokens <= 0 || n_tokens > eng->q35_maxctx) return -1;
+    if (q35_state_copy(eng, slot, (char *)buf, n_tokens, 0) != 0) return -1;
+    gemma4_seq *s = &eng->slots[slot];
+    s->n_tokens = n_tokens;
+    s->n_sampled = 0;
+    s->mtp_h_valid = 0;
+    return 0;
+}
+
+// Committed token count of a live slot (-1 if free/invalid). The scheduler's
+// per-sequence history can run one token AHEAD of the engine (the last sampled
+// token is not fed back until the next step), so snapshot callers use this to
+// key the saved state by the tokens actually in the arenas.
+extern "C" int gemma4_engine_seq_ntokens(gemma4_engine_t *eng, int slot) {
+    if (!eng || slot < 0 || slot >= GEMMA4_MAX_SEQS || !eng->slots[slot].used) return -1;
+    return eng->slots[slot].n_tokens;
+}
+
 static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
                              const int32_t *in_tokens, int B, int32_t *out_tokens) {
     if (!eng || !eng->loaded || B <= 0 || B > GEMMA4_MAX_SEQS) return -1;

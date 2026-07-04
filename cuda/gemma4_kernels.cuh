@@ -349,6 +349,18 @@ size_t gemma4_engine_kv_state_size(const gemma4_engine_t *eng, int n_tokens);
 int    gemma4_engine_kv_save(gemma4_engine_t *eng, void *buf, int n_tokens);
 int    gemma4_engine_kv_restore(gemma4_engine_t *eng, const void *buf, int n_tokens);
 
+// Qwen3.5 hybrid per-SLOT state snapshot (batched-engine conversation cache):
+// fixed GDN state S + conv ring per LINEAR layer, plus the FULL-layer K/V
+// prefix at n_tokens. The GDN recurrence pins the snapshot to EXACTLY
+// n_tokens, so restore is valid only for prompts that EXTEND the snapshot's
+// token sequence. save requires the slot live at exactly n_tokens; restore
+// overwrites a freshly opened slot's state and sets its token count.
+// seq_ntokens reports a live slot's committed token count (-1 if free).
+size_t gemma4_engine_q35_state_size(gemma4_engine_t *eng, int n_tokens);
+int    gemma4_engine_q35_state_save(gemma4_engine_t *eng, int slot, void *buf, int n_tokens);
+int    gemma4_engine_q35_state_restore(gemma4_engine_t *eng, int slot, const void *buf, int n_tokens);
+int    gemma4_engine_seq_ntokens(gemma4_engine_t *eng, int slot);
+
 // ─── Continuous batching (multi-sequence paged decode) ─────────────
 // All require paged mode (engine created with FUCINA_PAGED_KV). They drive B
 // independent sequences through ONE batched forward over the shared paged KV.

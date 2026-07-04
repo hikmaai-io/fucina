@@ -178,6 +178,19 @@ type PrefixCommitEngine interface {
 	PrefixCommit(slot int, history []int32)
 }
 
+// StateSaverEngine is the optional per-conversation STATE-SNAPSHOT hook for
+// hybrid (recurrent + attention) engines whose per-sequence state cannot live
+// in a paged radix tree (the recurrent state is pinned to an exact position).
+// The scheduler calls SaveState with the finished sequence's committed token
+// history right before its slot is freed; the engine snapshots the slot state
+// and serves it back from OpenSeq/AddSeq when a later prompt EXTENDS that
+// history — collapsing turn-2+ prefill of a multi-turn conversation to just
+// the new turn's tokens. Called only for cleanly finished sequences
+// (stop/length/cancelled), never after an engine error.
+type StateSaverEngine interface {
+	SaveState(slot int, tokens []int32)
+}
+
 // defaultPrefillChunk is the prompt-token budget committed per scheduler pass for a
 // chunked (interleaved) prefill. Each pass commits at most one chunk for ONE prefilling
 // sequence AND runs one decode step, so decode of the active sequences keeps flowing
@@ -361,6 +374,10 @@ type Scheduler struct {
 	// sequence crosses 256-token block boundaries.
 	prefixCommit PrefixCommitEngine
 
+	// stateSaver, when non-nil, snapshots a finishing sequence's slot state
+	// keyed by its token history (hybrid engines' conversation cache).
+	stateSaver StateSaverEngine
+
 	// submit carries new requests to the owner goroutine. It is bounded; a full
 	// channel is backpressure (Submit returns ErrQueueFull) rather than
 	// unbounded goroutine/memory growth.
@@ -443,6 +460,9 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	}
 	if pc, ok := engine.(PrefixCommitEngine); ok {
 		s.prefixCommit = pc
+	}
+	if ss, ok := engine.(StateSaverEngine); ok {
+		s.stateSaver = ss
 	}
 	return s
 }
@@ -769,10 +789,11 @@ func (s *Scheduler) newSeq(req Request, slot int) *seq {
 		remaining: req.MaxNew,
 		stops:     make(map[int32]struct{}, len(req.Stops)),
 	}
-	// Track full history for the drafter (spec) and/or decode-time prefix-cache
-	// registration. The prompt's full blocks are already registered by AddSeq, so
-	// start regBlocks past them — PrefixCommit only fires for generated blocks.
-	if s.spec != nil || s.prefixCommit != nil {
+	// Track full history for the drafter (spec), decode-time prefix-cache
+	// registration, and/or eviction-time state snapshots. The prompt's full
+	// blocks are already registered by AddSeq, so start regBlocks past them —
+	// PrefixCommit only fires for generated blocks.
+	if s.spec != nil || s.prefixCommit != nil || s.stateSaver != nil {
 		sq.hist = append(make([]int32, 0, len(req.Tokens)+req.MaxNew), req.Tokens...)
 		sq.regBlocks = len(req.Tokens) / 256
 	}
@@ -1115,6 +1136,15 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 const specCorpusCap = 1 << 16 // tokens kept in the cross-request suffix-decoding ring
 
 func (s *Scheduler) evict(active map[int]*seq, sq *seq, res Result) {
+	// Snapshot a cleanly finished conversation's slot state BEFORE the slot is
+	// freed, so a later request extending this conversation restores it instead
+	// of re-prefilling. Error/shutdown evictions never snapshot (state suspect).
+	if s.stateSaver != nil && len(sq.hist) > 0 {
+		switch res.Reason {
+		case FinishStop, FinishLength, FinishCancelled:
+			s.stateSaver.SaveState(sq.slot, sq.hist)
+		}
+	}
 	if err := s.engine.RemoveSeq(sq.slot); err != nil {
 		log.Printf("batch: RemoveSeq(%d): %v", sq.slot, err)
 	}

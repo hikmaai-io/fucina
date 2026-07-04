@@ -193,6 +193,16 @@ qwen35-batch-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_batch $(QWEN35_MODEL)"
 
+# ─── Qwen3.5 hybrid per-SLOT state snapshot gate (conversation cache) (GPU) ───
+# Saves a slot's hybrid state (GDN S + conv rings + FULL fp32 K/V prefix) mid-decode,
+# restores it into a DIFFERENT slot, and asserts the restored continuation is
+# bit-identical to both the uninterrupted continuation and a cold full re-prefill.
+qwen35-state-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_state.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_state \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_state $(QWEN35_MODEL)"
+
 # ─── Qwen3.5 hybrid (qwen35) P1 BATCHED single-pass prefill gate (GPU) ───
 # Drives the continuous-batching ABI (seq_add → qwen35_prefill_batched, then step_batch) and
 # asserts: (1) the integrated batched prefill reproduces the qwen35_forward_greedy oracle's

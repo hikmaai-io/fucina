@@ -37,6 +37,8 @@ import "C"
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"runtime"
 	"runtime/cgo"
 	"sync"
@@ -542,6 +544,62 @@ func (e *Engine) KVRestore(buf []byte, nTokens int) error {
 	return nil
 }
 
+// ─── Per-SLOT state snapshots (batched hybrid engine, Qwen3.5) ──────
+//
+// The hybrid batched engine keeps per-slot recurrent GDN state + conv rings
+// (fixed size) plus fp32 FULL-layer K/V (per token). SeqStateSize/Save/Restore
+// snapshot one SLOT's state at exactly nTokens; because the GDN recurrence is
+// pinned to that position, a snapshot restores only into a prompt that
+// EXTENDS its token sequence (the multi-turn agent case). Size is 0 on
+// non-hybrid engines — callers use that as the capability probe.
+
+// SeqStateSize returns the host bytes needed to snapshot one slot at nTokens
+// (0 when the engine has no per-slot snapshot support, e.g. non-Qwen3.5).
+func (e *Engine) SeqStateSize(nTokens int) int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return int64(C.gemma4_engine_q35_state_size(e.ptr, C.int(nTokens)))
+}
+
+// SeqStateSave snapshots slot's state (which must be live at exactly nTokens)
+// into buf (sized via SeqStateSize).
+func (e *Engine) SeqStateSave(slot int, buf []byte, nTokens int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(buf) == 0 {
+		return fmt.Errorf("fucina: seq state save: empty buffer")
+	}
+	if C.gemma4_engine_q35_state_save(e.ptr, C.int(slot), unsafe.Pointer(&buf[0]), C.int(nTokens)) != 0 {
+		return fmt.Errorf("fucina: seq state save failed (slot %d, %d tokens)", slot, nTokens)
+	}
+	return nil
+}
+
+// SeqStateRestore overwrites a freshly opened slot's state with a snapshot and
+// sets the slot's committed token count to nTokens; the caller then prefills
+// only the prompt suffix past the snapshot.
+func (e *Engine) SeqStateRestore(slot int, buf []byte, nTokens int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(buf) == 0 {
+		return fmt.Errorf("fucina: seq state restore: empty buffer")
+	}
+	if C.gemma4_engine_q35_state_restore(e.ptr, C.int(slot), unsafe.Pointer(&buf[0]), C.int(nTokens)) != 0 {
+		return fmt.Errorf("fucina: seq state restore failed (slot %d, %d tokens)", slot, nTokens)
+	}
+	return nil
+}
+
+// SeqNTokens reports a live slot's committed token count (-1 if the slot is
+// free). The scheduler's per-sequence history runs one token AHEAD of the
+// engine (the last sampled token is never fed back), so snapshot callers key
+// the saved state by tokens[:SeqNTokens(slot)].
+func (e *Engine) SeqNTokens(slot int) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return int(C.gemma4_engine_seq_ntokens(e.ptr, C.int(slot)))
+}
+
 // TimingStats holds accumulated prefill/decode timing for speed reporting.
 type TimingStats struct {
 	PrefillTokens int
@@ -889,19 +947,224 @@ func (e *Engine) SeqFreeCapacity() int {
 type BatchAdapter struct {
 	eng    *Engine
 	active int // slots currently held by the scheduler (incremented in AddSeq, decremented in RemoveSeq)
+
+	// Per-conversation STATE-SNAPSHOT cache (hybrid engines, Qwen3.5). The
+	// hybrid arch can't use the paged radix prefix tree (its GDN recurrent
+	// state is position-pinned, its fp32 arenas aren't paged), so multi-turn
+	// reuse is EXACT snapshots instead: on eviction the scheduler hands us the
+	// finished sequence's history (SaveState) and we copy the slot's state to
+	// host; on admission a prompt that EXTENDS a snapshot restores it and
+	// prefills only the new suffix — turn-2+ TTFT collapses to the delta.
+	// All fields are touched only on the scheduler run goroutine (the sole
+	// engine caller), so no lock is needed.
+	snaps       []*seqStateSnap
+	snapBytes   int64
+	snapBudget  int64
+	snapMode    int8 // 0 = unprobed, 1 = enabled, -1 = unsupported engine
+	snapTick    int64
+	scLookups   int64
+	scHitTokens int64
+	scEvictions int64
 }
+
+// seqStateSnap is one saved conversation: the exact token sequence committed
+// to the engine when it was captured, and the slot-state bytes at that point.
+type seqStateSnap struct {
+	tokens []int32
+	buf    []byte
+	used   int64 // LRU stamp (snapTick at last save/hit)
+}
+
+// defaultStateSnapBudget bounds host memory spent on state snapshots (~75 MiB
+// fixed GDN state + ~48 KiB/token fp32 KV per conversation on 35B-A3B ⇒ a few
+// dozen live agent conversations).
+const defaultStateSnapBudget int64 = 8 << 30
+
+// stateSnapMinTokens is the smallest conversation worth snapshotting: below
+// this the suffix prefill costs about as little as the restore itself.
+const stateSnapMinTokens = 64
 
 // NewBatchAdapter wraps eng for the batch scheduler. The engine must have been
 // created with FUCINA_PAGED_KV=1; Supported() reports whether batching is usable.
 func NewBatchAdapter(eng *Engine) *BatchAdapter { return &BatchAdapter{eng: eng} }
+
+// snapOn lazily probes whether the engine supports per-slot state snapshots
+// (Qwen3.5 hybrid). Probed on the scheduler goroutine so the cgo call is on
+// the CUDA-bound thread.
+func (a *BatchAdapter) snapOn() bool {
+	if a.snapMode == 0 {
+		if a.eng.SeqStateSize(16) > 0 {
+			a.snapMode = 1
+			a.snapBudget = defaultStateSnapBudget
+			log.Printf("fucina: hybrid state-snapshot conversation cache enabled (budget %d MiB)",
+				a.snapBudget>>20)
+		} else {
+			a.snapMode = -1
+		}
+	}
+	return a.snapMode == 1
+}
+
+func isTokenPrefix(p, s []int32) bool {
+	if len(p) > len(s) {
+		return false
+	}
+	for i, t := range p {
+		if s[i] != t {
+			return false
+		}
+	}
+	return true
+}
+
+// lookupSnap returns the index of the LONGEST snapshot whose token sequence is
+// a strict prefix of prompt (strict: at least one prompt token must remain to
+// prefill, or there would be no logits to sample from), or -1.
+func (a *BatchAdapter) lookupSnap(prompt []int32) int {
+	best, bestLen := -1, stateSnapMinTokens-1
+	for i, sn := range a.snaps {
+		if n := len(sn.tokens); n > bestLen && n < len(prompt) && isTokenPrefix(sn.tokens, prompt) {
+			best, bestLen = i, n
+		}
+	}
+	if best < 0 && len(a.snaps) > 0 && os.Getenv("FUCINA_DEBUG") != "" {
+		// The re-render drift debugger: show WHERE the closest snapshot stops
+		// matching the prompt (ids around the divergence), mirroring the
+		// single-flight path's "prefix diverges" dump.
+		bl, bi := 0, 0
+		for i, sn := range a.snaps {
+			l := 0
+			for l < len(sn.tokens) && l < len(prompt) && sn.tokens[l] == prompt[l] {
+				l++
+			}
+			if l > bl {
+				bl, bi = l, i
+			}
+		}
+		sn := a.snaps[bi]
+		w := func(s []int32, at int) []int32 {
+			hi := at + 8
+			if hi > len(s) {
+				hi = len(s)
+			}
+			if at > len(s) {
+				at = len(s)
+			}
+			return s[at:hi]
+		}
+		log.Printf("fucina: state-snap MISS: prompt %d toks vs closest snap %d toks, lcp=%d; snap[lcp:]=%v prompt[lcp:]=%v",
+			len(prompt), len(sn.tokens), bl, w(sn.tokens, bl), w(prompt, bl))
+	}
+	return best
+}
+
+func (a *BatchAdapter) dropSnap(i int) {
+	a.snapBytes -= int64(len(a.snaps[i].buf))
+	a.snaps[i] = a.snaps[len(a.snaps)-1]
+	a.snaps = a.snaps[:len(a.snaps)-1]
+}
+
+func (a *BatchAdapter) dropLRU() {
+	lru := 0
+	for i, sn := range a.snaps {
+		if sn.used < a.snaps[lru].used {
+			lru = i
+		}
+	}
+	a.dropSnap(lru)
+	a.scEvictions++
+}
+
+// SaveState implements batch.StateSaverEngine: snapshot a finishing sequence's
+// slot state, keyed by the tokens actually committed to the engine (the
+// scheduler's history runs one sampled-but-unfed token ahead).
+func (a *BatchAdapter) SaveState(slot int, tokens []int32) {
+	if !a.snapOn() {
+		return
+	}
+	n := a.eng.SeqNTokens(slot)
+	if n < stateSnapMinTokens || n > len(tokens) {
+		return
+	}
+	key := tokens[:n]
+	// Snapshots this one supersedes (their tokens are a prefix of ours — the
+	// same conversation at an earlier turn) die; a LONGER snapshot that merely
+	// shares our prefix stays (a fork may still extend it).
+	for i := 0; i < len(a.snaps); {
+		if isTokenPrefix(a.snaps[i].tokens, key) {
+			a.dropSnap(i)
+			continue
+		}
+		i++
+	}
+	sz := a.eng.SeqStateSize(n)
+	if sz <= 0 || sz > a.snapBudget {
+		return
+	}
+	for a.snapBytes+sz > a.snapBudget && len(a.snaps) > 0 {
+		a.dropLRU()
+	}
+	buf := make([]byte, sz)
+	if err := a.eng.SeqStateSave(slot, buf, n); err != nil {
+		log.Printf("fucina: state-snapshot save failed (slot %d, %d tokens): %v", slot, n, err)
+		return
+	}
+	a.snapTick++
+	a.snaps = append(a.snaps, &seqStateSnap{
+		tokens: append([]int32(nil), key...),
+		buf:    buf,
+		used:   a.snapTick,
+	})
+	a.snapBytes += sz
+}
+
+// restoreSnapAt restores snapshot i into a freshly opened slot. Returns the
+// number of prompt tokens satisfied (>0), or -1 when the restore FAILED
+// mid-copy — the slot state is then garbage and the caller must free + reopen
+// the slot before prefilling from scratch.
+func (a *BatchAdapter) restoreSnapAt(i, slot int) int {
+	sn := a.snaps[i]
+	if err := a.eng.SeqStateRestore(slot, sn.buf, len(sn.tokens)); err != nil {
+		log.Printf("fucina: state-snapshot restore failed (%d tokens): %v", len(sn.tokens), err)
+		a.dropSnap(i)
+		return -1
+	}
+	a.snapTick++
+	sn.used = a.snapTick
+	a.scHitTokens += int64(len(sn.tokens))
+	return len(sn.tokens)
+}
 
 // Supported reports whether the engine can serve batched requests: a free-slot
 // count > 0 means paged mode is enabled (seq_capacity returns 0 when it is not).
 func (a *BatchAdapter) Supported() bool { return a.eng.SeqFreeCapacity() > 0 }
 
 // AddSeq admits a new sequence (prefill + first token sampled with params). On
-// success it records the slot so Capacity() stays accurate.
+// success it records the slot so Capacity() stays accurate. On hybrid engines
+// a prompt extending a saved conversation restores that snapshot and prefills
+// only the suffix (one-shot), instead of the whole prompt.
 func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int32, error) {
+	if a.snapOn() {
+		a.scLookups++
+		// Probe BEFORE opening: a miss must not pay a slot open+reset+remove
+		// (the reset zeroes ~75 MiB of GDN arenas per admission).
+		if i := a.lookupSnap(prompt); i >= 0 {
+			if slot, err := a.eng.SeqOpen(params); err == nil {
+				a.active++
+				if n := a.restoreSnapAt(i, slot); n > 0 {
+					first, err2 := a.eng.SeqPrefillChunk(slot, prompt[n:], true)
+					if err2 == nil {
+						return slot, first, nil
+					}
+					log.Printf("fucina: state-snapshot suffix prefill failed, falling back cold: %v", err2)
+				}
+				// Failed restore: the opened slot's state is unreliable —
+				// free it and take the cold path (which resets it).
+				a.eng.SeqRemove(slot)
+				a.active--
+			}
+		}
+	}
 	slot, first, err := a.eng.SeqAdd(prompt, params)
 	if err != nil {
 		return 0, 0, err
@@ -998,6 +1261,32 @@ func (a *BatchAdapter) OpenSeq(prompt []int32, params batch.SeqParams) (slot int
 		return 0, 0, err
 	}
 	a.active++
+	// Hybrid engines get no radix-tree prefix (nShared==0 always): try the
+	// state-snapshot conversation cache instead, so the chunked prefill only
+	// covers the suffix past the restored turn.
+	if nShared == 0 && a.snapOn() {
+		a.scLookups++
+		i := a.lookupSnap(prompt)
+		n := 0
+		if i >= 0 {
+			n = a.restoreSnapAt(i, slot)
+		}
+		switch {
+		case n > 0:
+			nShared = n
+		case n < 0:
+			// Restore failed mid-copy: the slot's recurrent state is garbage
+			// and a plain suffix prefill would run FROM it. Free + reopen so
+			// the slot is reset before the cold full prefill.
+			a.eng.SeqRemove(slot)
+			a.active--
+			slot, nShared, err = a.eng.SeqOpenPrefix(prompt, params)
+			if err != nil {
+				return 0, 0, err
+			}
+			a.active++
+		}
+	}
 	return slot, nShared, nil
 }
 
@@ -1021,10 +1310,13 @@ func (a *BatchAdapter) RemoveSeq(slot int) error {
 // held), so the scheduler's admission test len(active) < Capacity() is correct.
 func (a *BatchAdapter) Capacity() int { return a.eng.SeqFreeCapacity() + a.active }
 
-// PrefixCacheStats forwards the engine's cross-request prefix-cache counters so the
-// scheduler can publish them lock-free for /metrics.
+// PrefixCacheStats merges the engine's radix prefix-cache counters with the
+// adapter's state-snapshot counters (hybrid engines have only the latter) so
+// the scheduler publishes ONE reuse picture for /metrics. Snapshot hits are
+// reported in 256-token block units to match the radix-tree accounting.
 func (a *BatchAdapter) PrefixCacheStats() (lookups, hitBlocks, cachedBlocks, evictions int64) {
-	return a.eng.PrefixCacheStats()
+	lk, hb, cb, ev := a.eng.PrefixCacheStats()
+	return lk + a.scLookups, hb + a.scHitTokens/256, cb + int64(len(a.snaps)), ev + a.scEvictions
 }
 
 // PrefixCommit forwards decode-time block registration so generated text becomes
