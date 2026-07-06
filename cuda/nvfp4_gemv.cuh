@@ -346,6 +346,30 @@ static inline void bf16_head_gemv1_launch(
     bf16_head_gemv1_kernel<<<blocks, 32 * BF16_HEAD_B_WARPS, 0, stream>>>(y, w, x, in_dim, out_dim);
 }
 
+// Load the K contiguous activation values of one transposed-xt row with the widest aligned
+// vector loads K permits (xt is cudaMalloc'd ⇒ 256-B base; row byte offset k·K·4 is 16-B
+// aligned iff K%4==0, 8-B iff K%2==0). Value-identical to K scalar loads — read width never
+// changes the FP accumulation order.
+template<int K>
+__device__ __forceinline__ void bf16_head_load_xrow(float* xv, const float* xp) {
+    if constexpr (K % 4 == 0) {
+        #pragma unroll
+        for (int c = 0; c < K / 4; c++) {
+            float4 v = reinterpret_cast<const float4*>(xp)[c];
+            xv[4*c+0] = v.x; xv[4*c+1] = v.y; xv[4*c+2] = v.z; xv[4*c+3] = v.w;
+        }
+    } else if constexpr (K % 2 == 0) {
+        #pragma unroll
+        for (int c = 0; c < K / 2; c++) {
+            float2 v = reinterpret_cast<const float2*>(xp)[c];
+            xv[2*c+0] = v.x; xv[2*c+1] = v.y;
+        }
+    } else {
+        #pragma unroll
+        for (int c = 0; c < K; c++) xv[c] = xp[c];
+    }
+}
+
 template<int K, int R>   // R = output rows per warp: 12 for K<=8, 6 for K<=16 (same ~96 acc regs)
 __global__ void bf16_head_gemv_batched_kernel(
     float*               __restrict__ y,    // [K][out_dim] token-major
@@ -365,19 +389,41 @@ __global__ void bf16_head_gemv_batched_kernel(
         #pragma unroll
         for (int c = 0; c < K; c++) acc[r][c] = 0.f;
 
-    for (int k = lane; k < in_dim; k += 32) {
-        const float* xp = xt + (size_t)k * K;       // K contiguous activation values for input k
-        // Load all ROWS weights for this k first (independent loads → memory-level parallelism).
-        float wv[R];
+    // Main loop: 4 k-steps (k, k+32, k+64, k+96) per iteration with ALL R×4 weight loads
+    // hoisted up-front — 4× the independent in-flight DRAM reads per lane (this kernel is
+    // memory-LATENCY starved on LPDDR5X: 160 GB/s with the rolled loop, ~230 GB/s unrolled).
+    // Accumulation runs in ascending-k order per acc[r][c], identical to the rolled loop ⇒
+    // bitwise-identical logits.
+    int k = lane;
+    for (; k + 96 < in_dim; k += 128) {
+        float wv[R][4];
         #pragma unroll
         for (int r = 0; r < R; r++) {
-            int rr = (r < nrow) ? r : 0;
-            wv[r] = __bfloat162float(w[(size_t)(row0 + rr) * in_dim + k]);
+            const __nv_bfloat16* wr = w + (size_t)(row0 + ((r < nrow) ? r : 0)) * in_dim + k;
+            #pragma unroll
+            for (int u = 0; u < 4; u++) wv[r][u] = __bfloat162float(wr[(size_t)u * 32]);
         }
+        #pragma unroll
+        for (int u = 0; u < 4; u++) {
+            float xv[K];
+            bf16_head_load_xrow<K>(xv, xt + (size_t)(k + u * 32) * K);
+            #pragma unroll
+            for (int r = 0; r < R; r++)
+                #pragma unroll
+                for (int c = 0; c < K; c++) acc[r][c] += wv[r][u] * xv[c];
+        }
+    }
+    for (; k < in_dim; k += 32) {   // tail: <4 k-steps left (in_dim not a multiple of 128)
+        float xv[K];
+        bf16_head_load_xrow<K>(xv, xt + (size_t)k * K);
+        float wv[R];
+        #pragma unroll
+        for (int r = 0; r < R; r++)
+            wv[r] = __bfloat162float(w[(size_t)(row0 + ((r < nrow) ? r : 0)) * in_dim + k]);
         #pragma unroll
         for (int r = 0; r < R; r++) {
             #pragma unroll
-            for (int c = 0; c < K; c++) acc[r][c] += wv[r] * xp[c];
+            for (int c = 0; c < K; c++) acc[r][c] += wv[r] * xv[c];
         }
     }
     #pragma unroll
