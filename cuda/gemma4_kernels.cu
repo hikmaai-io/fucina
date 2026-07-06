@@ -17649,6 +17649,10 @@ __global__ void q35fp8_bf16_to_f32_kernel(float *dst, const __nv_bfloat16 *src, 
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __bfloat162float(src[i]) + add;
 }
+__global__ void q35fp8_f32_bias_kernel(float *d, float add, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] += add;
+}
 // A_log (F32) → decay coefficient ssm_a = -exp(A_log), consumed directly by m2_decay_beta_kernel.
 __global__ void q35fp8_neg_exp_kernel(float *a, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -17748,9 +17752,20 @@ static void *q35fp8_up_bytes(const void *host, size_t nbytes) {
     cudaMemcpy(d, host, nbytes, cudaMemcpyHostToDevice);
     return d;
 }
-// BF16 tensor → freshly-allocated F32 device buffer (with optional +1 bias). n = element count.
+// Tensor → freshly-allocated F32 device buffer (with optional bias, e.g. +1 for the Gemma-style
+// norms). DTYPE-AWARE: these small params (norms, A_log, dt_bias, in_proj_a/b) ship as EITHER F32
+// or BF16 depending on the checkpoint export — Qwen3.5-35B-A3B-FP8 stored them F32, the Qwen3.6
+// repack stores them BF16. Read by the RECORDED dtype: a BF16 tensor copied as raw F32 bytes (the
+// old assumption) halves the element count and silently corrupts (the qwen3.6 A_log/norm garbage).
 static float *q35fp8_up_bf16_f32(const st::Tensor *t, float add) {
     if (!t) return nullptr;
+    if (t->dtype == st::Dtype::F32) {
+        size_t n = t->nbytes / 4;
+        float *dst = (float *)q35fp8_up_bytes(t->data, t->nbytes);
+        if (dst && add != 0.0f)
+            q35fp8_f32_bias_kernel<<<(unsigned)((n + 255) / 256), 256>>>(dst, add, n);
+        return dst;
+    }
     size_t n = t->nbytes / 2;
     __nv_bfloat16 *tmp = (__nv_bfloat16 *)q35fp8_up_bytes(t->data, t->nbytes);
     if (!tmp) return nullptr;
@@ -17760,8 +17775,10 @@ static float *q35fp8_up_bf16_f32(const st::Tensor *t, float add) {
     cudaFree(tmp);
     return dst;
 }
-static float *q35fp8_up_f32(const st::Tensor *t) {   // F32 tensor → device copy (no conversion)
-    return t ? (float *)q35fp8_up_bytes(t->data, t->nbytes) : nullptr;
+// Dtype-aware F32 upcast (no bias): F32 → copy, BF16 → convert. Was "copy raw bytes as F32",
+// which corrupted BF16 A_log / norm.weight in the Qwen3.6 checkpoints.
+static float *q35fp8_up_f32(const st::Tensor *t) {
+    return q35fp8_up_bf16_f32(t, 0.0f);
 }
 static bool q35fp8_load_proj(const st::Model &M, const std::string &key,
                              q35fp8_proj &P, int out_dim, int in_dim) {
@@ -18069,9 +18086,13 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         for(int64_t i=0;i<n;i++){ float v=q35_bf16_to_f32_host(src[i]); f[i]=neg_exp?(-expf(v)):(v+add); }
         tofree.push_back(f); D.push_back({off,nullptr,f,(size_t)n*4,-1,nullptr,0}); return true;
     };
-    // F32 tensor (already f32 on disk) → d_weights, optional neg_exp (A_log).
+    // A_log / linear_attn.norm → d_weights, optional neg_exp (ssm_a = -exp(A_log)). DTYPE-AWARE:
+    // these ship as F32 (Qwen3.5-35B-A3B-FP8) OR BF16 (the Qwen3.6 repack). Read by the recorded
+    // dtype — taking a BF16 tensor as raw F32 halves the element count and corrupts the values
+    // (the qwen3.6 A_log/norm garbage regression); BF16 delegates to the converting loader.
     auto put_f32=[&](uint64_t*off,const std::string&key,bool neg_exp)->bool{
         const st::Tensor*t=find(key); if(!t){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
+        if(t->dtype==st::Dtype::BF16) return put_f32_from_bf16(off,key,0.0f,neg_exp);
         int64_t n=(int64_t)(t->nbytes/4);
         if(neg_exp){ float*f=(float*)malloc((size_t)n*4); const float*src=(const float*)t->data;
             for(int64_t i=0;i<n;i++) f[i]=-expf(src[i]); tofree.push_back(f); D.push_back({off,nullptr,f,(size_t)n*4,-1,nullptr,0}); }
@@ -18116,10 +18137,12 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // 8/8 and every self-test bitwise across a full day of gates. FUCINA_MOE_FP8=1 restores the
     // pure-FP8 serving as the escape hatch.
     const bool q4k_mode = moe && !getenv("FUCINA_MOE_FP8");
-    // Experts default to NVFP4 (CUTLASS grouped tensor-core serving, same 4.5 bpw as Q4_K but
-    // 2.1× the grouped weight bandwidth at decode and a no-dequant tensor-core prefill).
-    // FUCINA_MOE_Q4K=1 restores the dp4a Q4_K-requant expert serving; FUCINA_MOE_FP8=1 raw FP8.
-    bool fp4_mode = q4k_mode && !getenv("FUCINA_MOE_Q4K");
+    // Experts DEFAULT to Q4_K (dp4a grouped GEMV, 4.5 bpw, ~half the raw-FP8 memory) — the working,
+    // memory-optimal serving. NVFP4 grouped experts would be 2.1× the decode weight bandwidth, but
+    // the CUTLASS sm120 block-scaled grouped GEMM builds a placeholder TMA descriptor the CUDA-13/
+    // GB10 driver rejects (cuTensorMapEncodeTiled err 700 → abort), so it is OPT-IN via
+    // FUCINA_MOE_FP4=1 (for a cutlass/driver where it encodes). FUCINA_MOE_FP8=1 = raw FP8.
+    bool fp4_mode = q4k_mode && getenv("FUCINA_MOE_FP4");
     auto put_w=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int od,int idm)->bool{
         return q4k_mode ? put_q4k_from_fp8(off,fmtp,key,od,idm) : put_fp8(off,fmtp,key,od,idm);
     };
