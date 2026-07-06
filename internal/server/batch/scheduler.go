@@ -382,14 +382,17 @@ type Scheduler struct {
 	// scheduler pass spend its time — the engine step (cgo forward), token
 	// delivery, admission/prefill, or loop overhead. Logged every telemetryEvery
 	// steps so the served-vs-engine throughput gap is attributable at a glance.
-	telSteps   int64
-	telTokens  int64
-	telBatch   int64         // Σ batch size over steps (avg B = telBatch/telSteps)
-	telEngine  time.Duration // inside the engine step call
-	telDeliver time.Duration // scattering tokens to sequences
-	telAdmit   time.Duration // drain+admit+prefill-advance section
-	telPass    time.Duration // whole pass wall (engine+deliver+admit+loop rest)
-	telMark    time.Time     // start of the current telemetry window
+	telSteps    int64
+	telTokens   int64
+	telBatch    int64         // Σ batch size over steps (avg B = telBatch/telSteps)
+	telEngine   time.Duration // inside the engine step call
+	telDeliver  time.Duration // scattering tokens to sequences (evict() time reported separately)
+	telEvict    time.Duration // inside evict() bodies (SaveState snapshot + RemoveSeq)
+	telEvicts   int64         // evict() calls this window
+	telAdmit    time.Duration // drain+admit+prefill-advance section
+	telAdmitEng time.Duration // strictly inside engine.AddSeq (the blocking one-shot prefill)
+	telPass     time.Duration // whole pass wall (engine+deliver+admit+loop rest)
+	telMark     time.Time     // start of the current telemetry window
 
 	// submit carries new requests to the owner goroutine. It is bounded; a full
 	// channel is backpressure (Submit returns ErrQueueFull) rather than
@@ -682,12 +685,13 @@ func (s *Scheduler) maybeLogTelemetry() {
 	win := time.Since(s.telMark)
 	st := s.telSteps
 	ms := func(d time.Duration) float64 { return d.Seconds() * 1000 / float64(st) }
-	log.Printf("batch: telemetry: %d steps / %.1fs — avgB %.1f, engine %.2f ms/step, deliver %.3f, admit %.3f, pass %.2f — %d tok (%.0f tok/s)",
+	log.Printf("batch: telemetry: %d steps / %.1fs — avgB %.1f, engine %.2f ms/step, deliver %.3f, evict %.3f (n=%d), admit %.3f (eng %.3f), pass %.2f — %d tok (%.0f tok/s)",
 		st, win.Seconds(), float64(s.telBatch)/float64(st),
-		ms(s.telEngine), ms(s.telDeliver), ms(s.telAdmit), ms(s.telPass),
+		ms(s.telEngine), ms(s.telDeliver), ms(s.telEvict), s.telEvicts,
+		ms(s.telAdmit), ms(s.telAdmitEng), ms(s.telPass),
 		s.telTokens, float64(s.telTokens)/win.Seconds())
-	s.telSteps, s.telTokens, s.telBatch = 0, 0, 0
-	s.telEngine, s.telDeliver, s.telAdmit, s.telPass = 0, 0, 0, 0
+	s.telSteps, s.telTokens, s.telBatch, s.telEvicts = 0, 0, 0, 0
+	s.telEngine, s.telDeliver, s.telEvict, s.telAdmit, s.telAdmitEng, s.telPass = 0, 0, 0, 0, 0, 0
 	s.telMark = time.Now()
 }
 
@@ -792,7 +796,9 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			break
 		}
 
+		tAdd := time.Now()
 		slot, first, err := s.engine.AddSeq(req.Tokens, req.Params)
+		s.telAdmitEng += time.Since(tAdd)
 		if err != nil {
 			log.Printf("batch: AddSeq failed: %v", err)
 			reply(req, Result{Reason: FinishError, Err: fmt.Errorf("prefill: %w", err)})
@@ -1098,6 +1104,7 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 	// stops emitting the moment a token evicts the sequence (stop/budget/cancel or the
 	// -1 KV-exhausted sentinel) — the rest of that run is then dropped.
 	t1 := time.Now()
+	ev0 := s.telEvict
 	for i, slot := range slots {
 		sq := active[slot]
 		if sq == nil {
@@ -1110,7 +1117,7 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 			}
 		}
 	}
-	s.telDeliver += time.Since(t1)
+	s.telDeliver += time.Since(t1) - (s.telEvict - ev0) // evict time reported on its own line
 	return true
 }
 
@@ -1167,6 +1174,7 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 	// sequence frees its slot now, making room for a queued request on the next
 	// admission pass.
 	t1 := time.Now()
+	ev0 := s.telEvict
 	for i, slot := range slots {
 		sq := active[int(slot)]
 		if sq == nil {
@@ -1179,7 +1187,7 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 			}
 		}
 	}
-	s.telDeliver += time.Since(t1)
+	s.telDeliver += time.Since(t1) - (s.telEvict - ev0) // evict time reported on its own line
 	return true
 }
 
@@ -1188,6 +1196,14 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 const specCorpusCap = 1 << 16 // tokens kept in the cross-request suffix-decoding ring
 
 func (s *Scheduler) evict(active map[int]*seq, sq *seq, res Result) {
+	// Timed separately from the deliver scatter: eviction runs a state snapshot
+	// (SaveState D2H copy) + RemoveSeq, a per-FINISH cost that would otherwise
+	// masquerade as per-token deliver overhead in the telemetry.
+	tEv := time.Now()
+	defer func() {
+		s.telEvict += time.Since(tEv)
+		s.telEvicts++
+	}()
 	// Snapshot a cleanly finished conversation's slot state BEFORE the slot is
 	// freed, so a later request extending this conversation restores it instead
 	// of re-prefilling. Error/shutdown evictions never snapshot (state suspect).
