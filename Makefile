@@ -231,6 +231,19 @@ qwen35-longctx-test: lib libdg
 	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_longctx $(QWEN35_MODEL) \
 		$(CURDIR)/cuda/qwen35_longctx_1k.ids $(CURDIR)/cuda/qwen35_longctx_4k.ids"
 
+# ─── Qwen3.5 chunked-prefill CONTINUATION (base>0) parity + timing gate (GPU) ───
+# One-shot seq_add vs seq_open + seq_prefill_chunk(1024, rest) on a 2400-token natural-text
+# prompt (first ids of qwen35_longctx_4k.ids), 24 greedy continuation tokens each — run with
+# BOTH the scalar continuation attention (g_fucina_q35_scalar_cont_attn=1) and the default
+# tensor-core one. Asserts the TC continuation tracks one-shot at least as well as the scalar
+# path (first token + 25-token agreement) and prints the continuation-chunk wall time of both.
+qwen35-chunk-parity-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_chunk_parity.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_chunk_parity \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_chunk_parity \
+		$(QWEN35_MOE_FP8_MODEL) $(CURDIR)/cuda/qwen35_longctx_4k.ids"
+
 # ─── Qwen3.5 FP8 block-quant decode GEMV standalone validation (GPU) ─────
 # Validates cuda/fp8_block.cuh (DeepSeek block-fp8 decode GEMV) vs a host dequant+dot reference
 # at cosine >= 0.999 — the kernel the M5 FP8 model forward drives for every projection.

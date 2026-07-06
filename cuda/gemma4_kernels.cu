@@ -412,6 +412,13 @@ __global__ void f32_to_bf16_kernel(__nv_bfloat16 *dst, const float *src, uint64_
     if (i < n) dst[i] = __float2bfloat16(src[i]);
 }
 
+// Convert f32 -> fp16 (for the cuBLAS GEMMs that read the __half K/V cache in place —
+// mixing fp16 A with bf16 B in one GemmEx is not supported, so Q converts to fp16 too).
+__global__ void f32_to_f16_kernel(__half *dst, const float *src, uint64_t n) {
+    uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
 // Convert bf16 -> f32 (FORMAT_NVFP4: safetensors norm tensors ship BF16; the engine's norm
 // stores (d_w_*_norm) are float, exactly like the GGUF path's UPLOAD_NORM destinations).
 __global__ void bf16_to_f32_kernel(float *dst, const __nv_bfloat16 *src, uint64_t n) {
@@ -3084,6 +3091,33 @@ __global__ void attn_softmax_batched_kernel(
     }
 }
 
+// RECTANGULAR causal softmax over KEY-MAJOR scores (base>0 chunked-prefill continuation):
+// per head h, S_[h] is an (Scols x T) col-major matrix (ld=Scols, batch stride Scols*T) whose
+// column i holds query (base+i)'s scores against keys j in [0,Scols). Query i attends keys
+// j <= base+i; masked entries write fp16 zero. Being contiguous over keys j, every loop is
+// fully coalesced — unlike attn_softmax_batched_kernel above whose row walk strides by N
+// (measured 7 ms at N=2048). grid=(T, n_heads), block 256, smem 32 floats.
+__global__ void attn_softmax_rect_kernel(const float *S_, __half *P, int T, int Scols, int base) {
+    extern __shared__ float red[];
+    int i = blockIdx.x, h = blockIdx.y;
+    if (i >= T) return;
+    const float *col = S_ + (size_t)h * Scols * T + (size_t)i * Scols;
+    __half     *pc  = P  + (size_t)h * Scols * T + (size_t)i * Scols;
+    int tid = threadIdx.x, nt = blockDim.x;
+    int hi = base + i;                        // inclusive causal bound
+    float m = -1e30f;
+    for (int j = tid; j <= hi; j += nt) m = fmaxf(m, col[j]);
+    m = block_reduce_max(m, red);
+    float l = 0.0f;
+    for (int j = tid; j <= hi; j += nt) l += __expf(col[j] - m);
+    l = block_reduce_sum(l, red);
+    float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int j = tid; j < Scols; j += nt) {
+        float p = (j <= hi) ? __expf(col[j] - m) * inv : 0.0f;
+        pc[j] = __float2half(p);
+    }
+}
+
 // NEOX RoPE over [rows][n_heads][head_dim] for Q and [rows][n_kv_heads][head_dim]
 // for K. Position of row r is base_pos+r. ff=freq_factors (global) or NULL (=1,
 // sliding). grid=(n_heads, rows), block=head_dim/2. Matches rope_*_kernel above.
@@ -3972,6 +4006,14 @@ struct gemma4_engine {
     __nv_bfloat16 *d_q35_pb;                         // BF16 softmax probs [NQ*N*N]
     float         *d_q35_scores;                     // FP32 QKᵀ scores [NQ*N*N]
     int            d_q35_attn_cap;                   // N this attn scratch is sized for (0=off)
+    // FULL-layer CONTINUATION prefill attention (base>0) via tensor-core GEMMs reading the
+    // fp16 K/V cache in place (no broadcast copies). All lazily sized to the largest request
+    // seen; any alloc failure falls back to the scalar kernel for that chunk (retried later).
+    __half        *d_q35_qh;                         // fp16 Q tile [T*NQ*HD]
+    size_t         d_q35_qh_cap;                     // elements d_q35_qh is sized for
+    float         *d_q35_cont_scores;                // fp32 QKᵀ scores [NQ*rows_sub*S]
+    __half        *d_q35_cont_p;                     // fp16 softmax probs [NQ*rows_sub*S]
+    size_t         d_q35_cont_cap;                   // score/prob elements allocated (0=off)
     // Resident BF16 prefill-weight cache: dequant each projection ONCE, reuse across prefills
     // (kills the per-prefill ~45% dequant cost). Auto-enabled when device memory allows; on OOM
     // it self-disables and the per-tile dequant fallback runs. [layer][WC_* slot].
@@ -5059,6 +5101,8 @@ gemma4_engine_t* gemma4_engine_create(
     eng->d_q35_qb = NULL; eng->d_q35_kb = NULL; eng->d_q35_vb = NULL;
     eng->d_q35_kbx = NULL; eng->d_q35_vbx = NULL; eng->d_q35_pb = NULL;
     eng->d_q35_scores = NULL; eng->d_q35_attn_cap = 0; eng->q35_wcache_on = 0;
+    eng->d_q35_qh = NULL; eng->d_q35_qh_cap = 0;
+    eng->d_q35_cont_scores = NULL; eng->d_q35_cont_p = NULL; eng->d_q35_cont_cap = 0;
     eng->d_q35_fp4_gsw = NULL; eng->q35_fp4_on = 0;
     eng->fp8_scale_tab = NULL; eng->fp8_scale_n = 0;
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++)
@@ -6650,6 +6694,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_q35_qb); CUDA_FREE(eng->d_q35_kb); CUDA_FREE(eng->d_q35_vb);
     CUDA_FREE(eng->d_q35_kbx); CUDA_FREE(eng->d_q35_vbx); CUDA_FREE(eng->d_q35_pb);
     CUDA_FREE(eng->d_q35_scores);
+    CUDA_FREE(eng->d_q35_qh); CUDA_FREE(eng->d_q35_cont_scores); CUDA_FREE(eng->d_q35_cont_p);
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++)
         for (int p = 0; p < 12; p++) {
             CUDA_FREE(eng->d_q35_wc[l][p]);
@@ -8846,6 +8891,10 @@ int gemma4_engine_prefill_batched(
 // Test override: when set, gemma4_engine_seq_add forces the token-by-token prefill
 // (skips paged_prefill_batched). Used ONLY by the dual-path determinism self-test.
 int g_fucina_force_slow_prefill = 0;
+
+// Test override: when set, the qwen35 base>0 chunked-prefill continuation forces the scalar
+// qwen35_b_attn_kernel instead of the tensor-core path. Used ONLY by test_qwen35_chunk_parity.
+int g_fucina_q35_scalar_cont_attn = 0;
 
 // ── Qwen3-MoE sparse FFN ────────────────────────────────────────────────────────────────────────
 // The dense SiLU-GLU FFN is replaced by a 128-expert top-8 mixture. The router is a PLAIN GEMV
@@ -17033,6 +17082,96 @@ static void q35_full_attn_tc(gemma4_engine_t *eng, float *attn, const float *qb,
         NQ, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
+// Lazily (re)allocate the base>0 CONTINUATION tensor-core attention scratch: an fp16 Q tile of
+// `qelems` plus fp32 score + fp16 prob buffers of `elems` each, grown to the largest request
+// seen (never sized up-front — the box is memory-pressured). Returns false on alloc failure;
+// the caller then falls back to the scalar kernel for THIS chunk and retries next time
+// (same retry semantics as ensure_q35_attn_scratch — never disabled, never crashes).
+static bool ensure_q35_cont_scratch(gemma4_engine_t *eng, size_t qelems, size_t elems) {
+    if (qelems > eng->d_q35_qh_cap || !eng->d_q35_qh) {
+        if (eng->d_q35_qh) { cudaFree(eng->d_q35_qh); eng->d_q35_qh = NULL; }
+        eng->d_q35_qh_cap = 0;
+        if (cudaMalloc(&eng->d_q35_qh, qelems * sizeof(__half)) != cudaSuccess) {
+            eng->d_q35_qh = NULL;
+            return false;
+        }
+        eng->d_q35_qh_cap = qelems;
+    }
+    if (elems > eng->d_q35_cont_cap || !eng->d_q35_cont_scores || !eng->d_q35_cont_p) {
+        if (eng->d_q35_cont_scores) { cudaFree(eng->d_q35_cont_scores); eng->d_q35_cont_scores = NULL; }
+        if (eng->d_q35_cont_p)      { cudaFree(eng->d_q35_cont_p);      eng->d_q35_cont_p = NULL; }
+        eng->d_q35_cont_cap = 0;
+        bool ok = cudaMalloc(&eng->d_q35_cont_scores, elems * sizeof(float)) == cudaSuccess;
+        ok = ok && cudaMalloc(&eng->d_q35_cont_p, elems * sizeof(__half)) == cudaSuccess;
+        if (!ok) {
+            if (eng->d_q35_cont_scores) { cudaFree(eng->d_q35_cont_scores); eng->d_q35_cont_scores = NULL; }
+            if (eng->d_q35_cont_p)      { cudaFree(eng->d_q35_cont_p);      eng->d_q35_cont_p = NULL; }
+            return false;
+        }
+        eng->d_q35_cont_cap = elems;
+    }
+    return true;
+}
+
+// FULL-layer CONTINUATION attention (base>0 chunked prefill) via tensor-core GEMMs reading the
+// fp16 K/V cache IN PLACE — replaces the scalar qwen35_b_attn_kernel walk of the whole cache
+// (measured 38–44× at this geometry: 82→2.1 ms/layer at S=2048, 426→9.7 ms at S=8192). Per KV
+// group g one strided-batched fp16×fp16→fp32 QKᵀ GEMM broadcasts the cached K over the group's
+// NQ/NKV query heads with strideA=0 (no kv-broadcast copies, no bf16 cache conversion), then the
+// KEY-MAJOR rectangular causal softmax, then the same strided-batched V·P GEMM. Query rows are
+// sub-tiled to bound the score scratch at ~96M elements (384 MB fp32 + 192 MB fp16). The current
+// chunk's K/V are already in the cache (qwen35_b_kv_write_kernel runs before the attention
+// branch). Returns false on any alloc/cuBLAS failure — attn may then be partially written, which
+// is safe because the scalar fallback rewrites ALL rows. NOT bitwise vs the scalar kernel
+// (fp16 Q + tensor-core reduction order); token-level parity is the gate, matching the TC
+// base==0 precedent — chunked prefill already mixes TC (chunk 1) with this path (chunk 2+).
+static bool q35_cont_attn_tc(gemma4_engine_t *eng, float *attn, const float *qb,
+                             int l, int slot, int base, int T, cudaStream_t st) {
+    const int NQ = eng->cfg.n_heads, NKV = eng->cfg.n_kv_global, HD = M2_HEAD;
+    if (NKV <= 0 || NQ % NKV != 0 || !eng->d_q35_Kc[l] || !eng->d_q35_Vc[l]) return false;
+    const int G = NQ / NKV, S = base + T, maxctx = eng->q35_maxctx;
+    const __half *Kc = eng->d_q35_Kc[l] + (size_t)slot * maxctx * NKV * HD;   // [pos][NKV][HD]
+    const __half *Vc = eng->d_q35_Vc[l] + (size_t)slot * maxctx * NKV * HD;
+    int rows_sub = (int)(((size_t)96 << 20) / ((size_t)NQ * S));   // NQ*rows_sub*S <= 96M elems
+    if (rows_sub < 64) rows_sub = 64;
+    if (rows_sub > T) rows_sub = T;
+    if (!ensure_q35_cont_scratch(eng, (size_t)T * NQ * HD, (size_t)NQ * rows_sub * S))
+        return false;
+    f32_to_f16_kernel<<<(unsigned)(((size_t)T * NQ * HD + 255) / 256), 256, 0, st>>>(
+        eng->d_q35_qh, qb, (size_t)T * NQ * HD);
+    const float scale = rsqrtf((float)HD), a1 = 1.0f, b0 = 0.0f;
+    for (int t0 = 0; t0 < T; t0 += rows_sub) {
+        const int Tq = (T - t0 < rows_sub) ? T - t0 : rows_sub;
+        for (int g = 0; g < NKV; g++) {
+            // scores[h] (S×Tq col-major, ld=S) = scale · K_gᵀ(S×HD) · Q_h(HD×Tq); the cached
+            // K_g (lda=NKV·HD over positions) is broadcast across the group via strideA=0.
+            if (cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, S, Tq, HD,
+                    &scale,
+                    Kc + (size_t)g * HD, CUDA_R_16F, NKV * HD, 0,
+                    eng->d_q35_qh + ((size_t)t0 * NQ + (size_t)g * G) * HD, CUDA_R_16F,
+                        NQ * HD, (long long)HD,
+                    &b0, eng->d_q35_cont_scores + (size_t)g * G * S * Tq, CUDA_R_32F,
+                        S, (long long)S * Tq,
+                    G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS)
+                return false;
+        }
+        attn_softmax_rect_kernel<<<dim3(Tq, NQ), 256, 32 * sizeof(float), st>>>(
+            eng->d_q35_cont_scores, eng->d_q35_cont_p, Tq, S, base + t0);
+        for (int g = 0; g < NKV; g++) {
+            // O_h (HD×Tq, into attn row-major [T][NQ][HD]) = V_g (HD×S, strideA=0) · P_h (S×Tq)
+            if (cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_N, CUBLAS_OP_N, HD, Tq, S,
+                    &a1,
+                    Vc + (size_t)g * HD, CUDA_R_16F, NKV * HD, 0,
+                    eng->d_q35_cont_p + (size_t)g * G * S * Tq, CUDA_R_16F, S, (long long)S * Tq,
+                    &b0, attn + ((size_t)t0 * NQ + (size_t)g * G) * HD, CUDA_R_32F,
+                        NQ * HD, (long long)HD,
+                    G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS)
+                return false;
+        }
+    }
+    return true;
+}
+
 // qwen35 prefill weight-cache slots (one per distinct projection a layer can hold).
 enum { WC_QKV=0, WC_Z, WC_OUT, WC_Q, WC_K, WC_V, WC_O, WC_GATE, WC_UP, WC_DOWN, WC_A, WC_B };
 
@@ -17255,9 +17394,15 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             qwen35_b_kv_write_kernel<<<dim3(grid1d((size_t)NKV*HD),T),256,0,st>>>(
                 eng->d_q35_Kc[l], eng->d_q35_Vc[l], kb, vb, d_pos, d_slot, maxctx, T, NKV);
             // base==0: the whole causal prompt is this tile → tensor-core GEMM attention (reads
-            // kb/vb directly). base>0 (chunked continuation): scalar kernel over the full cache.
+            // kb/vb directly). base>0 (chunked continuation): tensor-core GEMMs over the fp16
+            // K/V cache in place (q35_cont_attn_tc); the scalar kernel remains only as the
+            // alloc/cuBLAS-failure fallback (and under the parity-test override).
+            extern int g_fucina_q35_scalar_cont_attn;
             if (base == 0 && T <= 8192 && ensure_q35_attn_scratch(eng, T))
                 q35_full_attn_tc(eng, attn, qb, kb, vb, T, st);
+            else if (base > 0 && !g_fucina_q35_scalar_cont_attn &&
+                     q35_cont_attn_tc(eng, attn, qb, l, slot, base, T, st))
+                ;   // tensor-core continuation done
             else
                 qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
                     attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T, NKV, NQ);
