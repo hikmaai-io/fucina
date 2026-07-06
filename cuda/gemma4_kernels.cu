@@ -7776,6 +7776,39 @@ static cublasStatus_t gemm_bf16(
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
+// Grouped (ragged) BF16 tensor-core GEMM over ACTIVE MoE experts in ONE cuBLAS launch.
+// Each active expert e (hc[e]>0) contributes one problem: Y_e[out×n_e] = W_e[out×in] @ X_e[in×n_e]
+// with W_e = Wbase + e·wstride, X_e = Xbase + ho[e]·in_dim, Y_e = Ybase + ho[e]·out_dim — the SAME
+// per-expert cublasGemmEx(OP_T,OP_N) math as gemm_bf16, so results are bit-identical. Replaces the
+// per-expert loop (E separate ~16-row GEMMs landing on 16×16 tiles + E× launch overhead) with a
+// single grouped-batched kernel, the dominant 2k-prefill expert cost. Host pointer/dim arrays are
+// stack-sized to GEMMA4 max experts (E ≤ 256). No-op when no expert is active.
+static void gemm_bf16_grouped(gemma4_engine_t *eng,
+    const __nv_bfloat16 *Wbase, size_t wstride, const __nv_bfloat16 *Xbase, float *Ybase,
+    const int *hc, const int *ho, int E, int in_dim, int out_dim, cudaStream_t stream)
+{
+    const void *Aarr[256], *Barr[256]; void *Carr[256];
+    int m_arr[256], n_arr[256], k_arr[256], lda[256], ldb[256], ldc[256], gsize[256];
+    cublasOperation_t ta[256], tb[256];
+    float alpha[256], beta[256];
+    int g = 0;
+    for (int e = 0; e < E; e++) if (hc[e] > 0) {
+        Aarr[g]  = Wbase + (size_t)e * wstride;
+        Barr[g]  = Xbase + (size_t)ho[e] * in_dim;
+        Carr[g]  = Ybase + (size_t)ho[e] * out_dim;
+        m_arr[g] = out_dim; n_arr[g] = hc[e]; k_arr[g] = in_dim;
+        lda[g]   = in_dim;  ldb[g]   = in_dim; ldc[g]  = out_dim;
+        ta[g]    = CUBLAS_OP_T; tb[g] = CUBLAS_OP_N;
+        alpha[g] = 1.0f; beta[g] = 0.0f; gsize[g] = 1;
+        g++;
+    }
+    if (g == 0) return;
+    cublasSetStream(eng->cublas, stream);
+    cublasGemmGroupedBatchedEx(eng->cublas, ta, tb, m_arr, n_arr, k_arr,
+        alpha, Aarr, CUDA_R_16BF, lda, Barr, CUDA_R_16BF, ldb,
+        beta, Carr, CUDA_R_32F, ldc, g, gsize, CUBLAS_COMPUTE_32F);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // NVFP4 (block-scaled FP4) prefill projections — FUCINA_FP4.
 //
@@ -8857,21 +8890,17 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             cudaStreamSynchronize(stream);
             f32_to_bf16_kernel<<<(unsigned)(((size_t)total * H + 255) / 256), 256, 0, stream>>>(
                 eng->d_moe_xbf, eng->d_moe_xe, (uint64_t)total * H);
-            for (int e = 0; e < E; e++) if (hc[e] > 0) {
-                gemm_bf16(eng, eng->d_moe_wbf[0] + (size_t)e * EFFN * H,
-                          eng->d_moe_xbf + (size_t)ho[e] * H,
-                          eng->d_moe_gate + (size_t)ho[e] * EFFN, H, EFFN, hc[e]);
-                gemm_bf16(eng, eng->d_moe_wbf[1] + (size_t)e * EFFN * H,
-                          eng->d_moe_xbf + (size_t)ho[e] * H,
-                          eng->d_moe_up + (size_t)ho[e] * EFFN, H, EFFN, hc[e]);
-            }
+            // gate/up: one grouped-batched GEMM each over the active experts (in=H, out=EFFN).
+            gemm_bf16_grouped(eng, eng->d_moe_wbf[0], (size_t)EFFN * H, eng->d_moe_xbf,
+                              eng->d_moe_gate, hc, ho, E, H, EFFN, stream);
+            gemm_bf16_grouped(eng, eng->d_moe_wbf[1], (size_t)EFFN * H, eng->d_moe_xbf,
+                              eng->d_moe_up, hc, ho, E, H, EFFN, stream);
             dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
             f32_to_bf16_kernel<<<(unsigned)(((size_t)total * EFFN + 255) / 256), 256, 0, stream>>>(
                 eng->d_moe_xbf, eng->d_moe_act, (uint64_t)total * EFFN);
-            for (int e = 0; e < E; e++) if (hc[e] > 0)
-                gemm_bf16(eng, eng->d_moe_wbf[2] + (size_t)e * EFFN * H,
-                          eng->d_moe_xbf + (size_t)ho[e] * EFFN,
-                          eng->d_moe_oe + (size_t)ho[e] * H, EFFN, H, hc[e]);
+            // down: one grouped-batched GEMM over the active experts (in=EFFN, out=H).
+            gemm_bf16_grouped(eng, eng->d_moe_wbf[2], (size_t)EFFN * H, eng->d_moe_xbf,
+                              eng->d_moe_oe, hc, ho, E, EFFN, H, stream);
         } else if (fp8) {
             const __nv_bfloat16 *gs = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_gate_scales[l]);
             const __nv_bfloat16 *us = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_up_scales[l]);
@@ -16540,7 +16569,12 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
         const size_t per_layer = 2ull * (size_t)H *
             ((size_t)CONVD + 2ull*INNER + 3ull*(size_t)I + 4ull*(size_t)NQ*HD);
         const size_t need = (size_t)L * per_layer;
-        eng->q35_wcache_on = (freeb > need + (size_t)5ull * 1024 * 1024 * 1024) ? 1 : 0;
+        // 3 GiB working margin covers the MoE tc-prefill scratch (dequant slabs + gathered
+        // activations, ~2 GiB) on top of the fixed KV/arenas already reflected in `freeb`.
+        // The cache is a one-time alloc and each lazy per-layer build self-heals to off on
+        // failure, so a tight-but-passing decision never destabilizes serving. (Was 5 GiB —
+        // too conservative: it kept the ~350 ms/prefill mixer dequant on even with room.)
+        eng->q35_wcache_on = (freeb > need + (size_t)3ull * 1024 * 1024 * 1024) ? 1 : 0;
         if (const char *e = getenv("FUCINA_QWEN35_WCACHE")) eng->q35_wcache_on = (atoi(e) != 0);
         fprintf(stderr, "fucina: qwen35 prefill weight-cache %s (need %.1f GiB, free %.1f GiB)\n",
                 eng->q35_wcache_on ? "ON" : "off",
