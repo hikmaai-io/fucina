@@ -65,6 +65,24 @@ func (w *gw) kvU32(key string, v uint32) {
 	w.u32(v)
 }
 
+// kvString writes a KV pair whose value is a string scalar.
+func (w *gw) kvString(key, val string) {
+	w.str(key)
+	w.u32(ggufTypeString)
+	w.str(val)
+}
+
+// kvBool writes a KV pair whose value is a bool scalar (single byte).
+func (w *gw) kvBool(key string, v bool) {
+	w.str(key)
+	w.u32(ggufTypeBool)
+	var b byte
+	if v {
+		b = 1
+	}
+	w.buf = append(w.buf, b)
+}
+
 // buildTestGGUF serializes a minimal valid GGUF v3 binary in memory with the
 // metadata the tokenizer parser reads: tokens, scores, and the bos/eos/pad ids.
 func buildTestGGUF(tokens []string, scores []float32, bos, eos, pad int32) []byte {
@@ -484,6 +502,123 @@ func TestNumTokens(t *testing.T) {
 	tk, idx := newTestTokenizer(t)
 	if got := tk.NumTokens(); got != len(idx) {
 		t.Errorf("NumTokens() = %d, want %d", got, len(idx))
+	}
+}
+
+// ─── Byte-level (gpt2/qwen2) BPE ──────────────────────────────────
+
+// TestByteLevel_ByteToRuneSpace pins the GPT-2 byte↔unicode table's space slot:
+// 0x20 must map to U+0120, and the map must round-trip every byte.
+func TestByteLevel_ByteToRuneSpace(t *testing.T) {
+	if got := byteToRune(' '); got != 'Ġ' {
+		t.Errorf("byteToRune(space) = %U, want U+0120", got)
+	}
+	// printable identity sample
+	if got := byteToRune('a'); got != 'a' {
+		t.Errorf("byteToRune('a') = %U, want 'a'", got)
+	}
+	for b := 0; b < 256; b++ {
+		r := byteToRune(byte(b))
+		back, ok := runeToByte(r)
+		if !ok || back != byte(b) {
+			t.Errorf("round-trip byte %d via %U = (%d,%v)", b, r, back, ok)
+		}
+	}
+}
+
+// buildByteLevelGGUF serializes a minimal Qwen3-style byte-level GGUF: a full
+// 256-byte alphabet plus the merged pieces, tokenizer.ggml.model="gpt2", the
+// merges array, and add_bos_token (controllable).
+func buildByteLevelGGUF(extraPieces, merges []string, addBOS bool) []byte {
+	tokens := []string{"<pad>", "<eos>", "<bos>", "<unk>"}
+	for b := 0; b < 256; b++ {
+		tokens = append(tokens, string(byteToRune(byte(b))))
+	}
+	tokens = append(tokens, extraPieces...)
+
+	w := &gw{}
+	w.u32(0x46554747) // "GGUF"
+	w.u32(3)          // version
+	w.u64(0)          // tensor_count
+	w.u64(6)          // metadata_kv_count
+
+	w.kvStringArray("tokenizer.ggml.tokens", tokens)
+	w.kvString("tokenizer.ggml.model", "gpt2")
+	w.kvStringArray("tokenizer.ggml.merges", merges)
+	w.kvBool("tokenizer.ggml.add_bos_token", addBOS)
+	w.kvU32("tokenizer.ggml.bos_token_id", 2)
+	w.kvU32("tokenizer.ggml.eos_token_id", 1)
+	return w.buf
+}
+
+func TestByteLevelBPE_RoundTripAndFlags(t *testing.T) {
+	const sp = "Ġ" // GPT-2 space marker (byteToRune(' '))
+	// merges: build "ab" from a+b, and " cd" (sp+c+d) from sp+c then +d.
+	merges := []string{
+		"a b",
+		sp + " c",
+		sp + "c d",
+	}
+	pieces := []string{"ab", sp + "c", sp + "cd"}
+	data := buildByteLevelGGUF(pieces, merges, false)
+
+	tk, err := New(data, int64(len(data)))
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !tk.byteLevel {
+		t.Fatal("byteLevel flag not set for tokenizer.ggml.model=gpt2")
+	}
+	if !tk.bpe {
+		t.Fatal("bpe flag not set for gpt2 model")
+	}
+	if tk.byteFallback {
+		t.Fatal("byteFallback must be off for byte-level BPE")
+	}
+	if tk.AddBOS {
+		t.Fatal("AddBOS must be false (add_bos_token=false)")
+	}
+
+	// AddBOS honored: even with addBos=true the caller gets no BOS.
+	ids := tk.Encode("ab cd", true, false)
+	if len(ids) > 0 && ids[0] == tk.BOS {
+		t.Errorf("BOS prepended despite add_bos_token=false: %v", ids)
+	}
+
+	wantIDs := []int32{tk.tokenToID["ab"], tk.tokenToID[sp+"cd"]}
+	if len(ids) != len(wantIDs) || ids[0] != wantIDs[0] || ids[1] != wantIDs[1] {
+		t.Errorf("Encode(%q) = %v, want %v", "ab cd", ids, wantIDs)
+	}
+
+	// Round-trip Encode→Decode.
+	if got := tk.Decode(ids); got != "ab cd" {
+		t.Errorf("round-trip = %q, want %q", got, "ab cd")
+	}
+
+	// Space maps through U+0120 inside an encoded piece: the second token's
+	// string must start with the GPT-2 space marker.
+	if s := tk.TokenStr(ids[1]); !strings.HasPrefix(s, sp) {
+		t.Errorf("space token %q does not start with U+0120 marker", s)
+	}
+}
+
+func TestByteLevelBPE_DefaultAddBOSAndUnmergedBytes(t *testing.T) {
+	// No merges, no extra pieces, add_bos_token=true: every byte stays a single
+	// symbol and resolves against the 256-byte alphabet (no <0xXX> fallback).
+	data := buildByteLevelGGUF(nil, nil, true)
+	tk, err := New(data, int64(len(data)))
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !tk.AddBOS {
+		t.Fatal("AddBOS should be true (add_bos_token=true)")
+	}
+	ids := tk.Encode("hi!", true, false)
+	if len(ids) < 1 || ids[0] != tk.BOS {
+		t.Fatalf("expected leading BOS, got %v", ids)
+	}
+	if got := tk.Decode(ids); got != "hi!" {
+		t.Errorf("round-trip = %q, want %q", got, "hi!")
 	}
 }
 

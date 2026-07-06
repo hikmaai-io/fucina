@@ -52,7 +52,7 @@ func NewFromHFJSON(path string) (*Tokenizer, error) {
 		return nil, fmt.Errorf("tokenizer: %s has empty vocab", path)
 	}
 
-	t := &Tokenizer{BOS: 2, EOS: 1, PAD: 0, bpe: true, byteFallback: hf.Model.ByteFallback}
+	t := &Tokenizer{BOS: 2, EOS: 1, PAD: 0, AddBOS: true, bpe: true, byteFallback: hf.Model.ByteFallback}
 
 	// vocab[id] = token string; ids are dense 0..N-1.
 	maxID := int32(-1)
@@ -157,22 +157,7 @@ func (t *Tokenizer) bpeEncode(text string, tokens []int32) []int32 {
 	for _, r := range text {
 		syms = append(syms, string(r))
 	}
-	// merge by lowest rank until none applies
-	for len(syms) > 1 {
-		bestRank := int32(math.MaxInt32)
-		bestI := -1
-		for i := 0; i+1 < len(syms); i++ {
-			if r, ok := t.bpeMerges[mergePair{syms[i], syms[i+1]}]; ok && r < bestRank {
-				bestRank = r
-				bestI = i
-			}
-		}
-		if bestI < 0 {
-			break
-		}
-		syms[bestI] += syms[bestI+1]
-		syms = append(syms[:bestI+1], syms[bestI+2:]...)
-	}
+	syms = t.mergeByRank(syms)
 	// symbols → ids (byte fallback for out-of-vocab symbols)
 	for _, s := range syms {
 		if id, ok := t.tokenToID[s]; ok {
@@ -193,6 +178,59 @@ func (t *Tokenizer) bpeEncode(text string, tokens []int32) []int32 {
 			tokens = append(tokens, id)
 		} else {
 			tokens = append(tokens, t.PAD)
+		}
+	}
+	return tokens
+}
+
+// mergeByRank applies BPE merges to a symbol list in place: repeatedly merge the
+// adjacent pair with the lowest merge rank (leftmost on ties) until no pair has a
+// rank. Naive O(L²); fine for prompt/pretoken-piece lengths. Shared by the GGUF
+// BPE, HF-json, and byte-level paths.
+func (t *Tokenizer) mergeByRank(syms []string) []string {
+	for len(syms) > 1 {
+		bestRank := int32(math.MaxInt32)
+		bestI := -1
+		for i := 0; i+1 < len(syms); i++ {
+			if r, ok := t.bpeMerges[mergePair{syms[i], syms[i+1]}]; ok && r < bestRank {
+				bestRank = r
+				bestI = i
+			}
+		}
+		if bestI < 0 {
+			break
+		}
+		syms[bestI] += syms[bestI+1]
+		syms = append(syms[:bestI+1], syms[bestI+2:]...)
+	}
+	return syms
+}
+
+// bpeEncodeByteLevel encodes one control-marker-free segment with GPT-2 / Qwen2
+// byte-level BPE (the Qwen3 GGUF path). It runs the qwen2-style pretokenizer,
+// maps every byte of each piece through the GPT-2 byte↔unicode table, seeds the
+// merge loop with one symbol PER MAPPED RUNE, applies merge-by-rank, then maps
+// the final symbols to ids. There is NO <0xXX> byte fallback: the byte alphabet
+// already covers all 256 bytes as base vocab tokens, so a lookup miss means a
+// corrupt vocab/merge set and we fail loudly rather than silently mis-encode.
+func (t *Tokenizer) bpeEncodeByteLevel(text string, tokens []int32) []int32 {
+	if text == "" {
+		return tokens
+	}
+	for _, piece := range pretokenizeByteLevel(text) {
+		// Byte-map: one symbol per *byte* of the piece (UTF-8), via the table.
+		syms := make([]string, 0, len(piece))
+		for i := 0; i < len(piece); i++ {
+			syms = append(syms, string(byteToRune(piece[i])))
+		}
+		syms = t.mergeByRank(syms)
+		for _, s := range syms {
+			id, ok := t.tokenToID[s]
+			if !ok {
+				panic(fmt.Sprintf("tokenizer: byte-level BPE symbol %q not in vocab "+
+					"(corrupt vocab or merge set)", s))
+			}
+			tokens = append(tokens, id)
 		}
 	}
 	return tokens

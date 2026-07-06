@@ -32,13 +32,37 @@ const e4bCommandsHelp = "  /thinking LEVEL  set reasoning: off|on|low|medium|hig
 
 // runE4B is the CLI entry for an E4B checkpoint (already detected by main()).
 func runE4B(args CLIArgs) {
-	log.Printf("fucina: loading E4B checkpoint %s (ctx=%d, device=%d)...",
-		args.ModelPath, args.ContextSize, args.DeviceID)
-	eng, err := e4b.New(args.ModelPath, uint32(args.ContextSize), args.DeviceID)
+	// Desired KV slots = continuous-batching width + 1. Slot 0 is permanently reserved
+	// for the single-sequence Prefill/Decode API; the batch scheduler uses slots 1..N-1,
+	// so to give --parallel N *concurrent batch sequences* we provision N+1 slots. Single-
+	// stream (CLI / non-batched server) needs just 1. Reserving the old hardcoded 8
+	// multiplied KV memory 8× and was the dominant OOM term. The engine clamps to [1,8]
+	// (the Q8_1 batch-scratch ceiling) and further shrinks to fit device memory.
+	maxSeqs := 1
+	if args.Parallel > 1 {
+		maxSeqs = args.Parallel + 1
+	} else if args.ContBatching {
+		maxSeqs = 5 // 4 concurrent batch sequences + reserved slot 0
+	}
+	log.Printf("fucina: loading E4B checkpoint %s (ctx=%d, max-seqs=%d, device=%d)...",
+		args.ModelPath, args.ContextSize, maxSeqs, args.DeviceID)
+	eng, err := e4b.New(args.ModelPath, uint32(args.ContextSize), maxSeqs, args.DeviceID)
 	if err != nil {
 		log.Fatalf("fucina: %v", err)
 	}
 	defer eng.Close()
+
+	// Optional MTP assistant (the official Gemma-4-E4B draft head): enables greedy
+	// speculative decode on the single-sequence path (~2x decode, lossless). Non-fatal —
+	// the engine stays usable on plain decode if the draft head fails to load.
+	if args.AssistantPath != "" {
+		if err := eng.LoadAssistant(args.AssistantPath); err != nil {
+			log.Printf("fucina: WARNING — failed to load MTP assistant %s: %v (continuing without spec)",
+				args.AssistantPath, err)
+		} else {
+			log.Printf("fucina: loaded MTP assistant %s — greedy spec decode ENABLED", args.AssistantPath)
+		}
+	}
 
 	tok, err := loadTokenizer(args.ModelPath, args.TokenizerPath)
 	if err != nil {
@@ -228,7 +252,9 @@ func runE4BInteractive(eng *e4b.Engine, tok *tokenizer.Tokenizer, args CLIArgs) 
 				len(promptToks), ctxTokens)
 		}
 
-		eng.Reset()
+		// Prefill resets slot 0 to a fresh sequence internally, so no explicit Reset()
+		// is needed here. (Server-side prefix reuse is handled by the KVCache manager via
+		// the engine's NTokens/Rewind/append contract, not on this single-shot CLI path.)
 		pfStart := time.Now()
 		logits, err := eng.Prefill(promptToks)
 		if err != nil {

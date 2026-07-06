@@ -33,6 +33,27 @@ package cuda
 //         out, max_new, stops, n_stop, draft_k, temp, top_k, top_p, min_p,
 //         repeat_penalty, seed, n_accepted, fucinaSpecTokenGo, (void *)handle);
 // }
+//
+// // Batched speculative-decode bridge: builds the gemma4_spec_req[] from FLAT
+// // primitive arrays (slots/anchors/n_drafts + one concatenated drafts buffer) so
+// // no Go struct carrying Go pointers is ever handed to C (cgo pointer rule). The
+// // engine drafts are caller-supplied; this only marshals + forwards to the ABI.
+// static inline int _fucina_step_batch_spec_flat(gemma4_engine_t *eng,
+//     const int *slots, const int32_t *anchors, const int *n_drafts,
+//     const int32_t *drafts_flat, int R,
+//     int32_t *out_runs, int *out_run_len, int *err_rows) {
+//     if (R <= 0 || R > 32) return -1;   /* 32 = GEMMA4_MAX_SEQS (== Go maxBatchSeqs) */
+//     gemma4_spec_req reqs[32];
+//     const int32_t *p = drafts_flat;
+//     for (int i = 0; i < R; i++) {
+//         reqs[i].slot = slots[i];
+//         reqs[i].anchor = anchors[i];
+//         reqs[i].drafts = (n_drafts[i] > 0) ? p : (const int32_t *)0;
+//         reqs[i].n_draft = n_drafts[i];
+//         p += n_drafts[i];
+//     }
+//     return gemma4_engine_step_batch_spec(eng, reqs, R, out_runs, out_run_len, err_rows);
+// }
 import "C"
 
 import (
@@ -46,17 +67,19 @@ import (
 	"github.com/hikmaai-io/fucina/internal/server/batch"
 )
 
-// vocabSize is the gemma-4 logits width (the device writes exactly this many
-// floats per Prefill/Decode). Kept as a const so the scratch buffer and the C
-// side agree.
-const vocabSize = 262144
+// vocabSizeMax is the largest supported logits width (Gemma-4). The actual width is
+// per-model (Qwen3 = 151936) and read from the engine via gemma4_engine_vocab; this is
+// only a fallback if that query fails. The host logits buffer is sized to the ACTUAL
+// vocab so the host argmax/sampler never reads past valid logits into garbage.
+const vocabSizeMax = 262144
 
 // Engine wraps the C inference engine.
 type Engine struct {
 	mu   sync.Mutex
-	ptr  *C.gemma4_engine_t
-	ctx  uint32
-	path string
+	ptr   *C.gemma4_engine_t
+	ctx   uint32
+	vocab int
+	path  string
 
 	// closing is set true BEFORE Close() destroys e.ptr, so AbortPrefill (which
 	// reads e.ptr lock-free to avoid deadlocking the prefilling goroutine that
@@ -108,15 +131,23 @@ func NewEngine(cfg Config) (*Engine, error) {
 		return nil, fmt.Errorf("fucina: engine creation failed for %s", cfg.ModelPath)
 	}
 
+	vocab := int(C.gemma4_engine_vocab(ptr))
+	if vocab <= 0 || vocab > vocabSizeMax {
+		vocab = vocabSizeMax // fallback if the engine can't report it
+	}
 	eng := &Engine{
 		ptr:       ptr,
 		ctx:       ctxSize,
+		vocab:     vocab,
 		path:      cfg.ModelPath,
-		logitsBuf: make([]float32, vocabSize),
+		logitsBuf: make([]float32, vocab),
 	}
 
 	return eng, nil
 }
+
+// VocabSize reports the model's logits width (Gemma 262144, Qwen3 151936).
+func (e *Engine) VocabSize() int { return e.vocab }
 
 // LoadAssistant loads the official Gemma-4 MTP assistant GGUF (~423M draft head).
 // When loaded, speculative decoding drafts novel text with it (multi-token prediction
@@ -550,11 +581,11 @@ func (e *Engine) GraphStats() (hits, misses, captures, launches int) {
 // sequence's SeqParams (temperature/top_k/top_p/min_p/seed) are stored on its
 // slot at SeqAdd and applied to every token (temp<=0 ⇒ exact greedy argmax).
 //
-// maxBatchSeqs mirrors GEMMA4_MAX_SEQS (== GEMMA4_SPEC_MAX) in the kernels: the
-// fixed number of concurrent paged slots. seq_capacity() reports only the FREE
-// slots, so the adapter reconstructs the *total* (free+used) for the scheduler's
-// Capacity() contract by tracking how many slots it currently holds.
-const maxBatchSeqs = 16
+// maxBatchSeqs mirrors GEMMA4_MAX_SEQS in the kernels (now DECOUPLED from
+// GEMMA4_SPEC_MAX=16 and raised to 32 for higher continuous-batching concurrency).
+// seq_capacity() reports only the FREE slots, so the adapter reconstructs the *total*
+// (free+used) for the scheduler's Capacity() contract by tracking held slots.
+const maxBatchSeqs = 32
 
 // SeqAdd prefills prompt into a fresh paged slot and returns the slot id and the
 // first sampled token. The per-sequence sampling params are stored on the slot
@@ -615,6 +646,89 @@ func (e *Engine) StepBatch(slots []int32, inputs []int32) ([]int32, error) {
 		return nil, fmt.Errorf("fucina: step_batch failed")
 	}
 	return out, nil
+}
+
+// specMax mirrors GEMMA4_SPEC_MAX (max draft length per batched-decode pass): the
+// per-row run buffer is [GEMMA4_SPEC_MAX+1] (accepted prefix + the bonus token).
+const specMax = 16
+
+// SpecReq is one row of a speculative batched-decode step: feed Anchor to Slot,
+// verify the Drafts behind it. Σ(1+len(Drafts)) over all reqs must be ≤ maxBatchSeqs
+// (the verify flattens to that many forward rows).
+type SpecReq struct {
+	Slot   int32
+	Anchor int32
+	Drafts []int32
+}
+
+// StepBatchSpec runs ONE speculative batched-decode step: for each req it feeds the
+// anchor token and verifies the drafts (greedy rejection-sampling accept + lossless
+// paged rewind, all in the C engine). It returns, per req, the RUN of committed
+// tokens (accepted drafts + one bonus token, length ≥ 1) and an err flag (errRows[i]
+// = -1 if that seq's KV could not grow → caller stops it gracefully). This is the
+// speculative analogue of StepBatch; the accepted run is what makes spec pay off
+// (one weight pass commits multiple tokens). reqs order is preserved in the output.
+func (e *Engine) StepBatchSpec(reqs []SpecReq) (runs [][]int32, errRows []int, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	R := len(reqs)
+	if R == 0 {
+		return nil, nil, nil
+	}
+	if R > maxBatchSeqs {
+		return nil, nil, fmt.Errorf("fucina: step_batch_spec: %d reqs exceeds max %d", R, maxBatchSeqs)
+	}
+	// Flatten into primitive arrays (no Go struct with Go pointers crosses to C).
+	cslots := make([]C.int, R)
+	canchors := make([]C.int32_t, R)
+	cndraft := make([]C.int, R)
+	var draftsFlat []int32
+	total := 0
+	for i := range reqs {
+		cslots[i] = C.int(reqs[i].Slot)
+		canchors[i] = C.int32_t(reqs[i].Anchor)
+		cndraft[i] = C.int(len(reqs[i].Drafts))
+		draftsFlat = append(draftsFlat, reqs[i].Drafts...)
+		total += 1 + len(reqs[i].Drafts)
+	}
+	if total > maxBatchSeqs {
+		return nil, nil, fmt.Errorf("fucina: step_batch_spec: Σ(1+drafts)=%d exceeds %d", total, maxBatchSeqs)
+	}
+	// The flat drafts buffer must be non-nil for &draftsFlat[0]; a step with zero
+	// total drafts (all anchors, no speculation) still needs a valid (unused) ptr.
+	if len(draftsFlat) == 0 {
+		draftsFlat = []int32{0}
+	}
+	outRuns := make([]int32, R*(specMax+1))
+	outRunLen := make([]C.int, R)
+	cErr := make([]C.int, R)
+	ret := C._fucina_step_batch_spec_flat(
+		e.ptr,
+		&cslots[0], &canchors[0], &cndraft[0],
+		(*C.int32_t)(unsafe.Pointer(&draftsFlat[0])),
+		C.int(R),
+		(*C.int32_t)(unsafe.Pointer(&outRuns[0])),
+		&outRunLen[0], &cErr[0],
+	)
+	if ret != 0 {
+		return nil, nil, fmt.Errorf("fucina: step_batch_spec failed")
+	}
+	runs = make([][]int32, R)
+	errRows = make([]int, R)
+	for i := 0; i < R; i++ {
+		errRows[i] = int(cErr[i])
+		l := int(outRunLen[i])
+		if l < 0 {
+			l = 0
+		}
+		if l > specMax+1 {
+			l = specMax + 1
+		}
+		run := make([]int32, l)
+		copy(run, outRuns[i*(specMax+1):i*(specMax+1)+l])
+		runs[i] = run
+	}
+	return runs, errRows, nil
 }
 
 // SeqRemove frees a slot's paged KV back to the pool and marks it reusable.
@@ -687,6 +801,31 @@ func (a *BatchAdapter) StepBatch(active []int32, inputs []int32) ([][]int32, err
 		out[i] = []int32{t}
 	}
 	return out, nil
+}
+
+// StepBatchSpec runs ONE speculative batched step (batch.SpecBatchEngine contract):
+// per req it feeds the anchor and verifies the drafts, returning the committed RUN
+// per slot (accepted drafts + bonus token). A per-row KV-exhausted flag is folded
+// into the run as a trailing -1 sentinel, so the scheduler's run walker stops that
+// slot gracefully after delivering whatever it did commit — identical handling to
+// the StepBatch path. This is what makes the adapter a SpecBatchEngine, so the
+// scheduler auto-enables speculative decoding for every arch (drafting is host-side
+// and model-agnostic; only the lossless verify runs on-device).
+func (a *BatchAdapter) StepBatchSpec(reqs []batch.SpecReq) ([][]int32, error) {
+	creqs := make([]SpecReq, len(reqs))
+	for i, r := range reqs {
+		creqs[i] = SpecReq{Slot: r.Slot, Anchor: r.Anchor, Drafts: r.Drafts}
+	}
+	runs, errRows, err := a.eng.StepBatchSpec(creqs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range runs {
+		if i < len(errRows) && errRows[i] == -1 {
+			runs[i] = append(runs[i], -1) // graceful per-seq stop after the committed run
+		}
+	}
+	return runs, nil
 }
 
 // RemoveSeq frees a slot and updates the live-slot count.

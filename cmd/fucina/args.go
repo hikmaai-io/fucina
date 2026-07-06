@@ -59,9 +59,10 @@ type CLIArgs struct {
 	// is set or Parallel > 1. Parallel is the desired concurrent-slot count (capped by the
 	// engine's slot budget). FlashAttn is accepted for llama compatibility (fucina always
 	// uses flash/FP8 attention) and is otherwise a no-op.
-	Parallel     int
-	ContBatching bool
-	FlashAttn    string
+	Parallel       int
+	ContBatching   bool
+	NoContBatching bool
+	FlashAttn      string
 	ThreadsHTTP  int // alias of MaxConcurrent (llama --threads-http)
 
 	// System
@@ -172,7 +173,8 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.BoolVar(&a.Raw, "raw", false, "-p: feed the prompt verbatim, no chat template (base completion / benchmarks)")
 	// Continuous batching (llama.cpp-compatible aliases).
 	fs.IntVar(&a.Parallel, "parallel", 0, "Server: max concurrent sequences via continuous batching (>1 enables it; like llama --parallel)")
-	fs.BoolVar(&a.ContBatching, "cont-batching", false, "Server: enable continuous batching (like llama --cont-batching)")
+	fs.BoolVar(&a.ContBatching, "cont-batching", false, "Server: enable continuous batching (now DEFAULT-on; accepted as a no-op for llama compatibility)")
+	fs.BoolVar(&a.NoContBatching, "no-cont-batching", false, "Server: disable continuous batching / paged-KV multi-seq (single-flight; Gemma only — Qwen3 requires the batch path)")
 	fs.StringVar(&a.FlashAttn, "flash-attn", "", "Accepted for llama compatibility; fucina always uses flash/FP8 attention (no-op)")
 	fs.IntVar(&a.ThreadsHTTP, "threads-http", 0, "Server: max concurrent HTTP inference requests (alias of --max-concurrent)")
 	fs.BoolVar(&a.Verbose, "v", false, "Verbose output")

@@ -257,9 +257,12 @@ static void mmvq_batched_launch(
         case 3: LAUNCH(3); break;  case 4: LAUNCH(4); break;
         case 5: LAUNCH(5); break;  case 6: LAUNCH(6); break;
         case 7: LAUNCH(7); break;  case 8: LAUNCH(8); break;
+        case 9: LAUNCH(9); break;  case 10: LAUNCH(10); break; case 11: LAUNCH(11); break;
+        case 12: LAUNCH(12); break; case 13: LAUNCH(13); break; case 14: LAUNCH(14); break;
+        case 15: LAUNCH(15); break; case 16: LAUNCH(16); break;
         default:
-            for (int o = 0; o < K; o += 8) {
-                int kk = (K - o < 8) ? (K - o) : 8;
+            for (int o = 0; o < K; o += 16) {
+                int kk = (K - o < 16) ? (K - o) : 16;
                 mmvq_batched_launch(out + (size_t)o*out_dim, weight,
                                     qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
                                     sx + (size_t)o*(in_dim>>5),
@@ -353,9 +356,12 @@ static void mmvq_q4_0_packed_batched_launch(
         case 3: LP(3); break;  case 4: LP(4); break;
         case 5: LP(5); break;  case 6: LP(6); break;
         case 7: LP(7); break;  case 8: LP(8); break;
+        case 9: LP(9); break;  case 10: LP(10); break; case 11: LP(11); break;
+        case 12: LP(12); break; case 13: LP(13); break; case 14: LP(14); break;
+        case 15: LP(15); break; case 16: LP(16); break;
         default:
-            for (int o = 0; o < K; o += 8) {
-                int kk = (K - o < 8) ? (K - o) : 8;
+            for (int o = 0; o < K; o += 16) {
+                int kk = (K - o < 16) ? (K - o) : 16;
                 mmvq_q4_0_packed_batched_launch(out + (size_t)o*out_dim, quants, scales,
                     qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
                     sx + (size_t)o*(in_dim>>5), in_dim, out_dim, kk, stream);
@@ -422,6 +428,249 @@ static __global__ void mmvq_q6_k_kernel(
     if (lane == 0) out[idx] = acc;
 }
 
+// ── Q4_K decode GEMV (Qwen3 / K-quant) ───────────────────────────────────────
+// Q4_K superblock = 256 elems = 8 sub-blocks of 32. On-disk (144 bytes, GGML order):
+//   half d; half dmin; uint8 scales[12]; uint8 qs[128].
+// Per sub-block j: 6-bit scale sc_j and 6-bit min m_j packed in scales[12]; the 4-bit
+// (unsigned 0..15) quant q_i dequantizes to (d*sc_j)*q_i - (dmin*m_j). Decode GEMV keeps
+// weights native and dots against q8_1-quantized activations (qx int8 + per-32-block
+// scale dx[b] + per-32-block int sum sx[b]); the asymmetric min uses sx[b]:
+//   out += dx[b]·( d·sc_j·Σ(q_i·xq_i)  -  dmin·m_j·Σ(xq_i) )
+// Σ(q_i·xq_i) via __dp4a (nibbles 0..15 fit signed int8); Σ(xq_i)=sx[b] precomputed.
+static __device__ __forceinline__ void mmvq_q4k_scale_min(int j, const uint8_t *q, int *d, int *m) {
+    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+    else {
+        *d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4)   | ((q[j    ] >> 6) << 4);
+    }
+}
+
+#define MMVQ_Q4K_BLOCK_BYTES 144
+
+static __global__ void mmvq_q4_k_kernel(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.x * nwarps + warp;
+    if (idx >= out_dim) return;
+    int n_super = in_dim >> 8;       // 256-elem superblocks per row
+    int nb32    = in_dim >> 5;       // 32-elem sub-blocks per row (8 per superblock)
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * MMVQ_Q4K_BLOCK_BYTES;
+    float acc = 0.0f;
+    for (int b = lane; b < nb32; b += 32) {
+        const uint8_t *blk = wrow + (size_t)(b >> 3) * MMVQ_Q4K_BLOCK_BYTES;
+        int j = b & 7;                                   // sub-block 0..7
+        __half_raw dr; dr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        __half_raw mr; mr.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+        float d = __half2float(__half(dr)), dmin = __half2float(__half(mr));
+        int sc, mn; mmvq_q4k_scale_min(j, blk + 4, &sc, &mn);
+        const uint8_t *qbase = blk + 16 + 32 * (j >> 1); // 32 bytes; low/high nibble by j&1
+        int lowhigh = j & 1;
+        const int *xqs = (const int *)(qx + (size_t)b * 32);
+        int sumi = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int wq  = q8_get_int_b2(qbase, k);
+            int nib = lowhigh ? ((wq >> 4) & 0x0F0F0F0F) : (wq & 0x0F0F0F0F);
+            sumi = __dp4a(nib, xqs[k], sumi);
+        }
+        acc += dx[b] * (d * (float)sc * (float)sumi - dmin * (float)mn * (float)sx[b]);
+    }
+    acc = warp_reduce_sum_all(acc);
+    if (lane == 0) out[idx] = acc;
+}
+
+// out[out_dim] = W[out_dim,in_dim] · x[in_dim], W in Q4_K. Caller supplies q8_1 activations.
+static inline void mmvq_q4_k_launch(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim, cudaStream_t stream)
+{
+    const int WPB = 4;                               // warps per block
+    int blocks = (out_dim + WPB - 1) / WPB;
+    mmvq_q4_k_kernel<<<blocks, WPB * 32, 0, stream>>>(out, weight, qx, dx, sx, in_dim, out_dim);
+}
+
+// Batched Y[K][out_dim] = X[K][in_dim] · Wᵀ, W in Q4_K — WEIGHT-REUSE: each Q4_K
+// super-block is loaded ONCE and dotted against all NK activation columns (the nibbles
+// are unpacked once, reused across columns). This is the multi-stream win: weight DRAM
+// traffic is paid once for K sequences instead of K times (the per-row fallback).
+template<int NK>
+static __global__ void mmvq_q4_k_batched_kernel(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.x * nwarps + warp;
+    if (idx >= out_dim) return;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * MMVQ_Q4K_BLOCK_BYTES;
+    float acc[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
+    for (int b = lane; b < nb32; b += 32) {
+        const uint8_t *blk = wrow + (size_t)(b >> 3) * MMVQ_Q4K_BLOCK_BYTES;
+        int j = b & 7;
+        __half_raw dr; dr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        __half_raw mr; mr.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+        float d = __half2float(__half(dr)), dmin = __half2float(__half(mr));
+        int sc, mn; mmvq_q4k_scale_min(j, blk + 4, &sc, &mn);
+        const uint8_t *qbase = blk + 16 + 32 * (j >> 1);
+        int lowhigh = j & 1;
+        int nib[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int wq = q8_get_int_b2(qbase, k);
+            nib[k] = lowhigh ? ((wq >> 4) & 0x0F0F0F0F) : (wq & 0x0F0F0F0F);
+        }
+        #pragma unroll
+        for (int n = 0; n < NK; n++) {
+            const int *xqs = (const int *)(qx + (size_t)n*in_dim + (size_t)b*32);
+            int sumi = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) sumi = __dp4a(nib[k], xqs[k], sumi);
+            acc[n] += dx[(size_t)n*nb32 + b] *
+                      (d*(float)sc*(float)sumi - dmin*(float)mn*(float)sx[(size_t)n*nb32 + b]);
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) {
+        float v = warp_reduce_sum_all(acc[n]);
+        if (lane == 0) out[(size_t)n*out_dim + idx] = v;
+    }
+}
+
+static inline void mmvq_q4_k_batched_launch(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K, cudaStream_t stream)
+{
+    const int NWARPS = 4; int b = NWARPS*32;
+    dim3 g((out_dim + NWARPS - 1) / NWARPS);
+    #define LP_Q4K(NK) mmvq_q4_k_batched_kernel<NK><<<g,b,0,stream>>>(out,weight,qx,dx,sx,in_dim,out_dim)
+    switch (K) {
+        case 1: LP_Q4K(1); break; case 2: LP_Q4K(2); break; case 3: LP_Q4K(3); break;
+        case 4: LP_Q4K(4); break; case 5: LP_Q4K(5); break; case 6: LP_Q4K(6); break;
+        case 7: LP_Q4K(7); break; case 8: LP_Q4K(8); break;
+        case 9: LP_Q4K(9); break; case 10: LP_Q4K(10); break; case 11: LP_Q4K(11); break;
+        case 12: LP_Q4K(12); break; case 13: LP_Q4K(13); break; case 14: LP_Q4K(14); break;
+        case 15: LP_Q4K(15); break; case 16: LP_Q4K(16); break;
+        default:
+            for (int o = 0; o < K; o += 16) {
+                int kk = (K - o < 16) ? (K - o) : 16;
+                mmvq_q4_k_batched_launch(out + (size_t)o*out_dim, weight,
+                    qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5), sx + (size_t)o*(in_dim>>5),
+                    in_dim, out_dim, kk, stream);
+            }
+    }
+    #undef LP_Q4K
+}
+
+// ── FUCINA_PACKED Q4_K: de-interleaved superblock for coalesced uint4 loads ───────
+// The native Q4_K kernel reads qs strided + 2x redundant (each lane re-reads the
+// sibling sub-block's 32 bytes). Repack each 256-elem superblock IN PLACE to the SAME
+// 144 B: header [d,dmin,scales(12)] verbatim at [0..15], then 8 sub-blocks of 16
+// DE-INTERLEAVED quant bytes at [16+j*16 .. +15], byte m = nib(qbase[m]) |
+// (nib(qbase[m+16])<<4) — the GGML-Q4_0 nibble convention (low=elem m, high=elem m+16).
+// The packed kernel then reads one coalesced uint4 per sub-block and reuses the Q4_0
+// unpack/dp4a; the integer dot is identical → BIT-IDENTICAL to mmvq_q4_k_kernel.
+static __global__ void repack_q4_k_kernel(const uint8_t *src, uint8_t *dst, size_t n_super) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_super) return;
+    const uint8_t *blk = src + i * MMVQ_Q4K_BLOCK_BYTES;
+    uint8_t       *out = dst + i * MMVQ_Q4K_BLOCK_BYTES;
+    #pragma unroll
+    for (int h = 0; h < 16; h++) out[h] = blk[h];          // header verbatim
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const uint8_t *qbase = blk + 16 + 32 * (j >> 1);
+        int lh = j & 1;
+        uint8_t *p = out + 16 + j * 16;
+        #pragma unroll
+        for (int m = 0; m < 16; m++) {
+            int lo = lh ? ((qbase[m]      >> 4) & 0xF) : (qbase[m]      & 0xF);
+            int hi = lh ? ((qbase[m + 16] >> 4) & 0xF) : (qbase[m + 16] & 0xF);
+            p[m] = (uint8_t)(lo | (hi << 4));
+        }
+    }
+}
+
+template<int NK>
+static __global__ void mmvq_q4_k_packed_batched_kernel(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.x * nwarps + warp;
+    if (idx >= out_dim) return;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * MMVQ_Q4K_BLOCK_BYTES;
+    float acc[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
+    for (int b = lane; b < nb32; b += 32) {
+        const uint8_t *blk = wrow + (size_t)(b >> 3) * MMVQ_Q4K_BLOCK_BYTES;
+        int j = b & 7;
+        __half_raw dr; dr.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        __half_raw mr; mr.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
+        float d = __half2float(__half(dr)), dmin = __half2float(__half(mr));
+        int sc, mn; mmvq_q4k_scale_min(j, blk + 4, &sc, &mn);
+        uint4 q = *(const uint4 *)(blk + 16 + j * 16);     // one coalesced load, 32 nibbles
+        int wv[8];
+        int w0=(int)q.x, w1=(int)q.y, w2=(int)q.z, w3=(int)q.w;
+        wv[0]=w0&0x0F0F0F0F; wv[1]=(w0>>4)&0x0F0F0F0F;
+        wv[2]=w1&0x0F0F0F0F; wv[3]=(w1>>4)&0x0F0F0F0F;
+        wv[4]=w2&0x0F0F0F0F; wv[5]=(w2>>4)&0x0F0F0F0F;
+        wv[6]=w3&0x0F0F0F0F; wv[7]=(w3>>4)&0x0F0F0F0F;
+        #pragma unroll
+        for (int n = 0; n < NK; n++) {
+            const int *xqs = (const int *)(qx + (size_t)n*in_dim + (size_t)b*32);
+            int sumi = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                sumi = __dp4a(wv[2*k],   xqs[k],     sumi);
+                sumi = __dp4a(wv[2*k+1], xqs[k + 4], sumi);
+            }
+            acc[n] += dx[(size_t)n*nb32 + b] *
+                      (d*(float)sc*(float)sumi - dmin*(float)mn*(float)sx[(size_t)n*nb32 + b]);
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) {
+        float v = warp_reduce_sum_all(acc[n]);
+        if (lane == 0) out[(size_t)n*out_dim + idx] = v;
+    }
+}
+
+static inline void mmvq_q4_k_packed_batched_launch(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K, cudaStream_t stream)
+{
+    const int NWARPS = 4; int b = NWARPS*32;
+    dim3 g((out_dim + NWARPS - 1) / NWARPS);
+    #define LPP_Q4K(NK) mmvq_q4_k_packed_batched_kernel<NK><<<g,b,0,stream>>>(out,weight,qx,dx,sx,in_dim,out_dim)
+    switch (K) {
+        case 1: LPP_Q4K(1); break; case 2: LPP_Q4K(2); break; case 3: LPP_Q4K(3); break;
+        case 4: LPP_Q4K(4); break; case 5: LPP_Q4K(5); break; case 6: LPP_Q4K(6); break;
+        case 7: LPP_Q4K(7); break; case 8: LPP_Q4K(8); break; case 9: LPP_Q4K(9); break;
+        case 10: LPP_Q4K(10); break; case 11: LPP_Q4K(11); break; case 12: LPP_Q4K(12); break;
+        case 13: LPP_Q4K(13); break; case 14: LPP_Q4K(14); break; case 15: LPP_Q4K(15); break;
+        case 16: LPP_Q4K(16); break;
+        default:
+            for (int o = 0; o < K; o += 16) {
+                int kk = (K - o < 16) ? (K - o) : 16;
+                mmvq_q4_k_packed_batched_launch(out + (size_t)o*out_dim, weight,
+                    qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5), sx + (size_t)o*(in_dim>>5),
+                    in_dim, out_dim, kk, stream);
+            }
+    }
+    #undef LPP_Q4K
+}
+
+static inline void mmvq_q4_k_packed_launch(
+    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
+    int in_dim, int out_dim, cudaStream_t stream)
+{ mmvq_q4_k_packed_batched_launch(out, weight, qx, dx, sx, in_dim, out_dim, 1, stream); }
+
 template<int NK>
 static __global__ void mmvq_q6_k_batched_kernel(
     float *out, const uint8_t *weight, const int8_t *qx, const float *dx,
@@ -487,9 +736,11 @@ static void mmvq_q6_k_batched_launch(
     switch (K) {
         case 1: LQ6(1); break; case 2: LQ6(2); break; case 3: LQ6(3); break; case 4: LQ6(4); break;
         case 5: LQ6(5); break; case 6: LQ6(6); break; case 7: LQ6(7); break; case 8: LQ6(8); break;
+        case 9: LQ6(9); break; case 10: LQ6(10); break; case 11: LQ6(11); break; case 12: LQ6(12); break;
+        case 13: LQ6(13); break; case 14: LQ6(14); break; case 15: LQ6(15); break; case 16: LQ6(16); break;
         default:
-            for (int o = 0; o < K; o += 8) {
-                int kk = (K - o < 8) ? (K - o) : 8;
+            for (int o = 0; o < K; o += 16) {
+                int kk = (K - o < 16) ? (K - o) : 16;
                 mmvq_q6_k_batched_launch(out + (size_t)o*out_dim, w,
                                          qx + (size_t)o*in_dim, dx + (size_t)o*(in_dim>>5),
                                          in_dim, out_dim, kk, stream);

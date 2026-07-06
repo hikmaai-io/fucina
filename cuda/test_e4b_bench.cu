@@ -24,7 +24,7 @@ int main(int argc, char** argv){
     int n_pf  = (argc>2)?atoi(argv[2]):293;   // match the 31B comparison prompt
     int n_dec = (argc>3)?atoi(argv[3]):256;
 
-    e4b_engine_t* eng = e4b_engine_create(dir, 4096, 0);
+    e4b_engine_t* eng = e4b_engine_create(dir, 4096, 1, 0);
     if(!eng){ fprintf(stderr,"FAIL create\n"); return 1; }
     int V = e4b_engine_vocab_size(eng);
     printf("e4b_bench: %d layers, hidden %d, vocab %d, %.2f GB resident\n",

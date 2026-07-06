@@ -25,6 +25,7 @@
 #include <math.h>
 #include <assert.h>
 #include <pthread.h>
+#include "model_arch.h"
 
 // ─── Compile-time constants ────────────────────────────────────────────
 
@@ -57,6 +58,12 @@
 #define GEMMA4_SLIDING_SPLIT_CHUNK 64
 
 // Special tokens
+// Qwen3 dense attention geometry (compile-time template params for the GQA full-attn
+// paged kernels; the geom switch in the stack selects these for ARCH_QWEN3).
+#define QWEN3_HEADS     32
+#define QWEN3_KV_HEADS  8
+#define QWEN3_HEAD_DIM  128
+
 #define GEMMA4_BOS_ID  2
 #define GEMMA4_EOS_ID  1
 #define GEMMA4_PAD_ID  0
@@ -71,6 +78,9 @@ typedef enum {
     FORMAT_NVFP4 = 4,  // NVFP4 from safetensors (ModelOpt/compressed-tensors): E2M1 + per-16
                        // E4M3 block scales + per-tensor FP32 global. Single weight store feeds
                        // both the cuBLASLt block-scaled prefill and the fused decode GEMV.
+    FORMAT_Q4_K  = 5,  // GGML Q4_K super-blocks (256-elem, 6-bit sub-scales+mins). Qwen3 dense
+                       // (and K-quant GGUFs). Decode via mmvq_q4_k (needs q8_1 qx/dx/sx); used
+                       // per-tensor (Q4_K_M mixes Q4_K + Q6_K), never as a single whole-model fmt.
 } tensor_format_t;
 
 // ─── GGML Q8_0 block ──────────────────────────────────────────────────
@@ -239,6 +249,7 @@ void gemma4_engine_abort_prefill(gemma4_engine_t *eng);
 void gemma4_engine_print_info(const gemma4_engine_t *eng);
 void gemma4_engine_print_timing(const gemma4_engine_t *eng);
 int  gemma4_engine_get_n_layers(const gemma4_engine_t *eng);
+int  gemma4_engine_vocab(const gemma4_engine_t *eng);   // arch vocab (Gemma 262144, Qwen3 151936)
 int  gemma4_engine_get_context_size(const gemma4_engine_t *eng);
 
 // Timing accessors for speed logging
@@ -291,6 +302,18 @@ int  gemma4_engine_step_batch(gemma4_engine_t *eng, const int *slots,
                               const int32_t *in_tokens, int B, int32_t *out_tokens);
 void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot);
 int  gemma4_engine_seq_capacity(gemma4_engine_t *eng);
+
+// ─── DSpark spec-in-batch: ragged per-request speculative verify ──────────
+// Verifies R requests' drafts in ONE weight pass over the flattened Σ_r(1+d_r) rows
+// (anchor + d_r drafts per request), reusing the arch-driven multiseq forward. Per
+// request it does rejection-sampling accept (greedy: argmax==draft) + paged rewind
+// (commit only the accepted prefix; abandon provisional draft KV — lossless, since
+// every row's split-K scan is n_tokens-bounded). out_runs/out_conf are caller-allocated
+// flat [R][GEMMA4_SPEC_MAX+1]; out_run_len[r]=accepted+1 (>=1); err_rows[r]=-1 if that
+// seq's KV could not grow (graceful per-seq stop). Σ(1+d_r) must be <= GEMMA4_MAX_SEQS.
+typedef struct { int slot; int32_t anchor; const int32_t *drafts; int n_draft; } gemma4_spec_req;
+int  gemma4_engine_step_batch_spec(gemma4_engine_t *eng, const gemma4_spec_req *reqs, int R,
+                                   int32_t *out_runs, int *out_run_len, int *err_rows);
 
 // ─── CUDA Graph support (experimental, off by default) ─────────────
 // Call gemma4_engine_set_graph_mode(eng, 1) to enable. This allocates

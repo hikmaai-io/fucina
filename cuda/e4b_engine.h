@@ -25,9 +25,18 @@ int e4b_is_e4b_checkpoint(const char *path);
 
 // Create an engine: detect + parse config, upload all language_model weights to
 // device as BF16, and quantize the Per-Layer-Embedding table to FP8 E4M3 (the
-// "index"). context_size caps the KV cache. device_id selects the GPU.
+// "index"). context_size caps the KV cache; max_seqs is the desired number of
+// concurrent sequences for continuous batching (clamped to [1,8]; <=0 ⇒ 8).
+// device_id selects the GPU.
+//
+// MEMORY: after all weights/quant copies are resident, the engine queries free
+// device memory (and the optional FUCINA_MEM_BUDGET_GB *total-device* cap) and
+// AUTO-SHRINKS context_size and/or max_seqs so the KV cache provably fits —
+// instead of cudaMalloc'ing until the kernel OOM-kills the process. Read the
+// values actually chosen back with e4b_engine_max_ctx / e4b_engine_max_seqs.
 // Returns NULL on failure (message on stderr).
-e4b_engine_t *e4b_engine_create(const char *model_path, uint32_t context_size, int device_id);
+e4b_engine_t *e4b_engine_create(const char *model_path, uint32_t context_size,
+                                int max_seqs, int device_id);
 
 void e4b_engine_destroy(e4b_engine_t *eng);
 
@@ -38,6 +47,11 @@ int  e4b_engine_hidden_size(const e4b_engine_t *eng);
 int  e4b_engine_vocab_size(const e4b_engine_t *eng);
 // Total device bytes resident (weights + FP8 PLE index + KV cache).
 uint64_t e4b_engine_device_bytes(const e4b_engine_t *eng);
+// Effective KV-cache limits after the create-time memory fit (may be smaller
+// than requested): max_ctx = per-sequence token capacity, max_seqs = concurrent
+// sequence slots actually provisioned.
+uint32_t e4b_engine_max_ctx(const e4b_engine_t *eng);
+int      e4b_engine_max_seqs(const e4b_engine_t *eng);
 
 // ── Inference ─────────────────────────────────────────────────────────────
 
@@ -53,11 +67,66 @@ int e4b_engine_decode(e4b_engine_t *eng, int32_t token, float *logits_out);
 void e4b_engine_reset(e4b_engine_t *eng);          // rewind to empty (n_past=0)
 int  e4b_engine_n_past(const e4b_engine_t *eng);   // tokens currently in the cache
 
+// ── Prefix-cache reuse (server KVCache contract) ────────────────────────────
+// Append `suffix` at the CURRENT n_past (set by a prior rewind) instead of resetting;
+// writes the last token's logits. The server's KVCache reuses a shared prefix then
+// prefills only the divergent suffix through this.
+int  e4b_engine_prefill_append(e4b_engine_t *eng, const int32_t *suffix, int n, float *logits_out);
+// Rewind slot 0 to n_keep tokens. Returns 1 if safe, 0 if the sliding ring already
+// overwrote the window for n_keep (rewind depth > sliding_cap - window) — caller then
+// falls back to reset + full re-prefill.
+int  e4b_engine_rewind(e4b_engine_t *eng, int n_keep);
+
+// ── MTP speculative decode (draft head) ─────────────────────────────────────
+// Load the gemma4-assistant draft head GGUF (~78M, 4 Q-only layers) for ~2x decode via
+// greedy speculation. Returns 0 on success, -1 on failure (engine still usable, plain
+// decode). e4b_engine_has_assistant reports whether one is loaded.
+int  e4b_engine_load_assistant(e4b_engine_t *eng, const char *path);
+int  e4b_engine_has_assistant(const e4b_engine_t *eng);
+
+// Debug: run ONE drafter-head forward on slot 0. h_io is the [hidden] recurrent state
+// (in: target post-final-norm hidden of the preceding token; out: next recurrent h).
+// `tok` is that token id, `pos` its absolute RoPE position (= n_past at the draft point).
+// Writes the greedy-drafted next token id to *draft_id. Returns 0 on success, -1 on error.
+// (Increment 2 standalone numeric check; the spec loop will call this internally.)
+int  e4b_engine_mtp_forward_debug(e4b_engine_t *eng, int32_t tok, int pos,
+                                  float *h_io, int32_t *draft_id);
+
 // Greedy generate: prefill prompt then argmax-decode up to max_new tokens, stopping
 // at any id in stop_ids. Returns number of tokens written to out_tokens, -1 on error.
 int e4b_engine_generate_greedy(e4b_engine_t *eng, const int32_t *prompt, int n_prompt,
                                int32_t *out_tokens, int max_new,
                                const int32_t *stop_ids, int n_stop);
+
+// Greedy SPECULATIVE generate via the MTP draft head (must be loaded first with
+// e4b_engine_load_assistant). Drafts up to K tokens (default 4, FUCINA_E4B_DRAFT_K) per
+// step, verifies them in one target forward, and accepts the longest greedy-matching
+// prefix. Output is BIT-IDENTICAL to e4b_engine_generate_greedy (lossless). No assistant
+// loaded ⇒ transparently falls back to plain greedy. Returns tokens written, -1 on error.
+int e4b_engine_generate_spec_greedy(e4b_engine_t *eng, const int32_t *prompt, int n_prompt,
+                                    int32_t *out_tokens, int max_new,
+                                    const int32_t *stop_ids, int n_stop);
+
+// Streaming greedy speculative decode (server path). CONTINUE variant: resumes from slot 0's
+// CURRENT KV (caller must have prefilled `history`; n_hist == n_past) and `first_logits` (the
+// last-token logits the caller captured). Invokes cb(tok, ud) for every committed token in
+// order between verify rounds; cb returning non-zero stops after that token. out_tokens
+// receives ALL committed tokens (callback-declined + accepted-tail of the final round) so the
+// caller can reconcile its prefix cache with the engine KV (n_past advances by the count
+// returned). Bit-identical to plain greedy. No assistant ⇒ plain greedy decode driving cb.
+// Returns tokens written (>=0), -1 on error.
+typedef int (*e4b_spec_token_cb)(int32_t tok, void *ud);
+int e4b_engine_spec_stream(e4b_engine_t *eng, const int32_t *history, int n_hist,
+                           const float *first_logits, int32_t *out_tokens, int max_new,
+                           const int32_t *stop_ids, int n_stop,
+                           e4b_spec_token_cb cb, void *ud);
+
+// Cumulative speculative-decode acceptance counters for /metrics. τ = emitted/steps;
+// acceptance = accepted/drafted. All zero until the spec path runs.
+long e4b_engine_spec_steps(const e4b_engine_t *eng);
+long e4b_engine_spec_drafted(const e4b_engine_t *eng);
+long e4b_engine_spec_accepted(const e4b_engine_t *eng);
+long e4b_engine_spec_emitted(const e4b_engine_t *eng);
 
 // ── Continuous batching: multiple sequences decoded in one weight pass ──────
 // seq_add: claim a free slot, prefill `prompt` into it, return the slot id (≥1) and

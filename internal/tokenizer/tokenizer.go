@@ -75,6 +75,24 @@ type Tokenizer struct {
 	bpe          bool
 	byteFallback bool
 	bpeMerges    map[mergePair]int32 // ordered merge → rank (lower rank applied first)
+
+	// byteLevel selects the GPT-2 / Qwen2 byte-level BPE pre-processing used by
+	// Qwen3 GGUFs (tokenizer.ggml.model == "gpt2"). When set, Encode runs the
+	// qwen2-style pretokenizer, maps every input byte through the GPT-2
+	// byte↔unicode table (bytelevel.go) before BPE merging, and skips the
+	// SentencePiece U+2581 space normalization. Decode reverses the byte map.
+	// Mutually exclusive with the SentencePiece path; byteFallback is forced off
+	// (the byte alphabet already covers all 256 bytes as base vocab tokens).
+	byteLevel bool
+
+	// AddBOS mirrors tokenizer.ggml.add_bos_token (default true; Qwen3 sets it
+	// false). Encode only prepends BOS when both the caller asks for it AND this
+	// flag is set, so a checkpoint that must not start with BOS never gets one.
+	AddBOS bool
+
+	// pre is tokenizer.ggml.pre (the pretokenizer name, e.g. "qwen2"). Stored for
+	// diagnostics; the byte-level splitter currently approximates the qwen2 regex.
+	pre string
 }
 
 // mergePair keys the BPE merge table: the adjacent (left,right) symbol pair.
@@ -136,6 +154,16 @@ func (r *ggufReader) readU32() (uint32, bool) {
 	v := binary.LittleEndian.Uint32(r.data[r.pos : r.pos+4])
 	r.pos += 4
 	return v, true
+}
+
+// readBool reads a single-byte GGUF bool (type 7): nonzero ⇒ true.
+func (r *ggufReader) readBool() (bool, bool) {
+	if r.pos+1 > r.size {
+		return false, false
+	}
+	v := r.data[r.pos]
+	r.pos++
+	return v != 0, true
 }
 
 func (r *ggufReader) readU64() (uint64, bool) {
@@ -254,9 +282,10 @@ func (r *ggufReader) skipValue(valType uint32) bool {
 //	tokenizer.ggml.padding_token_id (u32/i32)
 func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 	t := &Tokenizer{
-		BOS: 2,
-		EOS: 1,
-		PAD: 0,
+		BOS:    2,
+		EOS:    1,
+		PAD:    0,
+		AddBOS: true, // GGUF default; tokenizer.ggml.add_bos_token overrides (Qwen3=false).
 	}
 
 	p := &ggufReader{data: ggufData, size: ggufSize, pos: 0}
@@ -339,6 +368,64 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 				return nil, fmt.Errorf("tokenizer: failed to read chat_template")
 			}
 
+		case "tokenizer.ggml.model":
+			if valType == ggufTypeString {
+				if s, ok := p.readString(); ok && s == "gpt2" {
+					// GPT-2 / Qwen2 byte-level BPE (Qwen3 GGUFs). Merge-by-rank
+					// over a byte-mapped alphabet; no SentencePiece, no <0xXX>
+					// byte fallback (the 256 byte runes are all base vocab).
+					t.bpe = true
+					t.byteLevel = true
+					t.byteFallback = false
+				}
+			} else if !p.skipValue(valType) {
+				return nil, fmt.Errorf("tokenizer: failed to read tokenizer model")
+			}
+
+		case "tokenizer.ggml.pre":
+			if valType == ggufTypeString {
+				if s, ok := p.readString(); ok {
+					t.pre = s
+				}
+			} else if !p.skipValue(valType) {
+				return nil, fmt.Errorf("tokenizer: failed to read tokenizer pre")
+			}
+
+		case "tokenizer.ggml.merges":
+			if valType != ggufTypeArray {
+				return nil, fmt.Errorf("tokenizer: merges is not an array")
+			}
+			arrType, n, ok := p.readArrayHeader()
+			if !ok || arrType != ggufTypeString {
+				return nil, fmt.Errorf("tokenizer: merges array malformed")
+			}
+			t.bpeMerges = make(map[mergePair]int32, n)
+			for j := uint64(0); j < n; j++ {
+				s, ok := p.readString()
+				if !ok {
+					return nil, fmt.Errorf("tokenizer: truncated merge %d", j)
+				}
+				// "LEFT RIGHT" split on the FIRST space; list index = rank
+				// (lower rank applied first). First occurrence wins on dupes.
+				sp := strings.IndexByte(s, ' ')
+				if sp < 0 {
+					continue // malformed merge line; skip defensively
+				}
+				pair := mergePair{a: s[:sp], b: s[sp+1:]}
+				if _, dup := t.bpeMerges[pair]; !dup {
+					t.bpeMerges[pair] = int32(j)
+				}
+			}
+
+		case "tokenizer.ggml.add_bos_token":
+			if valType == ggufTypeBool {
+				if v, ok := p.readBool(); ok {
+					t.AddBOS = v
+				}
+			} else if !p.skipValue(valType) {
+				return nil, fmt.Errorf("tokenizer: failed to read add_bos_token")
+			}
+
 		default:
 			if !p.skipValue(valType) {
 				return nil, fmt.Errorf("tokenizer: failed to skip value for %q", key)
@@ -375,10 +462,14 @@ func New(ggufData []byte, ggufSize int64) (*Tokenizer, error) {
 		}
 		return def
 	}
-	t.StartOfTurn = lookup("<|turn>", 105)
-	t.EndOfTurn = lookup("<turn|>", 106)
-	t.ChannelOpen = lookup("<|channel>", 100)
-	t.ChannelEnd = lookup("<channel|>", 101)
+	// Defaults are -1 (absent), NOT the Gemma ids: in non-Gemma vocabs (Qwen3) ids
+	// 100/101/105/106 are REAL tokens, so a 105/106/100/101 fallback would make IsStop
+	// spuriously stop and isControl silently DROP those tokens (word-salad). Gemma GGUFs
+	// carry the literals so lookup hits and the default is never used → Gemma unchanged.
+	t.StartOfTurn = lookup("<|turn>", -1)
+	t.EndOfTurn = lookup("<turn|>", -1)
+	t.ChannelOpen = lookup("<|channel>", -1)
+	t.ChannelEnd = lookup("<channel|>", -1)
 	t.ToolOpen = lookup("<|tool>", -1)
 	t.ToolEnd = lookup("<tool|>", -1)
 	t.ToolCallOpen = lookup("<|tool_call>", -1)
@@ -417,6 +508,10 @@ func (t *Tokenizer) DecodeRaw(tokens []int32) string {
 		}
 		s := t.vocab[id]
 		if s == "" {
+			continue
+		}
+		if t.byteLevel {
+			buf = appendByteLevel(buf, s)
 			continue
 		}
 		if b, ok := parseByteToken(s); ok {
@@ -466,12 +561,15 @@ func (t *Tokenizer) isControl(id int32) bool {
 func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 	var tokens []int32
 
-	if addBos {
+	if addBos && t.AddBOS {
 		tokens = append(tokens, t.BOS)
 	}
 
-	// SentencePiece space normalization: ' ' -> U+2581.
-	text = strings.ReplaceAll(text, " ", spaceMarker)
+	// SentencePiece space normalization: ' ' -> U+2581. Skipped for byte-level
+	// BPE (Qwen3), where spaces are handled by the byte↔unicode map instead.
+	if !t.byteLevel {
+		text = strings.ReplaceAll(text, " ", spaceMarker)
+	}
 
 	// Split at control-marker literals FIRST (see Tokenizer.specials): the
 	// greedy matcher below must never see a marker, or a piece straddling the
@@ -505,6 +603,9 @@ func (t *Tokenizer) Encode(text string, addBos bool, addEos bool) []int32 {
 // whichever model this tokenizer carries: BPE merge-by-rank (HF tokenizer.json) or
 // the unigram longest-prefix match (GGUF).
 func (t *Tokenizer) encodeSegment(text string, tokens []int32) []int32 {
+	if t.byteLevel {
+		return t.bpeEncodeByteLevel(text, tokens)
+	}
 	if t.bpe {
 		return t.bpeEncode(text, tokens)
 	}
@@ -566,6 +667,10 @@ func (t *Tokenizer) Decode(tokens []int32) string {
 		}
 		s := t.vocab[id]
 		if s == "" {
+			continue
+		}
+		if t.byteLevel {
+			buf = appendByteLevel(buf, s)
 			continue
 		}
 		// Raw byte token <0xXX> → the single byte it names.

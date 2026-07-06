@@ -16,21 +16,23 @@ import (
 
 // e4bServer adapts *e4b.Engine to the OpenAI server's serverEngine interface.
 //
-// E4B has no speculative decode and its Prefill resets to a FRESH KV cache, so:
-//   - GenerateSpecStream is a plain decode loop (0 accepted drafts);
-//   - NTokens() reports 0, so the server's KV prefix cache always does a full
-//     re-prefill — which matches E4B's reset-on-Prefill model and avoids reusing a
-//     stale prefix (E4B can't suffix-prefill at a non-zero position);
-//   - Rewind is a safe no-op: with no spec there are never accepted-but-unemitted
-//     tokens to trim, so the thinking-budget force-close (Rewind→Decode(<channel|>))
-//     lands the marker at the correct position regardless.
+// E4B has no speculative decode (GenerateSpecStream is a plain decode loop, 0 accepted
+// drafts), but it now supports the server KVCache prefix-reuse contract:
+//   - NTokens() reports the real n_past, so the KVCache tracks the live KV length;
+//   - Rewind(nKeep) rewinds slot 0 to the shared prefix (false if the sliding ring
+//     already dropped that window → KVCache falls back to a full reset+re-prefill);
+//   - Prefill(suffix) APPENDS at the current n_past, so the KVCache re-prefills only
+//     the divergent suffix after reusing a shared prefix — turning each request's full
+//     re-prefill of a large shared system prompt into suffix-only.
 type e4bServer struct {
 	eng  *e4b.Engine
 	last []float32 // last logits, for SampleDevice / DecodeNoCopy emulation
 }
 
 func (a *e4bServer) Prefill(tokens []int32) ([]float32, error) {
-	lg, err := a.eng.Prefill(tokens)
+	// The KVCache hands us only the divergent suffix and has already Rewound the engine
+	// to the shared-prefix length, so append at the current n_past (not a fresh reset).
+	lg, err := a.eng.PrefillAppend(tokens)
 	a.last = lg
 	return lg, err
 }
@@ -56,12 +58,26 @@ func (a *e4bServer) SampleDevice(temp float32, topK int, topP, minP, rnd float32
 	}, rng, nil)
 }
 
-// GenerateSpecStream: plain prefill-then-decode generation (no spec). Samples each token
-// from the host sampler, streams it via emit (return true = stop), and stops at a stop
-// token or max_new. Returns the generated tokens and 0 accepted drafts.
+// GenerateSpecStream generates the response, streaming each committed token via emit
+// (return true = stop) and stopping at a stop token or max_new.
+//
+// When an MTP assistant is loaded AND the request is greedy (temp<=0), it drives the C
+// greedy speculative-decode loop (~2x decode, byte-identical to greedy). Otherwise (temp>0,
+// or no assistant) it falls back to the plain host-sampled prefill-then-decode loop so
+// temperature/top-k/top-p/min-p still apply. Returns the committed tokens + accepted drafts.
 func (a *e4bServer) GenerateSpecStream(history []int32, firstLogits []float32, maxNew int,
 	stops []int32, draftK int, temp float32, topK int, topP, minP, repeatPenalty float32,
 	seed uint64, emit func(int32) bool) ([]int32, int, error) {
+
+	// Greedy + assistant → the lossless C spec loop (continues from the live KV the server
+	// already prefilled; emits per token; advances n_past by the committed count).
+	if temp <= 0 && a.eng.HasAssistant() {
+		_, _, accBefore, _ := a.eng.SpecStats()
+		toks, err := a.eng.SpecStream(history, firstLogits, maxNew, stops, emit)
+		_, _, accAfter, _ := a.eng.SpecStats()
+		return toks, int(accAfter - accBefore), err
+	}
+
 	p := sampler.Params{
 		Temperature: float64(temp), TopK: topK, TopP: float64(topP),
 		MinP: float64(minP), RepeatPenalty: float64(repeatPenalty),
@@ -96,11 +112,11 @@ func (a *e4bServer) GenerateSpecContinue(history []int32, firstLogits []float32,
 	return a.GenerateSpecStream(history, firstLogits, maxNew, stops, draftK, temp, topK, topP, minP, repeatPenalty, seed, nil)
 }
 
-func (a *e4bServer) NTokens() int                                 { return 0 }
+func (a *e4bServer) NTokens() int                                 { return a.eng.NPast() }
 func (a *e4bServer) Reset()                                       { a.eng.Reset() }
-func (a *e4bServer) Rewind(nKeep int) bool                        { return true }
+func (a *e4bServer) Rewind(nKeep int) bool                        { return a.eng.Rewind(nKeep) }
 func (a *e4bServer) ContextSize() uint32                          { return a.eng.ContextSize() }
-func (a *e4bServer) SpecStats() (steps, drafted, accepted, emitted int64) { return 0, 0, 0, 0 }
+func (a *e4bServer) SpecStats() (steps, drafted, accepted, emitted int64) { return a.eng.SpecStats() }
 
 func isStopToken(t int32, stops []int32) bool {
 	for _, s := range stops {
@@ -150,8 +166,14 @@ func runE4BServer(eng *e4b.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	go func() { <-sigCh; log.Println("fucina: shutting down..."); srv.Stop() }()
 
 	addr := fmt.Sprintf("%s:%d", args.Host, args.Port)
-	log.Printf("fucina: server starting on %s (Gemma-4-E4B; no spec/MTP)", addr)
-	log.Printf("fucina: model=%s ctx=%d", args.ModelPath, args.ContextSize)
+	specNote := "no spec/MTP"
+	if eng.HasAssistant() {
+		specNote = "greedy spec/MTP (temp=0)"
+	}
+	log.Printf("fucina: server starting on %s (Gemma-4-E4B; %s)", addr, specNote)
+	// Report the effective ctx (the engine may have auto-shrunk it to fit memory),
+	// not the raw --ctx request, so admission limits and this log agree.
+	log.Printf("fucina: model=%s ctx=%d", args.ModelPath, eng.ContextSize())
 	if err := srv.Start(addr); err != nil {
 		log.Printf("fucina: server stopped: %v", err)
 	}

@@ -24,7 +24,7 @@ int main(int argc, char** argv){
     std::vector<int32_t> expect(ng); for(int i=0;i<ng;i++) if(!rd(f,&expect[i])) return 1;
     fclose(f);
 
-    e4b_engine_t* eng=e4b_engine_create(dir,4096,0);
+    e4b_engine_t* eng=e4b_engine_create(dir,4096,1,0);
     if(!eng){ fprintf(stderr,"FAIL create\n"); return 1; }
 
     std::vector<int32_t> got(ng);

@@ -13,7 +13,7 @@ static const char* kDir =
 
 int main(int argc, char** argv){
     const char* dir=(argc>1)?argv[1]:kDir;
-    e4b_engine_t* eng=e4b_engine_create(dir,4096,0);
+    e4b_engine_t* eng=e4b_engine_create(dir,4096,8,0);
     if(!eng){ fprintf(stderr,"FAIL create\n"); return 1; }
 
     // three prompts of different lengths (valid token-id subsequences)

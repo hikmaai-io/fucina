@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     if (det != 1) { fprintf(stderr, "FAIL: GGUF not detected as E4B\n"); return 1; }
 
     // (2) create
-    e4b_engine_t* eng = e4b_engine_create(gguf, 4096, 0);
+    e4b_engine_t* eng = e4b_engine_create(gguf, 4096, 1, 0);
     if (!eng) { fprintf(stderr, "FAIL: e4b_engine_create returned NULL\n"); return 1; }
     e4b_engine_print_info(eng);
 
@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
     // (optional, stronger) BF16 parity on the same prompt — top-1 match or GGUF
     // top token within BF16 top-5 (Q4_0 QAT drift tolerance).
     if (e4b_is_e4b_checkpoint(bf16) == 1) {
-        e4b_engine_t* ref = e4b_engine_create(bf16, 4096, 0);
+        e4b_engine_t* ref = e4b_engine_create(bf16, 4096, 1, 0);
         if (ref) {
             std::vector<float> rl(V);
             if (e4b_engine_prefill(ref, prompt, nprompt, rl.data()) == 0) {

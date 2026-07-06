@@ -44,7 +44,7 @@ int main(int argc, char** argv){
        fread(logits.data(),4,V,f)!=(size_t)V){ fprintf(stderr,"short ref\n"); return 1; }
     fclose(f);
 
-    e4b_engine_t* eng = e4b_engine_create(dir, 4096, 0);
+    e4b_engine_t* eng = e4b_engine_create(dir, 4096, 1, 0);
     if(!eng){ fprintf(stderr,"FAIL: create\n"); return 1; }
 
     std::vector<float> e(T*H), c0(T*H), cf(T*H), cl(V);

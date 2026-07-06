@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     printf("e4b_is_e4b_checkpoint(%s) = %d\n", dir, det);
     if (det != 1) { fprintf(stderr, "FAIL: not detected as E4B\n"); return 1; }
 
-    e4b_engine_t* eng = e4b_engine_create(dir, 4096, 0);
+    e4b_engine_t* eng = e4b_engine_create(dir, 4096, 1, 0);
     if (!eng) { fprintf(stderr, "FAIL: e4b_engine_create returned NULL\n"); return 1; }
 
     e4b_engine_print_info(eng);

@@ -156,6 +156,27 @@ type GenerationParams struct {
 	Constraint grammar.Constraint `json:"-"`
 }
 
+// batchIneligible reports why a request cannot use the continuous-batching path (empty
+// string = eligible). serveBatch's on-device sampler has no repeat-penalty term, never
+// forwards the grammar Constraint, and honors only EOS/EndOfTurn — NOT custom stop
+// strings. The scheduler also owns the engine exclusively (no kv lock), so such requests
+// cannot fall through to the single-flight path without racing it; they are rejected with
+// a clear error instead of silently producing unconstrained/unstopped/unpenalized output.
+// (Speculative decode is a throughput-only gap on the batch path, not a correctness one,
+// so it is NOT gated here.)
+func batchIneligible(p GenerationParams) string {
+	if p.Constraint != nil {
+		return "response_format json_object/json_schema (constrained decoding)"
+	}
+	if len(p.Stop) > 0 {
+		return "custom stop strings"
+	}
+	if p.RepeatPenalty != 0 && p.RepeatPenalty != 1.0 {
+		return "repeat_penalty"
+	}
+	return ""
+}
+
 type ChatMessage struct {
 	Role             string     `json:"role"`
 	Content          string     `json:"content"`
@@ -1017,6 +1038,17 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	// (the single-flight kv path) is left exactly as before for when batching is
 	// off (s.scheduler == nil).
 	if s.scheduler != nil {
+		if reason := batchIneligible(params); reason != "" {
+			// ROUTE-GUARD: serveBatch cannot honor this feature and the scheduler owns
+			// the engine exclusively (cannot safely fall through to single-flight).
+			writeJSON(w, http.StatusNotImplemented, map[string]interface{}{
+				"error": map[string]string{
+					"message": "not supported under continuous batching: " + reason,
+					"type":    "unsupported_under_batching",
+				},
+			})
+			return
+		}
 		s.serveBatch(w, r, params, tokens, wantTools, legacy)
 		return
 	}
