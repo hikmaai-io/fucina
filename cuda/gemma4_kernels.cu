@@ -9172,10 +9172,12 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             if (!tc || !eng->d_moe_shbf) {
                 for (int b0 = 0; b0 < cn; b0 += FP8_MAXB) {
                     int bb = (cn - b0 < FP8_MAXB) ? (cn - b0) : FP8_MAXB;
-                    fp8_block_gemm_launch(eng->d_moe_gate + (size_t)b0 * SI, swg, wscale_fp8(eng, swg),
-                                          h + (size_t)b0 * H, H, SI, bb, stream);
-                    fp8_block_gemm_launch(eng->d_moe_up + (size_t)b0 * SI, swu, wscale_fp8(eng, swu),
-                                          h + (size_t)b0 * H, H, SI, bb, stream);
+                    // Gate+up in ONE dual launch: SI (512) rows/projection alone caps the
+                    // warp pool; the doubled grid halves the parallelism starvation.
+                    fp8_block_gemm_dual_launch(eng->d_moe_gate + (size_t)b0 * SI,
+                                               eng->d_moe_up + (size_t)b0 * SI,
+                                               swg, swu, wscale_fp8(eng, swg), wscale_fp8(eng, swu),
+                                               h + (size_t)b0 * H, H, SI, bb, stream);
                 }
                 dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)SI * cn, stream);
                 for (int b0 = 0; b0 < cn; b0 += FP8_MAXB) {
