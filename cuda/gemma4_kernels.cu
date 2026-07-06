@@ -843,6 +843,36 @@ __global__ void quantize_q8_1_kernel(
     if (lane == 0) { dx[b] = d; sx[b] = qsum; }
 }
 
+// Transposed-layout variant of quantize_q8_1_kernel for the packed-Q4_K batched decode GEMV.
+// Identical quantization math and dx/sx layout; ONLY the qx byte addresses change. The batched
+// mixer kernel was measured LSU-bound: with the row-major [n][in_dim] layout each of its
+// activation loads has a 32-byte lane stride (8 sector replays per LDG.128). This layout stores
+// each token row as epochs of 32 windows so that a warp reading "window b = lane+32p, half h"
+// is one DENSE LDG.128 (byte c of window b, token n → n*in_dim + (b>>5)*1024 + (c>>4)*512 +
+// (b&31)*16 + (c&15)). Requires in_dim % 1024 == 0 (full 32-window epochs); callers gate.
+__global__ void quantize_q8_1t_kernel(
+    const float *x, int8_t *qxT, float *dx, int *sx, int in_dim)
+{
+    int b = blockIdx.x, lane = threadIdx.x;     // 32 threads = one 32-elem window
+    int i = b*32 + lane;
+    float v = x[i];
+    float a = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, o));
+    float d  = a / 127.0f;
+    float id = (d > 0.0f) ? 1.0f / d : 0.0f;
+    int q = __float2int_rn(v * id);
+    q = max(-127, min(127, q));
+    int nb32 = in_dim >> 5;
+    int n = b / nb32, wb = b - n*nb32;          // token, window-within-token
+    qxT[(size_t)n*in_dim + (size_t)(wb >> 5)*1024 + (lane >> 4)*512 + (size_t)(wb & 31)*16
+        + (lane & 15)] = (int8_t)q;
+    int qsum = q;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) qsum += __shfl_xor_sync(0xFFFFFFFF, qsum, o);
+    if (lane == 0) { dx[b] = d; sx[b] = qsum; }
+}
+
 // BF16-input variant of quantize_q8_1_kernel: the prefill projection activation
 // already lives as BF16 in d_inb (rms-norm / attn-out / geglu outputs), so the
 // tiled-MMQ prefill path quantizes straight from BF16 instead of needing a FP32
@@ -1845,6 +1875,131 @@ static inline void mmvq_q4_k_packed_launch(
     float *out, const uint8_t *w, const int8_t *qx, const float *dx, const int *sx,
     int in_dim, int out_dim, cudaStream_t stream)
 { mmvq_q4_k_packed_batched_launch(out, w, qx, dx, sx, in_dim, out_dim, 1, stream); }
+
+// ── PACKED Q4_K, TRANSPOSED activations: the LSU-bound batched decode mixer fix ────────────
+// Profiling the B=16 decode step showed mmvq_q4_k_packed_batched at ~45-58 GB/s while a raw
+// stream over the same weights reaches >800 GB/s and time scales LINEARLY with NK — the kernel
+// is bound by its ACTIVATION loads, not by weight latency or dp4a: with qx in row-major
+// [n][in_dim], each inner LDG.128 has a 32-byte lane stride = 8 sector replays. Reading the
+// quantize_q8_1t_kernel layout instead makes every activation load a dense LDG.128 (2 loads
+// A=xqs[0..3], B=xqs[4..7] per (n, window)), halving LSU wavefronts per epoch; the superblock
+// header + quants are staged up-front as uint4 pairs (PIPE=2 epochs) and the (scale,min) are
+// decoded from the staged registers (q4k_scale_min_reg, integer-exact). The dp4a sequence
+// (wv[2k]·A.k then wv[2k+1]·B.k, k ascending) and the per-acc[n] float accumulation order
+// (b = lane, lane+32, … with the ORIGINAL (d·s)·sumi − (dmin·m)·Σx grouping) are exactly those
+// of mmvq_q4_k_packed_batched_kernel → BITWISE-identical output. Measured on the decode shapes
+// (weights uncached): NK=16 qkv 163.4→63.0 us, z 83.3→32.8, out_proj 88.2→44.5 (2.0-2.6×);
+// NK=8/4 ~2-2.4×. NK=1 is NOT routed here (row-major is already fine at one token).
+// Register variant of q4k_scale_min reading the 12 packed scale bytes from the staged header
+// uint4 (sy = header bytes 4..7, sz = 8..11, sw = 12..15). Same integer decode.
+__device__ __forceinline__ void q4k_scale_min_reg(
+    uint32_t sy, uint32_t sz, uint32_t sw, int j, int *s, int *m)
+{
+    if (j < 4) { *s = (int)((sy >> (8*j)) & 63); *m = (int)((sz >> (8*j)) & 63); }
+    else {
+        int sh = 8*(j - 4);
+        uint32_t bj4 = (sw >> sh) & 0xFF;        // sc[j+4]
+        uint32_t bjm = (sy >> sh) & 0xFF;        // sc[j-4]
+        uint32_t bj  = (sz >> sh) & 0xFF;        // sc[j]
+        *s = (int)((bj4 & 0x0F) | ((bjm >> 6) << 4));
+        *m = (int)((bj4 >> 4)   | ((bj  >> 6) << 4));
+    }
+}
+
+template<int NK>
+__global__ void mmvq_q4_k_packedT_batched_kernel(
+    float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
+    int in_dim, int out_dim)
+{
+    constexpr int PIPE = 2;                      // superblock epochs staged per chunk
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.x * nwarps + warp;
+    if (idx >= out_dim) return;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * 144;
+    float acc[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
+    for (int b0 = lane; b0 < nb32; b0 += 32*PIPE) {
+        // stage this chunk's independent weight loads (header + quants) up-front
+        uint4 hh[PIPE], hq[PIPE];
+        #pragma unroll
+        for (int p = 0; p < PIPE; p++) {
+            int b = b0 + 32*p;
+            if (b < nb32) {
+                const uint8_t *blk = wrow + (size_t)(b >> 3) * 144;
+                hh[p] = __ldg((const uint4 *)blk);
+                hq[p] = __ldg((const uint4 *)(blk + 16 + (size_t)(b & 7) * 16));
+            }
+        }
+        #pragma unroll
+        for (int p = 0; p < PIPE; p++) {
+            int b = b0 + 32*p;
+            if (b >= nb32) break;
+            int j = b & 7;
+            uint4 h = hh[p];
+            __half_raw hd; hd.x = (uint16_t)(h.x & 0xFFFF);
+            __half_raw hm; hm.x = (uint16_t)(h.x >> 16);
+            float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+            int s, m; q4k_scale_min_reg(h.y, h.z, h.w, j, &s, &m);
+            float ds = d*(float)s, dm = dmin*(float)m;   // original (d·s), (dmin·m) grouping
+            uint4 q = hq[p];
+            int wv[8];
+            int w0=(int)q.x, w1=(int)q.y, w2=(int)q.z, w3=(int)q.w;
+            wv[0]=w0&0x0F0F0F0F; wv[1]=(w0>>4)&0x0F0F0F0F;
+            wv[2]=w1&0x0F0F0F0F; wv[3]=(w1>>4)&0x0F0F0F0F;
+            wv[4]=w2&0x0F0F0F0F; wv[5]=(w2>>4)&0x0F0F0F0F;
+            wv[6]=w3&0x0F0F0F0F; wv[7]=(w3>>4)&0x0F0F0F0F;
+            const int8_t *xbase = qxT + (size_t)(b >> 5)*1024 + (size_t)(b & 31)*16;
+            #pragma unroll
+            for (int n = 0; n < NK; n++) {
+                uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);        // xqs[0..3]
+                uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);  // xqs[4..7]
+                int sumi = 0;
+                sumi = __dp4a(wv[0], (int)A.x, sumi);
+                sumi = __dp4a(wv[1], (int)B.x, sumi);
+                sumi = __dp4a(wv[2], (int)A.y, sumi);
+                sumi = __dp4a(wv[3], (int)B.y, sumi);
+                sumi = __dp4a(wv[4], (int)A.z, sumi);
+                sumi = __dp4a(wv[5], (int)B.z, sumi);
+                sumi = __dp4a(wv[6], (int)A.w, sumi);
+                sumi = __dp4a(wv[7], (int)B.w, sumi);
+                acc[n] += dx[(size_t)n*nb32 + b] *
+                          (ds*(float)sumi - dm*(float)sx[(size_t)n*nb32 + b]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) { float v = warp_reduce_sum_all(acc[n]); if (lane==0) out[(size_t)n*out_dim+idx] = v; }
+}
+
+static void mmvq_q4_k_packedT_batched_launch(
+    float *out, const uint8_t *w, const int8_t *qxT, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K, cudaStream_t stream)
+{
+    const int NWARPS = 8; int b = NWARPS*32; dim3 g((out_dim + NWARPS - 1) / NWARPS);
+    #define LPT_Q4K(NK,O) mmvq_q4_k_packedT_batched_kernel<NK><<<g,b,0,stream>>>( \
+        out + (size_t)(O)*out_dim, w, qxT + (size_t)(O)*in_dim, \
+        dx + (size_t)(O)*(in_dim>>5), sx + (size_t)(O)*(in_dim>>5), in_dim, out_dim)
+    switch (K) {
+        case 1: LPT_Q4K(1,0); return; case 2: LPT_Q4K(2,0); return; case 3: LPT_Q4K(3,0); return;
+        case 4: LPT_Q4K(4,0); return; case 5: LPT_Q4K(5,0); return; case 6: LPT_Q4K(6,0); return;
+        case 7: LPT_Q4K(7,0); return; case 8: LPT_Q4K(8,0); return;
+        default: break;
+    }
+    // K>8: same NK grouping as the row-major launch (32 prefill / 16 B=16-decode / 8 / rem).
+    int o = 0;
+    for (; o + 32 <= K; o += 32) LPT_Q4K(32, o);
+    for (; o + 16 <= K; o += 16) LPT_Q4K(16, o);
+    for (; o + 8  <= K; o += 8)  LPT_Q4K(8,  o);
+    int rem = K - o;
+    switch (rem) {
+        case 1: LPT_Q4K(1,o); break; case 2: LPT_Q4K(2,o); break; case 3: LPT_Q4K(3,o); break;
+        case 4: LPT_Q4K(4,o); break; case 5: LPT_Q4K(5,o); break; case 6: LPT_Q4K(6,o); break;
+        case 7: LPT_Q4K(7,o); break; default: break;
+    }
+    #undef LPT_Q4K
+}
 
 // ─── Native Q4_K / Q6_K → BF16 dequant (fast Qwen3 prefill) ─────────────────────────
 // Dequantize a full K-quant weight row-set [out_dim][in_dim] (whose in_dim is a multiple
@@ -6773,6 +6928,16 @@ static inline void gemv_batched_w(
     int fmt = (wfmt < 0) ? FMT(eng) : wfmt;
     if (fmt == FORMAT_FP8_BLOCK) {        // block-FP8: float activation directly, no Q8_1 quant
         fp8_block_gemm_launch(out, weight, wscale_fp8(eng, weight), x, in_dim, out_dim, K, stream);
+        return;
+    }
+    // Packed Q4_K at K>1: quantize straight into the transposed activation layout and use the
+    // dense-load mixer kernel (measured 2-2.6× on the batched decode GEMVs, bit-identical).
+    // K==1 keeps the row-major kernel (already dense enough at one token; measured faster).
+    if (fmt == FORMAT_Q4_K && K > 1 && (in_dim & 1023) == 0 && use_packed_q4k(eng, fmt, weight)) {
+        quantize_q8_1t_kernel<<<(K*in_dim)/32, 32, 0, stream>>>(
+            x, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b, in_dim);
+        mmvq_q4_k_packedT_batched_launch(out, weight, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b,
+                                         in_dim, out_dim, K, stream);
         return;
     }
     quantize_q8_1_kernel<<<(K*in_dim)/32, 32, 0, stream>>>(
