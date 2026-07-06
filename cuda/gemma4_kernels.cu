@@ -15216,15 +15216,15 @@ __global__ void m2_gemm_kernel(float *out, const float *in, const float *W,
 
 // Split the 2×-wide q projection qg[N,16,512] (per head [query(256)|gate(256)]) into a
 // contiguous query q[N,16,256] and a head-major gate[N,4096].
-__global__ void m2_split_query_gate_kernel(float *q, float *gate, const float *qg, int N) {
+__global__ void m2_split_query_gate_kernel(float *q, float *gate, const float *qg, int N, int nq) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;     // over N*NQ*HEAD
-    if (idx >= N * M2_NQ * M2_HEAD) return;
+    if (idx >= N * nq * M2_HEAD) return;
     int d = idx % M2_HEAD;
-    int h = (idx / M2_HEAD) % M2_NQ;
-    int n = idx / (M2_HEAD * M2_NQ);
-    q[idx]    = qg[((size_t)n * M2_NQ + h) * (M2_HEAD * 2) + d];
-    gate[(size_t)n * (M2_NQ * M2_HEAD) + h * M2_HEAD + d] =
-        qg[((size_t)n * M2_NQ + h) * (M2_HEAD * 2) + M2_HEAD + d];
+    int h = (idx / M2_HEAD) % nq;
+    int n = idx / (M2_HEAD * nq);
+    q[idx]    = qg[((size_t)n * nq + h) * (M2_HEAD * 2) + d];
+    gate[(size_t)n * (nq * M2_HEAD) + h * M2_HEAD + d] =
+        qg[((size_t)n * nq + h) * (M2_HEAD * 2) + M2_HEAD + d];
 }
 
 // Partial NEOX RoPE on the first ROT dims of each head, positions = row index. In-place.
@@ -15327,10 +15327,10 @@ __global__ void m2_l2norm_heads_kernel(float *x, int n_heads, int sd, int rows) 
 // Per-(token,v-head) decay g = ssm_a*softplus(a+dt_bias) and beta = sigmoid(b).
 __global__ void m2_decay_beta_kernel(float *g_out, float *beta_out, const float *a,
                                      const float *b, const float *ssm_a, const float *dt_bias,
-                                     int N) {
+                                     int N, int tsr) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;     // N*TSR
-    if (idx >= N * M2_TSR) return;
-    int h = idx % M2_TSR;
+    if (idx >= N * tsr) return;
+    int h = idx % tsr;
     float x = a[idx] + dt_bias[h];
     float sp = (x > 0.f) ? (x + log1pf(__expf(-x))) : log1pf(__expf(x));   // softplus
     g_out[idx]    = ssm_a[h] * sp;
@@ -15339,12 +15339,12 @@ __global__ void m2_decay_beta_kernel(float *g_out, float *beta_out, const float 
 
 // Gated RMSNorm + SiLU(z): out[N,VALD] = RMSNorm(core, ssm_norm) * silu(z), per v-head.
 __global__ void m2_gated_norm_kernel(float *out, const float *core, const float *z,
-                                     const float *ssm_norm, int N) {
+                                     const float *ssm_norm, int N, int nvh, int vald) {
     int vh = blockIdx.x, row = blockIdx.y;
-    if (vh >= M2_NVH || row >= N) return;
+    if (vh >= nvh || row >= N) return;
     __shared__ float red[32];
-    const float *c = core + ((size_t)row * M2_NVH + vh) * M2_SD;
-    const float *zz = z   + ((size_t)row * M2_NVH + vh) * M2_SD;
+    const float *c = core + ((size_t)row * nvh + vh) * M2_SD;
+    const float *zz = z   + ((size_t)row * nvh + vh) * M2_SD;
     float ss = 0.f;
     for (int i = threadIdx.x; i < M2_SD; i += blockDim.x) ss += c[i] * c[i];
     ss = block_reduce_sum(ss, red);
@@ -15353,7 +15353,7 @@ __global__ void m2_gated_norm_kernel(float *out, const float *core, const float 
         float zv = zz[i];
         float silu = zv / (1.f + __expf(-zv));
         // RMSNorm(o)*ssm_norm gain, then * SiLU(z) gate (gate NOT in the variance).
-        out[(size_t)row * M2_VALD + vh * M2_SD + i] = c[i] * rms * ssm_norm[i] * silu;
+        out[(size_t)row * vald + vh * M2_SD + i] = c[i] * rms * ssm_norm[i] * silu;
     }
 }
 
@@ -15644,7 +15644,7 @@ int qwen35_m2_layer_selftest(const char *ref_bin_path) {
         m2_gemm(qg,x,Wq,N,M2_H,M2_NQ*M2_HEAD*2);
         m2_gemm(k,x,Wk,N,M2_H,M2_NKV*M2_HEAD);
         m2_gemm(v,x,Wv,N,M2_H,M2_NKV*M2_HEAD);
-        m2_split_query_gate_kernel<<<(N*M2_NQ*M2_HEAD+255)/256,256>>>(q,gate,qg,N);
+        m2_split_query_gate_kernel<<<(N*M2_NQ*M2_HEAD+255)/256,256>>>(q,gate,qg,N,M2_NQ);
         per_head_rms_norm_rows_kernel<<<dim3(M2_NQ,N),256,32*sizeof(float)>>>(q,qn,M2_NQ,M2_HEAD,N,M2_EPS);
         per_head_rms_norm_rows_kernel<<<dim3(M2_NKV,N),256,32*sizeof(float)>>>(k,kn,M2_NKV,M2_HEAD,N,M2_EPS);
         m2_partial_rope_kernel<<<dim3((M2_ROT/2+31)/32,M2_NQ,N),32>>>(q,M2_NQ,N);
@@ -15708,10 +15708,10 @@ int qwen35_m2_layer_selftest(const char *ref_bin_path) {
         }
         m2_l2norm_heads_kernel<<<dim3(M2_NKH,N),128>>>(qk_q,M2_NKH,M2_SD,N);
         m2_l2norm_heads_kernel<<<dim3(M2_NKH,N),128>>>(qk_k,M2_NKH,M2_SD,N);
-        m2_decay_beta_kernel<<<(N*M2_TSR+255)/256,256>>>(gg,bb,a,b,ssma,dtb,N);
+        m2_decay_beta_kernel<<<(N*M2_TSR+255)/256,256>>>(gg,bb,a,b,ssma,dtb,N,M2_TSR);
         size_t smR = ((size_t)M2_SD*M2_SD + 3*M2_SD)*sizeof(float);
         m2_gdn_recurrent_kernel<<<M2_NVH,128,smR>>>(core,qk_q,qk_k,vv,gg,bb,N);
-        m2_gated_norm_kernel<<<dim3(M2_NVH,N),128,32*sizeof(float)>>>(gnorm,core,z,ssmn,N);
+        m2_gated_norm_kernel<<<dim3(M2_NVH,N),128,32*sizeof(float)>>>(gnorm,core,z,ssmn,N,M2_NVH,M2_VALD);
         m2_gemm(outR,gnorm,Wout,N,M2_VALD,M2_H);
         cudaError_t e1 = cudaDeviceSynchronize();
         if (e1 != cudaSuccess) { fprintf(stderr,"M2 GDN-recur: %s\n",cudaGetErrorString(e1)); rc=1; }
@@ -15722,7 +15722,7 @@ int qwen35_m2_layer_selftest(const char *ref_bin_path) {
         cudaMemset(core,0,(size_t)N*M2_NVH*M2_SD*sizeof(float));
         size_t smC = ((size_t)M2_SD*M2_SD + M2_CHUNK*M2_SD + 3*M2_CHUNK)*sizeof(float);
         m2_gdn_chunk_kernel<<<M2_NVH,128,smC>>>(core,qk_q,qk_k,vv,gg,bb,scratch,N,NPAD);
-        m2_gated_norm_kernel<<<dim3(M2_NVH,N),128,32*sizeof(float)>>>(gnorm,core,z,ssmn,N);
+        m2_gated_norm_kernel<<<dim3(M2_NVH,N),128,32*sizeof(float)>>>(gnorm,core,z,ssmn,N,M2_NVH,M2_VALD);
         m2_gemm(outC,gnorm,Wout,N,M2_VALD,M2_H);
         cudaError_t e2 = cudaDeviceSynchronize();
         if (e2 != cudaSuccess) { fprintf(stderr,"M2 GDN-chunk: %s\n",cudaGetErrorString(e2)); rc=1; }
@@ -16021,7 +16021,7 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                 gemv_w(eng, qg, Wq(T.attn_q),      xn, H, 2*NQ*HD, st, T.fmt_q);
                 gemv_w(eng, kb, Wq(T.attn_k),      xn, H, NKV*HD,  st, T.fmt_k);
                 gemv_w(eng, vb, Wq(T.attn_v),      xn, H, NKV*HD,  st, T.fmt_v);
-                m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(qb, gate, qg, 1);
+                m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(qb, gate, qg, 1, NQ);
                 per_head_rms_norm_rows_kernel<<<dim3(NQ,1),256,32*sizeof(float),st>>>(qb, Wf(T.attn_q_norm), NQ, HD, 1, eps);
                 per_head_rms_norm_rows_kernel<<<dim3(NKV,1),256,32*sizeof(float),st>>>(kb, Wf(T.attn_k_norm), NKV, HD, 1, eps);
                 qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NQ),32,0,st>>>(qb, NQ, p);
@@ -16049,7 +16049,7 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                 cudaMemcpyAsync(vh, conv_out+2*KEYD,      (size_t)INNER*sizeof(float), cudaMemcpyDeviceToDevice, st);
                 m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(qh, NKH, SD, 1);
                 m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(kh, NKH, SD, 1);
-                m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), 1);
+                m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), 1, TSR);
                 // Head expansion differs by checkpoint layout: the GGUF (llama.cpp) permutes the GDN
                 // q/k heads → TILE (vh%NKH); the FP8/safetensors keep HF order → repeat_INTERLEAVE
                 // (vh/(NVH/NKH)), matching the torch-verified oracle. Route by format.
@@ -16057,7 +16057,7 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                     qwen35_fp8_gdn_step_kernel<<<NVH,128,smGDN,st>>>(core, qh, kh, vh, gg, bb, Sst[l]);
                 else
                     qwen35_gdn_step_kernel<<<NVH,128,smGDN,st>>>(core, qh, kh, vh, gg, bb, Sst[l]);
-                m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), 1);
+                m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), 1, NVH, INNER);
                 gemv_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, st, T.ssm.fmt_out);
             }
             qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(x, mix, H);
@@ -16162,15 +16162,15 @@ __global__ void qwen35_b_kv_write_kernel(__half *Kc, __half *Vc, const float *kb
 // (maxctx floats; only [0..pos] touched). Arithmetic bit-identical to M3 qwen35_attn_step.
 __global__ void qwen35_b_attn_kernel(float *out, const float *q, const __half *Kc, const __half *Vc,
                                      const int *pos, const int *rowslot, int maxctx, int B,
-                                     int nkv) {
+                                     int nkv, int nq) {
     int hd = blockIdx.x;   // query head 0..NQ-1
     int r  = blockIdx.y;   // row
-    if (hd >= M2_NQ || r >= B) return;
+    if (hd >= nq || r >= B) return;
     int slot = rowslot[r], p = pos[r];
-    int kv  = hd / (M2_NQ / nkv);
+    int kv  = hd / (nq / nkv);
     int tid = threadIdx.x;
     extern __shared__ float sc[];   // [maxctx]
-    const float *qr = q + ((size_t)r * M2_NQ + hd) * M2_HEAD;
+    const float *qr = q + ((size_t)r * nq + hd) * M2_HEAD;
     const __half *Kb = Kc + (size_t)slot * maxctx * nkv * M2_HEAD;   // fp16 cache: convert on read
     const __half *Vb = Vc + (size_t)slot * maxctx * nkv * M2_HEAD;
     float scale = rsqrtf((float)M2_HEAD);
@@ -16195,7 +16195,7 @@ __global__ void qwen35_b_attn_kernel(float *out, const float *q, const __half *K
         float acc = 0.f;
         for (int j = 0; j <= p; j++)
             acc += sc[j] * __half2float(Vb[((size_t)j * nkv + kv) * M2_HEAD + d]);
-        out[((size_t)r * M2_NQ + hd) * M2_HEAD + d] = acc * inv;
+        out[((size_t)r * nq + hd) * M2_HEAD + d] = acc * inv;
     }
 }
 
@@ -16214,22 +16214,22 @@ __global__ void qwen35_b_attn_kernel(float *out, const float *q, const __half *K
 __global__ void qwen35_flash_partial_kernel(
     const float *q, const __half *Kc, const __half *Vc, const int *pos, const int *rowslot,
     int maxctx, int B, int nkv, int S,
-    float *part_m, float *part_l, float *part_o) {   // [B*NQ*S], [B*NQ*S], [B*NQ*S*HD]
+    float *part_m, float *part_l, float *part_o, int nq) {   // [B*NQ*S], [B*NQ*S], [B*NQ*S*HD]
     int hd = blockIdx.x, r = blockIdx.y, s = blockIdx.z;
-    if (hd >= M2_NQ || r >= B) return;
+    if (hd >= nq || r >= B) return;
     int slot = rowslot[r], p = pos[r];
     int tile = (maxctx + S - 1) / S;
     int lo = s * tile, hi = lo + tile - 1; if (hi > p) hi = p;
-    size_t pidx = (((size_t)r * M2_NQ + hd) * S + s);
+    size_t pidx = (((size_t)r * nq + hd) * S + s);
     int tid = threadIdx.x;
     if (lo > p) {                          // empty split → sentinel (combine drops it, NaN-safe)
         if (tid == 0) { part_m[pidx] = -1e30f; part_l[pidx] = 0.f; }
         for (int d = tid; d < M2_HEAD; d += blockDim.x) part_o[pidx * M2_HEAD + d] = 0.f;
         return;
     }
-    int kv = hd / (M2_NQ / nkv);           // runtime nkv (MoE 2 → hd/8, 9B 4 → hd/4)
+    int kv = hd / (nq / nkv);           // runtime nkv (MoE 2 → hd/8, 9B 4 → hd/4)
     extern __shared__ float sc[];          // [tile] — bounded, ctx-independent (~2 KB)
-    const float *qr = q + ((size_t)r * M2_NQ + hd) * M2_HEAD;
+    const float *qr = q + ((size_t)r * nq + hd) * M2_HEAD;
     const __half *Kb = Kc + (size_t)slot * maxctx * nkv * M2_HEAD;
     const __half *Vb = Vc + (size_t)slot * maxctx * nkv * M2_HEAD;
     float scale = rsqrtf((float)M2_HEAD);
@@ -16263,11 +16263,11 @@ __global__ void qwen35_flash_partial_kernel(
 // (m = max_s m_s; out = Σ_s e^{m_s-m}·o_s / Σ_s e^{m_s-m}·l_s). Grid dim3(NQ,B), thread d owns out
 // dim d. Empty splits (m_s == -1e30) are skipped — never multiply 0·Inf.
 __global__ void qwen35_flash_combine_kernel(
-    float *out, const float *part_m, const float *part_l, const float *part_o, int B, int S) {
+    float *out, const float *part_m, const float *part_l, const float *part_o, int B, int S, int nq) {
     int hd = blockIdx.x, r = blockIdx.y;
-    if (hd >= M2_NQ || r >= B) return;
+    if (hd >= nq || r >= B) return;
     int tid = threadIdx.x;
-    size_t base = ((size_t)r * M2_NQ + hd) * S;
+    size_t base = ((size_t)r * nq + hd) * S;
     float m = -1e30f;
     for (int s = 0; s < S; s++) { float ms = part_m[base + s]; if (ms > m) m = ms; }
     float l = 0.f;
@@ -16284,7 +16284,7 @@ __global__ void qwen35_flash_combine_kernel(
             if (ms <= -1e30f) continue;
             od += __expf(ms - m) * part_o[(base + s) * M2_HEAD + d];
         }
-        out[((size_t)r * M2_NQ + hd) * M2_HEAD + d] = od * inv;
+        out[((size_t)r * nq + hd) * M2_HEAD + d] = od * inv;
     }
 }
 
@@ -16310,48 +16310,48 @@ __global__ void qwen35_b_conv_kernel(float *conv_out, const float *qkv, float *r
 }
 
 // Split each row's conv output [B][CONVD] into contiguous qh[B][KEYD], kh[B][KEYD], vh[B][VALD].
-__global__ void qwen35_b_split_qkv_kernel(float *qh, float *kh, float *vh, const float *conv, int B) {
+__global__ void qwen35_b_split_qkv_kernel(float *qh, float *kh, float *vh, const float *conv, int B, int convd, int vald) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over CONVD
     int r   = blockIdx.y;
-    if (r >= B || idx >= M2_CONVDIM) return;
-    const float *cr = conv + (size_t)r * M2_CONVDIM;
+    if (r >= B || idx >= convd) return;
+    const float *cr = conv + (size_t)r * convd;
     if      (idx < M2_KEYD)     qh[(size_t)r * M2_KEYD + idx]               = cr[idx];
     else if (idx < 2 * M2_KEYD) kh[(size_t)r * M2_KEYD + (idx - M2_KEYD)]  = cr[idx];
-    else                        vh[(size_t)r * M2_VALD + (idx - 2*M2_KEYD)] = cr[idx];
+    else                        vh[(size_t)r * vald + (idx - 2*M2_KEYD)] = cr[idx];
 }
 
 // GDN single-step delta-rule recurrence for B rows; each (v-head,row) block loads/stores the
 // carried fp32 state S[SD×SD] from the per-slot arena. Bit-identical to M3 qwen35_gdn_step.
 __global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k, const float *v,
                                     const float *g, const float *beta, __nv_bfloat16 *S_arena,
-                                    const int *rowslot, int B, int interleave) {
+                                    const int *rowslot, int B, int interleave, int nvh) {
     int vh = blockIdx.x;
     int r  = blockIdx.y;
-    if (vh >= M2_NVH || r >= B) return;
+    if (vh >= nvh || r >= B) return;
     int slot = rowslot[r];
     // GGUF (llama.cpp) permutes GDN q/k heads → TILE (vh%NKH); FP8/safetensors keep HF order →
     // repeat-INTERLEAVE (vh/(NVH/NKH)). See [[qwen35-fp8-engine-serving]].
-    int kh  = interleave ? (vh / (M2_NVH / M2_NKH)) : (vh % M2_NKH);
+    int kh  = interleave ? (vh / (nvh / M2_NKH)) : (vh % M2_NKH);
     int tid = threadIdx.x;
     extern __shared__ float sm[];
     float *S   = sm;                 // [SD*SD] k-major
     float *kt  = S + M2_SD * M2_SD;  // [SD]
     float *qt  = kt + M2_SD;         // [SD]
     float *dlt = qt + M2_SD;         // [SD]
-    __nv_bfloat16 *Sg = S_arena + ((size_t)slot * M2_NVH + vh) * M2_SD * M2_SD;
+    __nv_bfloat16 *Sg = S_arena + ((size_t)slot * nvh + vh) * M2_SD * M2_SD;
     for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] = __bfloat162float(Sg[idx]);
     __syncthreads();
     float scale = rsqrtf((float)M2_SD);
     const float *qr = q + (size_t)r * M2_NKH * M2_SD;
     const float *kr = k + (size_t)r * M2_NKH * M2_SD;
-    const float *vr = v + (size_t)r * M2_NVH * M2_SD;
+    const float *vr = v + (size_t)r * nvh * M2_SD;
     if (tid < M2_SD) {
         kt[tid] = kr[(size_t)kh * M2_SD + tid];
         qt[tid] = qr[(size_t)kh * M2_SD + tid] * scale;
     }
     __syncthreads();
-    float gt = __expf(g[(size_t)r * M2_NVH + vh]);
-    float bt = beta[(size_t)r * M2_NVH + vh];
+    float gt = __expf(g[(size_t)r * nvh + vh]);
+    float bt = beta[(size_t)r * nvh + vh];
     for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] *= gt;
     __syncthreads();
     if (tid < M2_SD) {
@@ -16369,7 +16369,7 @@ __global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k,
     if (tid < M2_SD) {
         float acc = 0.f;
         for (int kd = 0; kd < M2_SD; kd++) acc += S[kd * M2_SD + tid] * qt[kd];
-        core[((size_t)r * M2_NVH + vh) * M2_SD + tid] = acc;
+        core[((size_t)r * nvh + vh) * M2_SD + tid] = acc;
     }
     __syncthreads();
     for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) Sg[idx] = __float2bfloat16(S[idx]);
@@ -16466,10 +16466,10 @@ __device__ inline void wmma_gemm_tf32(float *C, const float *A, const float *B,
 __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const float *k,
                                           const float *v, const float *g, const float *beta,
                                           __nv_bfloat16 *S_arena, float *scratch, int slot, int N, int NPAD,
-                                          int interleave) {
+                                          int interleave, int nvh) {
     int vh  = blockIdx.x;
     // TILE (GGUF) vs repeat-INTERLEAVE (FP8/safetensors). See [[qwen35-fp8-engine-serving]].
-    int kh  = interleave ? (vh / (M2_NVH / M2_NKH)) : (vh % M2_NKH);
+    int kh  = interleave ? (vh / (nvh / M2_NKH)) : (vh % M2_NKH);
     int tid = threadIdx.x;
     const int CS = M2_CHUNK, SD = M2_SD;
     extern __shared__ float sm[];
@@ -16487,7 +16487,7 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
     float *kchsT = qgs + CS * SD;        // [SD*CS] (k·decay)^T for the state-update GEMM
     float *ctmp  = kchsT + SD * CS;      // [CS*SD] core tile (before N-guarded copy-out)
     float *Stmp  = ctmp + CS * SD;       // [SD*SD] state-update GEMM result
-    __nv_bfloat16 *Sg = S_arena + ((size_t)slot * M2_NVH + vh) * SD * SD;
+    __nv_bfloat16 *Sg = S_arena + ((size_t)slot * nvh + vh) * SD * SD;
     float scale = rsqrtf((float)SD);
     int warp = tid >> 5, n_warps = blockDim.x >> 5;
     for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = __bfloat162float(Sg[idx]);   // carry-in
@@ -16502,14 +16502,14 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
         }
         for (int r = tid; r < CS; r += blockDim.x) {
             int gt = c * CS + r;
-            bet[r] = (gt < N) ? beta[(size_t)gt * M2_NVH + vh] : 0.f;
+            bet[r] = (gt < N) ? beta[(size_t)gt * nvh + vh] : 0.f;
         }
         __syncthreads();
         if (tid == 0) {
             float acc = 0.f;
             for (int r = 0; r < CS; r++) {
                 int gt = c * CS + r;
-                acc += (gt < N) ? g[(size_t)gt * M2_NVH + vh] : 0.f;
+                acc += (gt < N) ? g[(size_t)gt * nvh + vh] : 0.f;
                 gc[r] = acc;
             }
         }
@@ -16543,7 +16543,7 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
             for (int s = 0; s < CS; s++) {
                 float t = Tm[i * CS + s];
                 int gt = c * CS + s;
-                float vv = (gt < N) ? v[((size_t)gt * M2_NVH + vh) * SD + d] : 0.f;
+                float vv = (gt < N) ? v[((size_t)gt * nvh + vh) * SD + d] : 0.f;
                 su += t * (vv * bet[s]);
                 sk += t * (kch[s * SD + d] * bet[s] * __expf(gc[s]));
             }
@@ -16581,7 +16581,7 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
         __syncthreads();
         for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
             int i = idx / SD, d = idx % SD, gti = c * CS + i;
-            if (gti < N) core[((size_t)gti * M2_NVH + vh) * SD + d] = ctmp[idx];
+            if (gti < N) core[((size_t)gti * nvh + vh) * SD + d] = ctmp[idx];
         }
         // S = S·exp(glast) + (k·decay)^T @ vnew  (tensor-core)
         float glast = gc[CS - 1];
@@ -16614,8 +16614,8 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     }
     const gemma4_model_config_t *c = &eng->cfg;
     const int MS = GEMMA4_MAX_SEQS, L = c->n_layers;
-    const int H=c->hidden_size, HD=M2_HEAD, NQ=M2_NQ, NKV=c->n_kv_global, INNER=M2_VALD, CONVD=M2_CONVDIM;
-    const int KEYD=M2_KEYD, VALD=M2_VALD, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, CK=M2_CK;
+    const int H=c->hidden_size, HD=M2_HEAD, NQ=c->n_heads, NKV=c->n_kv_global, INNER=c->ssm_inner_size, CONVD=(2*M2_KEYD+c->ssm_inner_size);
+    const int KEYD=M2_KEYD, VALD=c->ssm_inner_size, NVH=(c->ssm_inner_size/M2_SD), SD=M2_SD, TSR=c->ssm_time_step_rank, CK=M2_CK;
     const int I = c->intermediate;
     // baked geometry must match the M2/M3 #defines (the mixer kernels bake head/GDN dims);
     // H and NKV are runtime (9B: 4096/4, 35B-A3B MoE: 2048/2).
@@ -16732,8 +16732,8 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
 // d_sb[11]; when want_argmax, appends the per-row greedy argmax into d_ms_outtok.
 static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_argmax, cudaStream_t st) {
     const gemma4_model_config_t *c = &eng->cfg;
-    const int H=c->hidden_size, HD=M2_HEAD, NQ=M2_NQ, NKV=c->n_kv_global;
-    const int INNER=M2_VALD, CONVD=M2_CONVDIM, NKH=M2_NKH, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, ROT=M2_ROT;
+    const int H=c->hidden_size, HD=M2_HEAD, NQ=c->n_heads, NKV=c->n_kv_global;
+    const int INNER=c->ssm_inner_size, CONVD=(2*M2_KEYD+c->ssm_inner_size), NKH=M2_NKH, NVH=(c->ssm_inner_size/M2_SD), SD=M2_SD, TSR=c->ssm_time_step_rank, ROT=M2_ROT;
     const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
     const int maxctx = eng->q35_maxctx;
     const float eps = 1e-6f;
@@ -16764,7 +16764,7 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             gemv_batched_w(eng, qg, Wq(T.attn_q),      xn, H, 2*NQ*HD, B, st, T.fmt_q);
             gemv_batched_w(eng, kb, Wq(T.attn_k),      xn, H, NKV*HD,  B, st, T.fmt_k);
             gemv_batched_w(eng, vb, Wq(T.attn_v),      xn, H, NKV*HD,  B, st, T.fmt_v);
-            m2_split_query_gate_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(qb, gate, qg, B);
+            m2_split_query_gate_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(qb, gate, qg, B, NQ);
             per_head_rms_norm_rows_kernel<<<dim3(NQ,B),256,32*sizeof(float),st>>>(qb, Wf(T.attn_q_norm), NQ, HD, B, eps);
             per_head_rms_norm_rows_kernel<<<dim3(NKV,B),256,32*sizeof(float),st>>>(kb, Wf(T.attn_k_norm), NKV, HD, B, eps);
             qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NQ,B),32,0,st>>>(qb, NQ, d_pos, B);
@@ -16778,9 +16778,9 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
                 size_t smP = (size_t)eng->q35_attn_tile * sizeof(float);
                 qwen35_flash_partial_kernel<<<dim3(NQ,B,S),256,smP,st>>>(
                     qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, B, NKV, S,
-                    eng->d_q35_part_m, eng->d_q35_part_l, eng->d_q35_part_o);
+                    eng->d_q35_part_m, eng->d_q35_part_l, eng->d_q35_part_o, NQ);
                 qwen35_flash_combine_kernel<<<dim3(NQ,B),256,0,st>>>(
-                    attn, eng->d_q35_part_m, eng->d_q35_part_l, eng->d_q35_part_o, B, S);
+                    attn, eng->d_q35_part_m, eng->d_q35_part_l, eng->d_q35_part_o, B, S, NQ);
             }
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(attn, gate, B*NQ*HD);
             gemv_batched_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, B, st, T.fmt_o);
@@ -16797,12 +16797,12 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             }
             qwen35_b_conv_kernel<<<dim3(grid1d((size_t)CONVD),B),256,0,st>>>(
                 conv, qkv, eng->d_q35_ring[l], Wf(T.ssm.conv1d), d_slot, CONVD, B);
-            qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),B),256,0,st>>>(qh, kh, vh, conv, B);
+            qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),B),256,0,st>>>(qh, kh, vh, conv, B, CONVD, INNER);
             m2_l2norm_heads_kernel<<<dim3(NKH,B),128,0,st>>>(qh, NKH, SD, B);
             m2_l2norm_heads_kernel<<<dim3(NKH,B),128,0,st>>>(kh, NKH, SD, B);
-            m2_decay_beta_kernel<<<grid1d((size_t)B*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), B);
-            qwen35_b_gdn_kernel<<<dim3(NVH,B),256,smGDN,st>>>(core, qh, kh, vh, gg, bb, eng->d_q35_S[l], d_slot, B, eng->format==FORMAT_FP8_BLOCK);  // 256 thr: 2x lanes on the SD*SD state loops
-            m2_gated_norm_kernel<<<dim3(NVH,B),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), B);
+            m2_decay_beta_kernel<<<grid1d((size_t)B*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), B, TSR);
+            qwen35_b_gdn_kernel<<<dim3(NVH,B),256,smGDN,st>>>(core, qh, kh, vh, gg, bb, eng->d_q35_S[l], d_slot, B, eng->format==FORMAT_FP8_BLOCK, NVH);  // 256 thr: 2x lanes on the SD*SD state loops
+            m2_gated_norm_kernel<<<dim3(NVH,B),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), B, NVH, INNER);
             gemv_batched_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, B, st, T.ssm.fmt_out);
         }
         residual_add_kernel<<<grid1d((size_t)B*H),256,0,st>>>(x, mix, B*H);
@@ -16903,7 +16903,7 @@ static bool ensure_q35_attn_scratch(gemma4_engine_t *eng, int N) {
     Q35_FREE(eng->d_q35_kbx); Q35_FREE(eng->d_q35_vbx); Q35_FREE(eng->d_q35_pb);
     Q35_FREE(eng->d_q35_scores);
     eng->d_q35_attn_cap = 0;
-    const int NQ = M2_NQ, NKV = eng->cfg.n_kv_global, HD = M2_HEAD;
+    const int NQ = eng->cfg.n_heads, NKV = eng->cfg.n_kv_global, HD = M2_HEAD;
     const size_t oq = (size_t)NQ * HD, okv = (size_t)NKV * HD, nn = (size_t)NQ * N * N;
     bool ok = true;
     ok &= cudaMalloc(&eng->d_q35_qb,  (size_t)N*oq*sizeof(__nv_bfloat16)) == cudaSuccess;
@@ -16930,7 +16930,7 @@ static bool ensure_q35_attn_scratch(gemma4_engine_t *eng, int N) {
 // Writes attn[N][NQ*HD]. Scale rsqrt(HD), causal, no softcap — identical math to the scalar path.
 static void q35_full_attn_tc(gemma4_engine_t *eng, float *attn, const float *qb,
                              const float *kb, const float *vb, int N, cudaStream_t st) {
-    const int NQ = M2_NQ, NKV = eng->cfg.n_kv_global, HD = M2_HEAD;
+    const int NQ = eng->cfg.n_heads, NKV = eng->cfg.n_kv_global, HD = M2_HEAD;
     const size_t oq = (size_t)NQ * HD, okv = (size_t)NKV * HD;
     auto g1 = [](size_t n){ return (unsigned)((n + 255) / 256); };
     f32_to_bf16_kernel<<<g1((size_t)N*oq),256,0,st>>>(eng->d_q35_qb, qb, (size_t)N*oq);
@@ -17103,7 +17103,7 @@ static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fm
 // attention only reads positions [0..pos] written this sequence).
 static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
     const gemma4_model_config_t *c = &eng->cfg;
-    const int NVH=M2_NVH, SD=M2_SD, CONVD=M2_CONVDIM, CK=M2_CK;
+    const int NVH=(c->ssm_inner_size/M2_SD), SD=M2_SD, CONVD=(2*M2_KEYD+c->ssm_inner_size), CK=M2_CK;
     for (int l = 0; l < c->n_layers; l++) if (c->attn_kind[l] != GEMMA4_ATTN_FULL) {
         cudaMemsetAsync(eng->d_q35_S[l]   + (size_t)slot*NVH*SD*SD, 0, (size_t)NVH*SD*SD*sizeof(__nv_bfloat16), st);  // bf16 arena: byte length halved (0.0f is bf16 0)
         cudaMemsetAsync(eng->d_q35_ring[l]+ (size_t)slot*CONVD*(CK-1), 0, (size_t)CONVD*(CK-1)*sizeof(float), st);
@@ -17136,9 +17136,9 @@ static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
 static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, int T,
                                       int want_logits, cudaStream_t st) {
     const gemma4_model_config_t *c = &eng->cfg;
-    const int H=c->hidden_size, HD=M2_HEAD, NQ=M2_NQ, NKV=c->n_kv_global;
-    const int INNER=M2_VALD, CONVD=M2_CONVDIM, NKH=M2_NKH, NVH=M2_NVH, SD=M2_SD, TSR=M2_TSR, ROT=M2_ROT;
-    const int KEYD=M2_KEYD, VALD=M2_VALD;
+    const int H=c->hidden_size, HD=M2_HEAD, NQ=c->n_heads, NKV=c->n_kv_global;
+    const int INNER=c->ssm_inner_size, CONVD=(2*M2_KEYD+c->ssm_inner_size), NKH=M2_NKH, NVH=(c->ssm_inner_size/M2_SD), SD=M2_SD, TSR=c->ssm_time_step_rank, ROT=M2_ROT;
+    const int KEYD=M2_KEYD, VALD=c->ssm_inner_size;
     const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
     const int maxctx = eng->q35_maxctx;
     const float eps = 1e-6f;
@@ -17170,7 +17170,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             q35_proj_gemm(eng, qg, Tn.attn_q, Tn.fmt_q, xn, H, 2*NQ*HD, T, st, l, WC_Q);
             q35_proj_gemm(eng, kb, Tn.attn_k, Tn.fmt_k, xn, H, NKV*HD,  T, st, l, WC_K);
             q35_proj_gemm(eng, vb, Tn.attn_v, Tn.fmt_v, xn, H, NKV*HD,  T, st, l, WC_V);
-            m2_split_query_gate_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(qb, gate, qg, T);
+            m2_split_query_gate_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(qb, gate, qg, T, NQ);
             per_head_rms_norm_rows_kernel<<<dim3(NQ,T),256,32*sizeof(float),st>>>(qb, Wf(Tn.attn_q_norm), NQ, HD, T, eps);
             per_head_rms_norm_rows_kernel<<<dim3(NKV,T),256,32*sizeof(float),st>>>(kb, Wf(Tn.attn_k_norm), NKV, HD, T, eps);
             qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NQ,T),32,0,st>>>(qb, NQ, d_pos, T);
@@ -17183,7 +17183,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 q35_full_attn_tc(eng, attn, qb, kb, vb, T, st);
             else
                 qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
-                    attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T, NKV);
+                    attn, qb, eng->d_q35_Kc[l], eng->d_q35_Vc[l], d_pos, d_slot, maxctx, T, NKV, NQ);
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
             q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st, l, WC_O);
         } else {
@@ -17204,17 +17204,17 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 conv, qkv, eng->d_q35_ring[l], Wf(Tn.ssm.conv1d), slot, CONVD, T);
             qwen35_b_ring_update_kernel<<<grid1d((size_t)CONVD),256,0,st>>>(
                 eng->d_q35_ring[l], qkv, slot, CONVD, T);
-            qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(qh, kh, vh, conv, T);
+            qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(qh, kh, vh, conv, T, CONVD, VALD);
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(qh, NKH, SD, T);
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(kh, NKH, SD, T);
-            m2_decay_beta_kernel<<<grid1d((size_t)T*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(Tn.ssm.a_log), Wf(Tn.ssm.dt_bias), T);
+            m2_decay_beta_kernel<<<grid1d((size_t)T*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(Tn.ssm.a_log), Wf(Tn.ssm.dt_bias), T, TSR);
             // RECURRENT: delta-rule state S update — ONE chunked parallel-scan launch over the
             // whole tile (CHUNK=64), carrying the per-slot fp32 state S in/out of the arena.
             // 512 threads: the O(SD*SD)=16384-element state/matmul loops stride over 4x the lanes.
             qwen35_b_gdn_chunk_kernel<<<NVH,512,smGDNchunk,st>>>(
                 core, qh, kh, vh, gg, bb, eng->d_q35_S[l], eng->d_q35_chunk_scr, slot, T, NPAD,
-                eng->format==FORMAT_FP8_BLOCK);
-            m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T);
+                eng->format==FORMAT_FP8_BLOCK, NVH);
+            m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T, NVH, VALD);
             q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, l, WC_OUT);
         }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
@@ -18029,21 +18029,38 @@ static inline bool qwen35_fp8_is_moe(st::Model &M, qwen35fp8::Layout &LO) {
 // is the shared M2_* baked set. Called EARLY (before the cfg-dependent scratch allocations); the
 // weight fill runs later, after create's d_weights=NULL reset.
 static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
-    const int HD=M2_HEAD, NQ=M2_NQ, INNER=M2_VALD, TSR=M2_TSR, SD=M2_SD, CK=M2_CK;
+    // Head/GDN geometry SHARED across all Qwen3.5/3.6 sizes stays baked (M2_*): head_dim, state_size,
+    // conv_kernel, key-head count, rotary_dim, theta. The dims that VARY by size are DERIVED from the
+    // loaded tensor shapes (NOT the substring config scanner — VL checkpoints carry a vision_config
+    // that shadows num_attention_heads / linear_num_value_heads):
+    //   n_heads (NQ)          = q_proj rows / (2*head_dim)   [fused q+gate pack]
+    //   ssm_inner_size (VALD) = in_proj_z rows               [value-path width = n_val_heads*SD]
+    //   ssm_time_step_rank    = n_val_heads = INNER/SD       [A_log/dt_bias/a/b width]
+    // 9B(H4096/NKV4)+35B-A3B(H2048/NKV2) derive back to the M2_* values (regression-safe); 27B-dense
+    // derives NQ24/INNER6144/NVH48 → runtime support with no new #defines.
+    const int HD=M2_HEAD, SD=M2_SD, CK=M2_CK;
     const bool moe = qwen35_fp8_is_moe(M, LO);
     const st::Tensor *embT=M.find(LO.embed_key);
-    // NKV from a FULL layer's k_proj rows (layer full_attention_interval-1 is always FULL).
+    // NKV/NQ from a FULL layer's k_proj/q_proj rows (layer full_attention_interval-1 is always FULL).
     const st::Tensor *kT=M.find(qwen35fp8::lkey(LO,LO.full_attention_interval-1,"self_attn.k_proj.weight"));
+    const st::Tensor *qT=M.find(qwen35fp8::lkey(LO,LO.full_attention_interval-1,"self_attn.q_proj.weight"));
+    // in_proj_z from a LINEAR (GDN) layer — layer 0 is LINEAR for the period-4 hybrid.
+    const st::Tensor *zT=M.find(qwen35fp8::lkey(LO,0,"linear_attn.in_proj_z.weight"));
     const st::Tensor *gateT=M.find(qwen35fp8::lkey(LO,0, moe ? "mlp.shared_expert.gate_proj.weight"
                                                             : "mlp.gate_proj.weight"));
-    if(!embT||!kT||!gateT){ fprintf(stderr,"qwen35_fp8_engine: missing embed/k_proj/gate\n"); return -1; }
+    if(!embT||!kT||!qT||!zT||!gateT){ fprintf(stderr,"qwen35_fp8_engine: missing embed/k_proj/q_proj/in_proj_z/gate\n"); return -1; }
     const int VOC=(int)embT->shape[0], H=(int)embT->shape[1], NKV=(int)kT->shape[0]/HD;
+    const int NQ=(int)qT->shape[0]/(2*HD);     // fused q+gate: q_proj rows = 2*NQ*HD
+    const int INNER=(int)zT->shape[0];          // value-path inner width = NVH*SD
+    const int NVH=INNER/SD, TSR=NVH;            // num value heads (== A_log/dt_bias width)
     const int I=(int)gateT->shape[0], L=LO.n_layers;
     gemma4_model_config_t *c=&eng->cfg;
     c->arch=GEMMA4_ARCH_QWEN3_5; c->n_layers=L; c->hidden_size=H; c->head_dim=HD; c->n_heads=NQ;
     c->n_kv_global=NKV; c->n_kv_sliding=NKV;
     c->intermediate=I; c->vocab_size=VOC; c->rotary_dim=M2_ROT; c->full_attention_interval=LO.full_attention_interval;
     c->ssm_state_size=SD; c->ssm_conv_kernel=CK; c->ssm_inner_size=INNER; c->ssm_group_count=M2_NKH; c->ssm_time_step_rank=TSR;
+    fprintf(stderr,"fucina: qwen35 geometry (runtime-derived) — NQ=%d NKV=%d NVH=%d INNER=%d CONVD=%d (M2 baked NQ%d/NVH%d/INNER%d)\n",
+            NQ, NKV, NVH, INNER, 2*M2_KEYD+INNER, M2_NQ, M2_NVH, M2_VALD);
     if (moe) {
         const st::Tensor *rgT=M.find(qwen35fp8::lkey(LO,0,"mlp.gate.weight"));
         const st::Tensor *egT=M.find(qwen35fp8::lkey(LO,0,"mlp.experts.0.gate_proj.weight"));
@@ -18064,8 +18081,8 @@ static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::L
 }
 
 static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
-    const int H=eng->cfg.hidden_size, HD=M2_HEAD, NQ=M2_NQ, NKV=eng->cfg.n_kv_global;
-    const int CONVD=M2_CONVDIM, INNER=M2_VALD;
+    const int H=eng->cfg.hidden_size, HD=M2_HEAD, NQ=eng->cfg.n_heads, NKV=eng->cfg.n_kv_global;
+    const int CONVD=(2*M2_KEYD+eng->cfg.ssm_inner_size), INNER=eng->cfg.ssm_inner_size;
     const int VOC=eng->cfg.vocab_size, I=eng->cfg.intermediate, L=LO.n_layers;
 
     std::vector<q35fp8_desc> D;
@@ -18528,7 +18545,7 @@ extern "C" int qwen35_fp8_forward_greedy(void *model, const int32_t *in_ids, int
                 fp8_block_gemv_launch(qg, T.q.w, T.q.s, xn, H, 2*NQ*HD, st);
                 fp8_block_gemv_launch(kb, T.k.w, T.k.s, xn, H, NKV*HD,  st);
                 fp8_block_gemv_launch(vb, T.v.w, T.v.s, xn, H, NKV*HD,  st);
-                m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(qb, gate, qg, 1);
+                m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(qb, gate, qg, 1, NQ);
                 per_head_rms_norm_rows_kernel<<<dim3(NQ,1),256,32*sizeof(float),st>>>(qb, T.q_norm, NQ, HD, 1, eps);
                 per_head_rms_norm_rows_kernel<<<dim3(NKV,1),256,32*sizeof(float),st>>>(kb, T.k_norm, NKV, HD, 1, eps);
                 qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NQ),32,0,st>>>(qb, NQ, p);
@@ -18549,9 +18566,9 @@ extern "C" int qwen35_fp8_forward_greedy(void *model, const int32_t *in_ids, int
                 cudaMemcpyAsync(vh, conv_out+2*KEYD, (size_t)INNER*sizeof(float), cudaMemcpyDeviceToDevice, st);
                 m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(qh, NKH, SD, 1);
                 m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(kh, NKH, SD, 1);
-                m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(gg, bb, ac, bc, T.a_coef, T.dt_bias, 1);
+                m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(gg, bb, ac, bc, T.a_coef, T.dt_bias, 1, TSR);
                 qwen35_fp8_gdn_step_kernel<<<NVH,128,smGDN,st>>>(core, qh, kh, vh, gg, bb, Sst[l]);
-                m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(gnorm, core, zc, T.ssm_norm, 1);
+                m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(gnorm, core, zc, T.ssm_norm, 1, NVH, INNER);
                 fp8_block_gemv_launch(mix, T.out.w, T.out.s, gnorm, INNER, H, st);
             }
             qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(x, mix, H);
@@ -18722,7 +18739,7 @@ static int q35fp8_main_step(q35fp8_ctx *c, int32_t token, int pos, int want_hidd
             fp8_block_gemv_launch(c->qg, T.q.w, T.q.s, c->xn, H, 2*NQ*HD, st);
             fp8_block_gemv_launch(c->kb, T.k.w, T.k.s, c->xn, H, NKV*HD, st);
             fp8_block_gemv_launch(c->vb, T.v.w, T.v.s, c->xn, H, NKV*HD, st);
-            m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->qb, c->gate, c->qg, 1);
+            m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->qb, c->gate, c->qg, 1, NQ);
             per_head_rms_norm_rows_kernel<<<dim3(NQ,1),256,32*sizeof(float),st>>>(c->qb, T.q_norm, NQ, HD, 1, eps);
             per_head_rms_norm_rows_kernel<<<dim3(NKV,1),256,32*sizeof(float),st>>>(c->kb, T.k_norm, NKV, HD, 1, eps);
             qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NQ),32,0,st>>>(c->qb, NQ, pos);
@@ -18743,9 +18760,9 @@ static int q35fp8_main_step(q35fp8_ctx *c, int32_t token, int pos, int want_hidd
             cudaMemcpyAsync(c->vh, c->conv_out+2*KEYD, (size_t)INNER*sizeof(float), cudaMemcpyDeviceToDevice, st);
             m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(c->qh, NKH, SD, 1);
             m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(c->kh, NKH, SD, 1);
-            m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(c->gg, c->bb, c->ac, c->bc, T.a_coef, T.dt_bias, 1);
+            m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(c->gg, c->bb, c->ac, c->bc, T.a_coef, T.dt_bias, 1, TSR);
             qwen35_fp8_gdn_step_kernel<<<NVH,128,smGDN,st>>>(c->core, c->qh, c->kh, c->vh, c->gg, c->bb, c->Sst[l]);
-            m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(c->gnorm, c->core, c->zc, T.ssm_norm, 1);
+            m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(c->gnorm, c->core, c->zc, T.ssm_norm, 1, NVH, INNER);
             fp8_block_gemv_launch(c->mix, T.out.w, T.out.s, c->gnorm, INNER, H, st);
         }
         qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(c->x, c->mix, H);
@@ -18789,7 +18806,7 @@ static int q35fp8_mtp_step(q35fp8_ctx *c, int32_t in_tok, const float *h_prev, i
     fp8_block_gemv_launch(c->mqg, P.q.w, P.q.s, c->mxn, H, 2*NQ*HD, st);
     fp8_block_gemv_launch(c->mkb, P.k.w, P.k.s, c->mxn, H, NKV*HD, st);
     fp8_block_gemv_launch(c->mvb, P.v.w, P.v.s, c->mxn, H, NKV*HD, st);
-    m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->mqb, c->mgate, c->mqg, 1);
+    m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(c->mqb, c->mgate, c->mqg, 1, NQ);
     per_head_rms_norm_rows_kernel<<<dim3(NQ,1),256,32*sizeof(float),st>>>(c->mqb, P.q_norm, NQ, HD, 1, eps);
     per_head_rms_norm_rows_kernel<<<dim3(NKV,1),256,32*sizeof(float),st>>>(c->mkb, P.k_norm, NKV, HD, 1, eps);
     qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NQ),32,0,st>>>(c->mqb, NQ, pos);
@@ -19164,7 +19181,7 @@ extern "C" int qwen35_moe_fp8_forward_greedy(void *model, const int32_t *in_ids,
                 fp8_block_gemv_launch(qg, T.q.w, T.q.s, xn, H, 2*NQ*HD, st);
                 fp8_block_gemv_launch(kb, T.k.w, T.k.s, xn, H, NKV*HD,  st);
                 fp8_block_gemv_launch(vb, T.v.w, T.v.s, xn, H, NKV*HD,  st);
-                m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(qb, gate, qg, 1);
+                m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(qb, gate, qg, 1, NQ);
                 per_head_rms_norm_rows_kernel<<<dim3(NQ,1),256,32*sizeof(float),st>>>(qb, T.q_norm, NQ, HD, 1, eps);
                 per_head_rms_norm_rows_kernel<<<dim3(NKV,1),256,32*sizeof(float),st>>>(kb, T.k_norm, NKV, HD, 1, eps);
                 qwen35_rope_pos_kernel<<<dim3((ROT/2+31)/32,NQ),32,0,st>>>(qb, NQ, p);
@@ -19185,9 +19202,9 @@ extern "C" int qwen35_moe_fp8_forward_greedy(void *model, const int32_t *in_ids,
                 cudaMemcpyAsync(vh, conv_out+2*KEYD, (size_t)INNER*sizeof(float), cudaMemcpyDeviceToDevice, st);
                 m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(qh, NKH, SD, 1);
                 m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(kh, NKH, SD, 1);
-                m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(gg, bb, ac, bc, T.a_coef, T.dt_bias, 1);
+                m2_decay_beta_kernel<<<(TSR+255)/256,256,0,st>>>(gg, bb, ac, bc, T.a_coef, T.dt_bias, 1, TSR);
                 qwen35_fp8_gdn_step_kernel<<<NVH,128,smGDN,st>>>(core, qh, kh, vh, gg, bb, Sst[l]);
-                m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(gnorm, core, zc, T.ssm_norm, 1);
+                m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(gnorm, core, zc, T.ssm_norm, 1, NVH, INNER);
                 fp8_block_gemv_launch(mix, T.out.w, T.out.s, gnorm, INNER, H, st);
             }
             qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(x, mix, H);
