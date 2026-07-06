@@ -8858,21 +8858,52 @@ int g_fucina_force_slow_prefill = 0;
 // (which adds a pre-rmsnorm / 1-sqrt-d / per-expert pes scale) — Qwen3-MoE has none of those.
 
 // Router GEMV: logits[t·E + e] = Σ_h W[e·H + h] · X[t·H + h]. W = ffn_gate_inp (F32, [hidden,n_expert]
-// row-major with hidden contiguous → row e is W+e·H). One block per (expert, token).
+// row-major with hidden contiguous → row e is W+e·H). One block per (expert, token-PAIR): the
+// expert-row chunk is hoisted into registers once and reused for both tokens, and the 8-wide load
+// hoisting keeps ~24 independent loads in flight per thread — this kernel is DRAM-LATENCY bound
+// (44 us/layer at cn=16 in the naive one-block-per-(e,t) form; 33 us with this shape, cold-L2
+// measured on GB10; a one-block-per-expert smem-staged form measured WORSE at 47-49 us: only E
+// blocks can't hide the latency). Per (e,t) the FP evaluation order is EXACTLY the classic form —
+// thread t accumulates k = t + i·blockDim ascending (hoisting reorders loads, not adds; the
+// per-chunk k sequence i, i+256, …, i+7·256, i+2048, … is the same ascending sequence), then the
+// identical 256-wide tree reduction → bit-identical logits.
 __global__ void moe_router_gemv_kernel(const float *__restrict__ W, const float *__restrict__ X,
-                                       float *__restrict__ logits, int H, int n_expert) {
-    int e = blockIdx.x, t = blockIdx.y;
+                                       float *__restrict__ logits, int H, int n_expert, int cn) {
+    const int e = blockIdx.x, t0 = blockIdx.y * 2;
+    const bool two = (t0 + 1 < cn);
     const float *w = W + (size_t)e * H;
-    const float *x = X + (size_t)t * H;
-    float acc = 0.f;
-    for (int i = threadIdx.x; i < H; i += blockDim.x) acc += w[i] * x[i];
+    const float *x0 = X + (size_t)t0 * H;
+    const float *x1 = x0 + H;
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int i = threadIdx.x; i < H; i += (int)blockDim.x * 8) {
+        float wv[8], xv0[8], xv1[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int k = i + j * (int)blockDim.x;
+            if (k < H) { wv[j] = w[k]; xv0[j] = x0[k]; if (two) xv1[j] = x1[k]; }
+        }
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int k = i + j * (int)blockDim.x;
+            if (k < H) acc0 += wv[j] * xv0[j];
+        }
+        if (two)
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                int k = i + j * (int)blockDim.x;
+                if (k < H) acc1 += wv[j] * xv1[j];
+            }
+    }
     __shared__ float sm[256];
-    sm[threadIdx.x] = acc; __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s];
+    for (int b = 0; b < (two ? 2 : 1); b++) {
+        sm[threadIdx.x] = b ? acc1 : acc0; __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) logits[(size_t)(t0 + b) * n_expert + e] = sm[0];
         __syncthreads();
     }
-    if (threadIdx.x == 0) logits[(size_t)t * n_expert + e] = sm[0];
 }
 
 // Lazily allocate the MoE forward scratch (QWEN3MOE only). Sized for ≤ GEMMA4_MOE_TMAX tokens per
@@ -9037,7 +9068,8 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             cublasSgemm(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, E, cn, H,
                         &alf, router_w, H, h, H, &bet, eng->d_moe_rlogits, E);
         } else
-        moe_router_gemv_kernel<<<dim3(E, cn), 256, 0, stream>>>(router_w, h, eng->d_moe_rlogits, H, E);
+        moe_router_gemv_kernel<<<dim3(E, (unsigned)((cn + 1) / 2)), 256, 0, stream>>>(
+            router_w, h, eng->d_moe_rlogits, H, E, cn);
         dg_softmax_topk(eng->d_moe_rlogits, E, cn, U, eng->d_moe_tki, eng->d_moe_tkw, stream);
         int n_slot = (total < E) ? total : E;   // grid.y for active-expert grouped GEMMs
         dg_moe_route_inv(eng->d_moe_tki, eng->d_moe_tkw, eng->d_moe_ones, cn, U, E,
