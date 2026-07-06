@@ -16392,7 +16392,17 @@ __global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k,
     float *qt  = kt + M2_SD;         // [SD]
     float *dlt = qt + M2_SD;         // [SD]
     __nv_bfloat16 *Sg = S_arena + ((size_t)slot * nvh + vh) * M2_SD * M2_SD;
-    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) S[idx] = __bfloat162float(Sg[idx]);
+    // Vectorized state load: 8 bf16 per 16-byte uint4 access (Sg is (SD*SD*2B)-aligned per head;
+    // elementwise bf16→f32 convert, values identical to the scalar loop).
+    static_assert((M2_SD * M2_SD) % 8 == 0, "GDN state must be uint4-tileable");
+    const uint4 *Sg_ld = reinterpret_cast<const uint4 *>(Sg);
+    for (int v4 = tid; v4 < (M2_SD * M2_SD) / 8; v4 += blockDim.x) {
+        uint4 pkt = Sg_ld[v4];
+        const __nv_bfloat16 *pe = reinterpret_cast<const __nv_bfloat16 *>(&pkt);
+        float *dst = S + (size_t)v4 * 8;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) dst[j] = __bfloat162float(pe[j]);
+    }
     __syncthreads();
     float scale = rsqrtf((float)M2_SD);
     const float *qr = q + (size_t)r * M2_NKH * M2_SD;
@@ -16425,7 +16435,16 @@ __global__ void qwen35_b_gdn_kernel(float *core, const float *q, const float *k,
         core[((size_t)r * nvh + vh) * M2_SD + tid] = acc;
     }
     __syncthreads();
-    for (int idx = tid; idx < M2_SD * M2_SD; idx += blockDim.x) Sg[idx] = __float2bfloat16(S[idx]);
+    // Vectorized state store: pack 8 f32→bf16 into one 16-byte uint4 write (same values as scalar).
+    uint4 *Sg_st = reinterpret_cast<uint4 *>(Sg);
+    for (int v4 = tid; v4 < (M2_SD * M2_SD) / 8; v4 += blockDim.x) {
+        const float *src = S + (size_t)v4 * 8;
+        uint4 pkt;
+        __nv_bfloat16 *pe = reinterpret_cast<__nv_bfloat16 *>(&pkt);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) pe[j] = __float2bfloat16(src[j]);
+        Sg_st[v4] = pkt;
+    }
 }
 
 // ── PREFILL chunked GDN/conv (P-perf): replace the per-token recurrence launches ────────────
