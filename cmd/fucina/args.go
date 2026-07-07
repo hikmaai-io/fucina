@@ -56,6 +56,11 @@ type CLIArgs struct {
 	MaxOutputToks int    // absolute per-request output-token ceiling; 0 = no extra cap
 	PagedKV       bool   // --paged-kv: allocate the paged multi-sequence KV pools (sets FUCINA_PAGED_KV)
 	Batch         bool   // --batch: route /v1/* through the continuous-batching scheduler (implies --paged-kv)
+	// llama-compat concurrency flags consumed by the Gemma-4-E4B path (its own engine sizes its
+	// slot pool from these). Parallel is the desired concurrent-slot count; ContBatching enables
+	// the per-step batched decode on the E4B server.
+	Parallel      int    // --parallel / -np: concurrent decode slots (E4B)
+	ContBatching  bool   // --cont-batching: enable E4B continuous batching
 
 	// System
 	System     string
@@ -170,6 +175,10 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 		"Allocate the paged multi-sequence KV pools (prerequisite for --batch; equivalent to FUCINA_PAGED_KV=1)")
 	fs.BoolVar(&a.Batch, "batch", false,
 		"Continuous batching: serve concurrent requests through the per-step scheduler (implies --paged-kv). OFF by default; no MTP spec decode in this path.")
+	// llama-compat aliases consumed by the Gemma-4-E4B engine.
+	fs.IntVar(&a.Parallel, "parallel", 1, "Gemma-4-E4B: number of concurrent decode slots")
+	fs.IntVar(&a.Parallel, "np", 1, "Gemma-4-E4B: number of concurrent decode slots (alias of --parallel)")
+	fs.BoolVar(&a.ContBatching, "cont-batching", false, "Gemma-4-E4B: enable continuous batching on the E4B server")
 
 	fs.StringVar(&a.System, "s", "", "System prompt")
 	fs.StringVar(&a.System, "system", "", "System prompt")

@@ -24,6 +24,7 @@ import (
 
 	"github.com/hikmaai-io/fucina/internal/engine/cuda"
 	"github.com/hikmaai-io/fucina/internal/engine/diffusion"
+	"github.com/hikmaai-io/fucina/internal/engine/e4b"
 	"github.com/hikmaai-io/fucina/internal/sampler"
 	gemserver "github.com/hikmaai-io/fucina/internal/server"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
@@ -131,6 +132,16 @@ func main() {
 			log.Fatalf("fucina: tokenizer init failed: %v", err)
 		}
 		runDiffusion(args, tok)
+		return
+	}
+
+	// Gemma-4-E4B is the on-device family member (Per-Layer Embeddings, KV-sharing,
+	// runtime dims) and runs through its own engine, not the dense gemma4 path. Detect
+	// it from the safetensors config.json / GGUF and route before the dense engine is
+	// created. The (mmap-ing) detector is guarded by a cheap suffix/dir pre-filter so a
+	// multi-GB non-E4B GGUF never reaches it.
+	if e4b.LooksLikeCheckpoint(args.ModelPath) && e4b.IsE4B(args.ModelPath) {
+		runE4B(args)
 		return
 	}
 
