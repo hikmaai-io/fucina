@@ -4205,6 +4205,12 @@ static int gguf_tensor_dims(
 static inline int ggml_to_fmt(uint32_t gt) {
     switch (gt) {
         case GGML_TYPE_Q4_0: return FORMAT_Q4_0;
+        // Q4_1 (Unsloth UD dynamic-quant ffn_down) has no native kernel; it is requantized to
+        // Q4_0 at load into a per-tensor device buffer + pointer override (see the "Unsloth UD
+        // dynamic-quant" block), so its resolved format IS Q4_0. Returning FORMAT_Q4_0 here lets
+        // LOAD_WT_FMT record fmt_down=Q4_0 (matching the override bytes) instead of tripping the
+        // unsupported-type guard and aborting the load before the requant ever runs.
+        case GGML_TYPE_Q4_1: return FORMAT_Q4_0;
         case GGML_TYPE_Q8_0: return FORMAT_Q8_0;
         case GGML_TYPE_Q4_K: return FORMAT_Q4_K;
         case GGML_TYPE_Q5_K: return FORMAT_Q5_K;  // requantized to Q8_0 at load (no native kernel)
