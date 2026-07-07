@@ -61,7 +61,7 @@ extern "C" {
     void dg_silu_mul(float *out, const float *gate, const float *up, int64_t n, cudaStream_t s);
 }
 
-#define GEMMA4_MOE_TMAX 512   // max tokens per MoE chunk (decode B≤16, prefill loops in chunks)
+#define GEMMA4_MOE_TMAX 2048  // max tokens per MoE chunk (decode B≤16, prefill loops in chunks)
 static int moe_alloc_scratch(gemma4_engine_t *eng);          // defined with the MoE FFN below
 
 // NVFP4 safetensors loading (FORMAT_NVFP4): container parser, dequant math, name mapping, and
@@ -9169,6 +9169,51 @@ __global__ void dequant_fp8_expert_slab_bf16_kernel(
     dst[i] = __float2bfloat16(float(v) * bs);
 }
 
+// Dequant a per-layer NVFP4 expert slab (packed E2M1 + per-expert 32×4×4-swizzled E4M3 SF +
+// per-(layer,proj) global scale) → the BF16 slab the tensor-core expert prefill GEMMs read.
+// row_off selects the gate (0) / up (MI) half of the fused gate|up slab; slab_rows is the
+// per-expert row count of the SOURCE slab (2·MI for gate|up, H for down). Reconstruction is
+// exactly the values the CUTLASS grouped GEMM consumes: e2m1 · e4m3(SF) · gs.
+__global__ void dequant_nvfp4_expert_slab_bf16_kernel(
+    __nv_bfloat16 *dst, const uint8_t *fp4, const uint8_t *sf, const float *gsp,
+    int in_dim, int out_dim, int row_off, int slab_rows, unsigned long long sfB, uint64_t n)
+{
+    // one thread per 16-element SF block: swizzle math + SF decode once, 8 quant bytes in,
+    // 16 bf16 out via two uint4 stores (n is the ELEMENT count; always a multiple of 16)
+    uint64_t blk = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t nblk_total = n / NVFP4_BLK;
+    if (blk >= nblk_total) return;
+    int nblk = in_dim / NVFP4_BLK, nbp = ((nblk + 3) / 4) * 4;
+    uint64_t per = (uint64_t)out_dim * nblk;
+    int e = (int)(blk / per);
+    uint64_t r = blk - (uint64_t)e * per;
+    int row = (int)(r / nblk), s = (int)(r % nblk);
+    int srow = row_off + row;
+    int oo = srow >> 7, oi = srow & 127, so = s >> 2, si = s & 3;
+    size_t off = ((size_t)oo * (size_t)(nbp / 4) + so) * 512 + (size_t)(oi % 32) * 16 + (oi / 32) * 4 + si;
+    float bsf = __half2float(__half(__nv_cvt_fp8_to_halfraw(
+        (__nv_fp8_storage_t)sf[(size_t)e * sfB + off], __NV_E4M3)));
+    float scale = bsf * (*gsp);
+    const uint8_t *q = fp4 + (size_t)e * slab_rows * (in_dim / 2)
+                     + (size_t)srow * (in_dim / 2) + (size_t)s * (NVFP4_BLK / 2);
+    __nv_bfloat16 o[NVFP4_BLK];
+    #pragma unroll
+    for (int i = 0; i < NVFP4_BLK / 2; i++) {
+        uint32_t byte = q[i];
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            uint32_t nib = h ? (byte >> 4) : (byte & 0x0F);
+            // E2M1 magnitude table {0,.5,1,1.5,2,3,4,6} + sign bit — the dense NVFP4 GEMV's decode
+            float tab = (nib & 4u) ? ((nib & 2u) ? ((nib & 1u) ? 6.f : 4.f) : ((nib & 1u) ? 3.f : 2.f))
+                                   : ((nib & 2u) ? ((nib & 1u) ? 1.5f : 1.f) : ((nib & 1u) ? 0.5f : 0.f));
+            o[2 * i + h] = __float2bfloat16(((nib & 8u) ? -tab : tab) * scale);
+        }
+    }
+    uint4 *out16 = (uint4 *)(dst + ((uint64_t)e * per + r) * NVFP4_BLK);
+    out16[0] = *(const uint4 *)&o[0];
+    out16[1] = *(const uint4 *)&o[8];
+}
+
 // out[t][i] += sigmoid(shlog[t]) · v[t][i] — the Qwen3.5-MoE shared-expert add (per-token
 // sigmoid-gated) into the MoE block output. One thread per element, token = blockIdx.y.
 __global__ void q35moe_b_shared_axpy_kernel(float *out, const float *v, const float *shlog, int H) {
@@ -9194,9 +9239,10 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
     // Q4_K-requantized experts route through the GGUF Q4_K grouped branch below (and skip the
     // FP8 tc-prefill dequant, which reads FP8 slabs). Router/shared expert stay on their paths.
     const int fp8 = (eng->format == FORMAT_FP8_BLOCK) && !eng->moe_experts_q4k && !eng->moe_experts_fp4;
-    // tc prefill works for FP8 AND Q4_K slabs; NVFP4 experts have no dequantable slab (and the
-    // grouped CUTLASS GEMM IS the tensor-core path at every width).
-    const int tc_ok = (eng->format == FORMAT_FP8_BLOCK) && !eng->moe_experts_fp4;
+    // tc prefill works for FP8, Q4_K AND NVFP4 slabs (each has a slab→BF16 dequant); wide calls
+    // ride the grouped-batched cuBLAS BF16 GEMMs (measured faster than the CUTLASS NVFP4 grouped
+    // GEMM at prefill widths: 2k TTFT 1.16 s vs 1.23 s), decode-sized calls keep CUTLASS NVFP4.
+    const int tc_ok = (eng->format == FORMAT_FP8_BLOCK);
     const float *router_w = (const float*)weight_fp8(eng, eng->moe_router[l]);
     const void  *gate_w   = (const void*)weight_fp8(eng, eng->moe_gate_exps[l]);
     const void  *up_w     = (const void*)weight_fp8(eng, eng->moe_up_exps[l]);
@@ -9228,7 +9274,16 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                                      weight_fp8(eng, eng->moe_down_exps[l]) };
             const uint64_t so[3] = { eng->moe_gate_scales[l], eng->moe_up_scales[l], eng->moe_down_scales[l] };
             for (int p = 0; p < 3; p++) {
-                if (eng->moe_experts_q4k)   // Q4_K slabs: element-parallel natural-layout dequant
+                if (eng->moe_experts_fp4)   // NVFP4 slabs: gate/up halves of the fused gu slab, then dn
+                    dequant_nvfp4_expert_slab_bf16_kernel<<<(unsigned)((ne / NVFP4_BLK + 255) / 256), 256, 0, stream>>>(
+                        eng->d_moe_wbf[p],
+                        (p == 2) ? eng->d_fp4m_dn[l]   : eng->d_fp4m_gu[l],
+                        (p == 2) ? eng->d_fp4m_dnsf[l] : eng->d_fp4m_gusf[l],
+                        eng->d_fp4m_gsw + 2 * l + ((p == 2) ? 1 : 0),
+                        (p == 2) ? EFFN : H, (p == 2) ? H : EFFN,
+                        (p == 1) ? EFFN : 0, (p == 2) ? H : 2 * EFFN,
+                        (p == 2) ? eng->fp4m_dn_sfB : eng->fp4m_gu_sfB, ne);
+                else if (eng->moe_experts_q4k)   // Q4_K slabs: element-parallel natural-layout dequant
                     dequant_q4_k_slab_bf16_fast_kernel<<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(
                         eng->d_moe_wbf[p], ws[p], ne);
                 else
@@ -9262,7 +9317,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                          (fp8 || eng->moe_experts_q4k) ? eng->d_moe_active : NULL, n_slot, stream);
         // Gather expert inputs → grouped gate/up/down. FP8 keeps FLOAT activations (no Q8_1).
         dg_gather_cols(eng->d_moe_xe, h, eng->d_moe_eidx, H, total, stream);
-        if (eng->moe_experts_fp4) {
+        if (!tc && eng->moe_experts_fp4) {
             // CUTLASS grouped block-scaled NVFP4 experts: quantize the gathered activations per
             // expert group to E2M1 + swizzled ue4m3 SF, then ONE ptr-array tensor-core GEMM per
             // projection covers every expert (fused gate|up, then down). Serves decode AND
@@ -18551,12 +18606,17 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // 8/8 and every self-test bitwise across a full day of gates. FUCINA_MOE_FP8=1 restores the
     // pure-FP8 serving as the escape hatch.
     const bool q4k_mode = moe && !getenv("FUCINA_MOE_FP8");
-    // Experts DEFAULT to Q4_K (dp4a grouped GEMV, 4.5 bpw, ~half the raw-FP8 memory) — the working,
-    // memory-optimal serving. NVFP4 grouped experts would be 2.1× the decode weight bandwidth, but
-    // the CUTLASS sm120 block-scaled grouped GEMM builds a placeholder TMA descriptor the CUDA-13/
-    // GB10 driver rejects (cuTensorMapEncodeTiled err 700 → abort), so it is OPT-IN via
-    // FUCINA_MOE_FP4=1 (for a cutlass/driver where it encodes). FUCINA_MOE_FP8=1 = raw FP8.
-    bool fp4_mode = q4k_mode && getenv("FUCINA_MOE_FP4");
+    // Experts DEFAULT to NVFP4 (CUTLASS sm120 grouped block-scaled GEMM, 4.5 bpw): the tensor-core
+    // tiles amortize the expert weight read across every token routed to the expert, where the
+    // dp4a grouped GEMV is memory-LATENCY-bound (measured B=16 aggregate: identical-prompt
+    // 436→600 tok/s, diverse 307→372; B=1 −3%, still ahead of vLLM). The CUDA-13 abort that
+    // demoted this path (placeholder-TMA cuTensorMapEncodeTiled err 700, a103b74) no longer
+    // reproduces on the current driver stack — gated by oracle 8/8 + self-test + prefill parity.
+    // Wide (prefill) calls dequant the NVFP4 slabs → BF16 and ride the grouped-cuBLAS tc path
+    // (faster than the CUTLASS GEMM at prefill widths). FUCINA_MOE_Q4K=1 restores the Q4_K
+    // grouped-GEMV experts (also the automatic fallback if the NVFP4 build fails);
+    // FUCINA_MOE_FP8=1 = raw FP8.
+    bool fp4_mode = q4k_mode && !getenv("FUCINA_MOE_Q4K");
     auto put_w=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int od,int idm)->bool{
         return q4k_mode ? put_q4k_from_fp8(off,fmtp,key,od,idm) : put_fp8(off,fmtp,key,od,idm);
     };
