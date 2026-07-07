@@ -382,6 +382,11 @@ type Scheduler struct {
 	// scheduler pass spend its time — the engine step (cgo forward), token
 	// delivery, admission/prefill, or loop overhead. Logged every telemetryEvery
 	// steps so the served-vs-engine throughput gap is attributable at a glance.
+	// pendingFin holds sequences whose client reply has been sent but whose
+	// engine slot teardown (state snapshot + RemoveSeq) is deferred to the next
+	// flushEvictions — see evict/flushEvictions.
+	pendingFin []pendingFin
+
 	telSteps    int64
 	telTokens   int64
 	telBatch    int64         // Σ batch size over steps (avg B = telBatch/telSteps)
@@ -562,6 +567,7 @@ func (s *Scheduler) run() {
 		// Drain everything on the way out so no client is left hanging and no
 		// slot is leaked: evict every active and prefilling sequence and reply to
 		// every queued request with FinishShutdown.
+		s.flushEvictions() // deferred teardowns from the final pass
 		for slot, sq := range active {
 			if err := s.engine.RemoveSeq(slot); err != nil {
 				log.Printf("batch: RemoveSeq(%d) on shutdown: %v", slot, err)
@@ -591,6 +597,11 @@ func (s *Scheduler) run() {
 	s.telMark = time.Now()
 	for {
 		passStart := time.Now()
+		// 0. Run deferred slot teardown (state snapshots + RemoveSeq) for
+		//    sequences that finished last pass, so their slots are truly free
+		//    before admission below. Their clients were replied to instantly.
+		s.flushEvictions()
+
 		// 1. Pull newly submitted requests into the waiting backlog without
 		//    blocking, so admission can consider them this pass. The backlog is
 		//    bounded: overflow stays in the channel buffer, so Submit observes a
@@ -627,11 +638,44 @@ func (s *Scheduler) run() {
 		//     timer, so a capacity that frees externally is retried without a
 		//     100%-CPU spin.
 		if len(active) == 0 && len(prefill) == 0 && !admitted {
+			// About to go idle: run deferred teardowns NOW, in the client-invisible
+			// gap after the last reply — never lazily on the next request's wake,
+			// where they would land in that request's TTFT.
+			s.flushEvictions()
 			select {
 			case <-s.quit:
 				return
 			case req := <-s.submit:
 				waiting = append(waiting, req)
+				// Idle burst coalescing: concurrent clients submit within a few
+				// ms of each other, but the scheduler wakes on the FIRST one — by
+				// the time the rest arrive it is already mid-prefill and the
+				// burst admits staggered (rows out of lockstep, one prefill per
+				// pass). ESCALATING wait: a lone request pays at most the short
+				// probe window; the moment a second request lands the window
+				// extends per-arrival (quiet-period), bounded by the burst cap,
+				// so the whole burst is admitted as one lockstep batch.
+				probe := time.After(burstCoalesceWindow)
+				var quiet <-chan time.Time // armed after the 2nd arrival
+				capHard := time.After(burstCoalesceMax)
+			coalesce:
+				for len(waiting) < s.engine.Capacity() {
+					select {
+					case r2 := <-s.submit:
+						waiting = append(waiting, r2)
+						quiet = time.After(burstCoalesceQuiet)
+					case <-probe:
+						if quiet == nil {
+							break coalesce // lone request: stop probing
+						}
+					case <-quiet:
+						break coalesce // burst went quiet: admit what we have
+					case <-capHard:
+						break coalesce
+					case <-s.quit:
+						return
+					}
+				}
 			case <-retryTimer(len(waiting) > 0):
 			}
 			continue
@@ -726,6 +770,17 @@ func (s *Scheduler) drainSubmit(waiting *[]Request) {
 	}
 }
 
+// Idle burst-coalescing windows: after the first request wakes an idle scheduler, wait
+// burstCoalesceWindow for a second one (the only cost a lone request ever pays). Once a
+// second request arrives the burst is real: keep collecting until no new request lands
+// for burstCoalesceQuiet, hard-capped at burstCoalesceMax (or engine capacity), then
+// admit everything in one pass — the rows prefill back-to-back and decode in lockstep.
+const (
+	burstCoalesceWindow = 3 * time.Millisecond
+	burstCoalesceQuiet  = 12 * time.Millisecond
+	burstCoalesceMax    = 150 * time.Millisecond
+)
+
 // retryPoll is how long the loop waits before re-checking engine capacity when
 // it holds waiters it cannot yet admit (engine momentarily at capacity). Short
 // enough to be responsive, long enough to avoid a busy spin.
@@ -749,9 +804,21 @@ func retryTimer(haveWaiters bool) <-chan time.Time {
 func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Request) bool {
 	admitted := false
 	oneShotAdmits := 0 // blocking AddSeq admissions this pass (capped to interleave decode)
+	// BURST admission: when the batch is fully idle there is no decode to starve, so a
+	// coalesced burst of short prompts is admitted in ONE pass instead of one-per-pass.
+	// Beyond removing (N-1) scheduler round-trips from the ramp, this starts every burst
+	// row at the same generated position, so the rows decode in lockstep from step one —
+	// the batched forward then sees the densest per-expert token groups the traffic
+	// allows (identical/shared-prefix bursts route convergently: measured 600 vs 372
+	// tok/s aggregate at B=16 on the 35B MoE).
+	oneShotCap := maxOneShotAdmitsPerPass
+	if len(active) == 0 && len(*prefill) == 0 {
+		oneShotCap = s.engine.Capacity()
+	}
 	w := *waiting
-	// A prefilling sequence also holds a slot, so it counts against capacity.
-	held := func() int { return len(active) + len(*prefill) }
+	// A prefilling sequence also holds a slot, so it counts against capacity —
+	// as does a finished sequence whose deferred teardown hasn't run yet.
+	held := func() int { return len(active) + len(*prefill) + len(s.pendingFin) }
 	for len(w) > 0 && held() < s.engine.Capacity() {
 		req := w[0]
 
@@ -792,7 +859,7 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		// step. Cap it to maxOneShotAdmitsPerPass so a long burst of admissions cannot
 		// starve decode (head-of-line TTFT blowup): the rest wait for the next pass,
 		// which runs a decode step in between.
-		if oneShotAdmits >= maxOneShotAdmitsPerPass {
+		if oneShotAdmits >= oneShotCap {
 			break
 		}
 
@@ -1191,41 +1258,65 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 	return true
 }
 
-// evict frees a sequence's engine slot, removes it from the active set, and
-// delivers its terminal Result. It is safe to call at most once per sequence.
+// pendingFin is one finished sequence awaiting deferred slot teardown.
+type pendingFin struct {
+	sq  *seq
+	res Result
+}
+
+// evict retires a sequence: it leaves the active set and its terminal Result is
+// delivered to the client IMMEDIATELY; the expensive engine-side teardown
+// (state snapshot + RemoveSeq) is deferred to flushEvictions at the top of the
+// next pass. It is safe to call at most once per sequence.
 const specCorpusCap = 1 << 16 // tokens kept in the cross-request suffix-decoding ring
 
 func (s *Scheduler) evict(active map[int]*seq, sq *seq, res Result) {
-	// Timed separately from the deliver scatter: eviction runs a state snapshot
-	// (SaveState D2H copy) + RemoveSeq, a per-FINISH cost that would otherwise
-	// masquerade as per-token deliver overhead in the telemetry.
-	tEv := time.Now()
-	defer func() {
-		s.telEvict += time.Since(tEv)
-		s.telEvicts++
-	}()
-	// Snapshot a cleanly finished conversation's slot state BEFORE the slot is
-	// freed, so a later request extending this conversation restores it instead
-	// of re-prefilling. Error/shutdown evictions never snapshot (state suspect).
-	if s.stateSaver != nil && len(sq.hist) > 0 {
-		switch res.Reason {
-		case FinishStop, FinishLength, FinishCancelled:
-			s.stateSaver.SaveState(sq.slot, sq.hist)
-		}
-	}
-	if err := s.engine.RemoveSeq(sq.slot); err != nil {
-		log.Printf("batch: RemoveSeq(%d): %v", sq.slot, err)
-	}
 	delete(active, sq.slot)
-	// Feed the finished sequence's tokens to the cross-request drafter corpus (spec engines
-	// only). Trim from the FRONT so the ring keeps the most recent traffic.
-	if s.spec != nil && len(sq.hist) > 0 {
-		s.corpus = append(s.corpus, sq.hist...)
-		if over := len(s.corpus) - specCorpusCap; over > 0 {
-			s.corpus = append(s.corpus[:0], s.corpus[over:]...)
-		}
-	}
 	reply(sq.req, res)
+	s.pendingFin = append(s.pendingFin, pendingFin{sq: sq, res: res})
+}
+
+// flushEvictions runs the deferred slot teardown for every sequence retired by
+// evict since the last flush. The teardown is the expensive part of finishing a
+// stream — a state snapshot (SaveState: per-layer D2H copies) plus RemoveSeq —
+// and it is deliberately NOT done inline in the deliver scatter: with several
+// rows finishing on the same step, an inline snapshot would stall every
+// still-undelivered batchmate's final tokens behind it (measured ~250 ms per
+// finishing stream on the 35B MoE). The client reply has already been sent by
+// evict; only the engine-side cleanup happens here. Called at the top of each
+// scheduler pass (so slots are truly free before admission) and on shutdown.
+func (s *Scheduler) flushEvictions() {
+	if len(s.pendingFin) == 0 {
+		return
+	}
+	tEv := time.Now()
+	for _, p := range s.pendingFin {
+		sq, res := p.sq, p.res
+		// Snapshot a cleanly finished conversation's slot state BEFORE the slot
+		// is freed, so a later request extending this conversation restores it
+		// instead of re-prefilling. Error/shutdown evictions never snapshot
+		// (state suspect).
+		if s.stateSaver != nil && len(sq.hist) > 0 {
+			switch res.Reason {
+			case FinishStop, FinishLength, FinishCancelled:
+				s.stateSaver.SaveState(sq.slot, sq.hist)
+			}
+		}
+		if err := s.engine.RemoveSeq(sq.slot); err != nil {
+			log.Printf("batch: RemoveSeq(%d): %v", sq.slot, err)
+		}
+		// Feed the finished sequence's tokens to the cross-request drafter corpus (spec
+		// engines only). Trim from the FRONT so the ring keeps the most recent traffic.
+		if s.spec != nil && len(sq.hist) > 0 {
+			s.corpus = append(s.corpus, sq.hist...)
+			if over := len(s.corpus) - specCorpusCap; over > 0 {
+				s.corpus = append(s.corpus[:0], s.corpus[over:]...)
+			}
+		}
+		s.telEvicts++
+	}
+	s.pendingFin = s.pendingFin[:0]
+	s.telEvict += time.Since(tEv)
 }
 
 // reply delivers a terminal Result on the request's Done channel without

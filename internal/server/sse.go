@@ -156,6 +156,13 @@ func (e *sseWriter) event(v interface{}) {
 	e.flush()
 }
 
+// eventBuffered writes one data event WITHOUT flushing — the caller batches a
+// burst of deltas and flushes once at the burst boundary (drainTokensBurst).
+// net/http's response buffer holds the bytes until then.
+func (e *sseWriter) eventBuffered(v interface{}) {
+	e.writeEvent(v)
+}
+
 // errorEvent reports a server-side failure in-stream (the OpenAI streaming
 // convention once the 200 is out) followed by [DONE].
 func (e *sseWriter) errorEvent(msg string) {

@@ -17886,6 +17886,16 @@ static int q35_state_copy(gemma4_engine_t *eng, int slot, char *h, int n_tokens,
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
+// Pinned host allocation for snapshot buffers — see the .cuh doc.
+extern "C" void *gemma4_host_alloc(size_t bytes) {
+    void *p = NULL;
+    if (cudaMallocHost(&p, bytes) != cudaSuccess) { cudaGetLastError(); return NULL; }
+    return p;
+}
+extern "C" void gemma4_host_free(void *p) {
+    if (p) cudaFreeHost(p);
+}
+
 extern "C" int gemma4_engine_q35_state_save(gemma4_engine_t *eng, int slot,
                                             void *buf, int n_tokens) {
     if (!eng || !eng->loaded || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5 || !buf) return -1;
