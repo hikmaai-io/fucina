@@ -960,6 +960,12 @@ type BatchAdapter struct {
 	snaps       []*seqStateSnap
 	snapBytes   int64
 	snapBudget  int64
+	// pinPool recycles pinned snapshot buffers (gemma4_host_alloc is a
+	// cudaMallocHost — tens of ms for a ~35 MiB buffer — so freed buffers are
+	// pooled by capacity instead of returned to the driver). pinPoolBytes is
+	// bounded by pinPoolCap.
+	pinPool      []pinBuf
+	pinPoolBytes int64
 	snapMode    int8 // 0 = unprobed, 1 = enabled, -1 = unsupported engine
 	snapTick    int64
 	scLookups   int64
@@ -969,10 +975,65 @@ type BatchAdapter struct {
 
 // seqStateSnap is one saved conversation: the exact token sequence committed
 // to the engine when it was captured, and the slot-state bytes at that point.
+//
+// buf is backed by C-allocated memory (ptr), NOT the Go heap: snapshots are
+// ~36 MiB each and retained under a multi-GiB budget — on the Go heap the
+// zeroed make() per eviction plus GC-assist/page-fault pressure from the
+// retained cache cost ~30 ms per finishing stream (vs a 1.95 ms engine
+// floor), measured inside the scheduler's deliver loop. Off-heap the buffers
+// are pointerless and invisible to the GC, and no zeroing is needed
+// (SeqStateSave overwrites every byte). dropSnap is the SINGLE release point
+// (covers dropLRU, the supersede scan, and failed restores); anything still
+// cached at process exit is reclaimed by the OS.
 type seqStateSnap struct {
 	tokens []int32
-	buf    []byte
-	used   int64 // LRU stamp (snapTick at last save/hit)
+	buf    []byte         // unsafe.Slice view over ptr, len == snapshot size
+	ptr    unsafe.Pointer // PINNED backing store; released via pinFree in dropSnap
+	cap    int64          // allocation capacity (pool may hand back a larger buffer)
+	used   int64          // LRU stamp (snapTick at last save/hit)
+}
+
+// pinBuf is one pooled pinned allocation (capacity sz, pointer p).
+type pinBuf struct {
+	p  unsafe.Pointer
+	sz int64
+}
+
+// pinPoolCap bounds pinned bytes idling in the pool (beyond this, freed
+// snapshot buffers go back to the driver).
+const pinPoolCap int64 = 2 << 30
+
+// pinAlloc returns a pinned buffer of at least sz bytes, reusing the smallest
+// adequate pooled buffer when available (cudaMallocHost costs tens of ms).
+func (a *BatchAdapter) pinAlloc(sz int64) (unsafe.Pointer, int64) {
+	best := -1
+	for i, b := range a.pinPool {
+		if b.sz >= sz && (best < 0 || b.sz < a.pinPool[best].sz) {
+			best = i
+		}
+	}
+	if best >= 0 {
+		b := a.pinPool[best]
+		a.pinPool[best] = a.pinPool[len(a.pinPool)-1]
+		a.pinPool = a.pinPool[:len(a.pinPool)-1]
+		a.pinPoolBytes -= b.sz
+		return b.p, b.sz
+	}
+	p := C.gemma4_host_alloc(C.size_t(sz))
+	return p, sz
+}
+
+// pinFree returns a pinned buffer to the pool (or the driver when over cap).
+func (a *BatchAdapter) pinFree(p unsafe.Pointer, sz int64) {
+	if p == nil {
+		return
+	}
+	if a.pinPoolBytes+sz <= pinPoolCap {
+		a.pinPool = append(a.pinPool, pinBuf{p: p, sz: sz})
+		a.pinPoolBytes += sz
+		return
+	}
+	C.gemma4_host_free(p)
 }
 
 // defaultStateSnapBudget bounds host memory spent on state snapshots (~75 MiB
@@ -1059,8 +1120,15 @@ func (a *BatchAdapter) lookupSnap(prompt []int32) int {
 }
 
 func (a *BatchAdapter) dropSnap(i int) {
-	a.snapBytes -= int64(len(a.snaps[i].buf))
+	sn := a.snaps[i]
+	a.snapBytes -= int64(len(sn.buf))
+	sn.buf = nil
+	if sn.ptr != nil {
+		a.pinFree(sn.ptr, sn.cap)
+		sn.ptr = nil
+	}
 	a.snaps[i] = a.snaps[len(a.snaps)-1]
+	a.snaps[len(a.snaps)-1] = nil
 	a.snaps = a.snaps[:len(a.snaps)-1]
 }
 
@@ -1104,8 +1172,18 @@ func (a *BatchAdapter) SaveState(slot int, tokens []int32) {
 	for a.snapBytes+sz > a.snapBudget && len(a.snaps) > 0 {
 		a.dropLRU()
 	}
-	buf := make([]byte, sz)
+	// Off-heap, unzeroed, PINNED: q35_state_copy issues ~2·L small async copies,
+	// and pageable memory forces a driver bounce-buffer sync per copy (~250 ms
+	// per snapshot on GB10/CUDA-13); pinned memory makes them true DMA (~ms).
+	// (The earlier zeroed Go alloc was the previous incarnation of this cost.)
+	p, pcap := a.pinAlloc(sz)
+	if p == nil {
+		log.Printf("fucina: state-snapshot save failed (slot %d, %d tokens): gemma4_host_alloc(%d) returned nil", slot, n, sz)
+		return
+	}
+	buf := unsafe.Slice((*byte)(p), int(sz))
 	if err := a.eng.SeqStateSave(slot, buf, n); err != nil {
+		a.pinFree(p, pcap)
 		log.Printf("fucina: state-snapshot save failed (slot %d, %d tokens): %v", slot, n, err)
 		return
 	}
@@ -1113,6 +1191,8 @@ func (a *BatchAdapter) SaveState(slot int, tokens []int32) {
 	a.snaps = append(a.snaps, &seqStateSnap{
 		tokens: append([]int32(nil), key...),
 		buf:    buf,
+		ptr:    p,
+		cap:    pcap,
 		used:   a.snapTick,
 	})
 	a.snapBytes += sz

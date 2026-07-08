@@ -34,6 +34,11 @@ struct Layout {
     std::string final_norm_key;       // BF16 final norm
     int         n_layers = 0;
     int         full_attention_interval = 4;
+    // nvidia ModelOpt MIXED_PRECISION repack (e.g. nvidia/Qwen3.6-35B-A3B-NVFP4): attn/GDN
+    // projections are PER-TENSOR FP8 (`<w>_scale` F32 scalar, no `_scale_inv` block grid);
+    // experts / shared expert / lm_head are native NVFP4 (`<w>_scale` E4M3 per-16-group +
+    // `<w>_scale_2` F32 global). The fill path branches per tensor on the scale siblings.
+    bool        modelopt = false;
 };
 
 // tiny config.json scanners (substring; the FP8 config keys we read are unambiguous in text_config)
@@ -79,9 +84,10 @@ inline bool detect(const st::Model& m, Layout& out, std::string& err) {
     if (cj.empty()) { err = "no config.json next to checkpoint"; return false; }
     std::string mtype, qmethod;
     cfg_str(cj, "\"model_type\"", mtype);      // top-level "qwen3_5"
-    cfg_str(cj, "\"quant_method\"", qmethod);  // quantization_config.quant_method == "fp8"
+    cfg_str(cj, "\"quant_method\"", qmethod);  // "fp8" (Qwen block-FP8) or "modelopt" (nvidia NVFP4 repack)
     if (mtype.find("qwen3_5") == std::string::npos) { err = "config model_type is not qwen3_5"; return false; }
-    if (qmethod != "fp8") { err = "config quant_method is not fp8"; return false; }
+    if (qmethod != "fp8" && qmethod != "modelopt") { err = "config quant_method is not fp8/modelopt"; return false; }
+    out.modelopt = (qmethod == "modelopt");
 
     out.lm_prefix    = "model.language_model.";
     out.layer_prefix = out.lm_prefix + "layers.";

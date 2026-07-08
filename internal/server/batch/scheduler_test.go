@@ -260,6 +260,49 @@ func TestConcurrentRequestsBatchTogether(t *testing.T) {
 	}
 }
 
+// A burst of short requests hitting an IDLE scheduler is admitted in ONE pass
+// (uncapped idle one-shot admission), so the very first decode step already
+// advances every row — the rows start in lockstep instead of a one-per-pass
+// staggered ramp. Submitting before Start() makes the burst deterministic.
+func TestIdleBurstAdmitsInOnePass(t *testing.T) {
+	const n = 4
+	const maxNew = 5
+	eng := newMockEngine(n)
+	sched := New(eng, 16)
+
+	cols := make([]*collector, n)
+	dones := make([]chan Result, n)
+	for i := 0; i < n; i++ {
+		cols[i] = &collector{}
+		dones[i] = make(chan Result, 1)
+		if err := sched.Submit(Request{
+			Tokens: []int32{int32(i)},
+			MaxNew: maxNew,
+			Ctx:    context.Background(),
+			Emit:   cols[i].emit,
+			Done:   dones[i],
+		}); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	sched.Start()
+	defer sched.Shutdown()
+
+	for i := 0; i < n; i++ {
+		res := waitResult(t, dones[i])
+		if res.Reason != FinishLength {
+			t.Errorf("seq %d: reason = %q want %q", i, res.Reason, FinishLength)
+		}
+	}
+	steps := eng.steps()
+	if len(steps) == 0 {
+		t.Fatal("no StepBatch calls recorded")
+	}
+	if got := len(steps[0]); got != n {
+		t.Errorf("first StepBatch advanced %d slots, want %d (burst was not admitted in one pass)", got, n)
+	}
+}
+
 // (b) A request hitting a stop token is evicted and frees its slot for a queued
 // request.
 func TestStopTokenEvictsAndFreesSlot(t *testing.T) {

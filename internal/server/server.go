@@ -580,6 +580,36 @@ func (s *Server) SetBatchEngine(eng BatchEngine) bool {
 	depth := 3 * slots
 	s.scheduler = batch.New(eng, depth)
 	s.scheduler.Start()
+	// Warm the per-B CUDA decode graphs BEFORE serving (vLLM captures its graphs at
+	// startup for the same reason): a staircase of dummy sequences with MaxNew=1..slots
+	// makes the live batch shrink through every size, so each step_batch graph is
+	// captured here (~seconds) instead of mid-request under concurrent load, where a
+	// capture stalls the whole batch and staggers the rows.
+	func() {
+		dones := make([]chan batch.Result, 0, slots)
+		for i := 1; i <= slots; i++ {
+			done := make(chan batch.Result, 1)
+			if err := s.scheduler.Submit(batch.Request{
+				Tokens: []int32{760, 6511, 314},
+				MaxNew: i,
+				Ctx:    context.Background(),
+				Done:   done,
+			}); err != nil {
+				return // queue full/shutdown: serve anyway, graphs capture lazily
+			}
+			dones = append(dones, done)
+		}
+		warmT := time.Now()
+		for _, d := range dones {
+			select {
+			case <-d:
+			case <-time.After(2 * time.Minute):
+				log.Printf("fucina: batch graph warmup timed out — continuing")
+				return
+			}
+		}
+		log.Printf("fucina: batch decode graphs warmed (B=1..%d) in %.1fs", slots, time.Since(warmT).Seconds())
+	}()
 	// The single-flight inflight bound (default 4) would cap concurrency below
 	// the engine's slot budget, since each batched handler holds an inflight slot
 	// for its whole request. Grow it so up to Capacity() sequences can run
@@ -1340,17 +1370,47 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 // the scheduler delivers the terminal Done only AFTER its last Emit, draining
 // tokCh to empty after Done guarantees no in-flight token is lost.
 func drainTokens(tokCh <-chan int32, done <-chan batch.Result, onTok func(int32)) batch.Result {
+	return drainTokensBurst(tokCh, done, onTok, nil)
+}
+
+// drainTokensBurst is drainTokens with a burst boundary hook: onBurstEnd (when
+// non-nil) runs each time tokCh goes momentarily empty after at least one token
+// was processed. A streaming handler uses it to FLUSH once per burst instead of
+// once per token: under concurrent load tokens queue between handler wakeups,
+// so the per-token JSON/syscall/flush churn (16 streams × per-token flushes)
+// collapses ~an order of magnitude — CPU work that directly steals unified
+// LPDDR5X bandwidth from the GPU's decode step on GB10. An idle single stream
+// sees bursts of 1 and flushes per token exactly as before.
+func drainTokensBurst(tokCh <-chan int32, done <-chan batch.Result, onTok func(int32), onBurstEnd func()) batch.Result {
 	for {
 		select {
 		case t := <-tokCh:
 			onTok(t)
-		case res := <-done:
-			// Flush any tokens already queued before the terminal result.
+			// Drain everything already queued, then mark the burst boundary.
+		burst:
 			for {
 				select {
 				case t := <-tokCh:
 					onTok(t)
 				default:
+					break burst
+				}
+			}
+			if onBurstEnd != nil {
+				onBurstEnd()
+			}
+		case res := <-done:
+			// Flush any tokens already queued before the terminal result.
+			n := 0
+			for {
+				select {
+				case t := <-tokCh:
+					onTok(t)
+					n++
+				default:
+					if n > 0 && onBurstEnd != nil {
+						onBurstEnd()
+					}
 					return res
 				}
 			}
@@ -1396,20 +1456,28 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 	inChannel := s.dialect.StartsInReasoning(params.Thinking)
 	labelPending := false
 	var contentIDs, reasonIDs []int32
+	// Decode() is per-token concatenative (byte-level: each id maps to bytes with
+	// no cross-token state), so the running text accumulates per NEW token —
+	// byte-identical to re-decoding the whole slice, without the O(k²) churn that
+	// was measurably starving the GPU's unified-memory bandwidth at concurrency.
+	fullContent, fullReason := "", ""
 	emittedContent, emittedReason := "", ""
 	callIdx := 0
 	pendingClar := ""
 	stopped := false // we cancelled the sequence ourselves
 	stopReason := "" // finish_reason override for a self-initiated stop
 
+	// Deltas are written BUFFERED; drainTokensBurst flushes once per burst (see
+	// its doc — per-token flushes at concurrency starve the GPU's unified-memory
+	// bandwidth). Tool-call/error/terminal events keep immediate flushes.
 	emitContentDelta := func(text string) {
 		if legacy {
-			sse.event(CompletionStreamResponse{
+			sse.eventBuffered(CompletionStreamResponse{
 				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
 				Choices: []CompletionStreamChoice{{Index: 0, Text: text}},
 			})
 		} else {
-			sse.event(StreamResponse{
+			sse.eventBuffered(StreamResponse{
 				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
 				Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: text}}},
 			})
@@ -1420,7 +1488,7 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 			emitContentDelta(text)
 			return
 		}
-		sse.event(StreamResponse{
+		sse.eventBuffered(StreamResponse{
 			ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
 			Choices: []StreamChoice{{Index: 0, Delta: Delta{ReasoningContent: text}}},
 		})
@@ -1455,7 +1523,7 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 		}
 	}
 
-	res := drainTokens(tokCh, done, func(t int32) {
+	res := drainTokensBurst(tokCh, done, func(t int32) {
 		if stopped || s.tokenizer.IsStop(t) {
 			return
 		}
@@ -1500,7 +1568,8 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 				return
 			}
 			reasonIDs = append(reasonIDs, t)
-			full := s.tokenizer.Decode(reasonIDs)
+			fullReason += s.tokenizer.Decode([]int32{t})
+			full := fullReason
 			if labelPending { // gemma's "thought\n" label line — never emitted
 				nl := strings.IndexByte(full, '\n')
 				if nl < 0 {
@@ -1537,12 +1606,12 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 			return
 		}
 		contentIDs = append(contentIDs, t)
-		full := s.tokenizer.Decode(contentIDs)
-		if len(full) > len(emittedContent) {
-			emitContentDelta(full[len(emittedContent):])
-			emittedContent = full
+		fullContent += s.tokenizer.Decode([]int32{t})
+		if len(fullContent) > len(emittedContent) {
+			emitContentDelta(fullContent[len(emittedContent):])
+			emittedContent = fullContent
 		}
-	})
+	}, sse.flush)
 
 	s.logGenSpeed(genStart, generated)
 	finish := batchFinish(res, r.Context())

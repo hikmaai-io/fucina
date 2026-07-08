@@ -291,7 +291,17 @@ func main() {
 		}
 	} else if args.Interactive {
 		// ── Interactive REPL ─────────────────────────────────────────────
-		runInteractive(eng, tok, args)
+		// The Qwen3 family and Qwen3.5 hybrid are served ONLY through the paged
+		// multi-sequence path — their single-flight prefill entry points decline
+		// (gemma-layout only), so the dense REPL's kv.Prefill fails with "prefill
+		// failed". SeqFreeCapacity()>0 means the engine is in paged mode; route
+		// those to the paged REPL (SeqAdd + StepBatch on one slot). Gemma/dense
+		// single-flight stays on the original path.
+		if eng.SeqFreeCapacity() > 0 {
+			runInteractivePaged(eng, tok, args)
+		} else {
+			runInteractive(eng, tok, args)
+		}
 	} else {
 		// ── One-shot prompt ───────────────────────────────────────────────
 		runOneShot(eng, tok, args)

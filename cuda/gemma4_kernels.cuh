@@ -360,6 +360,13 @@ size_t gemma4_engine_q35_state_size(gemma4_engine_t *eng, int n_tokens);
 int    gemma4_engine_q35_state_save(gemma4_engine_t *eng, int slot, void *buf, int n_tokens);
 int    gemma4_engine_q35_state_restore(gemma4_engine_t *eng, int slot, const void *buf, int n_tokens);
 int    gemma4_engine_seq_ntokens(gemma4_engine_t *eng, int slot);
+// PINNED host allocation for state-snapshot buffers: q35_state_copy issues ~2·L
+// small async copies, and pageable memory forces a driver bounce-buffer sync per
+// copy (~250 ms per 35 MB snapshot measured on GB10/CUDA-13); pinned buffers make
+// them true async DMA (~ms). Returns NULL on failure; free ONLY with the matching
+// gemma4_host_free.
+void  *gemma4_host_alloc(size_t bytes);
+void   gemma4_host_free(void *p);
 
 // ─── Continuous batching (multi-sequence paged decode) ─────────────
 // All require paged mode (engine created with FUCINA_PAGED_KV). They drive B

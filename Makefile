@@ -29,7 +29,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 .PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
-        qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test \
+        qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
         qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
@@ -201,6 +201,17 @@ qwen35-batch-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_batch $(QWEN35_MODEL)"
 
+# Diverse-prompt burst-admission gate: LONG diverse prompts (wide tc-prefill path) admitted
+# back-to-back and decoded in lockstep must be bit-identical per row to solo runs, prefill
+# must be deterministic across repeats, and a 16-seq warmup staircase must not poison the
+# engine. Guards the conc-N diverse serving corruption (grouped-GEMM nondeterminism) and the
+# runtime-NQ flash-partials overflow — identical-prompt benches mask both.
+qwen35-burst-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_burst.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_burst \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_burst $(QWEN35_MODEL)"
+
 # ─── Qwen3.5 hybrid per-SLOT state snapshot gate (conversation cache) (GPU) ───
 # Saves a slot's hybrid state (GDN S + conv rings + FULL fp32 K/V prefix) mid-decode,
 # restores it into a DIFFERENT slot, and asserts the restored continuation is
@@ -238,6 +249,19 @@ qwen35-longctx-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_longctx $(QWEN35_MODEL) \
 		$(CURDIR)/cuda/qwen35_longctx_1k.ids $(CURDIR)/cuda/qwen35_longctx_4k.ids"
+
+# ─── Qwen3.5 chunked-prefill CONTINUATION (base>0) parity + timing gate (GPU) ───
+# One-shot seq_add vs seq_open + seq_prefill_chunk(1024, rest) on a 2400-token natural-text
+# prompt (first ids of qwen35_longctx_4k.ids), 24 greedy continuation tokens each — run with
+# BOTH the scalar continuation attention (g_fucina_q35_scalar_cont_attn=1) and the default
+# tensor-core one. Asserts the TC continuation tracks one-shot at least as well as the scalar
+# path (first token + 25-token agreement) and prints the continuation-chunk wall time of both.
+qwen35-chunk-parity-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_chunk_parity.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_chunk_parity \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_chunk_parity \
+		$(QWEN35_MOE_FP8_MODEL) $(CURDIR)/cuda/qwen35_longctx_4k.ids"
 
 # ─── Qwen3.5 FP8 block-quant decode GEMV standalone validation (GPU) ─────
 # Validates cuda/fp8_block.cuh (DeepSeek block-fp8 decode GEMV) vs a host dequant+dot reference

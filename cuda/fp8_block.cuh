@@ -98,6 +98,60 @@ static inline void fp8_block_gemm_launch(
     fp8_block_gemm_kernel<<<blocks, WPB * 32, 0, stream>>>(out, w, wscale, x, in_dim, out_dim, B);
 }
 
+// DUAL batched: gate AND up projections in ONE launch. The shared-expert gate/up have
+// out_dim=moe_shared_inter (512 on 35B-A3B) → a lone fp8_block_gemm launch fields only
+// out_dim warps and runs parallelism-capped at ~25 GB/s; doubling the grid (gate rows in
+// warps [0,out_dim), up rows in [out_dim,2*out_dim)) doubles the resident-warp pool and
+// halves the launch count. Each warp runs the EXACT per-row inner loop of
+// fp8_block_gemm_kernel on its slab → bitwise-identical outputs. Static grid → graph-safe.
+static __global__ void fp8_block_gemm_dual_kernel(
+    float *gout, float *uout, const uint8_t *gw, const uint8_t *uw,
+    const __nv_bfloat16 *gscale, const __nv_bfloat16 *uscale,
+    const float *x, int in_dim, int out_dim, int B)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * nwarps + warp;          // 0..2*out_dim: gate rows then up rows
+    if (row >= 2 * out_dim) return;
+    int gate = row < out_dim;
+    int idx = gate ? row : row - out_dim;          // output row within the projection
+    float               *out    = gate ? gout   : uout;
+    const uint8_t       *w      = gate ? gw     : uw;
+    const __nv_bfloat16 *wscale = gate ? gscale : uscale;
+    int nblk = in_dim / FP8BLK, sstride = in_dim / FP8BLK, srow = idx / FP8BLK;
+    const uint8_t *wrow = w + (size_t)idx * in_dim;
+    float acc[FP8_MAXB];
+    #pragma unroll
+    for (int b = 0; b < FP8_MAXB; b++) acc[b] = 0.0f;
+    for (int ib = 0; ib < nblk; ib++) {
+        float bs = __bfloat162float(wscale[(size_t)srow * sstride + ib]);
+        uchar4 wq = *((const uchar4 *)(wrow + ib * FP8BLK) + lane);   // 4 contiguous elems/lane
+        float wv[4];
+        { __nv_fp8_e4m3 w0, w1, w2, w3; w0.__x = wq.x; w1.__x = wq.y; w2.__x = wq.z; w3.__x = wq.w;
+          wv[0] = float(w0); wv[1] = float(w1); wv[2] = float(w2); wv[3] = float(w3); }
+        for (int b = 0; b < B; b++) {
+            float4 xv = *((const float4 *)(x + (size_t)b * in_dim + ib * FP8BLK) + lane);
+            acc[b] += bs * (wv[0]*xv.x + wv[1]*xv.y + wv[2]*xv.z + wv[3]*xv.w);
+        }
+    }
+    for (int b = 0; b < B; b++) {
+        float a = acc[b];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xFFFFFFFFu, a, o);
+        if (lane == 0) out[(size_t)b * out_dim + idx] = a;
+    }
+}
+
+static inline void fp8_block_gemm_dual_launch(
+    float *gout, float *uout, const uint8_t *gw, const uint8_t *uw,
+    const __nv_bfloat16 *gscale, const __nv_bfloat16 *uscale,
+    const float *x, int in_dim, int out_dim, int B, cudaStream_t stream)
+{
+    const int WPB = 4;
+    int blocks = (2 * out_dim + WPB - 1) / WPB;
+    fp8_block_gemm_dual_kernel<<<blocks, WPB * 32, 0, stream>>>(
+        gout, uout, gw, uw, gscale, uscale, x, in_dim, out_dim, B);
+}
+
 // GROUPED (MoE): out[total][out_dim] = per-expert W_e · X, where the `total` rows of X are grouped
 // expert-contiguously — expert e owns rows [coloff[e], coloff[e]+count[e]) and uses the FP8 weight
 // slab wbase + e*w_stride with block-scale sbase + e*s_stride. Mirrors dg_mmq_*_grouped but the
