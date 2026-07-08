@@ -18838,7 +18838,14 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // FP8 path at every batch size once the grouped GEMV landed, with the greedy oracle still
     // 8/8 and every self-test bitwise across a full day of gates. FUCINA_MOE_FP8=1 restores the
     // pure-FP8 serving as the escape hatch.
-    const bool q4k_mode = moe && !getenv("FUCINA_MOE_FP8");
+    // DENSE checkpoints (9B/27B, no experts) get the SAME treatment via the SAME put_w/FORMAT_Q4_K
+    // machinery: previously q4k_mode was `moe &&`-gated, so dense attn/GDN (already routed through
+    // put_w below) silently stayed FP8-only and dense FFN was hardcoded put_fp8 with no Q4_K path
+    // at all — an oversight, not a measured tradeoff (the requant is byte-for-byte the identical
+    // FP8-E4M3-weight + BF16-block-scale source format MoE already proves correct). Dropping the
+    // `moe &&` extends 8→4.5 bpw to attn+GDN+FFN on dense too (~40% of resident weight bytes on a
+    // bandwidth-bound decode = both a memory win and a direct decode-speed win).
+    const bool q4k_mode = !getenv("FUCINA_MOE_FP8");
     // Experts DEFAULT to NVFP4 (CUTLASS sm120 grouped block-scaled GEMM, 4.5 bpw): the tensor-core
     // tiles amortize the expert weight read across every token routed to the expert, where the
     // dp4a grouped GEMV is memory-LATENCY-bound (measured B=16 aggregate: identical-prompt
@@ -18973,9 +18980,9 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                 }
             }
         } else {
-            ok=ok && put_fp8(&T.ffn_gate,&T.fmt_gate, lk(l,"mlp.gate_proj.weight"), I, H);
-            ok=ok && put_fp8(&T.ffn_up,  &T.fmt_up,   lk(l,"mlp.up_proj.weight"),   I, H);
-            ok=ok && put_fp8(&T.ffn_down,&T.fmt_down, lk(l,"mlp.down_proj.weight"), H, I);
+            ok=ok && put_w(&T.ffn_gate,&T.fmt_gate, lk(l,"mlp.gate_proj.weight"), I, H);
+            ok=ok && put_w(&T.ffn_up,  &T.fmt_up,   lk(l,"mlp.up_proj.weight"),   I, H);
+            ok=ok && put_w(&T.ffn_down,&T.fmt_down, lk(l,"mlp.down_proj.weight"), H, I);
         }
         if(qwen35fp8::is_full(LO,l)){
             ok=ok && put_w(&T.attn_q,&T.fmt_q, lk(l,"self_attn.q_proj.weight"), 2*NQ*HD, H);
@@ -19104,8 +19111,8 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     if(moe && moe_alloc_scratch(eng)!=0) return -6;
     cudaDeviceSynchronize();
     if(cudaGetLastError()!=cudaSuccess){ fprintf(stderr,"qwen35_fp8_engine: upload error\n"); return -7; }
-    fprintf(stderr,"fucina: qwen35 FP8%s served via batched engine (%d layers, vocab %d, H %d, NKV %d%s, %.2f GiB)\n",
-            moe?"-MoE":"-dense", L, VOC, H, NKV,
+    fprintf(stderr,"fucina: qwen35 %s%s served via batched engine (%d layers, vocab %d, H %d, NKV %d%s, %.2f GiB)\n",
+            q4k_mode?"Q4_K-mixer":"FP8", moe?"-MoE":"-dense", L, VOC, H, NKV,
             moe?", E-experts slabbed":"", total/(1024.0*1024*1024));
     return 0;
 }
