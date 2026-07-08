@@ -647,7 +647,7 @@ static int dg_layer_ffn(dg_engine *e, int il, int n, int canvas){
     } else {
         CKR(cudaMemset(e->d_moeout,0,(size_t)n_embd*n*4),-1);  // dp4a grouped, all on stream 0
         dg_quantize_q8_1(e->d_xe_all,e->d_q8,e->d_q8d,e->d_q8s,n_embd,total,0);
-        dg_mmq_q4_K_grouped(e->d_gu_all,gue.dev,gslab,e->d_q8,e->d_q8d,e->d_q8s,e->d_coloff,e->d_count,DG_N_EXPERTS,n_embd,2*DG_EXPERT_FFN,0);
+        dg_mmq_q4_K_grouped(e->d_gu_all,gue.dev,gslab,e->d_q8,e->d_q8d,e->d_q8s,e->d_coloff,e->d_count,NULL,0,DG_N_EXPERTS,n_embd,2*DG_EXPERT_FFN,0);
         dg_split_gelu_mul(e->d_act_all,e->d_gu_all,DG_EXPERT_FFN,total,0);
         dg_quantize_q8_1(e->d_act_all,e->d_q8,e->d_q8d,e->d_q8s,DG_EXPERT_FFN,total,0);
         if(dwe.type==DG_GGML_Q8_0)      dg_mmq_q8_0_grouped(e->d_oe_all,dwe.dev,dslab,e->d_q8,e->d_q8d,e->d_q8s,e->d_coloff,e->d_count,DG_N_EXPERTS,DG_EXPERT_FFN,n_embd,0);

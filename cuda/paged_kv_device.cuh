@@ -503,16 +503,26 @@ __global__ void paged_sliding_attn_splitk_batched(
 // (qreg[E][4], element 4*(lane+32*e)+j), and the per-lane dot accumulates those 4
 // terms per group BEFORE the warp reduce. Matching this grouping is what makes the
 // dot product bit-identical to the contiguous path (FP add reassociation order).
-template<int NH, int HD, int MAX_SPLITS>
-__global__ void paged_global_attn_splitk_batched(
+// __launch_bounds__(NH*32): the kernel is launched warp-per-query-head = NH*32 threads, so the
+// bound is the ACTUAL block size, not a hard-coded 1024. The 31B GQA instance <32,4,512> = 1024
+// threads naturally wants ~89 regs/thread (89*1024 = 91k > the 64k regs/block HW limit) → the
+// bound caps it to 64 regs/thread (some spill) so the block fits. CRITICAL FIX: the old
+// hard-coded 1024 ALSO capped the 12B instance <16,1,512> (only 512 threads) to 64 regs and
+// forced a spill, even though 512 threads can use ~128 regs/thread (64k/512) with NO spill.
+// Making the bound NH*32 lets ptxas give the 512-thread instance its full register budget.
+// Numerics are unchanged either way (register allocation only).
+template<int NH, int NKV, int HD, int MAX_SPLITS>
+__global__ void __launch_bounds__(NH*32) paged_global_attn_splitk_batched(
     float *part_acc, float *part_m, float *part_l,   // slot (seq*MAX_SPLITS + split)
     const float *q,                                  // [n_seq][NH*HD] row-major
-    const pkv_t *k_pool, const pkv_t *v_pool,        // ONE layer's pool (nkv=1)
+    const pkv_t *k_pool, const pkv_t *v_pool,        // ONE layer's pool, token layout [NKV][HD]
     const PagedSeqView *views,
     int chunk, int block_tokens, int elems_per_token)
 {
     constexpr int E = HD / 128;      // groups of 4 dims per lane (4 at HD 512)
+    constexpr int GQ = NH / NKV;     // query heads per KV head (GQA; NKV=1 ⇒ MQA, kv_off=0)
     static_assert(HD % 128 == 0, "global lane slices require HD multiple of 128");
+    static_assert(NH % NKV == 0, "NH must be a multiple of NKV");
     int seq   = blockIdx.y;
     int split = blockIdx.x;
     PagedSeqView v = views[seq];
@@ -523,6 +533,9 @@ __global__ void paged_global_attn_splitk_batched(
     if (split >= n_splits) return;
     int h    = threadIdx.x >> 5;     // warp = query head
     int lane = threadIdx.x & 31;
+    // GQA: query head h reads KV head h/GQ, whose elements start at (h/GQ)*HD within the
+    // token's [NKV][HD] block (mirrors global_attn_splitk_rows_kernel's kvh indexing).
+    int kv_off = (h / GQ) * HD;
 
     int per = (len + n_splits - 1) / n_splits;
     int t0  = lo + split * per;
@@ -541,7 +554,7 @@ __global__ void paged_global_attn_splitk_batched(
         for (int e = 0; e < E; e++)
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                size_t idx = paged_elem_index(v, p, 4*(lane + 32*e) + j, block_tokens, elems_per_token);
+                size_t idx = paged_elem_index(v, p, kv_off + 4*(lane + 32*e) + j, block_tokens, elems_per_token);
                 kd[e][j] = (idx != (size_t)-1) ? pkv_fp8_to_float(k_pool[idx]) : 0.0f;
                 vd[e][j] = (idx != (size_t)-1) ? pkv_fp8_to_float(v_pool[idx]) : 0.0f;
             }

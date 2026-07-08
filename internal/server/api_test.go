@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"github.com/hikmaai-io/fucina/internal/chat"
 	"testing"
 )
 
@@ -73,7 +74,7 @@ func TestStopHit(t *testing.T) {
 func TestToolCallUniqueIDs(t *testing.T) {
 	raw := `<|tool_call>call:search{q: <|"|>a<|"|>}<tool_call|>` +
 		`<|tool_call>call:search{q: <|"|>b<|"|>}<tool_call|>`
-	_, calls := parseToolCalls(raw)
+	_, calls := chat.ParseToolCalls(raw)
 	if len(calls) != 2 {
 		t.Fatalf("got %d calls", len(calls))
 	}

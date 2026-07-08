@@ -61,6 +61,14 @@ func TestParseArgsDefaults(t *testing.T) {
 	if a.Seed != -1 {
 		t.Errorf("Seed = %d, want -1", a.Seed)
 	}
+	if a.GPUMemUtil != 0.90 {
+		t.Errorf("GPUMemUtil = %v, want 0.90", a.GPUMemUtil)
+	}
+
+	// --gpu-mem-util overrides the default.
+	if b, _ := mustParse(t, []string{"--gpu-mem-util", "0.20"}); b.GPUMemUtil != 0.20 {
+		t.Errorf("GPUMemUtil = %v, want 0.20", b.GPUMemUtil)
+	}
 
 	// No test-flag dispatch by default.
 	if tf.parser || tf.cuda || tf.vectors != "" {
@@ -154,6 +162,24 @@ func TestParseArgsTestFlags(t *testing.T) {
 	_, tf = mustParse(t, []string{"--test-vectors", "vec.json"})
 	if tf.vectors != "vec.json" {
 		t.Errorf("--test-vectors = %q, want vec.json", tf.vectors)
+	}
+}
+
+func TestParseArgsBatchImpliesPagedKV(t *testing.T) {
+	// Default: both off.
+	a, _ := mustParse(t, nil)
+	if a.Batch || a.PagedKV {
+		t.Errorf("defaults: Batch=%v PagedKV=%v, want both false", a.Batch, a.PagedKV)
+	}
+	// --paged-kv alone enables the paged engine but not the scheduler.
+	a, _ = mustParse(t, []string{"--paged-kv"})
+	if !a.PagedKV || a.Batch {
+		t.Errorf("--paged-kv: PagedKV=%v Batch=%v, want true/false", a.PagedKV, a.Batch)
+	}
+	// --batch implies --paged-kv (scheduler is a no-op without the paged engine).
+	a, _ = mustParse(t, []string{"--batch"})
+	if !a.Batch || !a.PagedKV {
+		t.Errorf("--batch: Batch=%v PagedKV=%v, want both true", a.Batch, a.PagedKV)
 	}
 }
 

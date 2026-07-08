@@ -1,0 +1,70 @@
+{
+  "recipes": {
+    "uniform-2bit (all NF2)": {
+      "blended_bpe": 0.3125,
+      "blended_bits": 2.5,
+      "gb_weights": 9.59250432,
+      "gb_total": 9.597831408,
+      "weighted_incr_relmse": 0.155763756233139,
+      "frac_elem_2bit": 1.0,
+      "frac_elem_3bit": 0.0,
+      "frac_elem_4bit": 0.0,
+      "tot_elem": 30696013824
+    },
+    "MIXED (embed+KV @4bit, rest 2bit)": {
+      "blended_bpe": 0.3428084648493544,
+      "blended_bits": 2.742467718794835,
+      "gb_weights": 10.522853376,
+      "gb_total": 10.528180464,
+      "weighted_incr_relmse": 0.13482929258229165,
+      "frac_elem_2bit": 0.8787661406025825,
+      "frac_elem_3bit": 0.0,
+      "frac_elem_4bit": 0.1212338593974175,
+      "tot_elem": 30696013824
+    },
+    "MIXED+ (embed+KV @4bit, attn_q @3bit, rest 2bit)": {
+      "blended_bpe": 0.3553622668579627,
+      "blended_bits": 2.8428981348637015,
+      "gb_weights": 10.908205056,
+      "gb_total": 10.913532144,
+      "weighted_incr_relmse": 0.12200010457399597,
+      "frac_elem_2bit": 0.7783357245337159,
+      "frac_elem_3bit": 0.10043041606886657,
+      "frac_elem_4bit": 0.1212338593974175,
+      "tot_elem": 30696013824
+    },
+    "LEAN (embed+KV @3bit NF3, rest 2bit)": {
+      "blended_bpe": 0.32765423242467717,
+      "blended_bits": 2.6212338593974174,
+      "gb_weights": 10.057678848,
+      "gb_total": 10.063005936,
+      "weighted_incr_relmse": 0.13838815140293576,
+      "frac_elem_2bit": 0.8787661406025825,
+      "frac_elem_3bit": 0.1212338593974175,
+      "frac_elem_4bit": 0.0,
+      "tot_elem": 30696013824
+    },
+    "uniform-4bit (NVFP4 ref)": {
+      "blended_bpe": 0.5625,
+      "blended_bits": 4.5,
+      "gb_weights": 17.266507776,
+      "gb_total": 17.271834864,
+      "weighted_incr_relmse": 0.0,
+      "frac_elem_2bit": 0.0,
+      "frac_elem_3bit": 0.0,
+      "frac_elem_4bit": 1.0,
+      "tot_elem": 30696013824
+    }
+  },
+  "bpe": {
+    "2": 0.3125,
+    "3": 0.4375,
+    "4": 0.5625
+  },
+  "bits": {
+    "2": 2.5,
+    "3": 3.5,
+    "4": 4.5
+  },
+  "f32_bytes": 5327088.0
+}

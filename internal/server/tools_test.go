@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"github.com/hikmaai-io/fucina/internal/chat"
 	"strings"
 	"testing"
 )
@@ -22,7 +23,7 @@ func TestRenderToolDeclarations(t *testing.T) {
 			}`),
 		},
 	}}
-	got := renderToolDeclarations(tools)
+	got := chat.RenderToolDeclarations(tools)
 	for _, want := range []string{
 		"<|tool>declaration:get_weather{",
 		`description:<|"|>Get the weather for a city<|"|>`,
@@ -41,7 +42,7 @@ func TestParseToolCalls(t *testing.T) {
 	// Simulated raw model output (markers preserved, as DecodeRaw would produce).
 	raw := "<|channel>thought\n<channel|>Let me check the weather." +
 		`<|tool_call>call:get_weather{city: <|"|>Paris<|"|>, unit: <|"|>celsius<|"|>, days: 3}<tool_call|>`
-	content, calls := parseToolCalls(raw)
+	content, calls := chat.ParseToolCalls(raw)
 	if content != "Let me check the weather." {
 		t.Errorf("content = %q, want %q", content, "Let me check the weather.")
 	}
@@ -66,7 +67,7 @@ func TestParseToolCalls(t *testing.T) {
 
 func TestParseMultipleToolCalls(t *testing.T) {
 	raw := `Sure.<|tool_call>call:a{x: 1}<tool_call|><|tool_call>call:b{y: <|"|>hi<|"|>}<tool_call|>`
-	content, calls := parseToolCalls(raw)
+	content, calls := chat.ParseToolCalls(raw)
 	if content != "Sure." {
 		t.Errorf("content = %q", content)
 	}
@@ -81,8 +82,8 @@ func TestToolCallRoundTrip(t *testing.T) {
 		Type:     "function",
 		Function: ToolCallFunction{Name: "search", Arguments: `{"q":"golang","limit":5}`},
 	}}
-	rendered := renderAssistantToolCalls(calls)
-	_, got := parseToolCalls(rendered)
+	rendered := chat.RenderAssistantToolCalls(calls)
+	_, got := chat.ParseToolCalls(rendered)
 	if len(got) != 1 || got[0].Function.Name != "search" {
 		t.Fatalf("round-trip calls = %+v", got)
 	}
@@ -99,7 +100,7 @@ func TestToolCallRoundTrip(t *testing.T) {
 }
 
 func TestToolResponseRender(t *testing.T) {
-	got := renderToolResponse("get_weather", "18C sunny")
+	got := chat.RenderToolResponse("get_weather", "18C sunny")
 	want := `<|tool_response>response:get_weather{value:<|"|>18C sunny<|"|>}<tool_response|>`
 	if got != want {
 		t.Errorf("got %q want %q", got, want)

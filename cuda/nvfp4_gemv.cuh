@@ -346,7 +346,7 @@ static inline void bf16_head_gemv1_launch(
     bf16_head_gemv1_kernel<<<blocks, 32 * BF16_HEAD_B_WARPS, 0, stream>>>(y, w, x, in_dim, out_dim);
 }
 
-template<int K>
+template<int K, int R>   // R = output rows per warp: 12 for K<=8, 6 for K<=16 (same ~96 acc regs)
 __global__ void bf16_head_gemv_batched_kernel(
     float*               __restrict__ y,    // [K][out_dim] token-major
     const __nv_bfloat16* __restrict__ w,    // [out_dim][in_dim]
@@ -355,33 +355,33 @@ __global__ void bf16_head_gemv_batched_kernel(
 {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row0 = (blockIdx.x * BF16_HEAD_B_WARPS + warp) * BF16_HEAD_B_ROWS;
+    const int row0 = (blockIdx.x * BF16_HEAD_B_WARPS + warp) * R;
     if (row0 >= out_dim) return;
-    const int nrow = min(BF16_HEAD_B_ROWS, out_dim - row0);
+    const int nrow = min(R, out_dim - row0);
 
-    float acc[BF16_HEAD_B_ROWS][K];
+    float acc[R][K];
     #pragma unroll
-    for (int r = 0; r < BF16_HEAD_B_ROWS; r++)
+    for (int r = 0; r < R; r++)
         #pragma unroll
         for (int c = 0; c < K; c++) acc[r][c] = 0.f;
 
     for (int k = lane; k < in_dim; k += 32) {
         const float* xp = xt + (size_t)k * K;       // K contiguous activation values for input k
         // Load all ROWS weights for this k first (independent loads → memory-level parallelism).
-        float wv[BF16_HEAD_B_ROWS];
+        float wv[R];
         #pragma unroll
-        for (int r = 0; r < BF16_HEAD_B_ROWS; r++) {
+        for (int r = 0; r < R; r++) {
             int rr = (r < nrow) ? r : 0;
             wv[r] = __bfloat162float(w[(size_t)(row0 + rr) * in_dim + k]);
         }
         #pragma unroll
-        for (int r = 0; r < BF16_HEAD_B_ROWS; r++) {
+        for (int r = 0; r < R; r++) {
             #pragma unroll
             for (int c = 0; c < K; c++) acc[r][c] += wv[r] * xp[c];
         }
     }
     #pragma unroll
-    for (int r = 0; r < BF16_HEAD_B_ROWS; r++) {
+    for (int r = 0; r < R; r++) {
         if (r >= nrow) break;
         #pragma unroll
         for (int c = 0; c < K; c++) {
@@ -394,19 +394,27 @@ __global__ void bf16_head_gemv_batched_kernel(
 }
 // Dispatch the batched BF16 head to its compile-time-K kernel. `xt` = transposed activation
 // [in_dim][K] (nvfp4_xT_launch). Output token-major [K][out_dim]. CUDA-graph-capturable.
+// K<=16 supported: one call reads the head weights ONCE for up to 16 rows (K 9..16 runs a
+// narrower 6-row warp tile to stay inside the register budget).
 static inline void bf16_head_gemv_batched_launch(
     float* y, const __nv_bfloat16* w, const float* xt,
     int in_dim, int out_dim, int K, cudaStream_t stream)
 {
-    const int per_blk = BF16_HEAD_B_WARPS * BF16_HEAD_B_ROWS;
+    const int rows = (K <= 8) ? BF16_HEAD_B_ROWS : 6;
+    const int per_blk = BF16_HEAD_B_WARPS * rows;
     unsigned blocks = (unsigned)((out_dim + per_blk - 1) / per_blk);
     dim3 b(32 * BF16_HEAD_B_WARPS), g(blocks);
-    #define BF16_HB_DISPATCH(NK) \
-        case NK: bf16_head_gemv_batched_kernel<NK><<<g,b,0,stream>>>( \
+    #define BF16_HB_DISPATCH(NK, NR) \
+        case NK: bf16_head_gemv_batched_kernel<NK, NR><<<g,b,0,stream>>>( \
                      y, w, xt, in_dim, out_dim); break;
     switch (K) {
-        BF16_HB_DISPATCH(1) BF16_HB_DISPATCH(2) BF16_HB_DISPATCH(3) BF16_HB_DISPATCH(4)
-        BF16_HB_DISPATCH(5) BF16_HB_DISPATCH(6) BF16_HB_DISPATCH(7) BF16_HB_DISPATCH(8)
+        BF16_HB_DISPATCH(1, BF16_HEAD_B_ROWS)  BF16_HB_DISPATCH(2, BF16_HEAD_B_ROWS)
+        BF16_HB_DISPATCH(3, BF16_HEAD_B_ROWS)  BF16_HB_DISPATCH(4, BF16_HEAD_B_ROWS)
+        BF16_HB_DISPATCH(5, BF16_HEAD_B_ROWS)  BF16_HB_DISPATCH(6, BF16_HEAD_B_ROWS)
+        BF16_HB_DISPATCH(7, BF16_HEAD_B_ROWS)  BF16_HB_DISPATCH(8, BF16_HEAD_B_ROWS)
+        BF16_HB_DISPATCH(9, 6)  BF16_HB_DISPATCH(10, 6) BF16_HB_DISPATCH(11, 6)
+        BF16_HB_DISPATCH(12, 6) BF16_HB_DISPATCH(13, 6) BF16_HB_DISPATCH(14, 6)
+        BF16_HB_DISPATCH(15, 6) BF16_HB_DISPATCH(16, 6)
         default: break;
     }
     #undef BF16_HB_DISPATCH

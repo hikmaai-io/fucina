@@ -216,6 +216,17 @@ extern "C" void dg_gelu_mul(float *out, const float *g, const float *u, int64_t 
     dg_gelu_mul_kernel<<<(n + 255) / 256, 256, 0, s>>>(out, g, u, n);
 }
 
+// SiLU-GLU over SEPARATE gate/up buffers: out = silu(g)*u, silu(x)=x*sigmoid(x). Qwen3-MoE keeps
+// gate and up as distinct expert slabs (ffn_gate_exps / ffn_up_exps), so the fused split variant
+// above is not usable — this consumes the two grouped-GEMM outputs directly.
+__global__ void dg_silu_mul_kernel(float *out, const float *g, const float *u, int64_t n) {
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i < n) { float x = g[i]; out[i] = (x / (1.0f + __expf(-x))) * u[i]; }
+}
+extern "C" void dg_silu_mul(float *out, const float *g, const float *u, int64_t n, cudaStream_t s) {
+    dg_silu_mul_kernel<<<(n + 255) / 256, 256, 0, s>>>(out, g, u, n);
+}
+
 // gateup is [2*half, ncols] column-major; out[half,ncols] = gelu(gateup[0:half]) * gateup[half:2half]
 __global__ void dg_split_gelu_mul_kernel(float *out, const float *gu, int half, int ncols) {
     int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
@@ -284,11 +295,16 @@ extern "C" void dg_embed_gather(float *dst, const float *tok, const int *ids, in
 }
 
 // per-token softmax over n_expert → top-k (selection sort) → normalize. One block per token.
+// Probs are computed ONCE in parallel into shared memory; the thread-0 selection then scans
+// smem (the old form recomputed expf inside the k×ne selection loop — 2048 SERIAL expf per
+// token, measured 178 µs/call = 21% of a B=1 MoE-35B decode step). Same expf(L-gmax)/denom
+// values and the same strict-> lowest-index tie-break → bit-identical selection and weights.
 __global__ void dg_softmax_topk_kernel(const float *logits, int ne, int topk, int *oidx, float *ow) {
     int t = blockIdx.x;
     const float *L = logits + (size_t)t * ne;
     __shared__ float sm[256];
     __shared__ float mx[256];
+    __shared__ float pr[256];   // per-expert probs (ne <= 256: DG 128, Qwen3.5-MoE 256)
     float m = -1e30f;
     for (int i = threadIdx.x; i < ne; i += blockDim.x) m = fmaxf(m, L[i]);
     mx[threadIdx.x] = m; __syncthreads();
@@ -299,15 +315,41 @@ __global__ void dg_softmax_topk_kernel(const float *logits, int ne, int topk, in
     sm[threadIdx.x] = se; __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) { if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s]; __syncthreads(); }
     float denom = sm[0];
-    // thread 0 does top-k selection on probs (ne=128, topk<=8 — cheap)
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) pr[i] = expf(L[i] - gmax) / denom;
+    __syncthreads();
+    // PARALLEL top-k selection: topk iterative block-wide argmax reductions (each thread scans its
+    // strided share, then a tree reduce picks the global max with LOWEST-index tie-break) instead of
+    // the old 2048 serial comparisons on thread 0 — the grid is only `tokens` blocks, so that serial
+    // tail dominated (~76 us/call = 7% of a B=8 MoE decode step). Result is bit-identical: strict '>'
+    // keeps the lowest index on ties, same probs, same renormalization.
+    __shared__ float rv[128];
+    __shared__ int   ri[128];
+    __shared__ int   chosen[64];   // topk <= 64
+    for (int k = 0; k < topk; k++) {
+        float bv = -1.f; int bi = 0x7fffffff;
+        for (int i = threadIdx.x; i < ne; i += blockDim.x) {
+            float p = pr[i];
+            if (p > bv || (p == bv && i < bi)) { bv = p; bi = i; }   // p==-1 sentinel for used (set below)
+        }
+        rv[threadIdx.x] = bv; ri[threadIdx.x] = bi; __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                float ov = rv[threadIdx.x + s]; int oi = ri[threadIdx.x + s];
+                if (ov > rv[threadIdx.x] || (ov == rv[threadIdx.x] && oi < ri[threadIdx.x])) {
+                    rv[threadIdx.x] = ov; ri[threadIdx.x] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        int bidx = ri[0];
+        if (threadIdx.x == 0) { chosen[k] = bidx; oidx[t * topk + k] = bidx; ow[t * topk + k] = rv[0]; }
+        __syncthreads();
+        if (threadIdx.x == 0) pr[bidx] = -1.f;   // mask the selected expert for the next iteration
+        __syncthreads();
+    }
     if (threadIdx.x == 0) {
         float probs_sum = 0.f;
-        bool used[DG_N_EXPERTS]; for (int i = 0; i < ne; i++) used[i] = false;
-        for (int k = 0; k < topk; k++) {
-            float best = -1.f; int bi = -1;
-            for (int i = 0; i < ne; i++) { if (!used[i]) { float p = expf(L[i] - gmax) / denom; if (p > best) { best = p; bi = i; } } }
-            used[bi] = true; oidx[t * topk + k] = bi; ow[t * topk + k] = best; probs_sum += best;
-        }
+        for (int k = 0; k < topk; k++) probs_sum += ow[t * topk + k];
         for (int k = 0; k < topk; k++) ow[t * topk + k] /= probs_sum;  // normalize top-k
     }
 }
@@ -772,6 +814,102 @@ extern "C" void dg_moe_route(const int* tki, const float* tkw, const float* pes,
     dg_moe_scatter_kernel<<<(n_assign+255)/256,256,0,s>>>(tki,tkw,pes,n_assign,n_used,cursor,src,csc);
 }
 
+// Same counting-sort route, but also records invpos[i]=pos — the grouped column assigned to
+// assignment i (= token·n_used + k). The cursor atomicAdd makes the column ORDER nondeterministic,
+// but invpos captures the exact (token,k)→column map so a later per-token reduce can sum each
+// token's contributions in FIXED k order (no atomics) and stay bit-identical run-to-run.
+__global__ void dg_moe_scatter_inv_kernel(const int* tki, const float* tkw, const float* pes,
+        int n_assign, int n_used, int* cursor, int* src, float* csc, int* invpos){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n_assign) return;
+    int ex=tki[i]; int pos=atomicAdd(&cursor[ex],1);
+    src[pos]=i/n_used; csc[pos]=tkw[i]*pes[ex]; invpos[i]=pos;
+}
+// Scan variant that ALSO compacts the ids of experts with count>0 into active[0..], padding -1 up
+// to n_slot. Lets a grouped expert GEMM launch a grid of n_slot=min(n_assign,n_expert) blocks
+// (STATIC per batch size → CUDA-graph-safe) instead of all n_expert — at decode B·topk ≪ n_expert
+// that removes thousands of early-return blocks per launch.
+__global__ void dg_moe_scan_active_kernel(const int* count, int* coloff, int* cursor,
+        int n_expert, int* active, int n_slot){
+    if(threadIdx.x==0){
+        int a=0, na=0;
+        for(int e=0;e<n_expert;e++){
+            coloff[e]=a; cursor[e]=a; a+=count[e];
+            if(count[e]>0 && na<n_slot) active[na++]=e;
+        }
+        for(int j=na;j<n_slot;j++) active[j]=-1;
+    }
+}
+// FUSED single-block route (decode/prefill-chunk sizes: n_assign<=4096, n_expert<=1024): one
+// kernel does zero+count (smem atomics), the exclusive scan + active compaction (thread 0 over
+// n_expert — cheap in smem), and the scatter — replacing memset+count+scan+scatter (4 launches,
+// and the single-thread GLOBAL-memory scan that measured 14.8 us/call). Outputs are identical:
+// count/coloff/active are deterministic; the scatter column order comes from atomicAdd cursors
+// exactly as before (nondeterministic order, invpos-compensated — see dg_moe_reduce).
+__global__ void dg_moe_route_inv_fused_kernel(const int* tki, const float* tkw, const float* pes,
+        int n_assign, int n_used, int n_expert, int* count, int* coloff, int* cursor,
+        int* src, float* csc, int* invpos, int* active, int n_slot){
+    extern __shared__ float dgri_sm[];       // raw dynamic smem (typed float TU-wide)
+    int *scount = (int *)dgri_sm, *scur = (int *)dgri_sm + n_expert;   // [n_expert] each
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) scount[e] = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_assign; i += blockDim.x) atomicAdd(&scount[tki[i]], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int a = 0, na = 0;
+        for (int e = 0; e < n_expert; e++) {
+            int c = scount[e];
+            coloff[e] = a; scur[e] = a; count[e] = c; a += c;
+            if (active && c > 0 && na < n_slot) active[na++] = e;
+        }
+        if (active) for (int j = na; j < n_slot; j++) active[j] = -1;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_assign; i += blockDim.x) {
+        int ex = tki[i]; int pos = atomicAdd(&scur[ex], 1);
+        src[pos] = i / n_used; csc[pos] = tkw[i] * pes[ex]; invpos[i] = pos;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) cursor[e] = scur[e];
+}
+
+// active/n_slot: optional (active=NULL skips) compacted active-expert list, see scan_active above.
+extern "C" void dg_moe_route_inv(const int* tki, const float* tkw, const float* pes,
+        int n_tokens, int n_used, int n_expert, int* count, int* coloff, int* cursor,
+        int* src, float* csc, int* invpos, int* active, int n_slot, cudaStream_t s){
+    int n_assign=n_tokens*n_used;
+    if (n_assign <= 4096 && n_expert <= 1024) {
+        dg_moe_route_inv_fused_kernel<<<1, 256, (size_t)2*n_expert*sizeof(int), s>>>(
+            tki, tkw, pes, n_assign, n_used, n_expert, count, coloff, cursor,
+            src, csc, invpos, active, n_slot);
+        return;
+    }
+    cudaMemsetAsync(count,0,(size_t)n_expert*4,s);
+    dg_moe_count_kernel<<<(n_assign+255)/256,256,0,s>>>(tki,n_assign,count);
+    if(active) dg_moe_scan_active_kernel<<<1,32,0,s>>>(count,coloff,cursor,n_expert,active,n_slot);
+    else       dg_moe_scan_kernel<<<1,32,0,s>>>(count,coloff,cursor,n_expert);
+    dg_moe_scatter_inv_kernel<<<(n_assign+255)/256,256,0,s>>>(tki,tkw,pes,n_assign,n_used,cursor,src,csc,invpos);
+}
+
+// Deterministic per-token expert reduce. out[t] = Σ_k oe[invpos[t·n_used+k]]·csc[invpos[...]],
+// summed in fixed k order. For a fixed (t,k), both oe[pos] (that token's k-th expert output) and
+// csc[pos] (its router weight) are value-deterministic regardless of the nondeterministic column
+// order, so this fully replaces the atomicAdd scatter-add and removes all MoE float nondeterminism.
+// One block per token; out is fully written (no pre-memset needed).
+__global__ void dg_moe_reduce_kernel(float* out, const float* oe, const int* invpos,
+        const float* csc, int feat, int n_used){
+    int t=blockIdx.x;
+    for(int h=threadIdx.x; h<feat; h+=blockDim.x){
+        float acc=0.f;
+        for(int k=0;k<n_used;k++){ int pos=invpos[t*n_used+k]; acc += oe[(size_t)pos*feat+h]*csc[pos]; }
+        out[(size_t)t*feat+h]=acc;
+    }
+}
+extern "C" void dg_moe_reduce(float* out, const float* oe, const int* invpos, const float* csc,
+        int feat, int n_tokens, int n_used, cudaStream_t s){
+    if(n_tokens<=0) return;
+    dg_moe_reduce_kernel<<<n_tokens,256,0,s>>>(out,oe,invpos,csc,feat,n_used);
+}
+
 // Grouped expert Q4_K — narrow-column tiled MMQ (BM=64 × BN=16). Keeps the tiled kernel's smem
 // activation reuse (one staged column tile feeds all 64 rows → ~out_dim/64 L2 re-reads, vs
 // out_dim× for a warp-per-row scheme) AND removes the BN=64 padding waste: BN=16 ≈ the average
@@ -836,19 +974,24 @@ __device__ __forceinline__ void dg_mmq16_q4_K_tile(
 }
 __global__ void __launch_bounds__(256,6) dg_mmq_q4_K_grouped_kernel(float* out, const uint8_t* wbase, int64_t slab_stride,
         const int8_t* qx, const float* dx, const int* sx,
-        const int* coloff, const int* count, int in_dim, int out_dim){
-    int e=blockIdx.y; int ne=count[e]; if(ne==0) return; int co=coloff[e];
+        const int* coloff, const int* count, const int* active, int in_dim, int out_dim){
+    // active (optional): compacted active-expert list so a DECODE-sized grid.y = B·topk replaces
+    // the full-E grid (E=256 → ~248 early-return blocks per launch at B=1). Same as the FP8
+    // grouped kernel's indirection; -1 pads return immediately.
+    int e = active ? active[blockIdx.y] : (int)blockIdx.y;
+    if(e<0) return;
+    int ne=count[e]; if(ne==0) return; int co=coloff[e];
     const uint8_t* weight=wbase+(size_t)e*slab_stride; int rb=blockIdx.x*DG_GBM;
     for(int cb=0; cb<ne; cb+=DG_GBN){ int nc=ne-cb; if(nc>DG_GBN) nc=DG_GBN;
         dg_mmq16_q4_K_tile(out,weight,qx,dx,sx,in_dim,out_dim,rb,co+cb,nc); __syncthreads(); }
 }
 extern "C" void dg_mmq_q4_K_grouped(float* out, const void* wbase, int64_t slab_stride,
         const int8_t* qx, const float* dx, const int* sx,
-        const int* coloff, const int* count, int n_expert,
+        const int* coloff, const int* count, const int* active, int n_slot, int n_expert,
         int in_dim, int out_dim, cudaStream_t s){
-    dim3 g((unsigned)((out_dim+DG_GBM-1)/DG_GBM), (unsigned)n_expert);
+    dim3 g((unsigned)((out_dim+DG_GBM-1)/DG_GBM), (unsigned)(active ? n_slot : n_expert));
     dg_mmq_q4_K_grouped_kernel<<<g,256,0,s>>>(
-        out,(const uint8_t*)wbase,slab_stride,qx,dx,sx,coloff,count,in_dim,out_dim);
+        out,(const uint8_t*)wbase,slab_stride,qx,dx,sx,coloff,count,active,in_dim,out_dim);
 }
 
 // ── 32-block formats (Q8_0, Q5_0) — the expert/dense `down` projection ───────────────────
