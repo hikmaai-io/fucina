@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
     const int NP = 5;
     const int WARM = 16, STEPS = 256;
 
-    gemma4_engine_t *eng = gemma4_engine_create(path, FORMAT_Q4_0, 8192, 0, 0.90);
+    gemma4_engine_t *eng = gemma4_engine_create(path, FORMAT_Q4_0, 8192, 0);
     if (!eng) { fprintf(stderr, "create failed\n"); return 2; }
 
     // ---- single-stream decode ----

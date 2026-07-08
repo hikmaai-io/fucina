@@ -71,10 +71,36 @@ def single(base_url, model, prompt, max_tokens, ignore_eos, reps=3):
             "decode_tps": statistics.median(tpss),
             "ntok": res[-1]["ntok"], "sample": res[-1]["text"]}
 
-def concurrency(base_url, model, prompt, max_tokens, ignore_eos, N):
+# Diverse-prompt pool: each concurrent stream gets a DIFFERENT prompt (cycled by index),
+# so MoE routing/KV state genuinely diverges across rows instead of every row computing
+# the same value. An identical-prompt concurrency sweep cannot detect row-mixing or
+# nondeterministic-GEMM corruption (every row's output is indistinguishable from any
+# other's) and can also read faster than steady state on MoE checkpoints (convergent
+# routing needs fewer distinct expert weights per step). See memory: grouped-gemm-broken-gb10.
+DIVERSE_PROMPTS = [
+    "Reply with one short sentence: what is the capital of France?\n\nAnswer:",
+    "Write two sentences about photosynthesis.\n\nAnswer:",
+    "Name three prime numbers below 20 and explain briefly.\n\nAnswer:",
+    "What is 137 + 265? Show the addition.\n\nAnswer:",
+    "Translate 'good morning' into French, German, and Spanish.\n\nAnswer:",
+    "Explain recursion in programming in one paragraph.\n\nAnswer:",
+    "Describe the water cycle in three sentences.\n\nAnswer:",
+    "What year did World War II end, and who were the main allied powers?\n\nAnswer:",
+    "Reply with one short sentence: what is the capital of Japan?\n\nAnswer:",
+    "Explain the difference between TCP and UDP in two sentences.\n\nAnswer:",
+    "What is the boiling point of water in Celsius and Fahrenheit?\n\nAnswer:",
+    "Write a short haiku about autumn leaves.\n\nAnswer:",
+    "Name the largest planet in the solar system and one fact about it.\n\nAnswer:",
+    "What is 17 multiplied by 23? Show your work.\n\nAnswer:",
+    "Explain what a hash table is in one paragraph.\n\nAnswer:",
+    "Describe the causes of the French Revolution in three sentences.\n\nAnswer:",
+]
+
+def concurrency(base_url, model, prompt, max_tokens, ignore_eos, N, diverse=False, verify_sample=0):
     results = [None] * N
+    prompts = [DIVERSE_PROMPTS[i % len(DIVERSE_PROMPTS)] for i in range(N)] if diverse else [prompt] * N
     def work(i):
-        results[i] = one_request(base_url, model, prompt, max_tokens, ignore_eos)
+        results[i] = one_request(base_url, model, prompts[i], max_tokens, ignore_eos)
     t0 = time.perf_counter()
     threads = [threading.Thread(target=work, args=(i,)) for i in range(N)]
     for t in threads: t.start()
@@ -84,8 +110,12 @@ def concurrency(base_url, model, prompt, max_tokens, ignore_eos, N):
     agg_tps = total_decode / wall
     ttfts = [r["ttft"] * 1000 for r in results if r]
     per_tps = [r["decode_tps"] for r in results if r]
-    return {"N": N, "agg_decode_tps": agg_tps, "median_ttft_ms": statistics.median(ttfts),
-            "median_per_stream_tps": statistics.median(per_tps), "wall_s": wall}
+    out = {"N": N, "agg_decode_tps": agg_tps, "median_ttft_ms": statistics.median(ttfts),
+           "median_per_stream_tps": statistics.median(per_tps), "wall_s": wall}
+    if verify_sample:
+        out["samples"] = [{"prompt": prompts[i][:60], "text": (results[i] or {}).get("text", "")[:150]}
+                          for i in range(min(verify_sample, N))]
+    return out
 
 def main():
     ap = argparse.ArgumentParser()
@@ -96,6 +126,13 @@ def main():
     ap.add_argument("--long-tokens", type=int, default=3500)
     ap.add_argument("--ignore-eos", action="store_true")
     ap.add_argument("--conc", default="1,2,4,8")
+    ap.add_argument("--diverse", action="store_true",
+                    help="cycle a pool of distinct prompts across concurrent streams instead of "
+                         "repeating one identical prompt (required to detect row-mixing/GEMM "
+                         "corruption and to avoid MoE convergent-routing bias)")
+    ap.add_argument("--verify-sample", type=int, default=0,
+                    help="include the first N streams' prompt+output text in the concurrency "
+                         "results for manual correctness spot-check")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -111,9 +148,12 @@ def main():
     print(f"[{args.label}] single long ctx (~{args.long_tokens} tok) ...", flush=True)
     out["single_long"] = single(args.base_url, args.model, long_prompt, args.max_tokens, args.ignore_eos, reps=2)
     out["concurrency"] = []
+    out["diverse"] = args.diverse
     for N in [int(x) for x in args.conc.split(",")]:
-        print(f"[{args.label}] concurrency N={N} ...", flush=True)
-        out["concurrency"].append(concurrency(args.base_url, args.model, short_prompt, args.max_tokens, args.ignore_eos, N))
+        print(f"[{args.label}] concurrency N={N}{' (diverse prompts)' if args.diverse else ''} ...", flush=True)
+        out["concurrency"].append(concurrency(args.base_url, args.model, short_prompt, args.max_tokens,
+                                              args.ignore_eos, N, diverse=args.diverse,
+                                              verify_sample=args.verify_sample))
 
     print(json.dumps(out, indent=2))
     if args.out:

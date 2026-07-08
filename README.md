@@ -223,6 +223,29 @@ weight-load width. Single-token decode on GB10 is **bandwidth-bound on total wei
 wider (128-bit) loads change instruction count but not bytes and do not help. Watch the
 `speculation` block in `/metrics` (`accept_rate`, `tokens_per_forward`) to observe τ live.
 
+### Measured throughput & memory
+
+Single-stream decode on the **GB10** (`sm_121a`, CUDA 13, temperature 0). Decode is the
+steady-state, bandwidth-bound metric; resident is the weight footprint (KV cache adds the
+context-dependent amount in the note above).
+
+| Model | Format | Decode (tok/s) | Weights resident |
+|-------|--------|---------------:|-----------------:|
+| **Gemma-4-12B-it** | Q4_0 (QAT) | ~28 base · **~57** with MTP | ~8.0 GB¹ |
+| **Gemma-4-E4B-it** | Q4_0 (QAT), native dp4a MMVQ | **45.2** | **7.05 GB** |
+
+¹ 6.96 GB packed-Q4_0 decode copy + 1.0 GB (Q6_K→Q8_0 head); `FUCINA_NO_PACKED=1` drops ~7 GB.
+
+**Gemma-4-E4B decode path** — same checkpoint, decode speed is purely a function of the weight
+bytes read per token. The native Q4_0 path reads the original QAT nibbles directly via the shared
+dp4a MMVQ kernels (the same ones the 12B uses), **2.6× faster than BF16 decode at ~half the memory**:
+
+| E4B decode path | Decode (tok/s) | Weights resident @ 4096 ctx |
+|-----------------|---------------:|----------------------------:|
+| BF16 (dequantized at load) | 17.6 | ~12.5 GB |
+| NVFP4 hybrid (re-quant) | 38.6 | 15.4 GB |
+| **native Q4_0 (dp4a MMVQ)** | **45.2** | **7.05 GB** |
+
 ---
 
 ## 🖥️ Hardware support
@@ -312,6 +335,26 @@ hf download unsloth/diffusiongemma-26B-A4B-it-GGUF \
 > If you place a dense model at `./gemma-4-12b-it.gguf`, `./model.gguf`, or `./gguf/model.gguf`,
 > fucina finds it automatically when `-m` is omitted. The reported model id is derived from the
 > GGUF filename.
+
+### Gemma 4 E4B (Per-Layer Embeddings)
+
+fucina also runs **Gemma-4-E4B-it** — the effective-4B variant (Per-Layer Embeddings, KV-sharing,
+runtime-detected dims) — through a separate engine, auto-selected from the GGUF metadata (no flag).
+Decode reads the original **Q4_0 QAT nibbles** directly via the shared dp4a MMVQ kernels and a
+native Q6_K tied head; the BF16 projections are freed after load, so the weight footprint is
+**~7 GB** (see [Performance](#-performance)). Q4_K_M / Q5_K / BF16 GGUFs also load.
+
+```sh
+# Q4_0 (QAT) — official Google E4B GGUF
+hf download google/gemma-4-E4B-it-qat-q4_0-gguf \
+  gemma-4-E4B_q4_0-it.gguf --local-dir ./models
+
+./fucina -m ./models/gemma-4-E4B_q4_0-it.gguf --interactive   # same REPL commands as the 12B
+```
+
+The E4B REPL shares the dense command surface (`/help`, `/thinking`, `/stats`, `/reset`, `/quit`)
+and `--thinking off|on|low|medium|high|xhigh`. Server mode and the MTP draft head are not wired for
+E4B yet.
 
 ### Native NVFP4 (safetensors)
 

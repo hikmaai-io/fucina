@@ -42,6 +42,7 @@ type CLIArgs struct {
 	Spec         bool
 	DraftK       int
 	ThinkBudget  int     // server: reasoning-channel token budget (0=auto, <0=off)
+	Raw          bool    // -p: feed the prompt verbatim (no chat template) — base completion / benchmarks
 	KVSnapshotGB float64 // server: host-memory budget for saved KV sequences (0 = off)
 	CudaGraphs   bool    // --cuda-graphs (experimental, off by default)
 
@@ -56,21 +57,25 @@ type CLIArgs struct {
 	MaxOutputToks int    // absolute per-request output-token ceiling; 0 = no extra cap
 	PagedKV       bool   // --paged-kv: allocate the paged multi-sequence KV pools (sets FUCINA_PAGED_KV)
 	Batch         bool   // --batch: route /v1/* through the continuous-batching scheduler (implies --paged-kv)
-	// llama-compat concurrency flags consumed by the Gemma-4-E4B path (its own engine sizes its
-	// slot pool from these). Parallel is the desired concurrent-slot count; ContBatching enables
-	// the per-step batched decode on the E4B server.
-	Parallel      int    // --parallel / -np: concurrent decode slots (E4B)
-	ContBatching  bool   // --cont-batching: enable E4B continuous batching
+	// Continuous batching (llama.cpp-compatible). Batching is enabled when ContBatching
+	// is set or Parallel > 1. Parallel is the desired concurrent-slot count (capped by the
+	// engine's slot budget). FlashAttn is accepted for llama compatibility (fucina always
+	// uses flash/FP8 attention) and is otherwise a no-op.
+	Parallel       int
+	ContBatching   bool
+	NoContBatching bool
+	FlashAttn      string
+	ThreadsHTTP    int    // alias of MaxConcurrent (llama --threads-http)
 
 	// System
-	System     string
-	Verbose    bool
-	Timings    bool
-	DeviceID   int
+	System   string
+	Verbose  bool
+	Timings  bool
+	DeviceID int
 	GPUMemUtil float64 // --gpu-mem-util: fraction of total device mem the engine may use (vLLM-style)
-	Memory     string
-	Debug      bool
-	LogLevel   string
+	Memory   string
+	Debug    bool
+	LogLevel string
 
 	// Mode
 	Interactive bool
@@ -175,24 +180,23 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 		"Allocate the paged multi-sequence KV pools (prerequisite for --batch; equivalent to FUCINA_PAGED_KV=1)")
 	fs.BoolVar(&a.Batch, "batch", false,
 		"Continuous batching: serve concurrent requests through the per-step scheduler (implies --paged-kv). OFF by default; no MTP spec decode in this path.")
-	// llama-compat aliases consumed by the Gemma-4-E4B engine.
-	fs.IntVar(&a.Parallel, "parallel", 1, "Gemma-4-E4B: number of concurrent decode slots")
-	fs.IntVar(&a.Parallel, "np", 1, "Gemma-4-E4B: number of concurrent decode slots (alias of --parallel)")
-	fs.BoolVar(&a.ContBatching, "cont-batching", false, "Gemma-4-E4B: enable continuous batching on the E4B server")
+	// Continuous batching (llama.cpp-compatible aliases).
+	fs.IntVar(&a.Parallel, "parallel", 0, "Server: max concurrent sequences via continuous batching (>1 enables it; like llama --parallel)")
+	fs.IntVar(&a.Parallel, "np", 0, "Server: max concurrent sequences via continuous batching (alias of --parallel)")
+	fs.BoolVar(&a.ContBatching, "cont-batching", false, "Server: enable continuous batching (now DEFAULT-on; accepted as a no-op for llama compatibility)")
+	fs.BoolVar(&a.NoContBatching, "no-cont-batching", false, "Server: disable continuous batching / paged-KV multi-seq (single-flight; Gemma only — Qwen3 requires the batch path)")
+	fs.StringVar(&a.FlashAttn, "flash-attn", "", "Accepted for llama compatibility; fucina always uses flash/FP8 attention (no-op)")
+	fs.IntVar(&a.ThreadsHTTP, "threads-http", 0, "Server: max concurrent HTTP inference requests (alias of --max-concurrent)")
 
 	fs.StringVar(&a.System, "s", "", "System prompt")
 	fs.StringVar(&a.System, "system", "", "System prompt")
+	fs.BoolVar(&a.Raw, "raw", false, "-p: feed the prompt verbatim, no chat template (base completion / benchmarks)")
 	fs.BoolVar(&a.Verbose, "v", false, "Verbose output")
 	fs.BoolVar(&a.Verbose, "verbose", false, "Verbose output")
 	fs.BoolVar(&a.Timings, "timings", false, "Show timing information")
 	fs.BoolVar(&a.Debug, "debug", false, "Dump full request bodies + rendered prompts to "+"/tmp/fucina_debug.log")
 	fs.StringVar(&a.LogLevel, "log-level", "info", "Log level: info|debug (debug also dumps requests)")
 	fs.IntVar(&a.DeviceID, "cuda-device", 0, "CUDA device ID")
-	// GPU-memory budget (vLLM-style). The engine fits weights + KV + scratch +
-	// (optionally) the packed-Q4_0 decode copy under this fraction of total device
-	// memory, auto-capping ctx and dropping the packed copy as needed to satisfy it.
-	// Default 0.90 is behavior-preserving where everything already fits (e.g. the
-	// 128 GB GB10); lower it to share the GPU or fit a smaller host.
 	fs.Float64Var(&a.GPUMemUtil, "gpu-mem-util", 0.90,
 		"Fraction of total GPU memory the engine may use (0<F<=1); caps ctx / drops the packed-Q4_0 copy to fit")
 	fs.StringVar(&a.Memory, "mlock", "", "mlock model in memory (unused on CUDA)")
@@ -216,6 +220,17 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	if a.DiffModelPath != "" {
 		a.ModelPath = a.DiffModelPath
 		a.FP4MoE = true
+	}
+	// llama-compatible aliases: --threads-http feeds the admission limit; --parallel implies
+	// continuous batching (and seeds the admission limit if --max-concurrent is unset).
+	if a.ThreadsHTTP > 0 && a.MaxConcurrent == 0 {
+		a.MaxConcurrent = a.ThreadsHTTP
+	}
+	if a.Parallel > 1 {
+		a.ContBatching = true
+		if a.MaxConcurrent == 0 {
+			a.MaxConcurrent = a.Parallel
+		}
 	}
 	// --batch needs the paged multi-sequence engine; the scheduler is a no-op without it.
 	if a.Batch {

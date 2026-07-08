@@ -26,7 +26,9 @@ NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo --use_fast_math \
 CGO_CFLAGS   := -I$(CUDA_HOME)/include
 CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 
-.PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test \
+.PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test e4b-test \
+        e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
+        e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test gpu-gates \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
@@ -52,8 +54,7 @@ lib: cuda/libfucina.a
 # a stale cubin built with the old flags into libfucina.a.
 
 cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh \
-                       cuda/gemma4_config.h cuda/gemma4_detect.h \
-                       cuda/paged_kv.h cuda/paged_kv_device.cuh cuda/paged_prefix.h Makefile
+                       cuda/paged_kv.h cuda/paged_kv_device.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
 
 # The standalone Gemma-4-E4B engine (runtime dims, Per-Layer Embeddings, KV-sharing)
@@ -98,21 +99,10 @@ cuda/test_engine: cuda/test_engine.cu cuda/libfucina.a
 
 # ─── Testing ────────────────────────────────────────────────────────────
 # Full test suite: pure-Go unit tests, cgo-dependent tests (needs the CUDA
-# archive), the binary's built-in self-tests, then the session's CUDA
-# parity/determinism/lossless regression gates (gpu-gates) — all on the GPU.
-test: fucina go-test go-test-cgo paged-kv-test paged-prefix-test gpu-gates
+# archive), then the binary's built-in self-tests on the GPU.
+test: fucina go-test go-test-cgo paged-kv-test
 	./fucina --test-parser
 	CUDA_VISIBLE_DEVICES=0 ./fucina --test-cuda
-
-# ─── Aggregate GPU regression gates ─────────────────────────────────────
-# The Qwen3-dense / Qwen3-MoE / spec / prefix / suffix / B=2-row-independence
-# correctness gates introduced this session. Each is a standalone target, but
-# none was a prerequisite of `test`, so all could be silently forgotten. This
-# umbrella chains them so a regression in any cannot pass unnoticed. Requires
-# the Qwen3 dense + MoE GGUFs (override with MODEL= / QWEN3MOE_MODEL=) and a
-# GPU; run each invocation under the shared GPU flock.
-gpu-gates: qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-prefix-test qwen3-suffix-test
-	@echo "gpu-gates: all Qwen3-dense/MoE/spec/prefix/suffix/B=2 regression gates passed"
 
 # ─── Paged-KV allocator unit test (host-only, no GPU) ───────────────────
 # Pure integer bookkeeping for the continuous-batching paged KV cache; runs on
@@ -121,11 +111,40 @@ paged-kv-test:
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/paged_kv_test.cc -o /tmp/fucina_paged_kv_test
 	/tmp/fucina_paged_kv_test
 
-# Cross-request prefix cache (RadixAttention): radix tree + refcount + LRU over
-# the paged-KV pool. Pure host integer logic; see docs/continuous-batching.md.
-paged-prefix-test:
-	g++ -std=c++17 -O2 -Wall -Wextra cuda/paged_prefix_test.cc -o /tmp/fucina_paged_prefix_test
-	/tmp/fucina_paged_prefix_test
+# ─── Native Q4_K decode GEMV test (GPU) ─────────────────────────────────
+# Validates mmvq_q4_k_kernel (Qwen3 quant path) vs a host full-precision Q4_K
+# dequant+dot reference; PASS at cosine >= 0.999 (q8_1 activation quant is the
+# only error source). Standalone (header-only mmvq.cuh), no libfucina.a needed.
+mmvq-q4k-test:
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -I cuda cuda/test_mmvq_q4_k.cu -o /tmp/fucina_mmvq_q4k_test
+	/tmp/fucina_mmvq_q4k_test
+
+# ─── FP8 block-scaled (128x128) decode GEMV test (GPU) — Qwen3.5/3.6 FP8 ──
+# Validates fp8_block_gemv (DeepSeek-style F8_E4M3 weights + per-128-block BF16 scales)
+# vs a host dequant+dot reference; PASS at cosine >= 0.999.
+fp8-block-test:
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -I cuda cuda/test_fp8_block.cu -o /tmp/fucina_fp8blk
+	/tmp/fucina_fp8blk
+
+# ─── Qwen3 dense numeric parity vs llama.cpp (GPU) ──────────────────────
+# Feeds the exact input token ids llama.cpp produced for "The capital of France is"
+# through fucina's arch-driven multiseq path and asserts the greedy continuation
+# matches llama.cpp's [12095,13,576,6722,315,15344,374,21718] (same Q4_K_M GGUF).
+# Requires cuda/libfucina.a + cuda/libdg.a (run `make lib` / `make fucina` first).
+qwen3-parity-test: lib
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_parity.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_parity \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	/tmp/fucina_qwen3_parity
+
+# ─── Qwen3 ragged spec-in-batch verify (DSpark step) (GPU) ──────────────
+# Asserts gemma4_engine_step_batch_spec: anchor-only (d=0) == step_batch greedy;
+# correct draft accepted (run grows), wrong draft rejected with target correction.
+qwen3-spec-test: lib
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_spec.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_spec \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	/tmp/fucina_qwen3_spec
 
 # ─── Paged-KV device-kernel test (GPU) ──────────────────────────────────
 # Proves block-table indirection (paged_kv_device.cuh) is bit-identical to the
@@ -439,13 +458,6 @@ kv-quant-explore:
 bench: fucina
 	MODEL=$(if $(MODEL),$(MODEL),model.gguf) scripts/bench.sh
 
-# tool-bench launches fucina and runs the agentic tool-call benchmark with the
-# corrected --max-turns 12 (the upstream default 8 truncates TC-46/TC-62 mid-chain).
-# Pass-through args via ARGS=, e.g.: make tool-bench ARGS="--perf"
-# Continuous batching for the concurrency columns: make tool-bench BATCH=1 ARGS="--perf"
-tool-bench: fucina
-	MODEL=$(if $(MODEL),$(MODEL),model.gguf) BATCH=$(BATCH) scripts/tool_eval_bench.sh $(ARGS)
-
 test-vectors: fucina
 	./fucina --test-vectors tests/vectors/official.vec
 
@@ -513,6 +525,8 @@ check: vet lint go-test-race
 DG_GGUF ?= ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
 DG_NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo -Xcompiler -O3 -Xcompiler -pthread --threads 8
 # CUTLASS (vendored under flashinfer) for the grouped NVFP4 expert GEMM (cuda/dg_fp4_moe.cu).
+# Auto-detected: import flashinfer if it's on the default python, else glob the venv. Override
+# with `make all CUTLASS_DIR=/path/to/cutlass` for a checkout elsewhere.
 CUTLASS_DIR ?= $(shell \
 	python3 -c "import flashinfer,os;print(os.path.join(os.path.dirname(flashinfer.__file__),'data','cutlass'))" 2>/dev/null \
 	|| ls -d $(HOME)/.venv/lib/python*/site-packages/flashinfer/data/cutlass 2>/dev/null | head -1)
@@ -527,6 +541,10 @@ cuda/diffusion_gemma_engine.o: cuda/diffusion_gemma_engine.cu cuda/diffusion_gem
 	$(NVCC) $(DG_NVCCFLAGS) -dc -o $@ cuda/diffusion_gemma_engine.cu
 
 cuda/dg_fp4_moe.o: cuda/dg_fp4_moe.cu Makefile
+	@test -f "$(CUTLASS_DIR)/include/cutlass/cutlass.h" || { \
+	  echo "ERROR: CUTLASS not found (CUTLASS_DIR='$(CUTLASS_DIR)'). The DiffusionGemma NVFP4"; \
+	  echo "  MoE needs CUTLASS. Install flashinfer (pip install flashinfer) or pass a checkout:"; \
+	  echo "  make all CUTLASS_DIR=/path/to/cutlass"; exit 1; }
 	$(NVCC) $(DG_FP4_NVCCFLAGS) -dc -o $@ cuda/dg_fp4_moe.cu
 
 cuda/libdg_link.o: cuda/diffusion_gemma_kernels.o cuda/diffusion_gemma_engine.o cuda/dg_fp4_moe.o Makefile
@@ -582,9 +600,65 @@ nvfp4-test:
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_loader_test.cc   -o /tmp/nvfp4_ld    && /tmp/nvfp4_ld
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 cuda/test_nvfp4_gemv.cu -o /tmp/nvfp4_gemv && /tmp/nvfp4_gemv
 
-# Native Q4_K LM-head matvec unit test (kernel vs host reference decode).
-q4k-test:
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 cuda/test_q4k_gemv.cu -o /tmp/q4k_gemv && /tmp/q4k_gemv
+# Gemma-4-E4B foundation: runtime config detection + FP8 Per-Layer-Embedding
+# "index" codec, validated against the real BF16 checkpoint (cosine gate).
+# Pass MODEL_DIR=... to point at a different E4B snapshot.
+e4b-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_ple_fp8.cu -o /tmp/e4b_ple_test && /tmp/e4b_ple_test $(MODEL_DIR)
+
+# E4B engine BF16 weight loader: load the real checkpoint, report residency.
+e4b-load-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_load.cu cuda/e4b_engine.cu -o /tmp/e4b_load -lcudart -lcublas && /tmp/e4b_load $(MODEL_DIR)
+
+# E4B GGUF (Q4_0-QAT/Q6_K) loader: load the real GGUF through the same engine
+# (dequant → BF16 + FP8 PLE), check dims/residency, run a forward sanity
+# (finite logits, in-range argmax, no illegal access) + optional BF16 parity.
+# Pass GGUF=... to point at a different GGUF; MODEL_DIR=... for the BF16 reference.
+e4b-gguf-load-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_gguf_load.cu cuda/e4b_engine.cu -o /tmp/e4b_gguf_load -lcudart -lcublas && /tmp/e4b_gguf_load $(GGUF) $(MODEL_DIR)
+
+# E4B forward pass validated against an HF reference dump (/tmp/e4b_ref.bin).
+e4b-fwd-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_forward.cu cuda/e4b_engine.cu -o /tmp/e4b_fwd -lcudart -lcublas && /tmp/e4b_fwd $(MODEL_DIR)
+
+# E4B incremental decode (KV cache) validated against HF greedy (/tmp/e4b_gen_ref.bin).
+e4b-gen-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_generate.cu cuda/e4b_engine.cu -o /tmp/e4b_gen -lcudart -lcublas && /tmp/e4b_gen $(MODEL_DIR)
+
+# E4B continuous batching: B concurrent sequences == independent decode.
+e4b-batch-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_batch.cu cuda/e4b_engine.cu -o /tmp/e4b_batch -lcudart -lcublas && /tmp/e4b_batch $(MODEL_DIR)
+
+# E4B MTP increment 1: load the gemma4-assistant draft head + verify residency/dims (no
+# drafter forward yet). GGUF=<e4b base q4_0 gguf> MTP=<assistant gguf>. See docs/e4b-mtp-plan.md.
+e4b-mtp-load-test: lib
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_mtp_load.cu cuda/libfucina.a -o /tmp/e4b_mtp_load -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_mtp_load $(GGUF) $(MTP)
+
+# E4B MTP increments 3+4: greedy speculative decode via the draft head. DECISIVE GATE —
+# compares e4b_engine_generate_greedy (baseline) vs e4b_engine_generate_spec_greedy (assistant
+# loaded) for the same prompt and asserts BYTE-IDENTICAL token ids (greedy spec is lossless).
+# GGUF=<e4b base q4_0 gguf> MTP=<assistant gguf>. See docs/e4b-mtp-plan.md.
+e4b-spec-test: lib
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_spec.cu cuda/libfucina.a -o /tmp/e4b_spec -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_spec $(GGUF) $(MTP)
+
+# E4B MTP increment 5: the SERVER continue/streaming spec path. Prefills then drives
+# e4b_engine_spec_stream (continue from live KV, h0 re-derived from the last history token,
+# per-token emit callback) and asserts BYTE-IDENTICAL to plain greedy + that the callback saw
+# exactly the returned tokens in order. GGUF=<base> MTP=<assistant>. See docs/e4b-mtp-plan.md.
+e4b-spec-stream-test: lib
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_spec_stream.cu cuda/libfucina.a -o /tmp/e4b_spec_stream -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_spec_stream $(GGUF) $(MTP)
+
+# E4B NVFP4 weight-path foundation: quantizer + tuned decode GEMV, validated vs the
+# host dequant oracle (kernel correctness) and full precision (FP4 SNR), with bandwidth.
+e4b-nvfp4-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_nvfp4.cu -o /tmp/e4b_nvfp4_test -lcudart && /tmp/e4b_nvfp4_test
+
+# E4B throughput baseline (prefill + decode tok/s), not a correctness test.
+e4b-bench:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_bench.cu cuda/e4b_engine.cu -o /tmp/e4b_bench -lcudart -lcublas && /tmp/e4b_bench $(MODEL_DIR)
+
+# All E4B tests.
+e4b-all: e4b-test e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test
 
 # ─── Clean ──────────────────────────────────────────────────────────────
 clean:

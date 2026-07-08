@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
     const int NP = 5, NGEN = 8;
     int32_t ref[NGEN] = { 12095, 13, 576, 6722, 315, 15344, 374, 21718 };
 
-    gemma4_engine_t *eng = gemma4_engine_create(path, FORMAT_Q4_0, 4096, 0, 0.90);
+    gemma4_engine_t *eng = gemma4_engine_create(path, FORMAT_Q4_0, 4096, 0);
     if (!eng) { fprintf(stderr, "create failed\n"); return 2; }
 
     int32_t first = 0;
