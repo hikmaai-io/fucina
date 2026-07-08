@@ -8024,26 +8024,24 @@ static void gemm_bf16_grouped(gemma4_engine_t *eng,
     const __nv_bfloat16 *Wbase, size_t wstride, const __nv_bfloat16 *Xbase, float *Ybase,
     const int *hc, const int *ho, int E, int in_dim, int out_dim, cudaStream_t stream)
 {
-    const void *Aarr[256], *Barr[256]; void *Carr[256];
-    int m_arr[256], n_arr[256], k_arr[256], lda[256], ldb[256], ldc[256], gsize[256];
-    cublasOperation_t ta[256], tb[256];
-    float alpha[256], beta[256];
-    int g = 0;
-    for (int e = 0; e < E; e++) if (hc[e] > 0) {
-        Aarr[g]  = Wbase + (size_t)e * wstride;
-        Barr[g]  = Xbase + (size_t)ho[e] * in_dim;
-        Carr[g]  = Ybase + (size_t)ho[e] * out_dim;
-        m_arr[g] = out_dim; n_arr[g] = hc[e]; k_arr[g] = in_dim;
-        lda[g]   = in_dim;  ldb[g]   = in_dim; ldc[g]  = out_dim;
-        ta[g]    = CUBLAS_OP_T; tb[g] = CUBLAS_OP_N;
-        alpha[g] = 1.0f; beta[g] = 0.0f; gsize[g] = 1;
-        g++;
-    }
-    if (g == 0) return;
+    // Per-active-expert cublasGemmEx loop — NOT cublasGemmGroupedBatchedEx. The grouped-batched
+    // call is broken on this stack (CUDA 13 / GB10 sm_121): with bit-identical inputs it returned
+    // all-zeros on its first invocation and NONDETERMINISTIC output on later ones (measured via
+    // per-stage checksums: router/topk/gathered-X identical across runs, gate/up GEMM output
+    // different every call) — the diverse-prompt serving corruption. The plain GemmEx loop is
+    // bit-stable; its extra launch overhead only touches prefill-width calls.
     cublasSetStream(eng->cublas, stream);
-    cublasGemmGroupedBatchedEx(eng->cublas, ta, tb, m_arr, n_arr, k_arr,
-        alpha, Aarr, CUDA_R_16BF, lda, Barr, CUDA_R_16BF, ldb,
-        beta, Carr, CUDA_R_32F, ldc, g, gsize, CUBLAS_COMPUTE_32F);
+    const float alpha = 1.0f, beta = 0.0f;
+    for (int e = 0; e < E; e++) if (hc[e] > 0) {
+        cublasGemmEx(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            out_dim, hc[e], in_dim,
+            &alpha,
+            Wbase + (size_t)e * wstride, CUDA_R_16BF, in_dim,
+            Xbase + (size_t)ho[e] * in_dim, CUDA_R_16BF, in_dim,
+            &beta,
+            Ybase + (size_t)ho[e] * out_dim, CUDA_R_32F, out_dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -17051,7 +17049,9 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
         if (S < 1) S = 1; if (S > S_MAX) S = S_MAX;
         eng->q35_attn_splits = S;
         eng->q35_attn_tile = (maxctx + S - 1) / S;   // positions per split → shared-score floats
-        const size_t np = (size_t)MS * M2_NQ * S;
+        // Partials sized by the RUNTIME head count (27B-dense: NQ=24 > M2_NQ=16 — sizing with the
+        // baked constant under-allocated 1.5×, an illegal access once B·NQ·S crossed the arena).
+        const size_t np = (size_t)MS * NQ * S;
         ok = ok && cudaMalloc(&eng->d_q35_part_m, np * sizeof(float)) == cudaSuccess;
         ok = ok && cudaMalloc(&eng->d_q35_part_l, np * sizeof(float)) == cudaSuccess;
         ok = ok && cudaMalloc(&eng->d_q35_part_o, np * M2_HEAD * sizeof(float)) == cudaSuccess;
@@ -17865,14 +17865,16 @@ static int qwen35_seq_prefill_chunk(gemma4_engine_t *eng, int slot, const int32_
 
 static size_t q35_state_size_bytes(const gemma4_engine_t *eng, int n_tokens) {
     const gemma4_model_config_t *c = &eng->cfg;
+    // RUNTIME geometry (27B-dense: NVH=48, CONVD=10240 ≠ the baked M2_* 35B values).
     const int NKV = c->n_kv_global, HD = M2_HEAD;
+    const int NVH = c->ssm_time_step_rank, CONVD = 2 * M2_KEYD + c->ssm_inner_size;
     size_t bytes = 0;
     for (int l = 0; l < c->n_layers; l++) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL)
             bytes += 2ull * (size_t)n_tokens * NKV * HD * sizeof(__half);   // fp16 K + V
         else
-            bytes += (size_t)M2_NVH * M2_SD * M2_SD * sizeof(__nv_bfloat16)   // bf16 GDN state
-                   + (size_t)M2_CONVDIM * (M2_CK - 1) * sizeof(float);        // fp32 conv ring
+            bytes += (size_t)NVH * M2_SD * M2_SD * sizeof(__nv_bfloat16)   // bf16 GDN state
+                   + (size_t)CONVD * (M2_CK - 1) * sizeof(float);          // fp32 conv ring
     }
     return bytes;
 }
@@ -17891,9 +17893,12 @@ extern "C" size_t gemma4_engine_q35_state_size(gemma4_engine_t *eng, int n_token
 static int q35_state_copy(gemma4_engine_t *eng, int slot, char *h, int n_tokens, int to_host) {
     const gemma4_model_config_t *c = &eng->cfg;
     const int NKV = c->n_kv_global, HD = M2_HEAD, maxctx = eng->q35_maxctx;
+    // RUNTIME geometry: arena strides below must match the ensure_q35_scratch allocations,
+    // which use the runtime NVH/CONVD (baked M2_* here silently mis-strided the 27B).
+    const int NVH = c->ssm_time_step_rank, CONVD = 2 * M2_KEYD + c->ssm_inner_size;
     const size_t kv = (size_t)n_tokens * NKV * HD * sizeof(__half);   // fp16 K/V slice
-    const size_t s_sz = (size_t)M2_NVH * M2_SD * M2_SD * sizeof(__nv_bfloat16);  // bf16 GDN state arena
-    const size_t r_sz = (size_t)M2_CONVDIM * (M2_CK - 1) * sizeof(float);
+    const size_t s_sz = (size_t)NVH * M2_SD * M2_SD * sizeof(__nv_bfloat16);  // bf16 GDN state arena
+    const size_t r_sz = (size_t)CONVD * (M2_CK - 1) * sizeof(float);
     cudaStream_t st = eng->stream;
     for (int l = 0; l < c->n_layers; l++) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
@@ -17907,8 +17912,8 @@ static int q35_state_copy(gemma4_engine_t *eng, int slot, char *h, int n_tokens,
                 cudaMemcpyAsync(Vb, h, kv, cudaMemcpyHostToDevice, st); h += kv;
             }
         } else {
-            __nv_bfloat16 *S = eng->d_q35_S[l] + (size_t)slot * M2_NVH * M2_SD * M2_SD;  // bf16 arena
-            float *R = eng->d_q35_ring[l] + (size_t)slot * M2_CONVDIM * (M2_CK - 1);
+            __nv_bfloat16 *S = eng->d_q35_S[l] + (size_t)slot * NVH * M2_SD * M2_SD;  // bf16 arena
+            float *R = eng->d_q35_ring[l] + (size_t)slot * CONVD * (M2_CK - 1);
             if (to_host) {
                 cudaMemcpyAsync(h, S, s_sz, cudaMemcpyDeviceToHost, st); h += s_sz;
                 cudaMemcpyAsync(h, R, r_sz, cudaMemcpyDeviceToHost, st); h += r_sz;
@@ -17981,7 +17986,11 @@ static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
     int32_t outs[GEMMA4_MAX_SEQS];
     cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)Bv*sizeof(int32_t), cudaMemcpyDeviceToHost, eng->stream);
     cudaStreamSynchronize(eng->stream);
-    if (cudaGetLastError() != cudaSuccess) return -1;
+    { cudaError_t e = cudaGetLastError();
+      if (e != cudaSuccess) {
+          fprintf(stderr, "fucina: qwen35_step_batch CUDA error (B=%d): %s\n", Bv, cudaGetErrorString(e));
+          return -1;
+      } }
     for (int v = 0; v < Bv; v++) {
         slv[v]->n_tokens = positions[v] + 1;
         if (out_tokens) out_tokens[rowmap[v]] = outs[v];
