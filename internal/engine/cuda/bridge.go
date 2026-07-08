@@ -34,15 +34,14 @@ package cuda
 //         repeat_penalty, seed, n_accepted, fucinaSpecTokenGo, (void *)handle);
 // }
 //
-// // Batched speculative-decode bridge: builds the gemma4_spec_req[] from FLAT
-// // primitive arrays (slots/anchors/n_drafts + one concatenated drafts buffer) so
-// // no Go struct carrying Go pointers is ever handed to C (cgo pointer rule). The
-// // engine drafts are caller-supplied; this only marshals + forwards to the ABI.
+// // Batched speculative-decode bridge: builds gemma4_spec_req[] from FLAT
+// // primitive arrays (slots/anchors/n_drafts + concatenated drafts buffer). No
+// // Go pointers are handed to C — this only marshals + forwards to the ABI.
 // static inline int _fucina_step_batch_spec_flat(gemma4_engine_t *eng,
 //     const int *slots, const int32_t *anchors, const int *n_drafts,
 //     const int32_t *drafts_flat, int R,
 //     int32_t *out_runs, int *out_run_len, int *err_rows) {
-//     if (R <= 0 || R > 32) return -1;   /* 32 = GEMMA4_MAX_SEQS (== Go maxBatchSeqs) */
+//     if (R <= 0 || R > 32) return -1;
 //     gemma4_spec_req reqs[32];
 //     const int32_t *p = drafts_flat;
 //     for (int i = 0; i < R; i++) {

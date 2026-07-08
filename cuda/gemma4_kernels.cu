@@ -123,6 +123,7 @@ typedef enum {
     GGML_TYPE_F32  = 0,
     GGML_TYPE_F16  = 1,
     GGML_TYPE_Q4_0 = 2,
+    GGML_TYPE_Q4_1 = 3,   // 32-block: fp16 d, fp16 m, 16 nibble bytes (v = d*q + m)
     GGML_TYPE_Q8_0 = 8,
     GGML_TYPE_Q6_K = 14,
 } ggml_type_t;
@@ -3061,13 +3062,14 @@ gemma4_engine_t* gemma4_engine_create(
         const char *names[] = {"blk.0.ffn_down.weight", "blk.0.attn_q.weight"};
         for (int t = 0; t < 2; t++) {
             if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, names[t], &_off, &_n, &gtype) == 0) {
-                if (gtype != GGML_TYPE_Q4_0 && gtype != GGML_TYPE_Q8_0) {
+                if (gtype != GGML_TYPE_Q4_0 && gtype != GGML_TYPE_Q4_1 && gtype != GGML_TYPE_Q8_0) {
                     fprintf(stderr, "fucina: unsupported GGUF layer tensor type %u — "
-                            "only Q4_0 (QAT) and Q8_0 models are supported\n", gtype);
+                            "only Q4_0 (QAT), Q4_1 (UD dynamic-quant, requantized), and Q8_0 models are supported\n", gtype);
                     gemma4_engine_destroy(eng);
                     return NULL;
                 }
-                eng->format = (gtype == GGML_TYPE_Q4_0) ? FORMAT_Q4_0 : FORMAT_Q8_0;
+                // Q4_1 is requantized to Q4_0 at load — resolve format to Q4_0
+                eng->format = (gtype == GGML_TYPE_Q8_0) ? FORMAT_Q8_0 : FORMAT_Q4_0;
                 break;
             }
         }
@@ -7338,6 +7340,23 @@ extern "C" int gemma4_engine_step_batch(
         if (out_tokens) out_tokens[rowmap[v]] = outs[v];
     }
     return 0;
+}
+
+// Arch vocab size — always returns GEMMA4_VOCAB_SIZE (262144).
+extern "C" int gemma4_engine_vocab(const gemma4_engine_t *eng) {
+    (void)eng;
+    return GEMMA4_VOCAB_SIZE;
+}
+
+// Batched speculative-decode verify (external drafts, prompt-lookup ABI). NOT YET
+// IMPLEMENTED for the Gemma-4 12B dense path — returns -1 (not supported).
+extern "C" int gemma4_engine_step_batch_spec(
+    gemma4_engine_t *eng, const gemma4_spec_req *reqs, int R,
+    int32_t *out_accept_runs, int *out_run_len, int *err_rows)
+{
+    (void)eng; (void)reqs; (void)R;
+    (void)out_accept_runs; (void)out_run_len; (void)err_rows;
+    return -1;
 }
 
 // Free a slot's block tables back to the pools and mark it free.
