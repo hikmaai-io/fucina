@@ -5216,7 +5216,8 @@ gemma4_engine_t* gemma4_engine_create(
             }
             gemma4_apply_cfg(eng);   // derive layer_types / global_layer_indices / n_* from cfg
             is_fp8 = true;
-            fprintf(stderr, "fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine\n");
+            fprintf(stderr, "fucina: Qwen3.5 %s checkpoint detected → batched engine\n",
+                    fp8_layout.modelopt ? "ModelOpt NVFP4/FP8" : "block-FP8");
         }
     }
     if (is_nvfp4 && !is_fp8) {
@@ -9210,6 +9211,41 @@ __global__ void dequant_nvfp4_expert_slab_bf16_kernel(
         }
     }
     uint4 *out16 = (uint4 *)(dst + ((uint64_t)e * per + r) * NVFP4_BLK);
+    out16[0] = *(const uint4 *)&o[0];
+    out16[1] = *(const uint4 *)&o[8];
+}
+
+// Dequant a CONTIGUOUS native-NVFP4 expert slab in CHECKPOINT layout (E consecutive experts,
+// each `weight` U8 [out][in/2] packed E2M1 + `weight_scale` E4M3 [out][in/16] LINEAR + a
+// per-expert `weight_scale_2` F32 global) → BF16. Feeds the same requant pipeline as the FP8
+// source (q35_fp4_expert_slabs): both w and sc slabs are row-major-contiguous, so a 16-element
+// group's quant bytes sit at blk*8 and its scale at sc[blk] — only gs needs the expert index.
+__global__ void dequant_nvfp4ckpt_expert_slab_bf16_kernel(
+    __nv_bfloat16 *dst, const uint8_t *w, const uint8_t *sc, const float *gs,
+    int in_dim, int out_dim, uint64_t n)   // n = E·out·in elements (multiple of 16)
+{
+    uint64_t blk = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t nblk_total = n / NVFP4_BLK;
+    if (blk >= nblk_total) return;
+    uint64_t per = (uint64_t)out_dim * (in_dim / NVFP4_BLK);
+    int e = (int)(blk / per);
+    float bsf = __half2float(__half(__nv_cvt_fp8_to_halfraw(
+        (__nv_fp8_storage_t)sc[blk], __NV_E4M3)));
+    float scale = bsf * gs[e];
+    const uint8_t *q = w + blk * (NVFP4_BLK / 2);
+    __nv_bfloat16 o[NVFP4_BLK];
+    #pragma unroll
+    for (int i = 0; i < NVFP4_BLK / 2; i++) {
+        uint32_t byte = q[i];
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            uint32_t nib = h ? (byte >> 4) : (byte & 0x0F);
+            float tab = (nib & 4u) ? ((nib & 2u) ? ((nib & 1u) ? 6.f : 4.f) : ((nib & 1u) ? 3.f : 2.f))
+                                   : ((nib & 2u) ? ((nib & 1u) ? 1.5f : 1.f) : ((nib & 1u) ? 0.5f : 0.f));
+            o[2 * i + h] = __float2bfloat16(((nib & 8u) ? -tab : tab) * scale);
+        }
+    }
+    uint4 *out16 = (uint4 *)(dst + blk * NVFP4_BLK);
     out16[0] = *(const uint4 *)&o[0];
     out16[1] = *(const uint4 *)&o[8];
 }
@@ -18346,6 +18382,127 @@ static float q35_fp8_lut_val(int v) {
     return sign * (1.0f + m / 8.0f) * exp2f((float)(e - 7));
 }
 
+// ── ModelOpt (nvidia NVFP4 repack) host-side conversion helpers ──────────────────────────────
+// The nvidia Qwen3.6 checkpoints store attn/GDN projections as PER-TENSOR FP8 (F32 scalar scale)
+// and experts/shared-expert/lm_head as native NVFP4 (E4M3 per-16-group scales + F32 global).
+// These map every such tensor onto a representation the FP8-block engine already serves.
+
+static inline uint16_t q35_f32_to_bf16_host(float f) {
+    uint32_t u; memcpy(&u, &f, 4);
+    u += 0x7FFF + ((u >> 16) & 1);           // round-to-nearest-even
+    return (uint16_t)(u >> 16);
+}
+
+// float → FP8 E4M3 (e4m3fn: bias 7, no inf, max 448), round-to-nearest.
+static uint8_t q35_f32_to_e4m3_host(float f) {
+    if (f != f) return 0x7F;
+    uint8_t sign = f < 0 ? 0x80 : 0;
+    float a = fabsf(f);
+    if (a > 448.f) a = 448.f;
+    if (a < 0.87890625e-3f) {                 // < half the smallest subnormal (2^-9) → ±0
+        // fallthrough: subnormal rounding below handles [2^-10, 2^-6); exact 0 here
+        if (a < 0.9765625e-3f) return sign;   // 2^-10
+    }
+    int e; float m = frexpf(a, &e);           // a = m·2^e, m ∈ [0.5,1)
+    e -= 1; m *= 2.f;                         // m ∈ [1,2)
+    if (e < -6) {                             // subnormal: q = round(a·2^9), value q/8·2^-6
+        int q = (int)lrintf(a * 512.f);
+        if (q > 7) q = 7;
+        return sign | (uint8_t)q;
+    }
+    int mant = (int)lrintf((m - 1.f) * 8.f);
+    if (mant == 8) { mant = 0; e++; }
+    if (e > 8 || (e == 8 && mant == 7)) { e = 8; mant = 6; }   // clamp to 448, avoid NaN code
+    return sign | (uint8_t)((e + 7) << 3) | (uint8_t)mant;
+}
+
+// Per-tensor FP8 → the engine's 128×128 BF16 block-scale grid: broadcast the F32 scalar.
+// (BF16 rounding of the scale is ≤0.2% — negligible vs the e4m3 weight quantization itself.)
+static uint16_t *q35_synth_scale_grid(float s, int out_dim, int in_dim) {
+    size_t n = (size_t)((out_dim + 127) / 128) * (size_t)((in_dim + 127) / 128);
+    uint16_t *g = (uint16_t *)malloc(n * 2);
+    if (!g) return nullptr;
+    uint16_t b = q35_f32_to_bf16_host(s);
+    for (size_t i = 0; i < n; i++) g[i] = b;
+    return g;
+}
+
+// Native NVFP4 tensor (packed U8 [out][in/2] + E4M3 [out][in/16] + F32 global) → host BF16
+// [out][in]. Threaded: the lm_head is 248320×2048 (508M elements).
+static uint16_t *q35_nvfp4_to_bf16_host(const uint8_t *w, const uint8_t *sc, float gs,
+                                        int out_dim, int in_dim) {
+    uint16_t *dst = (uint16_t *)malloc((size_t)out_dim * in_dim * 2);
+    if (!dst) return nullptr;
+    const int ng = in_dim / 16;
+    std::atomic<int> next(0);
+    auto worker = [&]() {
+        for (;;) {
+            int r = next.fetch_add(1);
+            if (r >= out_dim) break;
+            const uint8_t *wr = w + (size_t)r * (in_dim / 2);
+            const uint8_t *sr = sc + (size_t)r * ng;
+            uint16_t *o = dst + (size_t)r * in_dim;
+            for (int c = 0; c < in_dim; c++)
+                o[c] = q35_f32_to_bf16_host(
+                    nvfp4::e2m1_decode(nvfp4::nibble_at(wr, c)) *
+                    nvfp4::e4m3_decode(sr[c / 16]) * gs);
+        }
+    };
+    std::vector<std::thread> th;
+    for (int t = 0; t < 12; t++) th.emplace_back(worker);
+    for (auto &x : th) x.join();
+    return dst;
+}
+
+// Host BF16 [out][in] → FP8-block (E4M3 bytes + per-128×128 BF16 scale grid, scale = amax/448),
+// the exact layout the FORMAT_FP8_BLOCK kernels consume. Used for the ModelOpt shared expert
+// (native NVFP4 with no direct engine consumer — the extra e4m3 rounding on top of the 4-bit
+// values is ~3%, small vs the FP4 quantization). Returns malloc'd (w8, grid) or false.
+static bool q35_bf16_to_fp8_block_host(const uint16_t *src, int out_dim, int in_dim,
+                                       uint8_t **w_out, uint16_t **s_out) {
+    const int nbr = (out_dim + 127) / 128, nbc = (in_dim + 127) / 128;
+    uint8_t  *w8 = (uint8_t *)malloc((size_t)out_dim * in_dim);
+    uint16_t *sg = (uint16_t *)malloc((size_t)nbr * nbc * 2);
+    if (!w8 || !sg) { free(w8); free(sg); return false; }
+    std::atomic<int> next(0);
+    auto worker = [&]() {
+        for (;;) {
+            int br = next.fetch_add(1);
+            if (br >= nbr) break;
+            const int r0 = br * 128, r1 = r0 + 128 > out_dim ? out_dim : r0 + 128;
+            for (int bc = 0; bc < nbc; bc++) {
+                const int c0 = bc * 128, c1 = c0 + 128 > in_dim ? in_dim : c0 + 128;
+                float amax = 0.f;
+                for (int r = r0; r < r1; r++)
+                    for (int c = c0; c < c1; c++) {
+                        float v = q35_bf16_to_f32_host(src[(size_t)r * in_dim + c]);
+                        amax = fmaxf(amax, fabsf(v));
+                    }
+                float scale = amax > 0.f ? amax / 448.f : 1.f;
+                // round the scale to BF16 FIRST so encode uses exactly what dequant will read
+                scale = q35_bf16_to_f32_host(q35_f32_to_bf16_host(scale));
+                sg[(size_t)br * nbc + bc] = q35_f32_to_bf16_host(scale);
+                float inv = 1.f / scale;
+                for (int r = r0; r < r1; r++)
+                    for (int c = c0; c < c1; c++) {
+                        float v = q35_bf16_to_f32_host(src[(size_t)r * in_dim + c]);
+                        w8[(size_t)r * in_dim + c] = q35_f32_to_e4m3_host(v * inv);
+                    }
+            }
+        }
+    };
+    std::vector<std::thread> th;
+    for (int t = 0; t < 12; t++) th.emplace_back(worker);
+    for (auto &x : th) x.join();
+    *w_out = w8; *s_out = sg;
+    return true;
+}
+
+// One expert projection in the native-NVFP4 checkpoint: packed codes, linear e4m3 group scales,
+// per-expert F32 global. Passed alongside (or instead of) the FP8 source arrays to
+// q35_fp4_expert_slabs.
+struct q35_nv4src { const uint8_t *w; const uint8_t *sc; float gs; };
+
 // Build the NVFP4 expert slabs for ONE layer from the host FP8 checkpoint tensors: upload each
 // proj's FP8+scales, dequant to BF16 on device, per-(layer,proj) global scale over ALL experts,
 // then per-expert E2M1 quant + 128x4-swizzled ue4m3 SF in exactly the layout dg_fp4_moe_grouped
@@ -18353,21 +18510,31 @@ static float q35_fp8_lut_val(int v) {
 // same bytes as the Q4_K requant it replaces, but tensor-core-consumable. Returns 0 / -1.
 static int q35_fp4_expert_slabs(gemma4_engine_t *eng, int l, int L,
         const uint8_t **wg, const uint16_t **sg, const uint8_t **wu, const uint16_t **su,
-        const uint8_t **wd, const uint16_t **sd, int E, int MI, int H) {
+        const uint8_t **wd, const uint16_t **sd,
+        const q35_nv4src *ng, const q35_nv4src *nu, const q35_nv4src *nd,  // native NVFP4 source (or NULL)
+        int E, int MI, int H) {
     const int GU = 2 * MI;
     const size_t wb = (size_t)MI * H;                    // FP8 bytes / expert (all 3 projs)
     const int sper = ((MI + 127) / 128) * (H / 128);     // BF16 scale elems / expert (all projs)
+    const bool nv4 = (ng != NULL);
     if (!eng->d_fp4m_gsw &&
         cudaMalloc(&eng->d_fp4m_gsw, (size_t)L * 2 * sizeof(float)) != cudaSuccess) return -1;
     { unsigned long long a, b;
       dg_fp4_sf_strides(0, GU, H, &a, &b); eng->fp4m_gu_sfB = b;
       dg_fp4_sf_strides(0, H, MI, &a, &b); eng->fp4m_dn_sfB = b; }
-    uint8_t *d8 = NULL, *tlin = NULL;
+    uint8_t *d8 = NULL, *tlin = NULL, *d_s4 = NULL;
     __nv_bfloat16 *dsc = NULL, *gbf = NULL, *ubf = NULL;
-    float *amax = NULL;
+    float *amax = NULL, *d_gs = NULL;
     int ok = 1;
-    ok &= cudaMalloc(&d8,   (size_t)E * wb) == cudaSuccess;
-    ok &= cudaMalloc(&dsc,  (size_t)E * sper * sizeof(__nv_bfloat16)) == cudaSuccess;
+    // FP8 source: full-byte weights + tiny 128×128 scale grids. NVFP4 source: half-byte codes
+    // (reuse d8, first wb/2) + per-16 e4m3 scales (wb/16) + per-expert F32 globals.
+    ok &= cudaMalloc(&d8,   (size_t)E * (nv4 ? wb / 2 : wb)) == cudaSuccess;
+    if (nv4) {
+        ok &= cudaMalloc(&d_s4, (size_t)E * (wb / NVFP4_BLK)) == cudaSuccess;
+        ok &= cudaMalloc(&d_gs, (size_t)E * sizeof(float)) == cudaSuccess;
+    } else {
+        ok &= cudaMalloc(&dsc, (size_t)E * sper * sizeof(__nv_bfloat16)) == cudaSuccess;
+    }
     ok &= cudaMalloc(&gbf,  (size_t)E * wb * sizeof(__nv_bfloat16)) == cudaSuccess;
     ok &= cudaMalloc(&ubf,  (size_t)E * wb * sizeof(__nv_bfloat16)) == cudaSuccess;
     ok &= cudaMalloc(&tlin, (size_t)GU * (H / NVFP4_BLK)) == cudaSuccess;  // ≥ H*(MI/16) too
@@ -18391,9 +18558,25 @@ static int q35_fp4_expert_slabs(gemma4_engine_t *eng, int l, int L,
         if (ok) dequant_fp8_expert_slab_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
                     dst, d8, dsc, ind, outd, n);
     };
+    // same, from the native NVFP4 checkpoint tensors (codes + linear e4m3 scales + per-expert gs)
+    auto dq4 = [&](const q35_nv4src *s4, int ind, int outd, __nv_bfloat16 *dst) {
+        std::vector<float> gs(E);
+        for (int e = 0; e < E && ok; e++) {
+            ok &= cudaMemcpy(d8 + (size_t)e * (wb / 2), s4[e].w, wb / 2,
+                             cudaMemcpyHostToDevice) == cudaSuccess;
+            ok &= cudaMemcpy(d_s4 + (size_t)e * (wb / NVFP4_BLK), s4[e].sc, wb / NVFP4_BLK,
+                             cudaMemcpyHostToDevice) == cudaSuccess;
+            gs[e] = s4[e].gs;
+        }
+        ok &= cudaMemcpy(d_gs, gs.data(), (size_t)E * sizeof(float),
+                         cudaMemcpyHostToDevice) == cudaSuccess;
+        uint64_t n = (uint64_t)E * wb;
+        if (ok) dequant_nvfp4ckpt_expert_slab_bf16_kernel<<<(unsigned)((n / NVFP4_BLK + 255) / 256), 256>>>(
+                    dst, d8, d_s4, d_gs, ind, outd, n);
+    };
     if (ok) {   // ── fused gate|up: global scale over BOTH tensors, one SF block per expert ──
-        dq(wg, sg, H, MI, gbf);
-        dq(wu, su, H, MI, ubf);
+        if (nv4) { dq4(ng, H, MI, gbf); dq4(nu, H, MI, ubf); }
+        else     { dq(wg, sg, H, MI, gbf); dq(wu, su, H, MI, ubf); }
         cudaMemset(amax, 0, sizeof(float));
         const uint64_t n = (uint64_t)E * wb;
         nvfp4_amax_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(gbf, n, amax);
@@ -18413,7 +18596,8 @@ static int q35_fp4_expert_slabs(gemma4_engine_t *eng, int l, int L,
         }
     }
     if (ok) {   // ── down [H][MI] ──
-        dq(wd, sd, MI, H, gbf);
+        if (nv4) dq4(nd, MI, H, gbf);
+        else     dq(wd, sd, MI, H, gbf);
         cudaMemset(amax, 0, sizeof(float));
         const uint64_t n = (uint64_t)E * wb;
         nvfp4_amax_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(gbf, n, amax);
@@ -18433,6 +18617,7 @@ static int q35_fp4_expert_slabs(gemma4_engine_t *eng, int l, int L,
     if (cudaGetLastError() != cudaSuccess) ok = 0;
     if (d8) cudaFree(d8);   if (dsc) cudaFree(dsc); if (gbf) cudaFree(gbf);
     if (ubf) cudaFree(ubf); if (tlin) cudaFree(tlin); if (amax) cudaFree(amax);
+    if (d_s4) cudaFree(d_s4); if (d_gs) cudaFree(d_gs);
     if (!ok) {
         auto FR = [](uint8_t *&p){ if (p) { cudaFree(p); p = NULL; } };
         FR(eng->d_fp4m_gu[l]); FR(eng->d_fp4m_gusf[l]); FR(eng->d_fp4m_dn[l]); FR(eng->d_fp4m_dnsf[l]);
@@ -18552,10 +18737,33 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     auto find=[&](const std::string&k)->const st::Tensor*{ return M.find(k); };
     auto lk=[&](int l,const char*s){ return qwen35fp8::lkey(LO,l,s); };
     // FP8 block weight: E4M3 bytes + BF16 block-scale sibling → FORMAT_FP8_BLOCK + scale-table entry.
+    // ModelOpt (LO.modelopt) fallbacks when no `_scale_inv` grid exists:
+    //   per-tensor FP8 (`<w>_scale` F32 scalar)          → broadcast the scalar into a block grid
+    //   native NVFP4  (`<w>_scale` e4m3 + `<w>_scale_2`) → dequant→BF16→requant to FP8-block
     auto put_fp8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int out_dim,int in_dim)->bool{
         const st::Tensor*w=find(key), *s=find(key+"_scale_inv");
-        if(!w||!s){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
-        D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,s->data,s->nbytes}); return true;
+        if(w&&s){ D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,s->data,s->nbytes}); return true; }
+        if(w&&LO.modelopt){
+            const st::Tensor*ps=find(key+"_scale"), *g2=find(key+"_scale_2");
+            const size_t gridb=(size_t)((out_dim+127)/128)*((in_dim+127)/128)*2;
+            if(ps&&g2&&w->dtype==st::Dtype::U8){          // native NVFP4
+                uint16_t*bf=q35_nvfp4_to_bf16_host((const uint8_t*)w->data,(const uint8_t*)ps->data,
+                                                   *(const float*)g2->data,out_dim,in_dim);
+                uint8_t*w8=nullptr; uint16_t*sg=nullptr;
+                if(bf&&q35_bf16_to_fp8_block_host(bf,out_dim,in_dim,&w8,&sg)){
+                    free(bf); tofree.push_back(w8); tofree.push_back(sg);
+                    D.push_back({off,fmtp,w8,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb});
+                    return true;
+                }
+                free(bf);
+            } else if(ps&&w->dtype==st::Dtype::F8_E4M3){  // per-tensor FP8
+                uint16_t*sg=q35_synth_scale_grid(*(const float*)ps->data,out_dim,in_dim);
+                if(sg){ tofree.push_back(sg);
+                    D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb});
+                    return true; }
+            }
+        }
+        fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false;
     };
     // BF16 tensor → f32 in d_weights (norms/conv/dt_bias). neg_exp for A_log; scalar +1 baked for norms.
     auto put_f32_from_bf16=[&](uint64_t*off,const std::string&key,float add,bool neg_exp)->bool{
@@ -18582,10 +18790,16 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // existing dp4a Q4_K batched GEMV + BF16-dequant prefill). Uses the expert requantizer with E=1.
     auto put_q4k_from_fp8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int out_dim,int in_dim)->bool{
         const st::Tensor*w=find(key), *sc=find(key+"_scale_inv");
-        if(!w||!sc){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
+        const uint16_t *sp=nullptr; uint16_t *synth=nullptr;
+        if(w&&sc) sp=(const uint16_t*)sc->data;
+        else if(w&&LO.modelopt&&w->dtype==st::Dtype::F8_E4M3){   // ModelOpt per-tensor FP8 scalar
+            const st::Tensor*ps=find(key+"_scale");
+            if(ps){ synth=q35_synth_scale_grid(*(const float*)ps->data,out_dim,in_dim); sp=synth; }
+        }
+        if(!w||!sp){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); free(synth); return false; }
         const uint8_t  *wp=(const uint8_t*)w->data;
-        const uint16_t *sp=(const uint16_t*)sc->data;
         unsigned char *q4=q35_fp8_experts_to_q4k(&wp,&sp,1,out_dim,in_dim);
+        free(synth);
         if(!q4) return false;
         tofree.push_back(q4);
         D.push_back({off,fmtp,q4,(size_t)((size_t)out_dim*in_dim/256)*144,FORMAT_Q4_K,nullptr,0});
@@ -18656,7 +18870,35 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             // machinery (dg_quantize_q8_1 + dg_mmq_q4_K_grouped). Opt-in until the greedy-match
             // quality gate flips it default. All decode-kernel knobs measured flat — fewer bytes
             // is the only remaining decode lever (see moe35b-vllm-headtohead).
-            if(fp4_mode){
+            if(LO.modelopt){
+                // Native NVFP4 experts (nvidia ModelOpt): gather per-expert codes + e4m3 group
+                // scales + F32 globals, repack into the engine slabs (dequant→BF16→requant with
+                // the per-(layer,proj) global — same double-quant the FP8 source path does, but
+                // starting from values already on the FP4 lattice). No FP8/Q4_K source exists in
+                // this checkpoint, so any failure aborts the load.
+                std::vector<q35_nv4src> n4[3];
+                bool got=true;
+                for(int p=0; p<3 && got; p++){
+                    n4[p].assign(E,{nullptr,nullptr,0.f});
+                    for(int e=0; e<E && got; e++){
+                        char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);
+                        const st::Tensor *w=find(lk(l,buf));
+                        snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight_scale",e,EX[p].proj);
+                        const st::Tensor *sct=find(lk(l,buf));
+                        snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight_scale_2",e,EX[p].proj);
+                        const st::Tensor *g2=find(lk(l,buf));
+                        if(!w||!sct||!g2){ got=false; break; }
+                        n4[p][e]={(const uint8_t*)w->data,(const uint8_t*)sct->data,*(const float*)g2->data};
+                    }
+                }
+                if(got && q35_fp4_expert_slabs(eng,l,L,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,
+                        n4[0].data(),n4[1].data(),n4[2].data(),E,MI,H)==0){
+                    eng->moe_experts_fp4 = 1;
+                } else {
+                    fprintf(stderr,"fucina: native NVFP4 expert build failed at layer %d — aborting load\n",l);
+                    ok=false;
+                }
+            } else if(fp4_mode){
                 // NVFP4 experts: gather the 3 projs' host FP8+scale pointers, build the fused
                 // gate|up + down E2M1 slabs on device. Failure on layer 0 falls back to Q4_K;
                 // failure after layer 0 aborts the load (mixed expert formats are not servable).
@@ -18674,7 +18916,8 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     }
                 }
                 if(got && q35_fp4_expert_slabs(eng,l,L,w3[0].data(),s3[0].data(),
-                        w3[1].data(),s3[1].data(),w3[2].data(),s3[2].data(),E,MI,H)==0){
+                        w3[1].data(),s3[1].data(),w3[2].data(),s3[2].data(),
+                        nullptr,nullptr,nullptr,E,MI,H)==0){
                     eng->moe_experts_fp4 = 1;
                 } else if(eng->moe_experts_fp4){
                     fprintf(stderr,"fucina: NVFP4 expert build failed at layer %d — aborting load\n",l);
@@ -18684,7 +18927,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     fp4_mode=false;
                 }
             }
-            if(!fp4_mode && q4k_mode){
+            if(!LO.modelopt && !fp4_mode && q4k_mode){
                 for(int p=0; p<3 && ok; p++){
                     int od = (p==2)? H : MI, idm = (p==2)? MI : H;
                     std::vector<const uint8_t*>  wpv(E, nullptr);
@@ -18709,7 +18952,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     eng->moe_up_slab       = eng->moe_gate_slab;
                     eng->moe_down_slab_q4k = (int64_t)((size_t)H*MI/256)*144;
                 }
-            } else if(!fp4_mode)
+            } else if(!LO.modelopt && !fp4_mode)
             for(int p=0; p<3 && ok; p++){
                 for(int e=0; e<E && ok; e++){
                     char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);
@@ -18822,10 +19065,22 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // 248320-vocab argmax is Q8_0-sensitive). Uploaded verbatim from the checkpoint's BF16 head.
     { const st::Tensor *lmT=M.find(LO.lmhead_key);
       if(!lmT){ fprintf(stderr,"qwen35_fp8_engine: missing lm_head %s\n",LO.lmhead_key.c_str()); return -5; }
-      eng->d_lmhead_bf16=(__nv_bfloat16*)q35fp8_up_bytes(lmT->data, lmT->nbytes);
-      if(!eng->d_lmhead_bf16) return -5;
+      // ModelOpt ships the lm_head native-NVFP4 (U8 codes + e4m3 group scales + F32 global):
+      // dequant to a host BF16 buffer and feed the SAME BF16/Q8_0 uploads as the BF16 head.
+      const uint16_t *lm_src=(const uint16_t*)lmT->data;
+      uint16_t *lm_deq=nullptr;
+      if(LO.modelopt && lmT->dtype==st::Dtype::U8){
+          const st::Tensor *ps=M.find(LO.lmhead_key+"_scale"), *g2=M.find(LO.lmhead_key+"_scale_2");
+          if(!ps||!g2){ fprintf(stderr,"qwen35_fp8_engine: NVFP4 lm_head missing scales\n"); return -5; }
+          lm_deq=q35_nvfp4_to_bf16_host((const uint8_t*)lmT->data,(const uint8_t*)ps->data,
+                                        *(const float*)g2->data,VOC,H);
+          if(!lm_deq) return -5;
+          lm_src=lm_deq;
+      }
+      eng->d_lmhead_bf16=(__nv_bfloat16*)q35fp8_up_bytes(lm_src,(size_t)VOC*H*2);
+      if(!eng->d_lmhead_bf16){ free(lm_deq); return -5; }
       // Q8_0 copy for the exact two-pass greedy head (approx scan; BF16 stays for the rescore).
-      { int64_t n=(int64_t)VOC*H; unsigned char*q8=q35_bf16_to_q8_0_host((const uint16_t*)lmT->data,n);
+      { int64_t n=(int64_t)VOC*H; unsigned char*q8=q35_bf16_to_q8_0_host(lm_src,n);
         if(q8){ eng->d_lmhead_q8=(unsigned char*)q35fp8_up_bytes(q8,(size_t)(n/32)*34); free(q8); }
         if(eng->d_lmhead_q8){
             if(cudaMalloc(&eng->d_head_cand,(size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int))!=cudaSuccess ||
@@ -18834,7 +19089,8 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                 if(eng->d_head_cand){cudaFree(eng->d_head_cand);eng->d_head_cand=NULL;}
                 cudaFree((void*)eng->d_lmhead_q8); eng->d_lmhead_q8=NULL;
             }
-        } } }
+        } }
+      free(lm_deq); }
     if(cudaMalloc(&eng->d_logits,(size_t)VOC*sizeof(float))!=cudaSuccess) return -6;
     if(moe && moe_alloc_scratch(eng)!=0) return -6;
     cudaDeviceSynchronize();

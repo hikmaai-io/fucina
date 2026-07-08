@@ -8,6 +8,7 @@ import (
 
 	"github.com/hikmaai-io/fucina/internal/engine/cuda"
 	"github.com/hikmaai-io/fucina/internal/sampler"
+	"github.com/hikmaai-io/fucina/internal/server/batch"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
@@ -36,6 +37,16 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	// Tokenize
 	tokens := tok.Encode(prompt, true, false)
 	log.Printf("fucina: prompt has %d tokens", len(tokens))
+
+	// Paged-only engines (Qwen3 family, Qwen3.5 hybrid): the single-flight
+	// prefill/spec entry points decline for these archs, so run the one-shot as
+	// a single continuous-batching request — SeqAdd prefills the raw prompt into
+	// a paged slot, StepBatch advances it token-by-token with on-device sampling.
+	// Same raw-completion semantics as the dense path (no chat template).
+	if eng.SeqFreeCapacity() > 0 {
+		runOneShotPaged(eng, tok, args, prompt, tokens)
+		return
+	}
 
 	// Spec enabled → prompt-lookup/MTP speculative decode. Works for greedy AND
 	// sampling — including repeat-penalty, which the engine applies on-GPU — with
@@ -148,4 +159,70 @@ func runOneShot(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 		log.Printf("fucina: [GPU] prefill %.1f tok/s, decode %.1f tok/s",
 			ts.PrefillTokensPerSec(), ts.DecodeTokensPerSec())
 	}
+}
+
+// runOneShotPaged runs the one-shot prompt on a paged multi-sequence engine:
+// one SeqAdd prefill, then a StepBatch loop on that slot. Sampling is on-device
+// per SeqParams, exactly like a served request. Output streams incrementally
+// with the whole-slice-decode/emit-new-suffix trick so multi-byte UTF-8 is
+// never split across tokens. Repeat-penalty is not applied on this path (the
+// on-device sampler does not take it).
+func runOneShotPaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs,
+	prompt string, tokens []int32) {
+
+	nToGenerate := args.Predict
+	if nToGenerate < 0 {
+		nToGenerate = 512
+	}
+	seed := uint64(args.Seed)
+	if args.Seed < 0 {
+		seed = uint64(time.Now().UnixNano())
+	}
+	params := batch.SeqParams{
+		Temperature: float32(args.Temperature),
+		TopK:        args.TopK,
+		TopP:        float32(args.TopP),
+		MinP:        float32(args.MinP),
+		Seed:        seed,
+	}
+
+	prefillStart := time.Now()
+	slot, token, err := eng.SeqAdd(tokens, params)
+	if err != nil {
+		log.Fatalf("fucina: prefill failed: %v", err)
+	}
+	defer eng.SeqRemove(slot)
+	prefillElapsed := time.Since(prefillStart)
+	log.Printf("fucina: prefill %d tokens in %.2fs (%.1f tok/s)",
+		len(tokens), prefillElapsed.Seconds(),
+		float64(len(tokens))/prefillElapsed.Seconds())
+
+	fmt.Print(prompt)
+	genStart := time.Now()
+	generated := 0
+	var outIDs []int32
+	emitted := ""
+	for generated < nToGenerate && !tok.IsStop(token) {
+		outIDs = append(outIDs, token)
+		if full := tok.Decode(outIDs); len(full) > len(emitted) {
+			fmt.Print(full[len(emitted):])
+			emitted = full
+		}
+		out, serr := eng.StepBatch([]int32{int32(slot)}, []int32{token})
+		if serr != nil {
+			log.Printf("fucina: decode error: %v", serr)
+			break
+		}
+		generated++
+		token = out[0]
+	}
+	genElapsed := time.Since(genStart)
+	fmt.Println()
+
+	genTPS := 0.0
+	if genElapsed.Seconds() > 0 {
+		genTPS = float64(generated) / genElapsed.Seconds()
+	}
+	log.Printf("fucina: generated %d tokens in %.2fs (%.1f tok/s)",
+		generated, genElapsed.Seconds(), genTPS)
 }
