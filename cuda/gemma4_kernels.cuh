@@ -427,6 +427,18 @@ int  gemma4_engine_step_batch_spec_ext(gemma4_engine_t *eng, const int *slots,
                                        const int32_t *in_tokens, int B,
                                        int32_t *out_tokens, int *out_lens,
                                        const int32_t *drafts, const int *dlens);
+// Stage 18 — FUSED prefill+decode (Qwen3 family only; returns -2 for other archs so the caller
+// falls back to its own path). Mixes B_dec decode rows + pf_len prefill-chunk rows of slot pf_slot
+// into ONE batched forward: the decode rows are byte-identical to step_batch (out_dec[B_dec] is the
+// per-row sampled token, -1 = KV-exhausted with out_dec_lens[r] = -1; surviving rows report
+// out_dec_lens[r] = 1), the prefill rows are byte-identical to seq_prefill_chunk, and neither
+// perturbs the other (distinct block tables, NULL rng_off). pf_slot advances by pf_len; when
+// pf_is_final != 0 the prompt's FIRST generated token is written to *pf_first_out. B_dec + pf_len
+// must be <= GEMMA4_MAX_SEQS. Returns 0 / -1 (hard error or KV exhaustion) / -2 (arch unsupported).
+int  gemma4_engine_step_batch_fused(gemma4_engine_t *eng,
+                                    const int *dec_slots, const int32_t *dec_toks, int B_dec,
+                                    int pf_slot, const int32_t *pf_chunk, int pf_len, int pf_is_final,
+                                    int32_t *out_dec, int *out_dec_lens, int32_t *pf_first_out);
 void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot);
 int  gemma4_engine_seq_capacity(gemma4_engine_t *eng);
 // Cross-request prefix cache (RadixAttention). set: enable/disable (effective only

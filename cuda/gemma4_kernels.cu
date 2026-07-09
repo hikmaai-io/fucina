@@ -12395,6 +12395,110 @@ extern "C" int gemma4_engine_step_batch(
     return 0;
 }
 
+// ── Stage 18 — FUSED prefill+decode ──────────────────────────────────────────
+// Mix B_dec DECODE rows and pf_len PREFILL-CHUNK rows of ONE prefilling sequence into a
+// SINGLE decode_multiseq_forward, so an arriving prompt's prefill never blocks the active
+// sequences' decode (vLLM-style chunked prefill + continuous batching). Qwen3 family ONLY
+// (full-causal geometry); Gemma returns -2 and keeps its own non-fused chunked path.
+//
+// Row layout (M = B_dec + pf_len rows, M <= GEMMA4_MAX_SEQS):
+//   rows [0, B_dec)   decode : row r → slot dec_slots[r], token dec_toks[r], pos = slot->n_tokens
+//   rows [B_dec, M)   prefill: ALL = pf_slot, token pf_chunk[j], pos = pf_base + j
+// Each row writes its K/V at positions[r] into its OWN seq's paged pool and attends
+// [0, positions[r]+1) via its per-row PagedSeqView.n_tokens bound (multiseq_upload_inputs), so
+// cross-sequence isolation is automatic (distinct block tables) and the prefill rows see the
+// adopted prefix + the earlier prefill rows of THIS pass (intra-pass causal) — exactly the
+// prefill_suffix_batched causality. rng_off is NULL for every row: a decode row draws the SAME
+// splitmix64 index it would in a plain step_batch (roff 0, its own n_sampled), so a co-batched
+// decode is BYTE-IDENTICAL to a plain step_batch of the same rows; the prefill rows' samples are
+// discarded except the LAST when pf_is_final (= the prompt's first generated token → *pf_first_out),
+// matching prefill_suffix_batched's sample (also roff 0 over n_sampled==0).
+//
+// COMMIT: each surviving dec_slot n_tokens += 1 and n_sampled += 1 (out_dec[r] = sampled,
+// out_dec_lens[r] = 1); a row whose KV could not grow is excluded from the forward and reports
+// out_dec[r] = -1 / out_dec_lens[r] = -1 (the step_batch sentinel). pf_slot n_tokens += pf_len;
+// pf_slot n_sampled += pf_is_final.
+//
+// GRAPH note: M varies per fused pass, so the greedy CUDA-graph fast path may not have a graph
+// captured for this M — that's fine, decode_multiseq_forward falls to the per-kernel body
+// (correctness first). When a graph for size M does exist (e.g. a prior plain step_batch of the
+// same width) it is reused and is bit-identical (both graph paths use the fixed max split count).
+extern "C" int gemma4_engine_step_batch_fused(
+    gemma4_engine_t *eng,
+    const int *dec_slots, const int32_t *dec_toks, int B_dec,
+    int pf_slot, const int32_t *pf_chunk, int pf_len, int pf_is_final,
+    int32_t *out_dec, int *out_dec_lens, int32_t *pf_first_out)
+{
+    if (!eng || !eng->loaded || !eng->paged_enabled) return -1;
+    if (!GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) return -2;   // Gemma keeps its own (non-fused) path
+    if (B_dec < 0 || pf_len <= 0 || !pf_chunk) return -1;
+    if (pf_slot < 0 || pf_slot >= GEMMA4_MAX_SEQS || !eng->slots[pf_slot].used) return -1;
+    if (B_dec + pf_len > GEMMA4_MAX_SEQS) return -1;
+    if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
+
+    gemma4_seq *pf = &eng->slots[pf_slot];
+    int pf_base = pf->n_tokens;
+
+    // Ensure the prefilling seq's paged blocks cover [pf_base, pf_base+pf_len) BEFORE the pass
+    // (mirror prefill_suffix_batched / seq_prefill_chunk). Done FIRST so a KV exhaustion here
+    // leaves the decode rows entirely untouched (no n_tokens advanced) — the caller evicts pf and
+    // retries the decode rows next pass.
+    if (paged_slot_sync(eng, pf, pf_base + pf_len - 1) != 0) return -1;
+
+    gemma4_seq *slv[GEMMA4_MAX_SEQS];
+    int32_t    in2[GEMMA4_MAX_SEQS];
+    int        positions[GEMMA4_MAX_SEQS];
+    int        rowmap[GEMMA4_MAX_SEQS];
+    int M = 0;
+
+    // Decode rows — per-row admission with the same -1 sentinel as gemma4_engine_step_batch.
+    for (int r = 0; r < B_dec; r++) {
+        if (out_dec)      out_dec[r] = 0;
+        if (out_dec_lens) out_dec_lens[r] = 1;
+        int id = dec_slots[r];
+        if (id < 0 || id >= GEMMA4_MAX_SEQS || !eng->slots[id].used) return -1;
+        gemma4_seq *s = &eng->slots[id];
+        if (paged_slot_sync(eng, s, s->n_tokens) != 0) {   // out of KV blocks → stop this row
+            if (out_dec)      out_dec[r] = -1;
+            if (out_dec_lens) out_dec_lens[r] = -1;
+            continue;
+        }
+        slv[M] = s; in2[M] = dec_toks[r]; positions[M] = s->n_tokens; rowmap[M] = r; M++;
+    }
+    int dec_rows = M;   // [0, dec_rows) are decode rows; [dec_rows, M) the prefill rows
+
+    // Prefill chunk rows: all = pf at consecutive positions pf_base+j (rng_off implicitly 0).
+    for (int j = 0; j < pf_len; j++) {
+        slv[M] = pf; in2[M] = pf_chunk[j]; positions[M] = pf_base + j; rowmap[M] = -1; M++;
+    }
+    if (M == 0) return 0;   // pf_len >= 1 guarantees M > 0; defensive.
+
+    // ONE batched forward over all M rows. rng_off = NULL → every row's splitmix64 index is
+    // (its seq's n_sampled + 1), identical to plain step_batch (decode) and prefill_suffix_batched
+    // (prefill), so decode is byte-identical with or without the co-batched prefill.
+    if (decode_multiseq_forward(eng, slv, in2, positions, M, /*want_sample=*/1, NULL) != 0) return -1;
+
+    int32_t outs[GEMMA4_MAX_SEQS];
+    cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)M*sizeof(int32_t), cudaMemcpyDeviceToHost, eng->stream);
+    cudaStreamSynchronize(eng->stream);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+
+    // Commit decode rows — byte-identical to gemma4_engine_step_batch.
+    for (int v = 0; v < dec_rows; v++) {
+        slv[v]->n_tokens = positions[v] + 1;
+        slv[v]->n_sampled++;
+        if (out_dec) out_dec[rowmap[v]] = outs[v];
+    }
+    // Commit prefill: advance pf by the whole chunk; the final chunk's LAST prefill row's sample
+    // is the prompt's first generated token (matching prefill_suffix_batched / seq_prefill_chunk).
+    pf->n_tokens = pf_base + pf_len;
+    if (pf_is_final) {
+        pf->n_sampled++;
+        if (pf_first_out) *pf_first_out = outs[M - 1];
+    }
+    return 0;
+}
+
 static int mtp_draft_paged(gemma4_engine_t *eng, gemma4_seq *s, int32_t g,
                            int32_t *draft_out, int max_draft);   // fwd decl (defined below)
 static void mtp_draft_paged_batched(
