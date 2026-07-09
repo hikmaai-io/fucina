@@ -77,7 +77,8 @@ type Engine struct {
 
 	// hasMTP is set once LoadAssistant succeeds: the batch scheduler then routes
 	// StepBatch through the speculative step_batch_spec ABI instead of plain decode.
-	hasMTP bool
+	hasMTP     bool
+	jspaceTopK int
 }
 
 // Config holds engine configuration. The weight format (Q4_0/Q8_0/NVFP4) is
@@ -89,6 +90,19 @@ type Config struct {
 	ContextSize uint32  // --ctx
 	DeviceID    int     // --cuda-device
 	GPUMemUtil  float64 // --gpu-mem-util: fraction of total device mem the engine may use (vLLM-style; <=0 → 0.90)
+}
+
+// MemoryStats is named engine memory accounting. Qwen fields are zero for other architectures.
+type MemoryStats struct {
+	QwenWorkspaceBytes        uint64
+	QwenRecurrentPerSlotBytes uint64
+	QwenKVPerSlotBytes        uint64
+	QwenCommittedBytes        uint64
+	QwenReservedBytes         uint64
+	QwenPeakBytes             uint64
+	QwenCapacity              int
+	QwenAllocatedSlots        int
+	QwenMaxContext            int
 }
 
 // NewEngine creates and initializes the CUDA inference engine.
@@ -646,6 +660,103 @@ func (e *Engine) SetGraphMode(mode int) {
 }
 
 // GraphStats returns CUDA graph statistics.
+// MemoryStats returns the engine's current named memory plan. It is intended for diagnostics and
+// low-frequency metrics snapshots; callers should not invoke it from a decode-critical section.
+func (e *Engine) MemoryStats() MemoryStats {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var s C.gemma4_memory_stats_t
+	if e.ptr != nil {
+		C.gemma4_engine_memory_stats(e.ptr, &s)
+	}
+	return MemoryStats{
+		QwenWorkspaceBytes:        uint64(s.qwen_workspace_bytes),
+		QwenRecurrentPerSlotBytes: uint64(s.qwen_recurrent_per_slot_bytes),
+		QwenKVPerSlotBytes:        uint64(s.qwen_kv_per_slot_bytes),
+		QwenCommittedBytes:        uint64(s.qwen_committed_bytes),
+		QwenReservedBytes:         uint64(s.qwen_reserved_bytes),
+		QwenPeakBytes:             uint64(s.qwen_peak_bytes),
+		QwenCapacity:              int(s.qwen_capacity),
+		QwenAllocatedSlots:        int(s.qwen_allocated_slots),
+		QwenMaxContext:            int(s.qwen_max_context),
+	}
+}
+
+// JSpaceEntry is one fitted layer's top Jacobian-lens readout.
+type JSpaceEntry struct {
+	Layer    int
+	TokenIDs []int32
+	Probs    []float32
+}
+
+// LoadJSpace enables the deliberately slow, debug-only Qwen3.5 J-Lens path.
+func (e *Engine) LoadJSpace(path string, topK int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	if C.gemma4_engine_jspace_load(e.ptr, cpath, C.int(topK)) != 0 {
+		return fmt.Errorf("cannot load %s (wrong architecture/dimensions or insufficient GPU memory)", path)
+	}
+	e.jspaceTopK = topK
+	return nil
+}
+
+// JSpaceSnapshot returns readouts for the latest single-sequence prefill/decode forward.
+func (e *Engine) JSpaceSnapshot() ([]JSpaceEntry, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.jspaceTopK <= 0 {
+		return nil, fmt.Errorf("J-space is not enabled")
+	}
+	const maxLayers = 64
+	layers := make([]C.int, maxLayers)
+	ids := make([]C.int, maxLayers*e.jspaceTopK)
+	probs := make([]C.float, maxLayers*e.jspaceTopK)
+	n := int(C.gemma4_engine_jspace_snapshot(e.ptr, maxLayers, C.int(e.jspaceTopK),
+		&layers[0], &ids[0], &probs[0]))
+	if n < 0 {
+		return nil, fmt.Errorf("J-space snapshot failed")
+	}
+	out := make([]JSpaceEntry, n)
+	for i := 0; i < n; i++ {
+		out[i].Layer = int(layers[i])
+		out[i].TokenIDs = make([]int32, e.jspaceTopK)
+		out[i].Probs = make([]float32, e.jspaceTopK)
+		for k := 0; k < e.jspaceTopK; k++ {
+			out[i].TokenIDs[k] = int32(ids[i*e.jspaceTopK+k])
+			out[i].Probs[k] = float32(probs[i*e.jspaceTopK+k])
+		}
+	}
+	return out, nil
+}
+
+// SetJSpaceSteer injects the selected token's normalized J-space direction. Empty layers means
+// every fitted layer. The native side clamps strength to one residual norm.
+func (e *Engine) SetJSpaceSteer(tokenID int32, strength float32, layers []int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var lp *C.int
+	clayers := make([]C.int, len(layers))
+	for i, l := range layers {
+		clayers[i] = C.int(l)
+	}
+	if len(clayers) > 0 {
+		lp = &clayers[0]
+	}
+	if C.gemma4_engine_jspace_steer(e.ptr, C.int(tokenID), C.float(strength), lp,
+		C.int(len(clayers))) != 0 {
+		return fmt.Errorf("cannot steer token %d at layers %v", tokenID, layers)
+	}
+	return nil
+}
+
+func (e *Engine) ClearJSpaceSteer() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	C.gemma4_engine_jspace_clear_steer(e.ptr)
+}
+
 func (e *Engine) GraphStats() (hits, misses, captures, launches int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -957,20 +1068,20 @@ type BatchAdapter struct {
 	// prefills only the new suffix — turn-2+ TTFT collapses to the delta.
 	// All fields are touched only on the scheduler run goroutine (the sole
 	// engine caller), so no lock is needed.
-	snaps       []*seqStateSnap
-	snapBytes   int64
-	snapBudget  int64
+	snaps      []*seqStateSnap
+	snapBytes  int64
+	snapBudget int64
 	// pinPool recycles pinned snapshot buffers (gemma4_host_alloc is a
 	// cudaMallocHost — tens of ms for a ~35 MiB buffer — so freed buffers are
 	// pooled by capacity instead of returned to the driver). pinPoolBytes is
 	// bounded by pinPoolCap.
 	pinPool      []pinBuf
 	pinPoolBytes int64
-	snapMode    int8 // 0 = unprobed, 1 = enabled, -1 = unsupported engine
-	snapTick    int64
-	scLookups   int64
-	scHitTokens int64
-	scEvictions int64
+	snapMode     int8 // 0 = unprobed, 1 = enabled, -1 = unsupported engine
+	snapTick     int64
+	scLookups    int64
+	scHitTokens  int64
+	scEvictions  int64
 }
 
 // seqStateSnap is one saved conversation: the exact token sequence committed

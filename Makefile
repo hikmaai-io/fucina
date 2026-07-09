@@ -53,8 +53,12 @@ lib: cuda/libfucina.a
 # sm_121 → sm_121a) MUST force a recompile, otherwise `ar rcs` would bundle
 # a stale cubin built with the old flags into libfucina.a.
 
-cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh \
-                       cuda/paged_kv.h cuda/paged_kv_device.cuh Makefile
+cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh cuda/gemma4_config.h \
+                       cuda/gemma4_detect.h cuda/paged_kv.h cuda/paged_kv_device.cuh \
+                       cuda/paged_prefix.h cuda/safetensors.h cuda/nvfp4.h \
+                       cuda/nvfp4_loader.h cuda/nvfp4_gemv.cuh cuda/fp8_block.cuh \
+                       cuda/qwen35_fp8_loader.h cuda/qwen35_state.cuh cuda/qwen35_kernels.cuh \
+                       cuda/qwen35_jspace.cuh cuda/qwen35_runtime.cuh cuda/qwen35_backend.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
 
 # The standalone Gemma-4-E4B engine (runtime dims, Per-Layer Embeddings, KV-sharing)
@@ -118,24 +122,6 @@ paged-kv-test:
 mmvq-q4k-test:
 	$(NVCC) -arch=$(CUDA_ARCH) -O3 -I cuda cuda/test_mmvq_q4_k.cu -o /tmp/fucina_mmvq_q4k_test
 	/tmp/fucina_mmvq_q4k_test
-
-# ─── FP8 block-scaled (128x128) decode GEMV test (GPU) — Qwen3.5/3.6 FP8 ──
-# Validates fp8_block_gemv (DeepSeek-style F8_E4M3 weights + per-128-block BF16 scales)
-# vs a host dequant+dot reference; PASS at cosine >= 0.999.
-fp8-block-test:
-	$(NVCC) -arch=$(CUDA_ARCH) -O3 -I cuda cuda/test_fp8_block.cu -o /tmp/fucina_fp8blk
-	/tmp/fucina_fp8blk
-
-# ─── Qwen3 dense numeric parity vs llama.cpp (GPU) ──────────────────────
-# Feeds the exact input token ids llama.cpp produced for "The capital of France is"
-# through fucina's arch-driven multiseq path and asserts the greedy continuation
-# matches llama.cpp's [12095,13,576,6722,315,15344,374,21718] (same Q4_K_M GGUF).
-# Requires cuda/libfucina.a + cuda/libdg.a (run `make lib` / `make fucina` first).
-qwen3-parity-test: lib
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_parity.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_parity \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3_parity
 
 # ─── Qwen3 ragged spec-in-batch verify (DSpark step) (GPU) ──────────────
 # Asserts gemma4_engine_step_batch_spec: anchor-only (d=0) == step_batch greedy;

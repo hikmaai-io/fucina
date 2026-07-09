@@ -65,17 +65,24 @@ type CLIArgs struct {
 	ContBatching   bool
 	NoContBatching bool
 	FlashAttn      string
-	ThreadsHTTP    int    // alias of MaxConcurrent (llama --threads-http)
+	ThreadsHTTP    int // alias of MaxConcurrent (llama --threads-http)
 
 	// System
-	System   string
-	Verbose  bool
-	Timings  bool
-	DeviceID int
+	System     string
+	Verbose    bool
+	Timings    bool
+	DeviceID   int
 	GPUMemUtil float64 // --gpu-mem-util: fraction of total device mem the engine may use (vLLM-style)
-	Memory   string
-	Debug    bool
-	LogLevel string
+	Memory     string
+	Debug      bool
+	LogLevel   string
+
+	// Debug-only Qwen3.5 Jacobian-lens tracing and steering.
+	JSpace      bool
+	JSpaceDebug bool
+	JLENSPath   string
+	JSpaceOut   string
+	JSpaceTopK  int
 
 	// Mode
 	Interactive bool
@@ -200,6 +207,14 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.Float64Var(&a.GPUMemUtil, "gpu-mem-util", 0.90,
 		"Fraction of total GPU memory the engine may use (0<F<=1); caps ctx / drops the packed-Q4_0 copy to fit")
 	fs.StringVar(&a.Memory, "mlock", "", "mlock model in memory (unused on CUDA)")
+	fs.BoolVar(&a.JSpace, "jspace", false,
+		"Debug: write per-generated-token Qwen3.5 Jacobian-lens readouts as JSONL")
+	fs.BoolVar(&a.JSpaceDebug, "jspace-debug", false,
+		"Debug: interactive J-space tracing plus /jsteer intervention commands")
+	fs.StringVar(&a.JLENSPath, "j-lens", "", "FJSPACE1 lens from scripts/convert_jlens.py")
+	fs.StringVar(&a.JLENSPath, "jlens", "", "Alias of --j-lens")
+	fs.StringVar(&a.JSpaceOut, "jspace-out", "/tmp/fucina_jspace.jsonl", "J-space JSONL output path")
+	fs.IntVar(&a.JSpaceTopK, "jspace-top-k", 8, "Top J-space token probabilities per fitted layer (1-32)")
 
 	fs.BoolVar(&a.Interactive, "interactive-first", false, "Force interactive mode")
 	fs.BoolVar(&a.Interactive, "interactive", false, "Force interactive mode")
@@ -235,6 +250,10 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	// --batch needs the paged multi-sequence engine; the scheduler is a no-op without it.
 	if a.Batch {
 		a.PagedKV = true
+	}
+	if a.JSpaceDebug {
+		a.JSpace = true
+		a.Interactive = true
 	}
 	return a, t, nil
 }

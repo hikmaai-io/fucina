@@ -360,6 +360,32 @@ size_t gemma4_engine_q35_state_size(gemma4_engine_t *eng, int n_tokens);
 int    gemma4_engine_q35_state_save(gemma4_engine_t *eng, int slot, void *buf, int n_tokens);
 int    gemma4_engine_q35_state_restore(gemma4_engine_t *eng, int slot, const void *buf, int n_tokens);
 int    gemma4_engine_seq_ntokens(gemma4_engine_t *eng, int slot);
+
+// Named device-memory accounting. Qwen fields are zero for other architectures.
+typedef struct gemma4_memory_stats {
+    uint64_t qwen_workspace_bytes;
+    uint64_t qwen_recurrent_per_slot_bytes;
+    uint64_t qwen_kv_per_slot_bytes;
+    uint64_t qwen_committed_bytes;
+    uint64_t qwen_reserved_bytes;
+    uint64_t qwen_peak_bytes;
+    int32_t  qwen_capacity;
+    int32_t  qwen_allocated_slots;
+    int32_t  qwen_max_context;
+} gemma4_memory_stats_t;
+void gemma4_engine_memory_stats(const gemma4_engine_t *eng, gemma4_memory_stats_t *out);
+
+// Debug-only Qwen3.5 Jacobian-lens support. `load` accepts the FJSPACE1 format produced by
+// scripts/convert_jlens.py. snapshot writes [returned_layers × max_topk] token ids/probabilities.
+// Steering injects the normalized J_l^T·unembed[token] direction at selected fitted layers;
+// n_layers<=0 selects all fitted layers. Strength is clamped to [-1,1] residual norms.
+int  gemma4_engine_jspace_load(gemma4_engine_t *eng, const char *path, int topk);
+int  gemma4_engine_jspace_snapshot(gemma4_engine_t *eng, int max_layers, int max_topk,
+                                   int *layers, int *token_ids, float *probs);
+int  gemma4_engine_jspace_steer(gemma4_engine_t *eng, int token_id, float strength,
+                                const int *layers, int n_layers);
+void gemma4_engine_jspace_clear_steer(gemma4_engine_t *eng);
+
 // PINNED host allocation for state-snapshot buffers: q35_state_copy issues ~2·L
 // small async copies, and pageable memory forces a driver bounce-buffer sync per
 // copy (~250 ms per 35 MB snapshot measured on GB10/CUDA-13); pinned buffers make

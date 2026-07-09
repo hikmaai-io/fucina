@@ -165,6 +165,18 @@ func TestParseArgsTestFlags(t *testing.T) {
 	}
 }
 
+func TestParseArgsJSpaceDebugImpliesTraceAndInteractive(t *testing.T) {
+	a, _ := mustParse(t, []string{"--jspace-debug", "--jlens", "lens.fjls",
+		"--jspace-out", "trace.jsonl", "--jspace-top-k", "12"})
+	if !a.JSpace || !a.JSpaceDebug || !a.Interactive {
+		t.Fatalf("JSpace=%v JSpaceDebug=%v Interactive=%v, want all true",
+			a.JSpace, a.JSpaceDebug, a.Interactive)
+	}
+	if a.JLENSPath != "lens.fjls" || a.JSpaceOut != "trace.jsonl" || a.JSpaceTopK != 12 {
+		t.Fatalf("unexpected J-space args: %+v", a)
+	}
+}
+
 func TestParseArgsBatchImpliesPagedKV(t *testing.T) {
 	// Default: both off.
 	a, _ := mustParse(t, nil)

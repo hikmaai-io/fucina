@@ -118,6 +118,17 @@ func main() {
 	runtime.LockOSThread() // CUDA requires thread affinity
 
 	args := parseFlags()
+	if args.JSpace {
+		if args.JLENSPath == "" {
+			log.Fatal("fucina: --jspace requires --j-lens <lens.fjls> (convert with scripts/convert_jlens.py)")
+		}
+		if !args.Interactive {
+			log.Fatal("fucina: --jspace is a debug-only interactive feature; add --interactive or use --jspace-debug")
+		}
+		if args.JSpaceTopK < 1 || args.JSpaceTopK > 32 {
+			log.Fatal("fucina: --jspace-top-k must be between 1 and 32")
+		}
+	}
 
 	// DiffusionGemma is a separate architecture (block text-diffusion MoE) with its own
 	// engine. Detect it from the GGUF and route to the diffusion path before the
@@ -151,6 +162,28 @@ func main() {
 	if args.PagedKV && os.Getenv("FUCINA_PAGED_KV") == "" {
 		os.Setenv("FUCINA_PAGED_KV", "1")
 	}
+	// Size per-sequence CUDA state to the concurrency the process can actually admit. Qwen3.5's
+	// recurrent arenas are large (GiBs at 16 slots), so always allocating the compile-time maximum
+	// wasted memory on the default 4-request server and on one-shot/interactive runs. An explicit
+	// env value remains the low-level override used by benchmarks and embedders.
+	if os.Getenv("FUCINA_PAGED_MAXSEQS") == "" {
+		maxSeqs := 4 // server's default admission depth
+		if args.MaxConcurrent > 0 {
+			maxSeqs = args.MaxConcurrent
+		}
+		if args.Parallel > 0 {
+			maxSeqs = args.Parallel
+		}
+		if args.Prompt != "" || args.Interactive {
+			maxSeqs = 1
+		}
+		if maxSeqs < 1 {
+			maxSeqs = 1
+		} else if maxSeqs > 16 {
+			maxSeqs = 16
+		}
+		os.Setenv("FUCINA_PAGED_MAXSEQS", fmt.Sprintf("%d", maxSeqs))
+	}
 
 	// Initialize engine (weight format Q4_0-QAT/Q8_0 auto-detected from the GGUF)
 	log.Printf("fucina: loading model %s (ctx=%d, device=%d)...",
@@ -166,6 +199,13 @@ func main() {
 		log.Fatalf("fucina: engine init failed: %v", err)
 	}
 	defer eng.Close()
+
+	if args.JSpace {
+		if err := eng.LoadJSpace(args.JLENSPath, args.JSpaceTopK); err != nil {
+			log.Fatalf("fucina: J-space initialization failed: %v", err)
+		}
+		log.Printf("fucina: J-space JSONL -> %s", args.JSpaceOut)
+	}
 
 	// Optional MTP assistant (the official Gemma-4 draft head): drafts novel text in
 	// the speculative loop; prompt-lookup still covers repeated/structured text.

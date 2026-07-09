@@ -51,6 +51,18 @@ func selectDialect(tok *tokenizer.Tokenizer) chat.Dialect {
 func runInteractivePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	dialect := selectDialect(tok)
 	var history []chat.RichMessage
+	jtrace, err := newJSpaceTracer(eng, tok, args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fucina: %v\n", err)
+		return
+	}
+	if jtrace != nil {
+		defer func() {
+			if err := jtrace.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "fucina: close J-space trace: %v\n", err)
+			}
+		}()
+	}
 
 	nToGenerate := args.Predict
 	if nToGenerate <= 0 {
@@ -71,9 +83,17 @@ func runInteractivePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArg
 	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
 	ctxTokens := int(eng.ContextSize())
 
+	commandsHelp := pagedCommandsHelp
+	if jtrace != nil {
+		commandsHelp += "  /jdump           print the latest J-space readout\n"
+		if args.JSpaceDebug {
+			commandsHelp += "  /jsteer \" TOKEN\" STRENGTH [LAYERS]  steer future forwards\n" +
+				"  /jclear          clear J-space steering\n"
+		}
+	}
 	fmt.Fprintf(os.Stderr,
 		"fucina: interactive mode (%s dialect, paged multi-seq) — ctx=%d, thinking=%s\n%s\n",
-		dialect.Name(), ctxTokens, thinkLevel, pagedCommandsHelp)
+		dialect.Name(), ctxTokens, thinkLevel, commandsHelp)
 
 	turn := uint64(0)
 
@@ -89,12 +109,18 @@ func runInteractivePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArg
 		}
 
 		// Slash commands
+		if handled, jerr := jtrace.handleCommand(input); handled {
+			if jerr != nil {
+				fmt.Fprintf(os.Stderr, "fucina: J-space: %v\n", jerr)
+			}
+			continue
+		}
 		switch input {
 		case "/quit", "/exit", "/q":
 			fmt.Fprintln(os.Stderr, "fucina: bye")
 			return
 		case "/help", "/h", "/?", "/commands":
-			fmt.Fprintf(os.Stderr, "fucina: commands —\n%s", pagedCommandsHelp)
+			fmt.Fprintf(os.Stderr, "fucina: commands —\n%s", commandsHelp)
 			continue
 		case "/reset", "/clear":
 			history = history[:0]
@@ -183,7 +209,8 @@ func runInteractivePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArg
 
 		genStart := time.Now()
 		reply, generated, gerr := generatePaged(eng, tok, dialect, slot, first,
-			nToGenerate, thinkOn, thinkBudget)
+			nToGenerate, thinkOn, thinkBudget, jtrace, turn-1,
+			promptToks[len(promptToks)-1], len(promptToks)-1)
 		eng.SeqRemove(slot)
 		fmt.Println() // newline after the streamed reply
 
@@ -215,7 +242,9 @@ func runInteractivePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArg
 // tokens the channel is force-closed by feeding the close marker, so the model
 // stops thinking and answers (mirrors the server's runSpec budget).
 func generatePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, dialect chat.Dialect,
-	slot int, first int32, nToGenerate int, thinkOn bool, thinkBudget int) (reply string, generated int, err error) {
+	slot int, first int32, nToGenerate int, thinkOn bool, thinkBudget int,
+	jtrace *jspaceTracer, turn uint64, sourceToken int32,
+	sourcePosition int) (reply string, generated int, err error) {
 
 	chOpen, chEnd := tok.ChannelOpen, tok.ChannelEnd
 	// Qwen renders the reasoning opener (<think>\n) INTO the prompt, so with
@@ -241,6 +270,9 @@ func generatePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, dialect chat.Dial
 
 		if tok.IsStop(token) {
 			break
+		}
+		if err := jtrace.Record(turn, generated, sourcePosition, sourceToken, token); err != nil {
+			return emittedContent, generated, err
 		}
 
 		switch {
@@ -283,6 +315,8 @@ func generatePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, dialect chat.Dial
 			return emittedContent, generated, serr
 		}
 		generated++
+		sourceToken = token
+		sourcePosition++
 		token = out[0]
 	}
 

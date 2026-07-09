@@ -187,6 +187,68 @@ budget-bounded), `/reset` (clear the conversation), `/stats` (KV-cache hit rate)
 Ctrl-D). The REPL applies the gemma-4 chat template and honours `--thinking` / `--repeat-penalty`,
 matching the server.
 
+**Qwen3.5 J-space debugging (experimental):**
+
+Fucina can record a fitted Anthropic Jacobian lens for each generated token and can steer the
+residual stream interactively. This path is intentionally slow and must never be enabled in a
+production server. The lens must match the model family/checkpoint and have the same hidden width/layer count.
+For Qwen3.5-9B Base, a converged 458-prompt lens is published in
+`neuronpedia/jacobian-lens`; the replication guide below gives the exact path and conversion.
+
+```sh
+# FP8 inference operators have no autograd formula. Materialize an offline BF16 fitting copy;
+# fucina itself should continue using the original FP8 checkpoint.
+python scripts/dequantize_fp8_hf.py /path/to/Qwen3.5-FP8 /tmp/Qwen3.5-BF16-for-jlens
+
+# Fit selected workspace layers and emit both .pt and .fjls. Run this with PyTorch,
+# transformers, accelerate, and anthropic/jacobian-lens installed; fitting is expensive.
+python scripts/fit_fucina_jlens.py \
+  --model /tmp/Qwen3.5-BF16-for-jlens \
+  --output qwen35_jacobian_lens.pt \
+  --layers 8,12,16,20,24,28 --n-prompts 8
+
+# Or convert a lens that was already fitted with the upstream package.
+python scripts/convert_jlens.py qwen35_jacobian_lens.pt qwen35.fjls --model-layers 32
+
+# Trace + permit interventions. --jspace alone traces but disables steering commands.
+fucina -m ./models/Qwen3.5.gguf --jspace-debug --j-lens qwen35.fjls \
+       --jspace-out /tmp/qwen35-jspace.jsonl --jspace-top-k 8
+```
+
+The JSONL contains one record per generated token with per-layer decoded strings and
+full-vocabulary probabilities. It records both `source_token` (the residual position being read)
+and `sampled_token` (the next token predicted from it), avoiding the common causal off-by-one
+mistake in autoregressive traces. Numeric ids are retained as replay metadata. Interactive commands:
+
+```text
+/jdump                              print the latest fitted-layer readouts
+/jsteer " Paris" 0.15 all          steer toward a token word at all fitted layers
+/jsteer " violence" -0.10 8,16,24  suppress a token word at selected layers
+/jclear                             disable steering
+```
+
+Steering follows the J-Lens direction `J_lᵀ·w_token`, normalized and scaled by the current
+residual norm. Strength is clamped to `[-1,1]`. Quote token words to preserve their significant
+leading whitespace. Numeric ids remain accepted only as an unambiguous fallback when multiple
+vocabulary entries decode to the same visible text.
+
+A runnable replication of the paper's Figure 9 citrus directed-modulation example is included:
+
+```sh
+python scripts/workspace_citrus_example.py \
+  --model ./models/Qwen3.5.gguf \
+  --lens ./qwen35.fjls \
+  --top-k 20 \
+  --output-dir workspace-citrus-run
+```
+
+It runs a no-side-task control and a `concentrate on citrus fruits` condition while the model
+copies `The old painting hung crookedly on the wall.` It then compares decoded J-space words at
+the generated token covering `ook` in `crookedly`, writing both traces and `summary.json`. This is
+a qualitative replication on a different model, not a reproduction of Anthropic's Sonnet 4.5
+numbers. See [`docs/workspace-paper-replication.md`](docs/workspace-paper-replication.md) for the
+method, causal trace convention, and scientific caveats.
+
 **As a one-shot prompt:**
 
 ```sh
