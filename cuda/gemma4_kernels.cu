@@ -12698,26 +12698,27 @@ extern "C" void gemma4_engine_prefix_cache_stats(const gemma4_engine_t *eng,
     prefix_tree_stats(c, lookups, hit_blocks, cached_blocks, evictions);
 }
 
-// Self-test (FUCINA_BATCH_SELFTEST): 3 distinct short token sequences, each run
-// through single-seq decode (greedy argmax, K steps) and then together as a batch
-// of 3 via seq_add + step_batch; assert the batched per-step argmax matches the
-// single-seq argmax for each sequence (a few fp near-tie flips tolerated — PASS if
-// each sequence agrees >= 90%). Mirrors the FUCINA_PAGED_*_SELFTEST create hooks.
+// Self-test (FUCINA_BATCH_SELFTEST): GEMMA4_MAX_SEQS (32) distinct short token
+// sequences, each run through single-seq decode (greedy argmax, K steps) and then
+// together as a full-width batch via seq_add + step_batch; assert the batched
+// per-step argmax is BYTE-IDENTICAL to the single-seq argmax for every sequence
+// (32-wide batched decode == 32 independent single-row decodes, greedy temp=0).
+// This is the 32-concurrency correctness gate. Mirrors the FUCINA_PAGED_*_SELFTEST
+// create hooks. Needs FUCINA_PAGED_MAXSEQS>=32 so 32 slots are addable at once.
 static void gemma4_engine_batch_selftest(gemma4_engine_t *eng) {
     if (!eng->paged_enabled) return;
     // qwen35 has its own hybrid batched path (own fp32 GDN/conv/KV arenas, not the paged
     // fp8 pool) and a dedicated M4 gate (qwen35_batch_selftest); this Gemma/Qwen3 greedy+
     // sampling self-test does not apply to it.
     if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return;
-    const int NSEQ = 3;
+    const int NSEQ = GEMMA4_MAX_SEQS;   // 32-wide: exercises the full multiseq decode batch
     const int KSTEP = 32;
-    // Three distinct short prompts (token ids in-vocab; avoid specials).
-    int32_t prompt[NSEQ][4] = {
-        { 100, 200, 300, 400 },
-        { 500, 600, 700, 800 },
-        { 111, 222, 333, 444 },
-    };
     const int NP = 4;
+    // NSEQ distinct short prompts (token ids in-vocab; clear of specials).
+    int32_t prompt[NSEQ][4];
+    for (int q = 0; q < NSEQ; q++)
+        for (int j = 0; j < NP; j++)
+            prompt[q][j] = 100 + q * 13 + j * 37;
 
     // ── Reference: each sequence alone through the single-seq slot path ──
     // Use a private slot (seq_add prefills then we step_batch with B=1), which is
@@ -12770,7 +12771,7 @@ static void gemma4_engine_batch_selftest(gemma4_engine_t *eng) {
             else if (first_mism < 0) first_mism = k;
         }
         double pct = 100.0 * agree / KSTEP;
-        int pass = (agree >= (KSTEP * 9 + 9) / 10);   // >= 90%
+        int pass = (agree == KSTEP);   // byte-identity: 32-wide batched == per-row single
         all_pass &= pass;
         fprintf(stderr,
             "fucina: batch self-test seq %d: %d/%d argmax agree (%.0f%%)%s%s\n",
@@ -12862,10 +12863,13 @@ static inline const float *mtp_f32(const gemma4_engine_t *eng, uint64_t off) {
 // correct iff the flattened spec stream is BYTE-IDENTICAL to the non-spec batch stream.
 static void gemma4_engine_spec_batch_selftest(gemma4_engine_t *eng) {
     if (!eng->paged_enabled || !eng->mtp.loaded) return;
-    const int NSEQ = 3, NEED = 48, NP = 4;
-    int32_t prompt[NSEQ][4] = {{100,200,300,400},{500,600,700,800},{111,222,333,444}};
+    const int NSEQ = GEMMA4_MAX_SEQS, NEED = 48, NP = 4;   // toward MAX_SEQS verify rows
+    int32_t prompt[NSEQ][4];
+    for (int q = 0; q < NSEQ; q++)
+        for (int j = 0; j < NP; j++)
+            prompt[q][j] = 100 + q * 13 + j * 37;
 
-    // ── Reference: all 3 as a batch through the NON-spec step_batch (greedy) ──
+    // ── Reference: all NSEQ as a batch through the NON-spec step_batch (greedy) ──
     int slots[NSEQ]; int32_t cur[NSEQ]; int32_t ref[NSEQ][NEED];
     for (int q = 0; q < NSEQ; q++) {
         int32_t first = 0;
@@ -12883,8 +12887,8 @@ static void gemma4_engine_spec_batch_selftest(gemma4_engine_t *eng) {
     }
     for (int q = 0; q < NSEQ; q++) gemma4_engine_seq_remove(eng, slots[q]);
 
-    // ── Spec-batch: all 3 through step_batch_spec; flatten each slot's emitted runs ──
-    int32_t got[NSEQ][NEED + GEMMA4_SPEC_MAX]; int ng[NSEQ] = {0,0,0};
+    // ── Spec-batch: all NSEQ through step_batch_spec; flatten each slot's emitted runs ──
+    int32_t got[NSEQ][NEED + GEMMA4_SPEC_MAX]; int ng[NSEQ] = {0};
     for (int q = 0; q < NSEQ; q++) {
         int32_t first = 0;
         slots[q] = gemma4_engine_seq_add(eng, prompt[q], NP, &first, 0.0f, 0, 0.0f, 0.0f, 0);
