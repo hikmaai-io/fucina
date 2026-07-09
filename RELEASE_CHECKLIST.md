@@ -2,6 +2,11 @@
 
 Internal checklist for the first public release as `github.com/hikmaai-io/fucina`.
 
+> **Note:** this checklist and scope predate the Qwen3/Qwen3.5/Qwen3.6 work on `qwen35-hybrid`.
+> "Ship" (§3) and "Launch" (§4) are still unchecked — v0.1.0 has not actually been tagged/released
+> — so treat "First release scope" below as historical intent, not the current feature set. See
+> [CHANGELOG.md](CHANGELOG.md) and [README.md](README.md) for what's actually implemented today.
+
 > **State of this branch (`release-prep`):** the rename is **done** (module path
 > `github.com/hikmaai-io/fucina`, `cmd/fucina`, `libfucina.a`, `FUCINA_*` env vars), the diffusion
 > engine is folded in, personal paths are scrubbed, and the **full build + dense smoke passed on the

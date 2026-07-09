@@ -5,21 +5,32 @@ import "fmt"
 // ─── Usage ────────────────────────────────────────────────────────
 
 func printUsage() {
-	fmt.Print(`fucina - Gemma 4 12B inference engine for DGX Spark GB10
+	fmt.Print(`fucina - Gemma 4 and Qwen3/Qwen3.5/Qwen3.6 inference engine for DGX Spark GB10
 
 Usage:
-  fucina -m model.gguf [options]                  # Server mode (default)
-  fucina -m model.gguf -p "Hello" -n 100          # One-shot prompt
-  fucina -m ./gemma-4-12B-it-NVFP4 -p "Hi" -n 64  # NVFP4 safetensors checkpoint (dir)
+  fucina -m model.gguf [options]                     # Server mode (default)
+  fucina -m model.gguf -p "Hello" -n 100             # One-shot prompt
+  fucina -m ./gemma-4-12B-it-NVFP4 -p "Hi" -n 64     # Gemma-4 NVFP4 safetensors checkpoint (dir)
+  fucina -m ./Qwen3.6-35B-A3B-FP8 --host 0.0.0.0     # Qwen checkpoint; batching auto-enabled
+
+Model detection: architecture (Gemma-4 / Qwen3 dense / Qwen3 MoE / Qwen3.5-3.6 hybrid dense or
+MoE) and weight format (Q4_0/Q8_0/Q4_K GGUF, official FP8-block safetensors, NVFP4 generic or
+NVIDIA ModelOpt mixed) are auto-detected from the file itself. There is no --model-type flag.
 
 Model options:
-  -m, --model PATH           GGUF file, or an NVFP4 safetensors checkpoint (a directory,
-                             an .index.json, or a single .safetensors). Auto-detected
-                             from the file header (Q4_0/Q8_0/NVFP4).
+  -m, --model PATH           GGUF file, or a safetensors checkpoint (a directory, an
+                             .index.json, or a single .safetensors) — Gemma-4 NVFP4,
+                             Qwen3.5/3.6 official FP8-block, or NVIDIA ModelOpt NVFP4/FP8.
+  --tokenizer PATH           tokenizer.json (HF BPE) or .gguf to source vocab from.
+                             Only needed if auto-discovery (a tokenizer.json sibling of
+                             -m) fails — e.g. -m points at a HF hub-cache repo root
+                             instead of its snapshots/<hash> dir. GGUF models never need
+                             this; their vocab is inline.
   -dm, --diffusion-model FILE  DiffusionGemma GGUF; like -m but also enables the NVFP4 MoE
                              experts (CUTLASS grouped FP4 tensor cores, ~1.9x denoise)
   --fp4-moe                  Enable DiffusionGemma NVFP4 MoE experts (use with -m)
-  --assistant FILE           Gemma-4 MTP assistant GGUF (official draft head; ~2x decode)
+  --assistant FILE           Gemma-4 MTP assistant GGUF (official draft head; ~2x decode).
+                             Gemma-4 only; has no effect on Qwen checkpoints.
 
 Inference options:
   --ctx N                    Context size (default: 262144, max: 262144)
@@ -54,11 +65,14 @@ Server options:
   --max-concurrent N         Admission-queue depth (in-flight + waiting); excess
                              requests get 503 (0 = default 4)
   --paged-kv                 Allocate the paged multi-sequence KV pools
-                             (prerequisite for --batch)
+                             (prerequisite for --batch). Auto-forced on for any
+                             Qwen3/3.5/3.6 checkpoint; no-op to pass explicitly there.
   --batch                    Continuous batching: serve concurrent requests in one
                              batched forward pass (implies --paged-kv). OFF by
-                             default — no MTP spec decode in this path, ~10%
-                             single-stream tax; opt in for concurrent serving.
+                             default for Gemma-4 — no MTP spec decode in this path,
+                             ~10% single-stream tax; opt in for concurrent Gemma-4
+                             serving. Auto-forced ON for every Qwen3/3.5/3.6
+                             checkpoint (no single-flight path exists for Qwen).
 
 Other options:
   --cuda-device N            CUDA device ID (default: 0)
@@ -71,7 +85,11 @@ Other options:
 
 Examples:
   fucina -m gemma-4-12b-it.gguf --ctx 32768 &
+  fucina -m ./Qwen3.6-35B-A3B-FP8 --host 0.0.0.0 --port 8080 &
   curl http://localhost:8080/v1/chat/completions \\
     -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+See llms.txt / README.md for the full model support matrix, checkpoint download commands,
+tool-calling examples, and diagnostics.
 `)
 }

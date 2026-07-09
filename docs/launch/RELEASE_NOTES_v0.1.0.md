@@ -1,5 +1,10 @@
 # fucina v0.1.0
 
+> **Draft, not yet published.** These are the release notes as drafted before the
+> Qwen3/Qwen3.5/Qwen3.6 work landed on `qwen35-hybrid` — v0.1.0 has not been tagged (see
+> [RELEASE_CHECKLIST.md](../../RELEASE_CHECKLIST.md)). They describe a Gemma-4-only snapshot;
+> current README.md/CHANGELOG.md are the source of truth for what fucina supports today.
+
 **Gemma 4 12B inference, forged for the NVIDIA DGX Spark GB10.** First public release
 (formerly the internal `gem4d`).
 

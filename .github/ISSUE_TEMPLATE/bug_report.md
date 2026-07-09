@@ -22,7 +22,8 @@ labels: bug
 ## What you expected
 
 ## Repro
-<!-- exact command(s), model file + quant (Q4_0-QAT / Q8_0), prompt, flags -->
+<!-- exact command(s); model family + format (Gemma-4 Q4_0-QAT/Q8_0/NVFP4, or Qwen3/3.5/3.6
+     GGUF/official-FP8/ModelOpt-NVFP4) and repo id if from Hugging Face; prompt; flags -->
 
 ```sh
 fucina -m ... 
