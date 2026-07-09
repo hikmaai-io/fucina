@@ -1,18 +1,32 @@
 # Continuous batching + paged KV — design & plan
 
-Status: **FUNCTIONAL** (on `main`). Enable with the `--batch` CLI flag (implies `--paged-kv`),
-or the legacy `FUCINA_PAGED_KV=1 FUCINA_BATCH=1` env pair — both converge on the same path.
-Default path unchanged (single-flight). Concurrent smoke: 4 parallel requests served
-concurrently (4.43s vs 5.56s sequential), correct outputs, no serialization. Remaining: perf
-(split-K paged attention), per-seq spec decode, sampling params in the batch kernels, CUDA
-graphs per batch size.
+> **Update (post-Qwen):** this doc was written when continuous batching was a Gemma-4-only,
+> opt-in experiment. That mechanism is unchanged, but it is no longer opt-in for every model:
+> **every Qwen3/Qwen3.5/Qwen3.6 checkpoint is now served exclusively through this path**, because
+> Qwen has no working single-flight prefill entry point (`cmd/fucina/main.go` detects
+> `eng.IsQwen3Family()` and force-enables `--batch`/`--paged-kv`; startup fails fast if the paged
+> pool can't allocate). The "why default-off" reasoning below still applies to **Gemma-4 only**.
+> For the Qwen-specific serving behavior (mandatory batching, dense-only spec decode inside the
+> batch path, the `response_format` 501 gap), see the README's
+> [Continuous batching & paged KV](../README.md#-continuous-batching--paged-kv) section and
+> [docs/qwen-models.md](qwen-models.md). The design/internals below are still accurate for both.
 
-Why default-off (deliberate, not just caution): the batch path has **no MTP speculative
-decode** yet (the per-slot paged+batched drafter kernel is unbuilt — see "Spec decode in the
-batch" below) and pays a **~10% split-K single-stream tax**, so for single-stream / low-
-concurrency traffic the single-flight path is faster. Turn `--batch` on only when you are
-actually serving concurrent clients, where flat TTFT and aggregate scaling dominate. Bench it
-both ways: `make tool-bench ARGS="--perf"` vs `make tool-bench BATCH=1 ARGS="--perf"`.
+Status: **FUNCTIONAL** (on `main`). Enable for Gemma-4 with the `--batch` CLI flag (implies
+`--paged-kv`), or the legacy `FUCINA_PAGED_KV=1 FUCINA_BATCH=1` env pair — both converge on the
+same path. Default path for Gemma-4 is unchanged (single-flight); Qwen3 is always on this path.
+Concurrent smoke: 4 parallel requests served concurrently (4.43s vs 5.56s sequential), correct
+outputs, no serialization. Remaining (Gemma-4 single-flight comparison): perf (split-K paged
+attention), per-seq MTP spec decode, CUDA graphs per batch size — the last two have since landed
+in part; see the scoreboard in [docs/qwen35-beat-vllm-plan.md](qwen35-beat-vllm-plan.md) for the
+current measured state on Qwen.
+
+Why default-off for Gemma-4 (deliberate, not just caution): the batch path has **no MTP
+speculative decode** (the per-slot paged+batched drafter kernel for the Gemma-4 assistant head is
+unbuilt — see "Spec decode in the batch" below; Qwen never used the MTP head in the first place)
+and pays a **~10% split-K single-stream tax**, so for single-stream / low-concurrency Gemma-4
+traffic the single-flight path is faster. Turn `--batch` on for Gemma-4 only when you are actually
+serving concurrent clients, where flat TTFT and aggregate scaling dominate. Bench it both ways:
+`make tool-bench ARGS="--perf"` vs `make tool-bench BATCH=1 ARGS="--perf"`.
 
 How it works end to end:
 - `FUCINA_PAGED_KV` allocates the block pools (capacity-sized; `paged_cap = min(MAX_SEQS,

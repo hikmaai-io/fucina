@@ -8,6 +8,24 @@ expect breaking changes between releases.
 First public release as `github.com/hikmaai-io/fucina` (formerly the internal `gem4d`).
 
 ### Added
+- **Qwen3 / Qwen3.5 / Qwen3.6 support** (dense and sparse-MoE, GGUF and safetensors): auto-detected
+  from GGUF `general.architecture` (`qwen3`/`qwen3moe`/`qwen35`) or safetensors `config.json`
+  (`model_type: "qwen3_5"`, `quant_method` `fp8`/`modelopt`). Covers the Qwen3.5/3.6 Gated-DeltaNet
+  hybrid mixer, MoE grouped-expert GEMM, official FP8-block safetensors, and NVIDIA ModelOpt
+  MIXED_PRECISION (NVFP4 experts/shared-expert/LM-head + FP8 attention/GDN) checkpoints. See
+  [docs/qwen-models.md](docs/qwen-models.md).
+- **Continuous batching is now mandatory (auto-enabled) for every Qwen3 checkpoint** — there is no
+  single-flight path for Qwen; `fucina -m <qwen-checkpoint>` detects the architecture and turns
+  batching on automatically. Still opt-in for Gemma-4 (`--batch`/`FUCINA_BATCH`).
+- **Qwen ChatML chat dialect + Qwen3-Coder XML tool calling**: the server auto-selects the Gemma-4
+  or Qwen dialect from the loaded vocab (no flag) and parses Qwen's `<tool_call>` XML output back
+  into standard OpenAI `tool_calls` JSON on the wire.
+- **`response_format`/`json_schema` structured output** (host-side constrained JSON decoding,
+  `internal/grammar`) for the Gemma-4 single-flight path; route-guarded off (HTTP 501) under
+  continuous batching, so not currently available for any Qwen checkpoint.
+- **Default Q4_K requant of the attention/GDN mixer and FFN/expert weights** for Qwen3.5/3.6 dense
+  and MoE checkpoints (smaller resident weight set, faster decode than on-disk FP8;
+  `FUCINA_MOE_FP8=1` reverts to pure FP8).
 - **Gemma 4 12B inference engine for the NVIDIA DGX Spark GB10** (Blackwell `sm_121a`, CUDA 13):
   full forward pass on-GPU, FP8 Tensor-Core attention, FP8 E4M3 KV cache.
 - **CUDA-graph decode** — position-independent graphs for single-token decode and the K-row
@@ -103,7 +121,12 @@ First public release as `github.com/hikmaai-io/fucina` (formerly the internal `g
 
 ### Known limitations
 - Runs **only** on the DGX Spark GB10; not portable to other GPUs as built.
-- Single logical sequence / single slot; the server has **no authentication**.
+- Single logical sequence / single slot by default for Gemma-4 (continuous batching is opt-in
+  there via `--batch`); every Qwen3 checkpoint is always served through continuous batching
+  (multiple concurrent sequences). Server authentication (`--api-key`/`FUCINA_API_KEY`) is
+  supported but **off by default**.
+- `response_format`/`json_schema` does not work under continuous batching, so it is unavailable
+  for any Qwen checkpoint today.
 - **No support commitment** — issues and PRs are handled best-effort.
 
 [0.1.0]: https://github.com/hikmaai-io/fucina/releases/tag/v0.1.0

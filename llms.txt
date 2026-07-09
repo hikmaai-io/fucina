@@ -1,14 +1,15 @@
 # fucina
 
-> A Gemma 4 12B inference engine in Go + CUDA C++, built for exactly one target: the NVIDIA DGX
-> Spark **GB10** (Blackwell, `sm_121a`, CUDA 13.0). Loads Q4_0 (QAT) / Q8_0 GGUF weights, runs the
-> full forward pass on-GPU with FP8 Tensor-Core attention, and serves an OpenAI-compatible HTTP API
-> plus one-shot and interactive CLI modes. It also runs the experimental DiffusionGemma 26B-A4B
-> MoE model via `-dm`. Apache-2.0, **experimental, hardware-specific, no support**.
+> A from-scratch Go + CUDA C++ inference engine for exactly one accelerator — the NVIDIA DGX
+> Spark **GB10** (Blackwell, `sm_121a`, CUDA 13.0). Serves **Gemma 4 12B**, **Qwen3 / Qwen3.5 /
+> Qwen3.6** (dense and MoE, GGUF/FP8-safetensors/NVFP4), and the experimental **DiffusionGemma
+> 26B-A4B** text-diffusion MoE — all through one binary with server, one-shot, and REPL modes.
+> Apache-2.0, **experimental, hardware-specific, no support**.
 > *fucina* is Italian for **forge**. Repo: `github.com/hikmaai-io/fucina` (formerly `gem4d`).
 
-This file orients an LLM/coding agent so it can answer questions about the repo AND actually run
-inference. Module path: `github.com/hikmaai-io/fucina`. Binary: `fucina`.
+This file orients an LLM/coding agent so it can build fucina, pick the right checkpoint, run
+inference, call the API (including tool calling), and self-diagnose failures — without reading
+the whole codebase first. Module path: `github.com/hikmaai-io/fucina`. Binary: `fucina`.
 
 ## Hard constraints (read before doing anything)
 
@@ -17,100 +18,254 @@ inference. Module path: `github.com/hikmaai-io/fucina`. Binary: `fucina`.
   and the hot paths use GB10 FP8/NVFP4 tensor-core features. Do not attempt ports casually.
 - **Toolchain:** CUDA 13.0 at `/usr/local/cuda-13`, Go 1.26 at `/usr/local/go` (override via
   `NVCC`/`CUDA_HOME`/`GO` make vars). `build-essential` (gcc/g++, make, ar).
-- **Quant:** only **Q4_0 (QAT)** or **Q8_0** GGUF for the dense 12B; other formats are rejected.
 - **Never commit/push model weights** — `*.gguf`, `*.safetensors`, `/models/` are git-ignored.
+- **No model-select flag exists.** The architecture, quant format, and MoE-vs-dense shape are all
+  detected from the model file/directory itself (GGUF metadata keys or `config.json` fields) —
+  never invent a `--model-type`/`--arch` flag; it doesn't exist and isn't needed.
 
-## Run inference (copy-paste)
+## Install & build (copy-paste)
 
 ```sh
-# 1. install deps (DGX OS / Ubuntu)
 sudo apt-get install -y build-essential
-pip install -U "huggingface_hub[cli]"
+pip install -U "huggingface_hub[cli]"     # provides the `hf` command
 
-# 2. build the dense engine (add CUTLASS_DIR=... only if you also want DiffusionGemma)
-make                       # -> ./fucina  (asserts cubin sm_121a + device-upload path)
+make                       # dense Gemma/Qwen engine only
+make CUTLASS_DIR=/path/to/cutlass   # add DiffusionGemma too (needs CUTLASS headers;
+                                     # `pip install flashinfer` vendors them)
+```
+`make` compiles the CUDA static libs (`nvcc -arch=sm_121a`) then the Go binary, and asserts the
+cubin arch + device-upload path are correct. Overridable vars: `NVCC`, `CUDA_HOME`, `GO`,
+`CUTLASS_DIR`, `DG_GGUF`.
 
-# 3. download a model (Q4_0 QAT recommended; optional MTP draft head)
-hf download google/gemma-4-12B-it-qat-q4_0-gguf gemma-4-12b-it-qat-q4_0.gguf --local-dir ./models
-hf download unsloth/gemma-4-12b-it-GGUF MTP/gemma-4-12b-it-Q8_0-MTP.gguf --local-dir ./models
+## Model support matrix (verified against the loader/detector code)
 
-# 4a. run as an OpenAI-compatible server
-./fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --ctx 32768 --host 0.0.0.0 --port 8080
+| Family | Detected from | On-disk format | Batching | Spec decode |
+|---|---|---|---|---|
+| **Gemma 4 12B** | GGUF fallback (no `qwen*` arch key) or generic NVFP4 safetensors | Q4_0-QAT / Q8_0 GGUF; NVFP4 safetensors (`RedHatAI/*`, `nvidia/*-FP4`) | opt-in (`--batch`) | prompt-lookup + MTP `--assistant` |
+| **Qwen3 dense** | GGUF `general.architecture = "qwen3"` | GGUF (Q4_K_M etc.) | **mandatory (auto)** | prompt-lookup |
+| **Qwen3 MoE** | GGUF `general.architecture = "qwen3moe"` | GGUF | **mandatory (auto)** | off (MoE) |
+| **Qwen3.5 hybrid dense** | GGUF `general.architecture = "qwen35"`, or safetensors `config.json` `model_type` contains `"qwen3_5"` + `quant_method` `fp8`/`modelopt` (no expert tensors) | Q4_K_M GGUF; official FP8-block safetensors | **mandatory (auto)** | prompt-lookup |
+| **Qwen3.5/3.6 MoE (A3B)** | same safetensors detection, `mlp.experts.0.gate_proj.weight` tensor present | official FP8-block safetensors; **nvidia ModelOpt mixed NVFP4/FP8** | **mandatory (auto)** | off (MoE) |
+| **DiffusionGemma 26B-A4B** | separate engine, selected with `-dm` | Q4_K_M GGUF + NVFP4 MoE experts | N/A (block diffusion) | N/A |
+
+"Qwen3.6" is a checkpoint generation name, not a separate architecture in code: `Qwen/Qwen3.6-27B-FP8`,
+`Qwen/Qwen3.6-35B-A3B-FP8`, and `nvidia/Qwen3.6-35B-A3B-NVFP4` are all served through the same
+`qwen3_5`/`qwen35` detector and loader as Qwen3.5 (same Gated-DeltaNet hybrid architecture). Don't
+grep the source for a literal `"qwen36"` string — it isn't there.
+
+**Continuous batching (paged KV + per-step scheduler) is auto-enabled and REQUIRED for every
+Qwen3/3.5/3.6 checkpoint** — the single-flight prefill path is Gemma-only. `cmd/fucina/main.go`
+detects this (`eng.IsQwen3Family()`) and turns batching on for you; a bare
+`fucina -m <qwen-checkpoint>` just works. If paged-KV pool allocation fails you'll see:
+`fucina: Qwen3 requires paged KV but the pools are not active (allocation failed — lower --ctx or
+raise --gpu-mem-util)` — that's your fix.
+
+## Run Qwen3.6 FP8 / NVFP4 (copy-paste)
+
+```sh
+# 35B-A3B MoE, official FP8 (DeepSeek-V3 block-quant)
+hf download Qwen/Qwen3.6-35B-A3B-FP8 --local-dir ./models/Qwen3.6-35B-A3B-FP8
+./fucina -m ./models/Qwen3.6-35B-A3B-FP8 --host 0.0.0.0 --port 8080
+
+# 27B dense, official FP8
+hf download Qwen/Qwen3.6-27B-FP8 --local-dir ./models/Qwen3.6-27B-FP8
+./fucina -m ./models/Qwen3.6-27B-FP8 --host 0.0.0.0 --port 8080
+
+# 35B-A3B MoE, NVIDIA ModelOpt MIXED_PRECISION (NVFP4 experts/shared-expert/lm_head,
+# FP8 attention/GDN) — smaller footprint than the official FP8 build
+hf download nvidia/Qwen3.6-35B-A3B-NVFP4 --local-dir ./models/Qwen3.6-35B-A3B-NVFP4
+./fucina -m ./models/Qwen3.6-35B-A3B-NVFP4 --host 0.0.0.0 --port 8080
+```
+
+One-shot and REPL work identically (both now route through the paged `SeqAdd`/`StepBatch` path,
+not the Gemma single-flight path):
+
+```sh
+./fucina -m ./models/Qwen3.6-35B-A3B-FP8 -p "Write a haiku about CUDA." -n 100
+./fucina -m ./models/Qwen3.6-35B-A3B-FP8 --interactive
+```
+
+`--batch`/`--paged-kv` and `FUCINA_BATCH`/`FUCINA_PAGED_KV` are no-ops to pass explicitly here —
+they're already forced on. `--assistant` (Gemma-4 MTP draft head) does not apply to Qwen; leave it
+unset for Qwen checkpoints.
+
+**Perf defaults you get for free:** dense AND MoE Qwen3.5/3.6 checkpoints are requanted to Q4_K for
+the attention/GDN mixer and FFN/expert weights at load (was MoE-only, now also dense) — smaller
+resident weight set, faster decode. Escape hatch back to pure FP8: `FUCINA_MOE_FP8=1`.
+
+## `-m` path resolution — the robust way (read this before debugging a load failure)
+
+`-m` accepts: a `.gguf` file; a single `.safetensors` file; a directory containing
+`model.safetensors.index.json` (sharded) or a lone `model.safetensors`, both needing a sibling
+`config.json`. **It does not descend into a HuggingFace hub-cache's `snapshots/<hash>/` for you in
+general** — with one exception:
+
+- The Qwen3.5/3.6 FP8/ModelOpt loader specifically globs `<dir>/snapshots/*/model.safetensors.index.json`,
+  so pointing `-m` at a raw hub-cache **repo root** (`models--Qwen--Qwen3.6-35B-A3B-FP8/`, i.e. what
+  `hf download <repo>` produces *without* `--local-dir`) works for **weight loading**.
+- The Go-side tokenizer auto-discovery (`cmd/fucina/main.go: siblingTokenizerJSON`) has **no such
+  glob** — it only looks for `tokenizer.json` directly inside `-m`'s directory. Pointed at a
+  repo root, it will NOT find the `tokenizer.json` that actually lives under `snapshots/<hash>/`,
+  and you'll get a tokenizer-init failure.
+- The generic (non-Qwen) NVFP4 loader used for Gemma-4 (`RedHatAI/*`, `nvidia/*-FP4`) has **no
+  repo-root resolution at all** — it needs the real snapshot-shaped directory.
+
+**Robust rule for every safetensors checkpoint, Qwen or Gemma:** always download with
+`hf download <repo> --local-dir <dir>` and point `-m` at `<dir>` directly. This gives you a flat
+directory with `config.json` + shards + `tokenizer.json` at the top level, which satisfies both the
+weight loader and the tokenizer auto-discovery uniformly — no `--tokenizer` needed, no
+repo-root-vs-snapshot ambiguity. If you instead used the bare `hf download <repo>` cache layout,
+pass the actual `~/.cache/huggingface/hub/models--.../snapshots/<hash>/` directory to `-m`, not the
+`models--...` parent.
+
+## Tokenizer rules
+
+- **GGUF models never need `--tokenizer`** — the vocab is inline in the GGUF (Gemma-4, Qwen3,
+  Qwen3.5 GGUF alike).
+- **Safetensors/NVFP4/FP8 checkpoints need a `tokenizer.json`**, auto-discovered as a sibling of
+  `-m` (see path-resolution rule above) or passed explicitly via `--tokenizer <tokenizer.json>`.
+  `--tokenizer` also accepts a `.gguf` to source vocab from instead.
+- Auto-discovery failure is fatal with a message telling you to pass `--tokenizer` — there is no
+  silent fallback in any run mode.
+
+## Server / one-shot / REPL (generic, all model families)
+
+```sh
+# OpenAI-compatible server
+./fucina -m <model> --ctx 32768 --host 0.0.0.0 --port 8080
 curl http://localhost:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 
-# 4b. run as an interactive REPL (commands: /reset /stats /quit)
-./fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf --interactive
+# Interactive REPL — /reset /stats /thinking LEVEL /quit
+./fucina -m <model> --interactive
 
-# 4c. one-shot
-./fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf -p "Write a haiku about CUDA." -n 100
-
-# 5. MTP speculative decoding (faster; works in all 3 modes) — add the draft head:
-./fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
-         --assistant ./models/MTP/gemma-4-12b-it-Q8_0-MTP.gguf --interactive
+# One-shot
+./fucina -m <model> -p "Write a haiku about CUDA." -n 100
 ```
+Chat dialect (Gemma template vs Qwen ChatML/XML tool calls) is picked **automatically from the
+loaded vocab** (`<|im_start|>` present → Qwen) — there is no `--dialect` flag.
 
-- **Gotcha:** a *raw* `-p` prompt on this instruction-tuned model degenerates into repetition. For
-  coherent output use the chat path (server `/v1/chat/completions`, or the REPL) — both apply the
-  gemma-4 chat template. `make smoke` uses a raw prompt on purpose (it only checks the engine runs).
-- Watch speculation live at `/metrics` → `speculation` (`accept_rate`, `tokens_per_forward`). Decode
-  on GB10 is bandwidth-bound on weight bytes; the levers are CUDA-graph launch-bubble removal + τ.
-- Key flags: `--ctx` (default 262144; raises only the global-layer KV), `--temp`/`--top-k`/`--top-p`,
-  `--thinking off|on|low|mid|high|xhigh`, `--spec` (on), `--draft-k`, `--assistant`. `fucina --help`.
-- Memory levers (memory-constrained hosts): `FUCINA_NO_PACKED=1` drops the repacked-Q4_0 decode-GEMV
-  weight copy — **frees ~7 GiB VRAM**, ~2–3% slower decode, output bit-identical. `FUCINA_SLIDING_RING=N`
-  sets the sliding ring capacity (default 8192); also the max-exact prefix-reuse rewind depth (deeper
-  → full re-prefill). ring + `FUCINA_NO_PACKED=1` ≈ **23 GiB total at 131072** (vs ~53 GiB before).
+## API requests / tool calling
 
-## DiffusionGemma (optional, experimental)
+The wire format is OpenAI-shaped for every model, regardless of dialect. Minimal tool-calling
+request (verified against `internal/server/qwen_dialect_test.go`):
 
 ```sh
-make CUTLASS_DIR=/path/to/cutlass          # needs CUTLASS headers (pip install flashinfer vendors them)
-hf download unsloth/diffusiongemma-26B-A4B-it-GGUF diffusiongemma-26B-A4B-it-Q4_K_M.gguf --local-dir ./models
-./fucina -dm ./models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --denoise-steps 16 -p "Explain hashing."
+curl http://localhost:8080/v1/chat/completions -d '{
+  "messages": [{"role": "user", "content": "weather in Paris?"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "Get the weather",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }
+  }],
+  "max_tokens": 64
+}'
 ```
-Block text-diffusion (256-token canvas), not autoregressive; no token streaming; `-dm` implies the
-NVFP4 MoE experts. See README "DiffusionGemma".
+Response carries standard `tool_calls` (`choices[0].message.tool_calls[].function.{name,arguments}`,
+`finish_reason: "tool_calls"`) even though Qwen internally emits Qwen3-Coder's XML
+`<tool_call><function=NAME>...</function></tool_call>` form — the server parses it for you.
+Force a specific tool: `"tool_choice": {"type":"function","function":{"name":"get_weather"}}`.
+
+Reasoning/thinking: `"reasoning_effort": "low"|"medium"|"high"` or `"thinking": true/false` in the
+request; response text appears in `choices[0].message.reasoning_content`. Works the same for Gemma
+and Qwen.
+
+**`response_format`/`json_schema` (structured output) does NOT work against any Qwen checkpoint.**
+It's implemented (host-side constrained JSON decoding) but explicitly route-guarded off the
+continuous-batching path with HTTP 501:
+`{"error":{"message":"response_format (constrained JSON decoding) is not supported under continuous
+batching; run without --batch","type":"unsupported_under_batching"}}`. Since Qwen is always forced
+into batching, this always 501s for Qwen today; it works for Gemma-4 single-flight.
+
+Endpoints: `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings` (stub),
+`GET /v1/models`, `GET /health` `/healthz`, `GET /readyz`, `GET /metrics`. `/v1/*` accept
+`Authorization: Bearer <key>` when `--api-key`/`FUCINA_API_KEY` is set; health/metrics stay open.
+
+## Diagnostics (exact messages, so you can grep for them)
+
+| Symptom | Message | Fix |
+|---|---|---|
+| No model given | `error: no model specified. Use -m <model.gguf \| nvfp4-dir \| model.safetensors>` | pass `-m` |
+| Bad/missing tokenizer | `fucina: tokenizer init failed: ...` / `auto-detected tokenizer %s is not usable: ... (pass --tokenizer ...)` | pass `--tokenizer <tokenizer.json\|gguf>` |
+| Safetensors dir has no config/index | loader error from `cuda/safetensors.h` (`Model::open`) | you likely pointed at a hub-cache repo root instead of the snapshot dir — see path-resolution rule above |
+| Unsupported quant/format | engine init fails with `fucina: engine init failed: ...` | only Q4_0-QAT/Q8_0/Q4_K GGUF, official FP8-block safetensors, and NVFP4 (generic or ModelOpt) are accepted; anything else is rejected at load |
+| GPU OOM at load | `fucina: engine init failed: ...` (CUDA alloc failure surfaces through the same wrapper) | lower `--ctx`, raise `--gpu-mem-util` toward 1.0, or use a smaller/lower-quant checkpoint |
+| Qwen paged-KV alloc fails | `fucina: Qwen3 requires paged KV but the pools are not active (allocation failed — lower --ctx or raise --gpu-mem-util)` | lower `--ctx` or raise `--gpu-mem-util` |
+| `response_format` on Qwen | HTTP 501 `unsupported_under_batching` | expected; not supported for any Qwen checkpoint today |
+
+Other useful env vars: `FUCINA_MOE_FP8=1` (disable the Q4_K mixer/FFN requant), `FUCINA_KV_NVFP4=1`
+(NVFP4 KV, memory-only), `FUCINA_NO_PACKED=1` (drop the packed-Q4_0 decode copy, Gemma dense, −~7 GiB
+VRAM), `FUCINA_PAGED_MAXCTX`/`FUCINA_PAGED_MAXSEQS` (paged-pool sizing overrides),
+`FUCINA_DEBUG=1`/`--debug` (dumps requests to `/tmp/fucina_debug.log`).
+
+## Hardware / memory notes
+
+- GB10: 128 GB unified LPDDR5X, ~273 GB/s peak bandwidth. Decode is bandwidth-bound on weight
+  bytes for both Gemma and Qwen — fewer resident bytes (lower quant, dropping the packed copy)
+  is the lever that helps; scheduling/launch tweaks are not.
+- `--gpu-mem-util` (default `0.90`) caps total device-memory use (weights + KV + scratch) as a
+  fraction of the GPU's total memory; the engine auto-caps `--ctx` / drops optional weight copies
+  to fit. No hardcoded minimum-VRAM number exists for the 35B-A3B MoE checkpoints — if it doesn't
+  fit, lower `--ctx` or raise `--gpu-mem-util` first, then try a smaller checkpoint.
+- Gemma-4 dense sliding-window KV is a capped ring (`FUCINA_SLIDING_RING`, default 8192 tokens),
+  ctx-independent; only the 8 global layers scale with `--ctx`. This ring mechanism is Gemma-only.
+
+## Testing
+
+```sh
+# CPU-only, no GPU/model required — this is what CI runs
+go test ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+make check      # go vet + the same pure-Go tests
+
+# GPU smoke (requires the GB10 + a built engine)
+make smoke      # build + raw-prompt run
+
+# GPU correctness/perf gates (require the GB10 AND real downloaded checkpoints at
+# hardcoded /opt/spark/models/... paths — override with MODEL=/QWEN35_MODEL=/etc.
+# NOT runnable in CI or without hardware+weights on disk)
+make gpu-gates          # Qwen3 dense/MoE parity + spec + prefix/suffix gates
+make qwen35-batch-test  # Qwen3.5/3.6 paged batch + CUDA-graph decode gate
+make bench              # batch==single self-test + greedy byte-identity + tok/s
+```
 
 ## Architecture (key files)
 
-- [cuda/gemma4_kernels.cu](cuda/gemma4_kernels.cu): the entire dense-12B forward pass — quantized
-  GEMV/GEMM (Q4_0/Q6_K/Q8_0 dp4a), FP8 flash attention, RoPE, RMSNorm, GeGLU, GPU sampling, CUDA
-  graphs, and the MTP draft head + speculative-verify loop. Compiled to `cuda/libfucina.a`.
-- [cuda/gemma4_kernels.cuh](cuda/gemma4_kernels.cuh): model dimensions + engine struct.
-- [internal/engine/cuda/bridge.go](internal/engine/cuda/bridge.go): cgo bridge (`NewEngine`,
-  `Prefill`, `Decode`, `GenerateSpec`, `LoadAssistant`, `SampleDevice`, …).
-- [internal/server](internal/server): OpenAI-compatible HTTP server, gemma-4 chat template, tool
-  calls, thinking channel, prefix-reuse KV cache, `/metrics` + `/health`.
-- [internal/tokenizer](internal/tokenizer): Gemma 4 SentencePiece/Unigram tokenizer (vocab 262144).
-- [cmd/fucina](cmd/fucina): CLI entry point + run modes (`main.go`, `args.go`, `oneshot.go`, `repl.go`).
-- DiffusionGemma (separate engine): [cuda/diffusion_gemma_engine.cu](cuda/diffusion_gemma_engine.cu),
-  [cuda/diffusion_gemma_kernels.cu](cuda/diffusion_gemma_kernels.cu),
-  [cuda/dg_fp4_moe.cu](cuda/dg_fp4_moe.cu) (CUTLASS NVFP4 expert GEMM),
-  [internal/engine/diffusion](internal/engine/diffusion), [cmd/fucina/diffusion.go](cmd/fucina/diffusion.go).
-
-## Model facts
-
-Gemma 4 12B: 48 layers (40 sliding-window + 8 global), GeGLU FFN (`gelu_pytorch_tanh`, intermediate
-15360), RoPE/p-RoPE, logit softcap 30.0, vocab 262144, hidden 3840, Q6_K tied LM head. KV cache is
-FP8 E4M3. The 40 sliding layers use a capped **ring buffer** (`FUCINA_SLIDING_RING`, default 8192
-slots ≈ 1.5 GiB, ctx-independent); only the 8 global layers scale with `--ctx` (~2.0 GiB at 262144).
-Total KV ≈ **3.5 GiB at 262144 / 2.5 GiB at 131072** (was ~54 GiB before the ring). The MTP draft head
-is a 4-layer `gemma4-assistant` GGUF (~444 MB Q8_0), a build of `google/gemma-4-12B-it-assistant`.
-
-## Build / test / dev
-
-- [Makefile](Makefile): `make` (dense + diffusion), `make smoke` (build + raw-prompt run),
-  `make check` (vet + pure-Go tests), `make test` (adds GPU self-tests). Overridable paths:
-  `NVCC` `CUDA_HOME` `GO` `CUTLASS_DIR` `DG_GGUF`.
-- CPU-only tests (no GPU): `go test ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/`.
-- Correctness bar: greedy output bit-exact vs reference; `compute-sanitizer` clean. Harnesses:
-  [scripts/pi_bench.py](scripts/pi_bench.py), [scripts/parity_bench.py](scripts/parity_bench.py),
-  [scripts/benchmark_gem4.py](scripts/benchmark_gem4.py).
+- [cuda/gemma4_detect.h](cuda/gemma4_detect.h): GGUF architecture/format detection
+  (`gemma4_detect_from_gguf` branches on `general.architecture` = `qwen3`/`qwen3moe`/`qwen35`/Gemma).
+- [cuda/qwen35_fp8_loader.h](cuda/qwen35_fp8_loader.h): Qwen3.5/3.6 FP8-block + ModelOpt
+  MIXED_PRECISION safetensors loader (dense and MoE, per-tensor FP8/NVFP4 scale-sibling sniffing).
+- [cuda/nvfp4_loader.h](cuda/nvfp4_loader.h) / [cuda/safetensors.h](cuda/safetensors.h): generic
+  (Gemma-4) NVFP4 safetensors path and the container parser both loaders share.
+- [cuda/gemma4_kernels.cu](cuda/gemma4_kernels.cu): the entire forward pass for every arch —
+  quantized GEMV/GEMM, FP8/NVFP4 attention, GDN (Gated-DeltaNet) mixer, MoE grouped-expert GEMM,
+  RoPE, RMSNorm, sampling, CUDA graphs, paged multi-sequence batching, spec-verify.
+- [internal/engine/cuda/bridge.go](internal/engine/cuda/bridge.go): cgo bridge
+  (`NewEngine`, `Prefill`, `Decode`, `IsQwen3Family`, `SeqAdd`/`StepBatch`, …).
+- [internal/chat/dialect.go](internal/chat/dialect.go), [internal/chat/qwen.go](internal/chat/qwen.go):
+  chat template + tool-call dialect (`Gemma` vs `Qwen`), auto-selected from the vocab.
+- [internal/server](internal/server): OpenAI-compatible HTTP server, `internal/server/batch`:
+  the continuous-batching scheduler (burst-admission coalescing, per-seq spec gating).
+- [internal/tokenizer](internal/tokenizer): Gemma SentencePiece + native HF BPE (`tokenizer.json`).
+- [cmd/fucina](cmd/fucina): CLI entry point + run modes (`main.go`, `args.go`, `oneshot.go`,
+  `repl.go`, `repl_paged.go`).
+- DiffusionGemma (separate engine): [internal/engine/diffusion](internal/engine/diffusion),
+  [cmd/fucina/diffusion.go](cmd/fucina/diffusion.go). See README "DiffusionGemma".
 
 ## More
 
-- [README.md](README.md): full install, models, usage, MTP, HTTP API, hardware, status.
+- [README.md](README.md): full install, models, usage, HTTP API, hardware, status.
+- [docs/qwen-models.md](docs/qwen-models.md): Qwen3/3.5/3.6 detection reference, checkpoint-path
+  gotchas, official-FP8-vs-ModelOpt distinction, dialect/tool-calling detail, diagnostics.
+- [docs/nvfp4-safetensors.md](docs/nvfp4-safetensors.md): Gemma-4 native NVFP4 schema/internals.
+- [docs/continuous-batching.md](docs/continuous-batching.md): paged-KV/batching design + internals.
+- [docs/qwen35-beat-vllm-plan.md](docs/qwen35-beat-vllm-plan.md): measured Qwen perf vs vLLM.
 - [CHANGELOG.md](CHANGELOG.md) · [LICENSE](LICENSE) (Apache-2.0) · [NOTICE](NOTICE) ·
   [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md).
 - Status: experimental, single-hardware (GB10), best-effort support only.

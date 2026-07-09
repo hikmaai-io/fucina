@@ -139,7 +139,7 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.IntVar(&a.BatchSize, "batch-size", 2048, "Logical maximum batch size")
 	fs.IntVar(&a.Threads, "threads", 8, "Number of CPU threads for preprocessing")
 
-	fs.BoolVar(&a.Spec, "spec", true, "Prompt-lookup speculative decoding (greedy/temp=0 only)")
+	fs.BoolVar(&a.Spec, "spec", true, "Prompt-lookup speculative decoding (works at any temperature; Gemma-4 also gets MTP with --assistant)")
 	fs.IntVar(&a.DraftK, "draft-k", 6, "Max speculative draft length per step")
 	fs.IntVar(&a.ThinkBudget, "think-budget", 0,
 		"Server: max reasoning-channel tokens per turn before the thought channel is force-closed (0 = auto: half of max_tokens; negative = unlimited)")

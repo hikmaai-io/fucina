@@ -14,16 +14,19 @@ First, the honest expectations.
   GB10**. Bug reports for other GPUs (RTX 30xx/40xx/50xx, A100, H100, B100/B200, …) are **out of
   scope** today — the build is pinned to `sm_121a` and the hot paths use GB10-class FP8/NVFP4
   tensor-core features. See the README's *Hardware support* section.
-- **Scope.** The first-class target is the dense **Gemma 4 12B** engine. DiffusionGemma and any
-  multi-GPU port are roadmap, not current guarantees.
+- **Scope.** First-class targets are the dense **Gemma 4 12B** engine and the **Qwen3 / Qwen3.5 /
+  Qwen3.6** family (dense and MoE, GGUF and safetensors/FP8/NVFP4) — see
+  [docs/qwen-models.md](docs/qwen-models.md) for the Qwen detection/loader reference. DiffusionGemma
+  and any multi-GPU port are roadmap, not current guarantees.
 
 ## What you can build & test without a GPU
 
-The Go server, tokenizer, sampler, and chat packages are **pure Go** and run anywhere:
+The Go server, tokenizer, sampler, chat, and batch-scheduler packages are **pure Go** and run
+anywhere:
 
 ```sh
-go test ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
-go vet  ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+go test ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+go vet  ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 gofmt -l .   # must print nothing
 ```
 
@@ -48,7 +51,8 @@ description (which harness, which prompts, before/after).
 ## Style
 
 - Go: `gofmt` (CI enforces); match the surrounding code.
-- CUDA: match the conventions already in `cuda/gemma4_kernels.cu`.
+- CUDA: match the conventions already in `cuda/gemma4_kernels.cu` (all architectures share this
+  file) and `cuda/qwen35_fp8_loader.h` (Qwen3.5/3.6 safetensors loading).
 - Commits: clear, imperative subject; explain the *why*. (This repo keeps a clean, linear history.)
 
 ## DCO / licensing
