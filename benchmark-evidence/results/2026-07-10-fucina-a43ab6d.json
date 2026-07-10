@@ -1,0 +1,150 @@
+{
+  "label": "fucina-a43ab6d",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 83.88893899973482,
+    "decode_tps": 60.17648869519233,
+    "ntok": 128,
+    "sample": "Continuous batching (also known as **dynamic batching** or **in-flight batching**) is a technique used in Large Language Model (LLM) serving to maximize throughput by eliminating the idle time that oc"
+  },
+  "single_long": {
+    "ttft_ms": 4737.906325492077,
+    "decode_tps": 52.053159574818615,
+    "ntok": 128,
+    "sample": "1. The decode phase is bandwidth bound while the prefill phase is compute bound. 2. Continuous batching interleaves prefill and decode to keep the accelerator busy. 3. The decode phase is bandwidth bo"
+  },
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 31.27555321415764,
+      "median_ttft_ms": 119.15505598881282,
+      "median_per_stream_tps": 59.37903660238901,
+      "wall_s": 0.28776469398871996,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        }
+      ]
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 58.262205304174934,
+      "median_ttft_ms": 117.08683798497077,
+      "median_per_stream_tps": 49.49490599355761,
+      "wall_s": 0.9268444220069796,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants, algae, and some bacteria convert light energy into chemical energy. During this reac"
+        }
+      ]
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 102.33174030407184,
+      "median_ttft_ms": 266.3848629890708,
+      "median_per_stream_tps": 44.89360428832077,
+      "wall_s": 3.009818841004744,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants, algae, and some bacteria convert light energy into chemical energy. During this reac"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers below 20 are: 2, 3, 5, 7, 11, 13, 17, and 19.\n\nThree examples are: 2, 3, and 5.\n\nExplanation:\n\nA prime number is a natural number gr"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n137 + 265 = 402\n\nStep-by-step explanation:\n137 + 265 = 402\n\n**Pair 2:**\nWhat is 137 + 265? Show the addition.\nAnswer: 4"
+        }
+      ]
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 155.2422214336213,
+      "median_ttft_ms": 511.32783049251884,
+      "median_per_stream_tps": 32.128995830650396,
+      "wall_s": 4.380251672002487,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants, algae, and some bacteria convert light energy into chemical energy. During this reac"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers below 20 are: 2, 3, 5, 7, 11, 13, 17, and 19.\n\nThree examples are: 2, 3, and 5.\n\nExplanation:\n\nA prime number is a natural number gr"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n137 + 265 = 402\n\nStep-by-step explanation:\n137 + 265 = 402\n\n**Pair 2:**\nWhat is 137 + 265? Show the addition.\nAnswer: 4"
+        }
+      ]
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 207.97550071456945,
+      "median_ttft_ms": 973.9757110073697,
+      "median_per_stream_tps": 21.833676705994733,
+      "wall_s": 6.635396935016615,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants, algae, and some bacteria convert light energy into chemical energy. During this reac"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers below 20 are: 2, 3, 5, 7, 11, 13, 17, and 19.\n\nThree examples are: 2, 3, and 5.\n\nExplanation:\n\nA prime number is a natural number gr"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n137 + 265 = 402\n\nStep-by-step explanation:\n137 + 265 = 402\n\n**Pair 2:**\nWhat is 137 + 265? Show the addition.\nAnswer: 4"
+        }
+      ]
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 291.22386214245455,
+      "median_ttft_ms": 1930.8825915068155,
+      "median_per_stream_tps": 16.126717231947676,
+      "wall_s": 9.477245373011101,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants, algae, and some bacteria convert light energy into chemical energy. During this reac"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers below 20 are: 2, 3, 5, 7, 11, 13, 17, and 19.\n\nThree examples are: 2, 3, and 5.\n\nExplanation:\n\nA prime number is a natural number gr"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n137 + 265 = 402\n\nStep-by-step explanation:\n137 + 265 = 402\n\n**Pair 2:**\nWhat is 137 + 265? Show the addition.\nAnswer: 4"
+        }
+      ]
+    }
+  ],
+  "diverse": true
+}

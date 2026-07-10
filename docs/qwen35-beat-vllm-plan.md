@@ -1,5 +1,26 @@
 # Qwen3.5-MoE-35B — Finalized "beat vLLM on agentic coding" plan
 
+## July 10 follow-up: cold-prefill and C32 plan completed
+
+The later `perf/qwen35-cold-ttft-c32` work closed the remaining serving-capacity gap. Under the
+reproducible diverse-prompt protocol in [`../benchmark-evidence/PROTOCOL.md`](../benchmark-evidence/PROTOCOL.md):
+
+| Metric | Earlier fucina | Current fucina | Recorded vLLM |
+|---|---:|---:|---:|
+| Unique ~2k cold TTFT | 3.51 s | 1.49 s median (1.15 s best clean run) | 0.807 s |
+| Warm state-cache TTFT | 76.5 ms | 71.8 ms median | 215–233 ms |
+| Served tok/s N=16 | 206.0 | 208.0 | 159 |
+| Served tok/s N=32 | 212.6 | **291.2** | 269.9 |
+
+The C32 fix was capacity/accounting, not another decode kernel: exact Qwen allocations replace
+cold/warm mmap free-memory guesses, Linux `MemAvailable` recognizes reclaimable page cache, slot
+admission reserves a configurable 8K typical context while KV grows transactionally, and the
+stale CLI cap of 16 was lifted to the real 32-row engine ceiling. N=1–16 throughput remains inside
+the protection band; C32 improves 37%. CUDA-event telemetry also shows current 2k prefill at
+1.38 s warm (27% expert GEMMs, 27% expert dequant, 4% routing, 2% shared expert, 40% other), so
+the old 71.6%-expert prior below is historical. See the raw result and gate report under
+`benchmark-evidence/results/2026-07-10-fucina-a43ab6d.*`.
+
 _Finalized Jul 4 2026 (branch `qwen35-hybrid`), after the decode-kernel push. Backed by
 measurement + adversarial design review; see memory `qwen35-decode-opt-findings.md`._
 
