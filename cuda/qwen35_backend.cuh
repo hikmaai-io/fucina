@@ -540,6 +540,27 @@ static unsigned char *q35_fp8_experts_to_q4k(
     return slab;
 }
 
+// Linux GB10 exposes GPU unified memory through system RAM. cudaMemGetInfo reports raw free pages,
+// so reading a safetensors mmap into the file cache can look exactly like a device allocation.
+// Capture the reclaimable/cache counters alongside CUDA free memory to make that distinction clear.
+struct q35_host_meminfo { size_t mem_free, mem_available, cached, sreclaimable; };
+static q35_host_meminfo q35_read_host_meminfo() {
+    q35_host_meminfo m{};
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return m;
+    char line[256], key[64]; unsigned long long kib=0;
+    while (fgets(line,sizeof(line),f)) {
+        if (sscanf(line,"%63s %llu",key,&kib) != 2) continue;
+        size_t bytes=(size_t)kib*1024;
+        if (!strcmp(key,"MemFree:")) m.mem_free=bytes;
+        else if (!strcmp(key,"MemAvailable:")) m.mem_available=bytes;
+        else if (!strcmp(key,"Cached:")) m.cached=bytes;
+        else if (!strcmp(key,"SReclaimable:")) m.sreclaimable=bytes;
+    }
+    fclose(f);
+    return m;
+}
+
 // One descriptor per tensor placed into eng->d_weights.
 struct q35fp8_desc { uint64_t *off; uint8_t *fmtp; const void *host; size_t bytes; int fmt; const void *scale_host; size_t scale_bytes; };
 
@@ -608,6 +629,10 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     const int H=eng->cfg.hidden_size, HD=M2_HEAD, NQ=eng->cfg.n_heads, NKV=eng->cfg.n_kv_global;
     const int CONVD=(2*M2_KEYD+eng->cfg.ssm_inner_size), INNER=eng->cfg.ssm_inner_size;
     const int VOC=eng->cfg.vocab_size, I=eng->cfg.intermediate, L=LO.n_layers;
+    size_t fill_free_before=0, fill_total=0, fill_free_after_experts=0;
+    size_t fill_free_after_core=0, fill_free_before_scratch=0, fill_free_after_scratch=0;
+    cudaMemGetInfo(&fill_free_before, &fill_total);
+    const q35_host_meminfo host_mem_before=q35_read_host_meminfo();
 
     std::vector<q35fp8_desc> D;
     std::vector<void*> tofree;          // host temporaries (bf16→f32 / bf16→Q8_0) freed after upload
@@ -878,6 +903,9 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // globals: output_norm (f32, +1), lm_head → Q8_0
     ok=ok && put_f32_from_bf16(&TS.output_norm, LO.final_norm_key, 1.0f,false);
     if(!ok){ for(void*p:tofree) free(p); return -2; }
+    // At this point the persistent expert slabs are resident, while the descriptor-backed core
+    // weights are still host-side. This checkpoint separates expert setup from the bulk upload.
+    cudaMemGetInfo(&fill_free_after_experts, &fill_total);
 
     // Lay out d_weights: 32-byte-aligned running offset; then one H2D copy per descriptor.
     size_t total=0; for(auto&d:D){ total=(total+31)&~size_t(31); total+=d.bytes; }
@@ -907,6 +935,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         while(j>=0 && eng->q35.fp8_scale_tab[j].w>key.w){ eng->q35.fp8_scale_tab[j+1]=eng->q35.fp8_scale_tab[j]; j--; }
         eng->q35.fp8_scale_tab[j+1]=key; }
     for(void*p:tofree) free(p);
+    cudaMemGetInfo(&fill_free_after_core, &fill_total);
 
     // FUCINA_MOE_Q4K: repack the requanted Q4_K mixer projections in place (de-interleaved
     // superblocks → the coalesced-uint4 mmvq_q4_k_packed kernels, ~74% of BW on the GGUF path
@@ -976,12 +1005,66 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         } }
       free(lm_deq); }
     if(cudaMalloc(&eng->d_logits,(size_t)VOC*sizeof(float))!=cudaSuccess) return -6;
+    cudaMemGetInfo(&fill_free_before_scratch, &fill_total);
     if(moe && moe_alloc_scratch(eng)!=0) return -6;
+    cudaMemGetInfo(&fill_free_after_scratch, &fill_total);
     cudaDeviceSynchronize();
     if(cudaGetLastError()!=cudaSuccess){ fprintf(stderr,"qwen35_fp8_engine: upload error\n"); return -7; }
+
+    // Exact allocation ledger for the FP8/NVFP4 model-load path. Unlike the historical
+    // free-at-start minus free-now estimate, these bytes cannot be perturbed by another process
+    // allocating or releasing unified memory while the CPU-heavy expert requantization runs.
+    size_t scale_bytes=0;
+    for(const auto &d:D) if(d.fmt==FORMAT_FP8_BLOCK && d.scale_host) scale_bytes += d.scale_bytes;
+    size_t expert_bytes = eng->d_fp4m_gsw ? (size_t)L*2*sizeof(float) : 0;
+    if(moe && eng->moe_experts_fp4) for(int l=0;l<L;l++) {
+        if(eng->d_fp4m_gu[l])   expert_bytes += (size_t)E*2*MI*(H/2);
+        if(eng->d_fp4m_gusf[l]) expert_bytes += (size_t)E*eng->fp4m_gu_sfB;
+        if(eng->d_fp4m_dn[l])   expert_bytes += (size_t)E*H*(MI/2);
+        if(eng->d_fp4m_dnsf[l]) expert_bytes += (size_t)E*eng->fp4m_dn_sfB;
+    }
+    const size_t embed_elems=(size_t)VOC*H;
+    size_t embed_bytes=(embed_elems/32)*34 + embed_elems*2 + embed_elems*4;
+    size_t head_bytes=embed_elems*2 + (eng->d_lmhead_q8 ? (embed_elems/32)*34 : 0);
+    if(eng->d_head_cand) head_bytes += (size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int);
+    if(eng->d_head_cnt)  head_bytes += (size_t)GEMMA4_MAX_SEQS*sizeof(int);
+    const size_t misc_bytes=(size_t)VOC*sizeof(float);
+    const size_t ledger_bytes=expert_bytes + total + scale_bytes + embed_bytes + head_bytes +
+                              eng->moe_scratch_bytes + misc_bytes;
+    size_t fill_free_final=0; cudaMemGetInfo(&fill_free_final, &fill_total);
+    const q35_host_meminfo host_mem_final=q35_read_host_meminfo();
+    const double GiB=1024.0*1024.0*1024.0;
+    auto delta_gib=[&](size_t a,size_t b){ return ((double)a-(double)b)/GiB; };
+    fprintf(stderr,
+        "fucina: qwen35 allocation decision: source=%s mixer=%s experts=%s d_weights=%.2f GiB\n"
+        "fucina: qwen35 allocation ledger: experts=%.2f core=%.2f scales=%.2f embed=%.2f "
+        "head=%.2f moe-scratch=%.2f misc=%.2f total=%.2f GiB\n"
+        "fucina: qwen35 free-memory trace: enter=%.2f after-experts=%.2f after-core=%.2f "
+        "before-scratch=%.2f after-scratch=%.2f final=%.2f GiB\n"
+        "fucina: qwen35 host-memory trace: free %.2f->%.2f available %.2f->%.2f "
+        "cached %.2f->%.2f reclaimable %.2f->%.2f GiB\n"
+        "fucina: qwen35 observed deltas: experts=%+.2f core=%+.2f embed/head=%+.2f "
+        "moe-scratch=%+.2f fill-total=%+.2f ledger-residual=%+.2f GiB\n",
+        LO.modelopt?"ModelOpt-NVFP4":"block-FP8", q4k_mode?"Q4_K":"FP8",
+        !moe?"n/a":(eng->moe_experts_fp4?"NVFP4":(eng->moe_experts_q4k?"Q4_K":"FP8")),
+        total/GiB,
+        expert_bytes/GiB,total/GiB,scale_bytes/GiB,embed_bytes/GiB,head_bytes/GiB,
+        eng->moe_scratch_bytes/GiB,misc_bytes/GiB,ledger_bytes/GiB,
+        fill_free_before/GiB,fill_free_after_experts/GiB,fill_free_after_core/GiB,
+        fill_free_before_scratch/GiB,fill_free_after_scratch/GiB,fill_free_final/GiB,
+        host_mem_before.mem_free/GiB,host_mem_final.mem_free/GiB,
+        host_mem_before.mem_available/GiB,host_mem_final.mem_available/GiB,
+        host_mem_before.cached/GiB,host_mem_final.cached/GiB,
+        host_mem_before.sreclaimable/GiB,host_mem_final.sreclaimable/GiB,
+        delta_gib(fill_free_before,fill_free_after_experts),
+        delta_gib(fill_free_after_experts,fill_free_after_core),
+        delta_gib(fill_free_after_core,fill_free_before_scratch),
+        delta_gib(fill_free_before_scratch,fill_free_after_scratch),
+        delta_gib(fill_free_before,fill_free_final),
+        delta_gib(fill_free_before,fill_free_final)-ledger_bytes/GiB);
     fprintf(stderr,"fucina: qwen35 %s%s served via batched engine (%d layers, vocab %d, H %d, NKV %d%s, %.2f GiB)\n",
             q4k_mode?"Q4_K-mixer":"FP8", moe?"-MoE":"-dense", L, VOC, H, NKV,
-            moe?", E-experts slabbed":"", total/(1024.0*1024*1024));
+            moe?", E-experts slabbed":"", total/GiB);
     return 0;
 }
 

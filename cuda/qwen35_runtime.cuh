@@ -175,6 +175,14 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     size_t budget_room = util_budget > resident ? util_budget - resident : 0;
     size_t room = physical_room < budget_room ? physical_room : budget_room;
     int fit = (room > workspace && per_slot) ? (int)((room - workspace) / per_slot) : 0;
+    fprintf(stderr,
+            "fucina: qwen35 memory-plan inputs: requested=%d free(create)=%.2f GiB "
+            "free(plan)=%.2f GiB delta=%+.2f GiB resident-est=%.2f GiB "
+            "physical-room=%.2f GiB budget-room=%.2f GiB chosen-room=%.2f GiB fit=%d\n",
+            MS, eng->free_mem/(1024.0*1024*1024), plan_free_before/(1024.0*1024*1024),
+            ((double)eng->free_mem-(double)plan_free_before)/(1024.0*1024*1024),
+            resident/(1024.0*1024*1024), physical_room/(1024.0*1024*1024),
+            budget_room/(1024.0*1024*1024), room/(1024.0*1024*1024), fit);
     if (fit < MS) {
         if (fit < 1) {
             fprintf(stderr, "fucina: qwen35 memory plan cannot fit one slot: workspace %.2f GiB, "
@@ -244,13 +252,19 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
         // The cache is a one-time alloc and each lazy per-layer build self-heals to off on
         // failure, so a tight-but-passing decision never destabilizes serving. (Was 5 GiB —
         // too conservative: it kept the ~350 ms/prefill mixer dequant on even with room.)
-        eng->q35.wcache_on = (freeb > need + (size_t)3ull * 1024 * 1024 * 1024 &&
-                              eng->q35.reserved_bytes + need <= room) ? 1 : 0;
-        if (const char *e = getenv("FUCINA_QWEN35_WCACHE")) eng->q35.wcache_on = (atoi(e) != 0);
+        const bool physical_ok = freeb > need + (size_t)3ull * 1024 * 1024 * 1024;
+        const bool budget_ok = eng->q35.reserved_bytes + need <= room;
+        eng->q35.wcache_on = (physical_ok && budget_ok) ? 1 : 0;
+        const char *wcache_env = getenv("FUCINA_QWEN35_WCACHE");
+        if (wcache_env) eng->q35.wcache_on = (atoi(wcache_env) != 0);
         if (eng->q35.wcache_on) eng->q35.reserved_bytes += need;
-        fprintf(stderr, "fucina: qwen35 prefill weight-cache %s (need %.1f GiB, free %.1f GiB)\n",
-                eng->q35.wcache_on ? "ON" : "off",
-                need / (1024.0*1024*1024), freeb / (1024.0*1024*1024));
+        fprintf(stderr, "fucina: qwen35 prefill weight-cache %s (decision=%s, need %.2f GiB, "
+                "free %.2f GiB, physical=%s, budget=%s, reserved-before %.2f GiB, room %.2f GiB)\n",
+                eng->q35.wcache_on ? "ON" : "off", wcache_env ? "env" : "auto",
+                need / (1024.0*1024*1024), freeb / (1024.0*1024*1024),
+                physical_ok ? "fit" : "no-fit", budget_ok ? "fit" : "no-fit",
+                (eng->q35.reserved_bytes - (eng->q35.wcache_on ? need : 0))/(1024.0*1024*1024),
+                room/(1024.0*1024*1024));
     }
     q35_fp4_setup(eng);   // NVFP4 4-bit tensor-core prefill GEMM (preferred; BF16 cache is fallback)
     eng->q35.ready = 1;
@@ -657,8 +671,15 @@ static int q35_fp4_setup(gemma4_engine_t *eng) {
     // is much faster + smaller, but a random-token stress prompt can flip an argmax near-tie, so the
     // strict slow==fast self-consistency gate isn't guaranteed. Default keeps the BF16 cache path.
     const char *e = getenv("FUCINA_QWEN35_FP4");
-    if (!e || atoi(e) == 0) return -1;
-    if (!eng->cublaslt && cublasLtCreate(&eng->cublaslt) != CUBLAS_STATUS_SUCCESS) return -1;
+    if (!e || atoi(e) == 0) {
+        fprintf(stderr, "fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)\n");
+        return -1;
+    }
+    fprintf(stderr, "fucina: qwen35 NVFP4 prefill GEMM setup attempting\n");
+    if (!eng->cublaslt && cublasLtCreate(&eng->cublaslt) != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "fucina: qwen35 NVFP4 prefill GEMM setup failed (cublasLtCreate)\n");
+        return -1;
+    }
     const int L = eng->cfg.n_layers;
     bool ok = true;
     if (!eng->q35.fp4_gsw) ok &= cudaMalloc(&eng->q35.fp4_gsw, (size_t)L*12*sizeof(float)) == cudaSuccess;
@@ -677,7 +698,10 @@ static int q35_fp4_setup(gemma4_engine_t *eng) {
         int32_t pmode=CUBLASLT_POINTER_MODE_DEVICE;
         cublasLtMatmulDescSetAttribute(eng->fp4_desc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pmode, sizeof(pmode));
     }
-    if (!ok) return -1;
+    if (!ok) {
+        fprintf(stderr, "fucina: qwen35 NVFP4 prefill GEMM setup failed (device allocation/descriptor)\n");
+        return -1;
+    }
     eng->q35.fp4_on = 1;
     fprintf(stderr, "fucina: qwen35 NVFP4 prefill GEMM ON (4-bit tensor cores, ~2x FP8)\n");
     return 0;

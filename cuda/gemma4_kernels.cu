@@ -4108,6 +4108,7 @@ struct gemma4_engine {
     // MoE forward scratch (lazy, QWEN3MOE only). Processes ≤ GEMMA4_MOE_TMAX tokens per chunk;
     // total assignments = tokens·n_experts_used. FP32 column-major [feat, tokens] throughout.
     int             moe_scratch_ready;
+    size_t          moe_scratch_bytes; // exact bytes successfully allocated by moe_alloc_scratch
     float          *d_moe_rlogits;   // [TMAX·n_experts] router logits (per-token softmax input)
     int            *d_moe_tki;       // [TMAX·n_used] top-k expert ids
     float          *d_moe_tkw;       // [TMAX·n_used] renormalized router weights
@@ -9069,7 +9070,12 @@ static int moe_alloc_scratch(gemma4_engine_t *eng) {
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
     const int T = GEMMA4_MOE_TMAX, A = T * U;
     int ok = 1;
-    #define MOE_A(p, bytes) do { if (cudaMalloc(&(p), (size_t)(bytes)) != cudaSuccess) { cudaGetLastError(); ok = 0; } } while (0)
+    size_t allocated_bytes = 0;
+    #define MOE_A(p, bytes) do { \
+        size_t _n = (size_t)(bytes); \
+        if (cudaMalloc(&(p), _n) != cudaSuccess) { cudaGetLastError(); ok = 0; } \
+        else allocated_bytes += _n; \
+    } while (0)
     MOE_A(eng->d_moe_rlogits, (size_t)T * E * sizeof(float));
     MOE_A(eng->d_moe_tki,     (size_t)A * sizeof(int));
     MOE_A(eng->d_moe_tkw,     (size_t)A * sizeof(float));
@@ -9115,6 +9121,7 @@ static int moe_alloc_scratch(gemma4_engine_t *eng) {
     for (int i = 0; i < E; i++) ones[i] = 1.0f;
     cudaMemcpy(eng->d_moe_ones, ones, (size_t)E * sizeof(float), cudaMemcpyHostToDevice);
     free(ones);
+    eng->moe_scratch_bytes = allocated_bytes;
     eng->moe_scratch_ready = 1;
     return 0;
 }
