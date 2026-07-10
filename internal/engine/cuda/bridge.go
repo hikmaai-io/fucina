@@ -103,6 +103,7 @@ type MemoryStats struct {
 	QwenCapacity              int
 	QwenAllocatedSlots        int
 	QwenMaxContext            int
+	QwenReservedContext       int
 }
 
 // NewEngine creates and initializes the CUDA inference engine.
@@ -679,6 +680,7 @@ func (e *Engine) MemoryStats() MemoryStats {
 		QwenCapacity:              int(s.qwen_capacity),
 		QwenAllocatedSlots:        int(s.qwen_allocated_slots),
 		QwenMaxContext:            int(s.qwen_max_context),
+		QwenReservedContext:       int(s.qwen_reserved_context),
 	}
 }
 

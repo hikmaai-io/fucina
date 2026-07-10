@@ -1,5 +1,31 @@
 #pragma once
 
+// Linux GB10 exposes CUDA unified memory through system RAM. cudaMemGetInfo reports raw free
+// pages, while MemAvailable includes reclaimable file cache. Keep both visible so admission can
+// distinguish actual allocations from safetensors mmap cache growth.
+struct q35_host_meminfo { size_t mem_free, mem_available, cached, sreclaimable; };
+static q35_host_meminfo q35_read_host_meminfo() {
+    q35_host_meminfo m{};
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return m;
+    char line[256], key[64]; unsigned long long kib=0;
+    while (fgets(line,sizeof(line),f)) {
+        if (sscanf(line,"%63s %llu",key,&kib) != 2) continue;
+        size_t bytes=(size_t)kib*1024;
+        if (!strcmp(key,"MemFree:")) m.mem_free=bytes;
+        else if (!strcmp(key,"MemAvailable:")) m.mem_available=bytes;
+        else if (!strcmp(key,"Cached:")) m.cached=bytes;
+        else if (!strcmp(key,"SReclaimable:")) m.sreclaimable=bytes;
+    }
+    fclose(f);
+    return m;
+}
+
+static size_t q35_physical_available(size_t cuda_free) {
+    q35_host_meminfo m=q35_read_host_meminfo();
+    return m.mem_available > cuda_free ? m.mem_available : cuda_free;
+}
+
 // Qwen3.5 engine-owned runtime state. This is deliberately separate from gemma4_engine:
 // generic model weights/configuration stay in the parent engine, while hybrid recurrent state,
 // attention KV, prefill workspace, graph cache and Qwen-specific quantization caches live here.
@@ -8,6 +34,7 @@ struct qwen35_runtime_state {
     int ready;
     int capacity;
     int maxctx;
+    int reserved_context;
     int graph_enabled;
 
     // Stable device pointer tables indexed by slot. Individual slot allocations are created on
@@ -90,11 +117,21 @@ struct qwen35_runtime_state {
     size_t           jspace_bytes;
 
     // Phase-1 accounting. committed includes eager workspace + currently allocated state;
-    // reserved is the configured worst-case capacity used by admission decisions.
+    // reserved covers the configured typical-context capacity; state may grow beyond it
+    // transactionally up to maxctx, declining cleanly if physical/budget headroom disappears.
+    size_t model_bytes;
     size_t workspace_bytes;
     size_t per_slot_recurrent_bytes;
     size_t per_slot_kv_bytes;
+    size_t reserved_slot_kv_bytes;
     size_t committed_bytes;
     size_t reserved_bytes;
     size_t peak_bytes;
+
+    // Opt-in prefill phase telemetry (--timings / FUCINA_QWEN35_PREFILL_TIMINGS=1).
+    int    prefill_timing;
+    double prefill_dequant_ms;
+    double prefill_router_ms;
+    double prefill_expert_ms;
+    double prefill_shared_ms;
 };

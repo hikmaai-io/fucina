@@ -162,10 +162,14 @@ func main() {
 	if args.PagedKV && os.Getenv("FUCINA_PAGED_KV") == "" {
 		os.Setenv("FUCINA_PAGED_KV", "1")
 	}
-	// Size per-sequence CUDA state to the concurrency the process can actually admit. Qwen3.5's
-	// recurrent arenas are large (GiBs at 16 slots), so always allocating the compile-time maximum
-	// wasted memory on the default 4-request server and on one-shot/interactive runs. An explicit
-	// env value remains the low-level override used by benchmarks and embedders.
+	// --timings includes the opt-in, synchronizing Qwen MoE prefill phase breakdown. The
+	// low-level env remains available to embedders that do not use this CLI.
+	if args.Timings && os.Getenv("FUCINA_QWEN35_PREFILL_TIMINGS") == "" {
+		os.Setenv("FUCINA_QWEN35_PREFILL_TIMINGS", "1")
+	}
+	// Size Qwen's lazy sequence pool to the concurrency the process can actually admit. The C
+	// memory planner may reduce this target; the 32-row compile-time ceiling sizes graph/scratch
+	// arrays. An explicit env remains the low-level override used by benchmarks and embedders.
 	if os.Getenv("FUCINA_PAGED_MAXSEQS") == "" {
 		maxSeqs := 4 // server's default admission depth
 		if args.MaxConcurrent > 0 {
@@ -179,8 +183,8 @@ func main() {
 		}
 		if maxSeqs < 1 {
 			maxSeqs = 1
-		} else if maxSeqs > 16 {
-			maxSeqs = 16
+		} else if maxSeqs > 32 {
+			maxSeqs = 32
 		}
 		os.Setenv("FUCINA_PAGED_MAXSEQS", fmt.Sprintf("%d", maxSeqs))
 	}

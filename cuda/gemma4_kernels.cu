@@ -5064,7 +5064,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->multiseq_graph_failed = 0; eng->multiseq_graph_logged = 0;
     // qwen35 M4 batched-decode arenas (lazy; allocated on first qwen35 seq_add).
     eng->q35.ready = 0; eng->q35.capacity = requested_seq_capacity();
-    eng->q35.maxctx = 0; eng->q35.graph_enabled = 1;
+    eng->q35.maxctx = 0; eng->q35.reserved_context = 0; eng->q35.graph_enabled = 1;
     eng->q35.rowslot = NULL; eng->q35.chunk_scr = NULL;
     eng->q35.pf_pos = NULL; eng->q35.pf_tok = NULL;
     eng->q35.attn_splits = 0; eng->q35.attn_tile = 0;
@@ -5077,9 +5077,12 @@ gemma4_engine_t* gemma4_engine_create(
     eng->q35.cont_scores = NULL; eng->q35.cont_p = NULL; eng->q35.cont_cap = 0;
     eng->q35.fp4_gsw = NULL; eng->q35.fp4_on = 0;
     eng->q35.fp8_scale_tab = NULL; eng->q35.fp8_scale_n = 0;
-    eng->q35.workspace_bytes = eng->q35.per_slot_recurrent_bytes = 0;
-    eng->q35.per_slot_kv_bytes = eng->q35.committed_bytes = 0;
-    eng->q35.reserved_bytes = eng->q35.peak_bytes = 0;
+    eng->q35.model_bytes = eng->q35.workspace_bytes = eng->q35.per_slot_recurrent_bytes = 0;
+    eng->q35.per_slot_kv_bytes = eng->q35.reserved_slot_kv_bytes = 0;
+    eng->q35.committed_bytes = eng->q35.reserved_bytes = eng->q35.peak_bytes = 0;
+    eng->q35.prefill_timing = getenv("FUCINA_QWEN35_PREFILL_TIMINGS") ? 1 : 0;
+    eng->q35.prefill_dequant_ms = eng->q35.prefill_router_ms = 0;
+    eng->q35.prefill_expert_ms = eng->q35.prefill_shared_ms = 0;
     eng->q35.jspace_enabled = eng->q35.jspace_topk = eng->q35.jspace_nlayers = 0;
     eng->q35.jspace_hidden = eng->q35.jspace_transport = eng->q35.jspace_norm = NULL;
     eng->q35.jspace_logits = eng->q35.jspace_dirs = NULL;
@@ -9268,6 +9271,18 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                     cudaStream_t stream) {
     const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn;
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
+    // Diagnostic phase timing is deliberately synchronizing and opt-in only. Reuse two events
+    // as a moving boundary; each mark drains the stream, attributes the completed interval, then
+    // swaps start/stop. Normal serving creates no events and takes no timing branches past `timing`.
+    const bool timing = eng->q35.prefill_timing && n > 2 * FP8_MAXB;
+    cudaEvent_t tev0=nullptr, tev1=nullptr;
+    if (timing) { cudaEventCreate(&tev0); cudaEventCreate(&tev1); cudaEventRecord(tev0,stream); }
+    auto timing_mark = [&](double *dst) {
+        if (!timing) return;
+        cudaEventRecord(tev1,stream); cudaEventSynchronize(tev1);
+        float ms=0; cudaEventElapsedTime(&ms,tev0,tev1); *dst += ms;
+        cudaEvent_t tmp=tev0; tev0=tev1; tev1=tmp;
+    };
     // Q4_K-requantized experts route through the GGUF Q4_K grouped branch below (and skip the
     // FP8 tc-prefill dequant, which reads FP8 slabs). Router/shared expert stay on their paths.
     const int fp8 = (eng->format == FORMAT_FP8_BLOCK) && !eng->moe_experts_q4k && !eng->moe_experts_fp4;
@@ -9326,6 +9341,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             tc = 1;
         }
     }
+    timing_mark(&eng->q35.prefill_dequant_ms);
     for (int t0 = 0; t0 < n; t0 += GEMMA4_MOE_TMAX) {
         int cn = n - t0; if (cn > GEMMA4_MOE_TMAX) cn = GEMMA4_MOE_TMAX;
         const float *h = h_f32 + (size_t)t0 * H;
@@ -9349,6 +9365,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                          (fp8 || eng->moe_experts_q4k) ? eng->d_moe_active : NULL, n_slot, stream);
         // Gather expert inputs → grouped gate/up/down. FP8 keeps FLOAT activations (no Q8_1).
         dg_gather_cols(eng->d_moe_xe, h, eng->d_moe_eidx, H, total, stream);
+        timing_mark(&eng->q35.prefill_router_ms);
         if (!tc && eng->moe_experts_fp4) {
             // CUTLASS grouped block-scaled NVFP4 experts: quantize the gathered activations per
             // expert group to E2M1 + swizzled ue4m3 SF, then ONE ptr-array tensor-core GEMM per
@@ -9470,6 +9487,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         // per-token reduce (fixed k order via d_moe_invpos) — no atomicAdd, so bit-identical
         // run-to-run (was nondeterministic atomic scatter-add). out is fully written (no memset).
         dg_moe_reduce(out, eng->d_moe_oe, eng->d_moe_invpos, eng->d_moe_ecs, H, cn, U, stream);
+        timing_mark(&eng->q35.prefill_expert_ms);
         // Qwen3.5-MoE shared expert: out += sigmoid(h·shared_expert_gate) · down_s(silu(gate_s(h))·up_s(h)).
         // Runs on the cn TOKENS (not assignments); reuses the grouped scratch, all consumed above.
         if (eng->moe_shared_inter > 0) {
@@ -9534,7 +9552,9 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             q35moe_b_shared_axpy_kernel<<<dim3((unsigned)((H + 255) / 256), cn), 256, 0, stream>>>(
                 out, eng->d_moe_xe, eng->d_moe_shlog, H);
         }
+        timing_mark(&eng->q35.prefill_shared_ms);
     }
+    if (timing) { cudaEventDestroy(tev0); cudaEventDestroy(tev1); }
 }
 
 // Per-row multiseq sampler (defined far below; paged_prefill_batched routes the

@@ -93,6 +93,13 @@ convention this repo's own test fixtures and golden-generation scripts use, e.g.
 - **Burst-admission coalescing** in the scheduler holds a short escalating window (few ms, capped
   at 150 ms) when it wakes from idle, so near-simultaneous requests land in the same batch instead
   of admitting one at a time. Unconditional, no flag.
+- **Hybrid state capacity is lazy and context-proportional.** `--parallel` can request up to 32
+  rows. The planner reserves 8192 context tokens per slot by default while FULL-attention KV grows
+  transactionally to `--ctx`; `FUCINA_QWEN35_SLOT_CTX=N` changes the reservation or restores the
+  old worst-case policy by setting it equal to `--ctx`.
+- **`--timings` includes Qwen MoE prefill phases.** Wide prefills log expert dequant, router/route,
+  grouped-expert, shared-expert, and remaining mixer/attention/head milliseconds. The diagnostic
+  inserts CUDA synchronization boundaries and should not be used for normal serving benchmarks.
 - **`response_format`/`json_schema` (constrained JSON decoding) is rejected under continuous
   batching** with HTTP `501 unsupported_under_batching` — since Qwen is always served through that
   path, structured output does not currently work against any Qwen checkpoint. It works for Gemma-4

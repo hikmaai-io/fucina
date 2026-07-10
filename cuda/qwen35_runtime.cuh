@@ -22,8 +22,15 @@ static bool q35_can_grow(gemma4_engine_t *eng, size_t extra) {
     if (!extra) return true;
     size_t free_now=0, total_now=0; cudaMemGetInfo(&free_now, &total_now);
     const size_t safety = 256ull << 20;
-    if (free_now <= safety || extra > free_now - safety) return false;
-    size_t resident = eng->free_mem > free_now ? eng->free_mem - free_now : 0;
+    // On GB10, cudaMemGetInfo tracks raw MemFree and therefore treats reclaimable safetensors
+    // page cache as unavailable. MemAvailable is the kernel's pressure-aware allocatable view;
+    // use the larger value for the physical gate. cudaMalloc remains the final transactional gate.
+    size_t physical=q35_physical_available(free_now);
+    if (physical <= safety || extra > physical - safety) return false;
+    // Exact owned bytes avoid billing file-cache/neighbor churn to this engine's util budget.
+    size_t resident = eng->q35.model_bytes
+        ? eng->q35.model_bytes + eng->q35.committed_bytes
+        : (eng->free_mem > free_now ? eng->free_mem - free_now : eng->q35.committed_bytes);
     size_t budget = (size_t)(eng->gpu_mem_util * (double)(total_now ? total_now : eng->total_mem));
     return resident < budget && extra <= budget - resident;
 }
@@ -106,6 +113,7 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     if (PF < MS) PF = MS;
     size_t plan_free_before = 0, plan_total = 0;
     cudaMemGetInfo(&plan_free_before, &plan_total);
+    const size_t plan_available_before=q35_physical_available(plan_free_before);
     int ok = 1;
     for (int i = 0; i < 24 && ok; i++)
         ok &= cudaMalloc(&eng->q35.sb[i], (size_t)PF * SBSZ[i] * sizeof(float)) == cudaSuccess;
@@ -150,12 +158,12 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     workspace += 2ull * (size_t)L * MS * sizeof(void*); // two state pointer tables per layer
     workspace += (size_t)MS * NQ * eng->q35.attn_splits *
                  (2 * sizeof(float) + M2_HEAD * sizeof(float));
-    size_t per_recur = 0, per_kv = 0;
+    size_t per_recur = 0, kv_per_token = 0;
     const size_t recurrent_s_bytes = (size_t)NVH * SD * SD * sizeof(__nv_bfloat16);
     const size_t recurrent_ring_bytes = (size_t)CONVD * (CK - 1) * sizeof(float);
     for (int l = 0; l < L; l++) {
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
-            per_kv += 2ull * (size_t)maxctx * NKV * HD * sizeof(__half);
+            kv_per_token += 2ull * (size_t)NKV * HD * sizeof(__half);
         } else {
             // One fixed-state slab per slot, with independently aligned layer views. Besides
             // reducing 48 cudaMallocs/slot to one, this makes admission genuinely transactional:
@@ -167,22 +175,39 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
         }
     }
     per_recur = q35_align_up(per_recur);
-    const size_t per_slot = per_recur + per_kv;
+    const size_t per_kv = kv_per_token * (size_t)maxctx; // maximum growth/accounting bytes
+    // Admission reserves a production-typical context per slot, not maxctx for every slot. FULL
+    // KV grows transactionally; a sequence beyond this reservation may continue while budget is
+    // available, otherwise q35_can_grow declines before allocation and serving stops gracefully.
+    // Set FUCINA_QWEN35_SLOT_CTX=maxctx to restore the old worst-case reservation policy.
+    int slotctx=maxctx < 8192 ? maxctx : 8192;
+    if (const char *e=getenv("FUCINA_QWEN35_SLOT_CTX")) { int v=atoi(e); if(v>0) slotctx=v; }
+    if (slotctx>maxctx) slotctx=maxctx; if(slotctx<256) slotctx=256;
+    eng->q35.reserved_context=slotctx;
+    const size_t reserved_kv=kv_per_token*(size_t)slotctx;
+    const size_t per_slot = per_recur + reserved_kv;
     const size_t reserve = 512ull << 20;
-    size_t physical_room = plan_free_before > reserve ? plan_free_before - reserve : 0;
-    size_t resident = eng->free_mem > plan_free_before ? eng->free_mem - plan_free_before : 0;
+    size_t physical_room = plan_available_before > reserve ? plan_available_before - reserve : 0;
+    // The exact Qwen model ledger is stable across cold/warm mmap cache state. workspace is
+    // subtracted explicitly below, so resident here is model-only.
+    size_t resident = eng->q35.model_bytes
+        ? eng->q35.model_bytes
+        : (eng->free_mem > plan_free_before ? eng->free_mem - plan_free_before : 0);
     size_t util_budget = (size_t)(eng->gpu_mem_util * (double)(plan_total ? plan_total : eng->total_mem));
     size_t budget_room = util_budget > resident ? util_budget - resident : 0;
     size_t room = physical_room < budget_room ? physical_room : budget_room;
     int fit = (room > workspace && per_slot) ? (int)((room - workspace) / per_slot) : 0;
     fprintf(stderr,
-            "fucina: qwen35 memory-plan inputs: requested=%d free(create)=%.2f GiB "
-            "free(plan)=%.2f GiB delta=%+.2f GiB resident-est=%.2f GiB "
+            "fucina: qwen35 memory-plan inputs: requested=%d slotctx=%d maxctx=%d "
+            "cuda-free=%.2f GiB available=%.2f GiB model-resident=%.2f GiB (%s) "
+            "workspace=%.2f GiB reserve/slot=%.2f GiB (max %.2f) "
             "physical-room=%.2f GiB budget-room=%.2f GiB chosen-room=%.2f GiB fit=%d\n",
-            MS, eng->free_mem/(1024.0*1024*1024), plan_free_before/(1024.0*1024*1024),
-            ((double)eng->free_mem-(double)plan_free_before)/(1024.0*1024*1024),
-            resident/(1024.0*1024*1024), physical_room/(1024.0*1024*1024),
-            budget_room/(1024.0*1024*1024), room/(1024.0*1024*1024), fit);
+            MS,slotctx,maxctx,plan_free_before/(1024.0*1024*1024),
+            plan_available_before/(1024.0*1024*1024),resident/(1024.0*1024*1024),
+            eng->q35.model_bytes ? "ledger" : "free-delta",
+            workspace/(1024.0*1024*1024),per_slot/(1024.0*1024*1024),
+            (per_recur+per_kv)/(1024.0*1024*1024),physical_room/(1024.0*1024*1024),
+            budget_room/(1024.0*1024*1024),room/(1024.0*1024*1024),fit);
     if (fit < MS) {
         if (fit < 1) {
             fprintf(stderr, "fucina: qwen35 memory plan cannot fit one slot: workspace %.2f GiB, "
@@ -196,6 +221,7 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     eng->q35.workspace_bytes = workspace;
     eng->q35.per_slot_recurrent_bytes = per_recur;
     eng->q35.per_slot_kv_bytes = per_kv;
+    eng->q35.reserved_slot_kv_bytes = reserved_kv;
     eng->q35.reserved_bytes = workspace + (size_t)MS * per_slot + eng->q35.jspace_bytes;
 
     ok = ok && cudaMalloc(&eng->q35.wbf16[0], wbf_max * sizeof(__nv_bfloat16)) == cudaSuccess;
@@ -252,16 +278,19 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
         // The cache is a one-time alloc and each lazy per-layer build self-heals to off on
         // failure, so a tight-but-passing decision never destabilizes serving. (Was 5 GiB —
         // too conservative: it kept the ~350 ms/prefill mixer dequant on even with room.)
-        const bool physical_ok = freeb > need + (size_t)3ull * 1024 * 1024 * 1024;
+        const size_t available=q35_physical_available(freeb);
+        const bool physical_ok = available > need + (size_t)3ull * 1024 * 1024 * 1024;
         const bool budget_ok = eng->q35.reserved_bytes + need <= room;
         eng->q35.wcache_on = (physical_ok && budget_ok) ? 1 : 0;
         const char *wcache_env = getenv("FUCINA_QWEN35_WCACHE");
         if (wcache_env) eng->q35.wcache_on = (atoi(wcache_env) != 0);
         if (eng->q35.wcache_on) eng->q35.reserved_bytes += need;
         fprintf(stderr, "fucina: qwen35 prefill weight-cache %s (decision=%s, need %.2f GiB, "
-                "free %.2f GiB, physical=%s, budget=%s, reserved-before %.2f GiB, room %.2f GiB)\n",
+                "cuda-free %.2f GiB, available %.2f GiB, physical=%s, budget=%s, "
+                "reserved-before %.2f GiB, room %.2f GiB)\n",
                 eng->q35.wcache_on ? "ON" : "off", wcache_env ? "env" : "auto",
                 need / (1024.0*1024*1024), freeb / (1024.0*1024*1024),
+                available / (1024.0*1024*1024),
                 physical_ok ? "fit" : "no-fit", budget_ok ? "fit" : "no-fit",
                 (eng->q35.reserved_bytes - (eng->q35.wcache_on ? need : 0))/(1024.0*1024*1024),
                 room/(1024.0*1024*1024));
@@ -269,11 +298,12 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     q35_fp4_setup(eng);   // NVFP4 4-bit tensor-core prefill GEMM (preferred; BF16 cache is fallback)
     eng->q35.ready = 1;
     fprintf(stderr,
-            "fucina: qwen35 memory plan ready: maxctx=%d slots=%d/%d workspace=%.2f GiB "
-            "state/slot=%.2f GiB (recurrent %.2f + KV %.2f) committed=%.2f GiB reserved=%.2f GiB\n",
-            maxctx, MS, GEMMA4_MAX_SEQS,
+            "fucina: qwen35 memory plan ready: maxctx=%d slotctx=%d slots=%d/%d workspace=%.2f GiB "
+            "reserve/slot=%.2f GiB (recurrent %.2f + KV %.2f; max-KV %.2f) committed=%.2f GiB reserved=%.2f GiB\n",
+            maxctx, slotctx, MS, GEMMA4_MAX_SEQS,
             eng->q35.workspace_bytes/(1024.0*1024*1024), per_slot/(1024.0*1024*1024),
-            per_recur/(1024.0*1024*1024), per_kv/(1024.0*1024*1024),
+            per_recur/(1024.0*1024*1024), reserved_kv/(1024.0*1024*1024),
+            per_kv/(1024.0*1024*1024),
             eng->q35.committed_bytes/(1024.0*1024*1024),
             eng->q35.reserved_bytes/(1024.0*1024*1024));
     return 0;
@@ -1091,6 +1121,14 @@ static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t 
     cudaStream_t st = eng->stream;
     const int CH = QWEN35_PF_TILE;             // wide prefill tile (amortizes the 5 GB weight read)
     int h_slot[QWEN35_PF_TILE], h_pos[QWEN35_PF_TILE];
+    const bool timing=eng->q35.prefill_timing && n > 2 * FP8_MAXB;
+    cudaEvent_t timing_start=nullptr, timing_stop=nullptr;
+    if (timing) {
+        eng->q35.prefill_dequant_ms=eng->q35.prefill_router_ms=0;
+        eng->q35.prefill_expert_ms=eng->q35.prefill_shared_ms=0;
+        cudaEventCreate(&timing_start); cudaEventCreate(&timing_stop);
+        cudaEventRecord(timing_start,st);
+    }
     int done = 0;
     while (done < n) {
         int T = n - done; if (T > CH) T = CH;
@@ -1110,7 +1148,22 @@ static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t 
             qwen35_sample_rows(eng, one, eng->d_logits, 1, st);
         cudaMemcpyAsync(&first, eng->d_ms_outtok, sizeof(int32_t), cudaMemcpyDeviceToHost, st);
     }
-    cudaStreamSynchronize(st);
+    float total_ms=0;
+    if (timing) {
+        cudaEventRecord(timing_stop,st); cudaEventSynchronize(timing_stop);
+        cudaEventElapsedTime(&total_ms,timing_start,timing_stop);
+        cudaEventDestroy(timing_start); cudaEventDestroy(timing_stop);
+        double measured=eng->q35.prefill_dequant_ms+eng->q35.prefill_router_ms+
+                        eng->q35.prefill_expert_ms+eng->q35.prefill_shared_ms;
+        double other=(double)total_ms-measured; if(other<0) other=0;
+        fprintf(stderr,
+                "fucina: qwen35 prefill phases: tokens=%d base=%d tiles=%d total=%.2f ms "
+                "expert-dequant=%.2f router-route=%.2f grouped-experts=%.2f "
+                "shared-expert=%.2f other=%.2f sum=%.1f%%\n",
+                n,base,(n+CH-1)/CH,total_ms,eng->q35.prefill_dequant_ms,
+                eng->q35.prefill_router_ms,eng->q35.prefill_expert_ms,
+                eng->q35.prefill_shared_ms,other,total_ms>0?100.0*(measured+other)/total_ms:0.0);
+    } else cudaStreamSynchronize(st);
     if (cudaGetLastError() != cudaSuccess) return -1;
     if (do_sample && first_tok_out) *first_tok_out = first;
     return 0;
@@ -1348,6 +1401,7 @@ extern "C" void gemma4_engine_memory_stats(const gemma4_engine_t *eng,
     out->qwen_capacity = eng->q35.capacity;
     out->qwen_allocated_slots = eng->q35.allocated_slots;
     out->qwen_max_context = eng->q35.maxctx;
+    out->qwen_reserved_context = eng->q35.reserved_context;
 }
 
 static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,

@@ -372,6 +372,7 @@ typedef struct gemma4_memory_stats {
     int32_t  qwen_capacity;
     int32_t  qwen_allocated_slots;
     int32_t  qwen_max_context;
+    int32_t  qwen_reserved_context;
 } gemma4_memory_stats_t;
 void gemma4_engine_memory_stats(const gemma4_engine_t *eng, gemma4_memory_stats_t *out);
 

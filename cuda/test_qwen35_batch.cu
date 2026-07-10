@@ -52,7 +52,8 @@ int main(int argc, char **argv) {
     gemma4_engine_memory_stats(eng, &ms);
     if (ms.qwen_workspace_bytes == 0 || ms.qwen_committed_bytes == 0 ||
         ms.qwen_reserved_bytes < ms.qwen_committed_bytes || ms.qwen_capacity <= 0 ||
-        ms.qwen_allocated_slots != 3) {
+        ms.qwen_allocated_slots != 3 || ms.qwen_reserved_context <= 0 ||
+        ms.qwen_reserved_context > ms.qwen_max_context) {
         fprintf(stderr, "qwen35 memory-plan gate failed: workspace=%llu committed=%llu "
                         "reserved=%llu capacity=%d allocated=%d\n",
                 (unsigned long long)ms.qwen_workspace_bytes,
@@ -62,12 +63,12 @@ int main(int argc, char **argv) {
         rc = 1;
     } else {
         fprintf(stderr, "qwen35 memory-plan gate: workspace=%.2f GiB committed=%.2f GiB "
-                        "reserved=%.2f GiB capacity=%d allocated=%d maxctx=%d — PASS\n",
+                        "reserved=%.2f GiB capacity=%d allocated=%d slotctx=%d maxctx=%d — PASS\n",
                 ms.qwen_workspace_bytes/(1024.0*1024*1024),
                 ms.qwen_committed_bytes/(1024.0*1024*1024),
                 ms.qwen_reserved_bytes/(1024.0*1024*1024),
                 (int)ms.qwen_capacity, (int)ms.qwen_allocated_slots,
-                (int)ms.qwen_max_context);
+                (int)ms.qwen_reserved_context, (int)ms.qwen_max_context);
     }
     gemma4_engine_destroy(eng);
 

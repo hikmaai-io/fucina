@@ -540,27 +540,6 @@ static unsigned char *q35_fp8_experts_to_q4k(
     return slab;
 }
 
-// Linux GB10 exposes GPU unified memory through system RAM. cudaMemGetInfo reports raw free pages,
-// so reading a safetensors mmap into the file cache can look exactly like a device allocation.
-// Capture the reclaimable/cache counters alongside CUDA free memory to make that distinction clear.
-struct q35_host_meminfo { size_t mem_free, mem_available, cached, sreclaimable; };
-static q35_host_meminfo q35_read_host_meminfo() {
-    q35_host_meminfo m{};
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return m;
-    char line[256], key[64]; unsigned long long kib=0;
-    while (fgets(line,sizeof(line),f)) {
-        if (sscanf(line,"%63s %llu",key,&kib) != 2) continue;
-        size_t bytes=(size_t)kib*1024;
-        if (!strcmp(key,"MemFree:")) m.mem_free=bytes;
-        else if (!strcmp(key,"MemAvailable:")) m.mem_available=bytes;
-        else if (!strcmp(key,"Cached:")) m.cached=bytes;
-        else if (!strcmp(key,"SReclaimable:")) m.sreclaimable=bytes;
-    }
-    fclose(f);
-    return m;
-}
-
 // One descriptor per tensor placed into eng->d_weights.
 struct q35fp8_desc { uint64_t *off; uint8_t *fmtp; const void *host; size_t bytes; int fmt; const void *scale_host; size_t scale_bytes; };
 
@@ -1031,6 +1010,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     const size_t misc_bytes=(size_t)VOC*sizeof(float);
     const size_t ledger_bytes=expert_bytes + total + scale_bytes + embed_bytes + head_bytes +
                               eng->moe_scratch_bytes + misc_bytes;
+    eng->q35.model_bytes=ledger_bytes;
     size_t fill_free_final=0; cudaMemGetInfo(&fill_free_final, &fill_total);
     const q35_host_meminfo host_mem_final=q35_read_host_meminfo();
     const double GiB=1024.0*1024.0*1024.0;
