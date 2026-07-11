@@ -67,6 +67,8 @@ struct qwen35_runtime_state {
     float   *part_o;
     __nv_bfloat16 *wbf16[2];
     __nv_bfloat16 *xbf16;
+    WorkspaceRef   prefill_weight_workspace[2];
+    WorkspaceRef   prefill_input_workspace;
 
     // Full-attention prefill workspace (lazy).
     __nv_bfloat16 *qb;

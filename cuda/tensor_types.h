@@ -54,8 +54,28 @@ struct ExpertWeightRef {
     int64_t scale_stride;
 };
 
+enum class WorkspaceKind : uint8_t {
+    DECODE,
+    PREFILL,
+    MOE,
+    ATTENTION,
+    RECURRENT_STATE,
+    KV_CACHE,
+};
+
+struct WorkspaceRef {
+    uint8_t *data;
+    uint64_t bytes;
+    uint32_t alignment;
+    WorkspaceKind kind;
+    uint8_t flags;
+    uint16_t reserved;
+};
+
 static_assert(std::is_trivially_copyable<WeightRef>::value, "WeightRef must remain trivially copyable");
 static_assert(std::is_trivially_copyable<ExpertWeightRef>::value,
               "ExpertWeightRef must remain trivially copyable");
+static_assert(std::is_trivially_copyable<WorkspaceRef>::value,
+              "WorkspaceRef must remain trivially copyable");
 
 #endif  // FUCINA_TENSOR_TYPES_H
