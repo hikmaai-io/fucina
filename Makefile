@@ -32,7 +32,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test qwen3-fused-test gpu-gates \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
-        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
+        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen36-ssd-stream-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench phase-b-test \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -336,6 +336,15 @@ qwen36-unsloth-nvfp4-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen36_unsloth_nvfp4 \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen36_unsloth_nvfp4 $(QWEN36_UNSLOTH_NVFP4_MODEL)"
+
+# Artificial low-residency gate: only 64 transformed experts may occupy device slots while the
+# immutable 16.88-GiB store is read from SSD. The same oracle/batch test proves slot remapping,
+# chunk fallback, checksums, and graph-off streaming preserve exact generated tokens.
+qwen36-ssd-stream-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_moe_fp8_engine.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen36_ssd_stream \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 2400 /tmp/fucina_gpu.lock -c 'store=/tmp/fucina-qwen36-experts.$$$$.bin; trap "rm -f $$store" EXIT; FUCINA_EXPERT_STREAM_SSD=$$store FUCINA_EXPERT_STREAM_SLOTS=64 /tmp/fucina_qwen36_ssd_stream $(QWEN36_UNSLOTH_NVFP4_MODEL)'
 
 # ─── Qwen3.5 hybrid (qwen35) M6 single-MTP draft head + LOSSLESS spec (GPU) ───
 # Loads the 22 mtp.* tensors (FP8 checkpoint only) and asserts the MTP-drafted speculative decode
