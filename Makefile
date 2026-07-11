@@ -308,6 +308,13 @@ qwen35-fp8-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_fp8 $(QWEN35_FP8_MODEL)"
 
+# ─── Session persistence restart gate (GPU) ─────────────────────────────────
+# Saves a long Qwen3.5 hybrid REPL session, restarts the process, /loads it and
+# asserts the continuation re-prefills ONLY the new turn (the saved prefix —
+# including the GDN recurrent state — costs zero prefill tokens).
+session-restart-test: fucina
+	flock -w 1800 /tmp/fucina_gpu.lock -c "scripts/test_session_restart.sh $(QWEN35_FP8_MODEL)"
+
 # ─── Qwen3.5 FP8-9B served through the REAL batched engine (not the B=1 oracle) (GPU) ───
 # Loads the official Qwen3.5-9B FP8 checkpoint via gemma4_engine_create (FORMAT_FP8_BLOCK loader:
 # every FP8 proj → d_weights + per-128 block-scale table; norms/conv/a_log → f32; in_a/in_b + embed
