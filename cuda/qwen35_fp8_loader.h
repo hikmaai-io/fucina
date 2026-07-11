@@ -34,11 +34,15 @@ struct Layout {
     std::string final_norm_key;       // BF16 final norm
     int         n_layers = 0;
     int         full_attention_interval = 4;
-    // nvidia ModelOpt MIXED_PRECISION repack (e.g. nvidia/Qwen3.6-35B-A3B-NVFP4): attn/GDN
-    // projections are PER-TENSOR FP8 (`<w>_scale` F32 scalar, no `_scale_inv` block grid);
-    // experts / shared expert / lm_head are native NVFP4 (`<w>_scale` E4M3 per-16-group +
-    // `<w>_scale_2` F32 global). The fill path branches per tensor on the scale siblings.
+    // Mixed FP8/NVFP4 producers. Attention/GDN is scalar FP8 in ModelOpt and per-row FP8 in
+    // compressed-tensors; native NVFP4 expert naming differs as follows:
+    // ModelOpt native NVFP4:   <p>.weight,        .weight_scale, .weight_scale_2
+    // compressed-tensors:     <p>.weight_packed, .weight_scale, .weight_global_scale
+    // The latter stores a reciprocal global scale, normalized by the fill path before use.
     bool        modelopt = false;
+    bool        compressed = false;
+
+    bool mixed_nvfp4() const { return modelopt || compressed; }
 };
 
 // tiny config.json scanners (substring; the FP8 config keys we read are unambiguous in text_config)
@@ -59,7 +63,9 @@ inline bool cfg_str(const std::string& j, const char* key, std::string& out) {
 inline bool cfg_int(const std::string& j, const char* key, long& out) {
     size_t p; if (!cfg_find(j, key, p)) return false;
     char* end = nullptr; long v = std::strtol(j.c_str() + p, &end, 10);
-    if (end == j.c_str() + p) return false; out = v; return true;
+    if (end == j.c_str() + p) return false;
+    out = v;
+    return true;
 }
 
 // "<layer_prefix><l>.<suffix>"  (suffix e.g. "input_layernorm.weight", "self_attn.q_proj.weight")
@@ -84,10 +90,15 @@ inline bool detect(const st::Model& m, Layout& out, std::string& err) {
     if (cj.empty()) { err = "no config.json next to checkpoint"; return false; }
     std::string mtype, qmethod;
     cfg_str(cj, "\"model_type\"", mtype);      // top-level "qwen3_5"
-    cfg_str(cj, "\"quant_method\"", qmethod);  // "fp8" (Qwen block-FP8) or "modelopt" (nvidia NVFP4 repack)
+    cfg_str(cj, "\"quant_method\"", qmethod);  // fp8, modelopt, or compressed-tensors
     if (mtype.find("qwen3_5") == std::string::npos) { err = "config model_type is not qwen3_5"; return false; }
-    if (qmethod != "fp8" && qmethod != "modelopt") { err = "config quant_method is not fp8/modelopt"; return false; }
+    const bool compressed = qmethod == "compressed-tensors" &&
+                            cj.find("nvfp4-pack-quantized") != std::string::npos;
+    if (qmethod != "fp8" && qmethod != "modelopt" && !compressed) {
+        err = "config quant_method is not fp8/modelopt/compressed-tensors NVFP4"; return false;
+    }
     out.modelopt = (qmethod == "modelopt");
+    out.compressed = compressed;
 
     out.lm_prefix    = "model.language_model.";
     out.layer_prefix = out.lm_prefix + "layers.";

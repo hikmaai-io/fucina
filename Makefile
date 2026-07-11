@@ -32,7 +32,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test qwen3-fused-test gpu-gates \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
-        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
+        qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
         dg dg-dequant-test dg-forward-test dg-generate
 
@@ -167,6 +167,7 @@ packed-kv-test:
 QWEN35_MODEL ?= /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf
 QWEN35_FP8_MODEL ?= /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8
 QWEN35_MOE_FP8_MODEL ?= /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8
+QWEN36_UNSLOTH_NVFP4_MODEL ?= /opt/spark/models/unsloth/Qwen3.6-35B-A3B-NVFP4-Fast
 qwen35-detect-test:
 	g++ -std=c++17 -O2 -Wall -Wextra -Icuda cuda/test_qwen35_detect.cc -o /tmp/fucina_qwen35_detect
 	/tmp/fucina_qwen35_detect $(QWEN35_MODEL)
@@ -320,6 +321,14 @@ qwen35-moe-fp8-engine-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_moe_fp8_engine \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_moe_fp8_engine $(QWEN35_MOE_FP8_MODEL)"
+
+# Unsloth compressed-tensors mixed FP8/NVFP4 gate. Reuses the MoE engine oracle because it
+# exercises the real continuous-batching prefill, B-row decode, CUDA graph, and B=1 parity paths.
+qwen36-unsloth-nvfp4-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_moe_fp8_engine.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen36_unsloth_nvfp4 \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen36_unsloth_nvfp4 $(QWEN36_UNSLOTH_NVFP4_MODEL)"
 
 # ─── Qwen3.5 hybrid (qwen35) M6 single-MTP draft head + LOSSLESS spec (GPU) ───
 # Loads the 22 mtp.* tensors (FP8 checkpoint only) and asserts the MTP-drafted speculative decode
@@ -607,6 +616,7 @@ nvfp4-test:
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/safetensors_test.cc   -o /tmp/st_test     && /tmp/st_test
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_test.cc          -o /tmp/nvfp4_test  && /tmp/nvfp4_test
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_loader_test.cc   -o /tmp/nvfp4_ld    && /tmp/nvfp4_ld
+	g++ -std=c++17 -O2 -Wall -Wextra cuda/qwen35_fp8_loader_test.cc -o /tmp/q35fp8_ld && /tmp/q35fp8_ld
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 cuda/test_nvfp4_gemv.cu -o /tmp/nvfp4_gemv && /tmp/nvfp4_gemv
 
 # Gemma-4-E4B foundation: runtime config detection + FP8 Per-Layer-Embedding

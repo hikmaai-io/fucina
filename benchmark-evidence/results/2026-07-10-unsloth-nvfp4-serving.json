@@ -1,0 +1,150 @@
+{
+  "label": "unsloth-nvfp4",
+  "base_url": "http://127.0.0.1:18081",
+  "model": "qwen36-nvfp4",
+  "single_short": {
+    "ttft_ms": 108.1869539921172,
+    "decode_tps": 60.8731188948191,
+    "ntok": 128,
+    "sample": "\nHere's a thinking process:\n\n1.  **Understand User Query:** The user asks for a detailed explanation of how continuous batching improves LLM serving throughput. They want a thorough, technical explana"
+  },
+  "single_long": {
+    "ttft_ms": 4515.630797512131,
+    "decode_tps": 53.100842906085475,
+    "ntok": 104,
+    "sample": "\n\nIn the context of large language model inference, system performance\u2014specifically throughput and latency\u2014is primarily determined by memory bandwidth, kernel fusion techniques, and the scheduling of "
+  },
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 56.62753235520232,
+      "median_ttft_ms": 135.7312160253059,
+      "median_per_stream_tps": 60.77772864265778,
+      "wall_s": 2.242725309013622,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": "\nThinking Process:\n1.  **Identify the core question:** The user is asking for the capital of France.\n2.  **Determine the answer:** The capital of Fran"
+        }
+      ]
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 94.0289430715812,
+      "median_ttft_ms": 162.46453500934877,
+      "median_per_stream_tps": 50.24229320326113,
+      "wall_s": 2.701295917009702,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": "\nThinking Process:\n1.  **Identify the core question:** The user is asking for the capital of France.\n2.  **Determine the answer:** The capital of Fran"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\nThinking Process:\n1.  **Analyze User Input:**\n   - Topic: Photosynthesis\n   - Constraint: Exactly two sentences\n   - Output format: \"Answer:\" followe"
+        }
+      ]
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 142.12532994141404,
+      "median_ttft_ms": 285.4997949907556,
+      "median_per_stream_tps": 38.63139192810905,
+      "wall_s": 3.5743100839899853,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": "\nThinking Process:\n1.  **Identify the core question:** The user is asking for the capital of France.\n2.  **Determine the answer:** The capital of Fran"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\nThinking Process:\n1.  **Analyze User Input:**\n   - Topic: Photosynthesis\n   - Constraint: Exactly two sentences\n   - Output format: \"Answer:\" followe"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Question:** \"Name three prime numbers below 20 and explain briefly.\"\n   - **Requiremen"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n  137\n+ 265\n-----\n  402\n\n- 1 + 5 = 6 (ones place)\n- 3 + 6 = 9 (tens place)\n- 1 + 2 = 3 (hundreds place)\n\nWait, let me c"
+        }
+      ]
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 181.48083655373938,
+      "median_ttft_ms": 524.5403529988835,
+      "median_per_stream_tps": 29.421173658309314,
+      "wall_s": 4.843486599973403,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": "\nThinking Process:\n1.  **Identify the core question:** The user is asking for the capital of France.\n2.  **Determine the answer:** The capital of Fran"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\nThinking Process:\n1.  **Analyze User Input:**\n   - Topic: Photosynthesis\n   - Constraint: Exactly two sentences\n   - Output format: \"Answer:\" followe"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Question:** \"Name three prime numbers below 20 and explain briefly.\"\n   - **Requiremen"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n  137\n+ 265\n-----\n  402\n\n- 1 + 5 = 6 (ones place)\n- 3 + 6 = 9 (tens place)\n- 1 + 2 = 3 (hundreds place)\n\nWait, let me c"
+        }
+      ]
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 244.0107669221601,
+      "median_ttft_ms": 1001.9654305069707,
+      "median_per_stream_tps": 20.10664021678311,
+      "wall_s": 7.323447332018986,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": "\nThinking Process:\n1.  **Identify the core question:** The user is asking for the capital of France.\n2.  **Determine the answer:** The capital of Fran"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\nThinking Process:\n1.  **Analyze User Input:**\n   - Topic: Photosynthesis\n   - Constraint: Exactly two sentences\n   - Output format: \"Answer:\" followe"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Question:** \"Name three prime numbers below 20 and explain briefly.\"\n   - **Requiremen"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n  137\n+ 265\n-----\n  402\n\n- 1 + 5 = 6 (ones place)\n- 3 + 6 = 9 (tens place)\n- 1 + 2 = 3 (hundreds place)\n\nWait, let me c"
+        }
+      ]
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 333.07108263146336,
+      "median_ttft_ms": 1977.690158499172,
+      "median_per_stream_tps": 14.47352053509088,
+      "wall_s": 10.730442197993398,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": "\nThinking Process:\n1.  **Identify the core question:** The user is asking for the capital of France.\n2.  **Determine the answer:** The capital of Fran"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\nThinking Process:\n1.  **Analyze User Input:**\n   - Topic: Photosynthesis\n   - Constraint: Exactly two sentences\n   - Output format: \"Answer:\" followe"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Question:** \"Name three prime numbers below 20 and explain briefly.\"\n   - **Requiremen"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n  137\n+ 265\n-----\n  402\n\n- 1 + 5 = 6 (ones place)\n- 3 + 6 = 9 (tens place)\n- 1 + 2 = 3 (hundreds place)\n\nWait, let me c"
+        }
+      ]
+    }
+  ],
+  "diverse": true
+}

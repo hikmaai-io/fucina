@@ -331,6 +331,35 @@ static uint16_t *q35_nvfp4_to_bf16_host(const uint8_t *w, const uint8_t *sc, flo
     return dst;
 }
 
+// E4M3 weight + scalar or per-output-channel multiplier → host BF16. Unsloth compressed-
+// tensors uses BF16 [out,1] scales, while ModelOpt uses one F32 scalar. Treating the former as
+// a scalar silently produces fluent-looking repeated-token corruption, so shape/dtype handling
+// is deliberately centralized here.
+static uint16_t *q35_fp8_scaled_to_bf16_host(const uint8_t *w, const st::Tensor *scale,
+                                             int out_dim, int in_dim) {
+    if(!scale) return nullptr;
+    const bool scalar=scale->nbytes==4;
+    const bool row_bf16=scale->dtype==st::Dtype::BF16 && scale->nbytes==(size_t)out_dim*2;
+    const bool row_f32=scale->dtype==st::Dtype::F32 && scale->nbytes==(size_t)out_dim*4;
+    if(!scalar&&!row_bf16&&!row_f32) return nullptr;
+    uint16_t *dst=(uint16_t*)malloc((size_t)out_dim*in_dim*2);
+    if(!dst) return nullptr;
+    static float lut[256]; static bool ready=false;
+    if(!ready){ for(int i=0;i<256;i++) lut[i]=q35_fp8_lut_val(i); ready=true; }
+    std::atomic<int> next(0);
+    auto worker=[&](){ for(;;){
+        int r=next.fetch_add(1); if(r>=out_dim) break;
+        float mul=scalar?*(const float*)scale->data:
+                  (row_bf16?q35_bf16_to_f32_host(((const uint16_t*)scale->data)[r]):
+                            ((const float*)scale->data)[r]);
+        const uint8_t *src=w+(size_t)r*in_dim; uint16_t *out=dst+(size_t)r*in_dim;
+        for(int c=0;c<in_dim;c++) out[c]=q35_f32_to_bf16_host(lut[src[c]]*mul);
+    }};
+    std::vector<std::thread> th; for(int t=0;t<12;t++) th.emplace_back(worker);
+    for(auto &x:th) x.join();
+    return dst;
+}
+
 // Host BF16 [out][in] → FP8-block (E4M3 bytes + per-128×128 BF16 scale grid, scale = amax/448),
 // the exact layout the FORMAT_FP8_BLOCK kernels consume. Used for the ModelOpt shared expert
 // (native NVFP4 with no direct engine consumer — the extra e4m3 rounding on top of the 4-bit
@@ -511,7 +540,6 @@ static unsigned char *q35_fp8_experts_to_q4k(
     static float lut[256]; static bool lut_init = false;
     if (!lut_init) { for (int i = 0; i < 256; i++) lut[i] = q35_fp8_lut_val(i); lut_init = true; }
     const size_t per_w = (size_t)out_dim * in_dim;
-    const int    sper  = ((out_dim + 127) / 128) * (in_dim / 128);
     const size_t per_q = per_w / 256 * 144;
     unsigned char *slab = (unsigned char *)malloc((size_t)E * per_q);
     if (!slab) return nullptr;
@@ -543,9 +571,43 @@ static unsigned char *q35_fp8_experts_to_q4k(
 // One descriptor per tensor placed into eng->d_weights.
 struct q35fp8_desc { uint64_t *off; uint8_t *fmtp; const void *host; size_t bytes; int fmt; const void *scale_host; size_t scale_bytes; };
 
-// A qwen3_5_moe FP8 checkpoint iff the per-layer sparse experts are present (dense has mlp.gate_proj).
+// Resolve a logical `<module>.weight` across block-FP8/ModelOpt and compressed-tensors. Packed
+// NVFP4 preserves the output dimension in shape[0] and halves only shape[1].
+static inline const st::Tensor *q35_weight_tensor(st::Model &M, const qwen35fp8::Layout &LO,
+                                                  const std::string &weight_key) {
+    if (const st::Tensor *t=M.find(weight_key)) return t;
+    if (LO.compressed && weight_key.size() >= 6 &&
+        weight_key.compare(weight_key.size()-6,6,"weight") == 0)
+        return M.find(weight_key.substr(0,weight_key.size()-6)+"weight_packed");
+    return nullptr;
+}
+
+struct q35_native_nv4 {
+    const st::Tensor *packed=nullptr, *scale=nullptr, *global=nullptr;
+    float global_mul=0.f;
+};
+static inline q35_native_nv4 q35_native_nv4_resolve(st::Model &M,
+                                                     const qwen35fp8::Layout &LO,
+                                                     const std::string &weight_key) {
+    q35_native_nv4 r;
+    std::string base=weight_key.substr(0,weight_key.size()-6);
+    if (LO.compressed) {
+        r.packed=M.find(base+"weight_packed");
+        r.scale=M.find(base+"weight_scale");
+        r.global=M.find(base+"weight_global_scale");
+        if (r.global) { float raw=*(const float*)r.global->data; r.global_mul=raw!=0.f?1.f/raw:0.f; }
+    } else if (LO.modelopt) {
+        r.packed=M.find(weight_key);
+        r.scale=M.find(weight_key+"_scale");
+        r.global=M.find(weight_key+"_scale_2");
+        if (r.global) r.global_mul=*(const float*)r.global->data;
+    }
+    return r;
+}
+
+// A qwen3_5_moe checkpoint iff the per-layer sparse experts are present (dense has mlp.gate_proj).
 static inline bool qwen35_fp8_is_moe(st::Model &M, qwen35fp8::Layout &LO) {
-    return M.has(qwen35fp8::lkey(LO, 0, "mlp.experts.0.gate_proj.weight"));
+    return q35_weight_tensor(M,LO,qwen35fp8::lkey(LO,0,"mlp.experts.0.gate_proj.weight")) != nullptr;
 }
 
 // Set eng->cfg from the FP8 checkpoint. H / NKV / vocab / FFN dims come from the tensor shapes
@@ -570,8 +632,8 @@ static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::L
     const st::Tensor *qT=M.find(qwen35fp8::lkey(LO,LO.full_attention_interval-1,"self_attn.q_proj.weight"));
     // in_proj_z from a LINEAR (GDN) layer — layer 0 is LINEAR for the period-4 hybrid.
     const st::Tensor *zT=M.find(qwen35fp8::lkey(LO,0,"linear_attn.in_proj_z.weight"));
-    const st::Tensor *gateT=M.find(qwen35fp8::lkey(LO,0, moe ? "mlp.shared_expert.gate_proj.weight"
-                                                            : "mlp.gate_proj.weight"));
+    const st::Tensor *gateT=q35_weight_tensor(M,LO,qwen35fp8::lkey(
+        LO,0,moe ? "mlp.shared_expert.gate_proj.weight" : "mlp.gate_proj.weight"));
     if(!embT||!kT||!qT||!zT||!gateT){ fprintf(stderr,"qwen35_fp8_engine: missing embed/k_proj/q_proj/in_proj_z/gate\n"); return -1; }
     const int VOC=(int)embT->shape[0], H=(int)embT->shape[1], NKV=(int)kT->shape[0]/HD;
     const int NQ=(int)qT->shape[0]/(2*HD);     // fused q+gate: q_proj rows = 2*NQ*HD
@@ -587,7 +649,7 @@ static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::L
             NQ, NKV, NVH, INNER, 2*M2_KEYD+INNER, M2_NQ, M2_NVH, M2_VALD);
     if (moe) {
         const st::Tensor *rgT=M.find(qwen35fp8::lkey(LO,0,"mlp.gate.weight"));
-        const st::Tensor *egT=M.find(qwen35fp8::lkey(LO,0,"mlp.experts.0.gate_proj.weight"));
+        const st::Tensor *egT=q35_weight_tensor(M,LO,qwen35fp8::lkey(LO,0,"mlp.experts.0.gate_proj.weight"));
         if(!rgT||!egT){ fprintf(stderr,"qwen35_fp8_engine: missing router/expert tensors\n"); return -1; }
         c->n_experts=(int)rgT->shape[0]; c->expert_ffn=(int)egT->shape[0];
         long tk=8; qwen35fp8::cfg_int(M.config_json(),"\"num_experts_per_tok\"",tk);
@@ -618,18 +680,20 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     auto find=[&](const std::string&k)->const st::Tensor*{ return M.find(k); };
     auto lk=[&](int l,const char*s){ return qwen35fp8::lkey(LO,l,s); };
     // FP8 block weight: E4M3 bytes + BF16 block-scale sibling → FORMAT_FP8_BLOCK + scale-table entry.
-    // ModelOpt (LO.modelopt) fallbacks when no `_scale_inv` grid exists:
-    //   per-tensor FP8 (`<w>_scale` F32 scalar)          → broadcast the scalar into a block grid
-    //   native NVFP4  (`<w>_scale` e4m3 + `<w>_scale_2`) → dequant→BF16→requant to FP8-block
+    // Mixed-NVFP4 fallbacks when no `_scale_inv` grid exists:
+    //   per-tensor FP8 (`<w>_scale` F32 scalar) → broadcast the scalar into a block grid;
+    //   native NVFP4 (ModelOpt or compressed-tensors naming) → dequant→BF16→FP8-block for
+    //   consumers that do not yet have a direct FP4 projection (principally shared expert).
     auto put_fp8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int out_dim,int in_dim)->bool{
         const st::Tensor*w=find(key), *s=find(key+"_scale_inv");
         if(w&&s){ D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,s->data,s->nbytes}); return true; }
-        if(w&&LO.modelopt){
-            const st::Tensor*ps=find(key+"_scale"), *g2=find(key+"_scale_2");
+        if(LO.mixed_nvfp4()){
             const size_t gridb=(size_t)((out_dim+127)/128)*((in_dim+127)/128)*2;
-            if(ps&&g2&&w->dtype==st::Dtype::U8){          // native NVFP4
-                uint16_t*bf=q35_nvfp4_to_bf16_host((const uint8_t*)w->data,(const uint8_t*)ps->data,
-                                                   *(const float*)g2->data,out_dim,in_dim);
+            q35_native_nv4 n4=q35_native_nv4_resolve(M,LO,key);
+            if(n4.packed&&n4.scale&&n4.global&&n4.packed->dtype==st::Dtype::U8){
+                uint16_t*bf=q35_nvfp4_to_bf16_host((const uint8_t*)n4.packed->data,
+                                                   (const uint8_t*)n4.scale->data,n4.global_mul,
+                                                   out_dim,in_dim);
                 uint8_t*w8=nullptr; uint16_t*sg=nullptr;
                 if(bf&&q35_bf16_to_fp8_block_host(bf,out_dim,in_dim,&w8,&sg)){
                     free(bf); tofree.push_back(w8); tofree.push_back(sg);
@@ -637,11 +701,23 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     return true;
                 }
                 free(bf);
-            } else if(ps&&w->dtype==st::Dtype::F8_E4M3){  // per-tensor FP8
-                uint16_t*sg=q35_synth_scale_grid(*(const float*)ps->data,out_dim,in_dim);
-                if(sg){ tofree.push_back(sg);
-                    D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb});
-                    return true; }
+            } else if(w&&w->dtype==st::Dtype::F8_E4M3){
+                const st::Tensor*ps=find(key+"_scale");
+                if(ps&&ps->nbytes==4){
+                    uint16_t*sg=q35_synth_scale_grid(*(const float*)ps->data,out_dim,in_dim);
+                    if(sg){ tofree.push_back(sg);
+                        D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb});
+                        return true; }
+                } else if(ps){
+                    uint16_t *bf=q35_fp8_scaled_to_bf16_host((const uint8_t*)w->data,ps,out_dim,in_dim);
+                    uint8_t *w8=nullptr; uint16_t *sg=nullptr;
+                    if(bf&&q35_bf16_to_fp8_block_host(bf,out_dim,in_dim,&w8,&sg)){
+                        free(bf); tofree.push_back(w8); tofree.push_back(sg);
+                        D.push_back({off,fmtp,w8,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb});
+                        return true;
+                    }
+                    free(bf);
+                }
             }
         }
         fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false;
@@ -671,28 +747,26 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // existing dp4a Q4_K batched GEMV + BF16-dequant prefill). Uses the expert requantizer with E=1.
     auto put_q4k_from_fp8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int out_dim,int in_dim)->bool{
         const st::Tensor*w=find(key), *sc=find(key+"_scale_inv");
-        const uint16_t *sp=nullptr; uint16_t *synth=nullptr;
+        const uint8_t *wp=w?(const uint8_t*)w->data:nullptr;
+        const uint16_t *sp=nullptr; uint16_t *synth=nullptr; uint8_t *requant=nullptr;
         if(w&&sc) sp=(const uint16_t*)sc->data;
-        else if(w&&LO.modelopt&&w->dtype==st::Dtype::F8_E4M3){   // ModelOpt per-tensor FP8 scalar
+        else if(w&&LO.mixed_nvfp4()&&w->dtype==st::Dtype::F8_E4M3){
             const st::Tensor*ps=find(key+"_scale");
-            if(ps){ synth=q35_synth_scale_grid(*(const float*)ps->data,out_dim,in_dim); sp=synth; }
+            if(ps&&ps->nbytes==4){ synth=q35_synth_scale_grid(*(const float*)ps->data,out_dim,in_dim); sp=synth; }
+            else if(ps){
+                uint16_t *bf=q35_fp8_scaled_to_bf16_host(wp,ps,out_dim,in_dim);
+                if(bf){ q35_bf16_to_fp8_block_host(bf,out_dim,in_dim,&requant,&synth); free(bf); }
+                if(requant&&synth){ wp=requant; sp=synth; }
+            }
         }
-        if(!w||!sp){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); free(synth); return false; }
-        const uint8_t  *wp=(const uint8_t*)w->data;
+        if(!w||!sp){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); free(requant); free(synth); return false; }
         unsigned char *q4=q35_fp8_experts_to_q4k(&wp,&sp,1,out_dim,in_dim);
-        free(synth);
+        free(requant); free(synth);
         if(!q4) return false;
         tofree.push_back(q4);
         D.push_back({off,fmtp,q4,(size_t)((size_t)out_dim*in_dim/256)*144,FORMAT_Q4_K,nullptr,0});
         return true;
     };
-    // BF16 tensor → Q8_0 in d_weights (in_a/in_b + lm_head).
-    auto put_q8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key)->bool{
-        const st::Tensor*t=find(key); if(!t){ fprintf(stderr,"qwen35_fp8_engine: missing %s\n",key.c_str()); return false; }
-        int64_t n=(int64_t)(t->nbytes/2); unsigned char*q8=q35_bf16_to_q8_0_host((const uint16_t*)t->data,n);
-        if(!q8) return false; tofree.push_back(q8); D.push_back({off,fmtp,q8,(size_t)(n/32)*34,FORMAT_Q8_0,nullptr,0}); return true;
-    };
-
     // Raw-bytes descriptor (no format tag, no scale-table entry): builds the CONTIGUOUS per-layer
     // MoE expert slabs — E consecutive FP8 weight blocks (EFFN·H each, 32-aligned by size) and E
     // consecutive BF16 scale blocks. `off` records only the slab base (expert 0).
@@ -758,32 +832,58 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             // machinery (dg_quantize_q8_1 + dg_mmq_q4_K_grouped). Opt-in until the greedy-match
             // quality gate flips it default. All decode-kernel knobs measured flat — fewer bytes
             // is the only remaining decode lever (see moe35b-vllm-headtohead).
-            if(LO.modelopt){
-                // Native NVFP4 experts (nvidia ModelOpt): gather per-expert codes + e4m3 group
-                // scales + F32 globals, repack into the engine slabs (dequant→BF16→requant with
-                // the per-(layer,proj) global — same double-quant the FP8 source path does, but
-                // starting from values already on the FP4 lattice). No FP8/Q4_K source exists in
-                // this checkpoint, so any failure aborts the load.
+            if(LO.mixed_nvfp4()){
+                // Mixed checkpoints may use native NVFP4 (ModelOpt or compressed-tensors naming)
+                // or per-tensor FP8 for a whole expert layer. The accurate Unsloth variant keeps
+                // its final layers FP8; the Fast variant is native NVFP4 throughout.
                 std::vector<q35_nv4src> n4[3];
-                bool got=true;
-                for(int p=0; p<3 && got; p++){
+                bool native=true;
+                for(int p=0; p<3 && native; p++){
                     n4[p].assign(E,{nullptr,nullptr,0.f});
-                    for(int e=0; e<E && got; e++){
+                    for(int e=0; e<E && native; e++){
                         char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);
-                        const st::Tensor *w=find(lk(l,buf));
-                        snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight_scale",e,EX[p].proj);
-                        const st::Tensor *sct=find(lk(l,buf));
-                        snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight_scale_2",e,EX[p].proj);
-                        const st::Tensor *g2=find(lk(l,buf));
-                        if(!w||!sct||!g2){ got=false; break; }
-                        n4[p][e]={(const uint8_t*)w->data,(const uint8_t*)sct->data,*(const float*)g2->data};
+                        std::string key=lk(l,buf);
+                        q35_native_nv4 src=q35_native_nv4_resolve(M,LO,key);
+                        if(!src.packed||!src.scale||!src.global){ native=false; break; }
+                        n4[p][e]={(const uint8_t*)src.packed->data,
+                                  (const uint8_t*)src.scale->data,src.global_mul};
                     }
                 }
-                if(got && q35_fp4_expert_slabs(eng,l,L,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,
-                        n4[0].data(),n4[1].data(),n4[2].data(),E,MI,H)==0){
-                    eng->moe_experts_fp4 = 1;
-                } else {
-                    fprintf(stderr,"fucina: native NVFP4 expert build failed at layer %d — aborting load\n",l);
+                bool built=false;
+                if(native) built=q35_fp4_expert_slabs(eng,l,L,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,
+                    n4[0].data(),n4[1].data(),n4[2].data(),E,MI,H)==0;
+                if(!native){
+                    std::vector<const uint8_t*> w3[3];
+                    std::vector<const uint16_t*> s3[3];
+                    std::vector<void*> converted;
+                    bool scalar=true;
+                    for(int p=0;p<3&&scalar;p++){
+                        const int od=p==2?H:MI, idm=p==2?MI:H;
+                        w3[p].assign(E,nullptr); s3[p].assign(E,nullptr);
+                        for(int e=0;e<E&&scalar;e++){
+                            char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);
+                            std::string key=lk(l,buf);
+                            const st::Tensor *w=find(key), *sc=find(key+"_scale");
+                            if(!w||!sc||w->dtype!=st::Dtype::F8_E4M3){ scalar=false; break; }
+                            uint16_t *grid=nullptr; uint8_t *w8=nullptr;
+                            if(sc->nbytes==4) grid=q35_synth_scale_grid(*(const float*)sc->data,od,idm);
+                            else {
+                                uint16_t *bf=q35_fp8_scaled_to_bf16_host((const uint8_t*)w->data,sc,od,idm);
+                                if(bf){ q35_bf16_to_fp8_block_host(bf,od,idm,&w8,&grid); free(bf); }
+                            }
+                            if(!grid){ free(w8); scalar=false; break; }
+                            converted.push_back(grid); if(w8) converted.push_back(w8);
+                            w3[p][e]=w8?w8:(const uint8_t*)w->data; s3[p][e]=grid;
+                        }
+                    }
+                    if(scalar) built=q35_fp4_expert_slabs(eng,l,L,w3[0].data(),s3[0].data(),
+                        w3[1].data(),s3[1].data(),w3[2].data(),s3[2].data(),
+                        nullptr,nullptr,nullptr,E,MI,H)==0;
+                    for(void *p:converted) free(p);
+                }
+                if(built) eng->moe_experts_fp4=1;
+                else {
+                    fprintf(stderr,"fucina: mixed NVFP4/FP8 expert build failed at layer %d — aborting load\n",l);
                     ok=false;
                 }
             } else if(fp4_mode){
@@ -815,7 +915,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     fp4_mode=false;
                 }
             }
-            if(!LO.modelopt && !fp4_mode && q4k_mode){
+            if(!LO.mixed_nvfp4() && !fp4_mode && q4k_mode){
                 for(int p=0; p<3 && ok; p++){
                     int od = (p==2)? H : MI, idm = (p==2)? MI : H;
                     std::vector<const uint8_t*>  wpv(E, nullptr);
@@ -840,7 +940,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     eng->moe_up_slab       = eng->moe_gate_slab;
                     eng->moe_down_slab_q4k = (int64_t)((size_t)H*MI/256)*144;
                 }
-            } else if(!LO.modelopt && !fp4_mode)
+            } else if(!LO.mixed_nvfp4() && !fp4_mode)
             for(int p=0; p<3 && ok; p++){
                 for(int e=0; e<E && ok; e++){
                     char buf[96]; snprintf(buf,sizeof(buf),"mlp.experts.%d.%s.weight",e,EX[p].proj);
@@ -957,16 +1057,20 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // 248320-vocab argmax is Q8_0-sensitive). Uploaded verbatim from the checkpoint's BF16 head.
     { const st::Tensor *lmT=M.find(LO.lmhead_key);
       if(!lmT){ fprintf(stderr,"qwen35_fp8_engine: missing lm_head %s\n",LO.lmhead_key.c_str()); return -5; }
-      // ModelOpt ships the lm_head native-NVFP4 (U8 codes + e4m3 group scales + F32 global):
-      // dequant to a host BF16 buffer and feed the SAME BF16/Q8_0 uploads as the BF16 head.
+      // Mixed checkpoints quantize lm_head either per-tensor FP8 (Unsloth) or native NVFP4
+      // (ModelOpt). Normalize both into the existing BF16 + exact-Q8-rescore head stores.
       const uint16_t *lm_src=(const uint16_t*)lmT->data;
       uint16_t *lm_deq=nullptr;
-      if(LO.modelopt && lmT->dtype==st::Dtype::U8){
-          const st::Tensor *ps=M.find(LO.lmhead_key+"_scale"), *g2=M.find(LO.lmhead_key+"_scale_2");
-          if(!ps||!g2){ fprintf(stderr,"qwen35_fp8_engine: NVFP4 lm_head missing scales\n"); return -5; }
-          lm_deq=q35_nvfp4_to_bf16_host((const uint8_t*)lmT->data,(const uint8_t*)ps->data,
-                                        *(const float*)g2->data,VOC,H);
-          if(!lm_deq) return -5;
+      if(LO.mixed_nvfp4()){
+          q35_native_nv4 n4=q35_native_nv4_resolve(M,LO,LO.lmhead_key);
+          if(n4.packed&&n4.scale&&n4.global){
+              lm_deq=q35_nvfp4_to_bf16_host((const uint8_t*)n4.packed->data,
+                                            (const uint8_t*)n4.scale->data,n4.global_mul,VOC,H);
+          } else if(lmT->dtype==st::Dtype::F8_E4M3){
+              const st::Tensor *sc=M.find(LO.lmhead_key+"_scale");
+              if(sc) lm_deq=q35_fp8_scaled_to_bf16_host((const uint8_t*)lmT->data,sc,VOC,H);
+          }
+          if(!lm_deq){ fprintf(stderr,"qwen35_fp8_engine: quantized lm_head missing scales\n"); return -5; }
           lm_src=lm_deq;
       }
       eng->d_lmhead_bf16=(__nv_bfloat16*)q35fp8_up_bytes(lm_src,(size_t)VOC*H*2);
@@ -1025,7 +1129,8 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         "cached %.2f->%.2f reclaimable %.2f->%.2f GiB\n"
         "fucina: qwen35 observed deltas: experts=%+.2f core=%+.2f embed/head=%+.2f "
         "moe-scratch=%+.2f fill-total=%+.2f ledger-residual=%+.2f GiB\n",
-        LO.modelopt?"ModelOpt-NVFP4":"block-FP8", q4k_mode?"Q4_K":"FP8",
+        LO.compressed?"compressed-NVFP4":(LO.modelopt?"ModelOpt-NVFP4":"block-FP8"),
+        q4k_mode?"Q4_K":"FP8",
         !moe?"n/a":(eng->moe_experts_fp4?"NVFP4":(eng->moe_experts_q4k?"Q4_K":"FP8")),
         total/GiB,
         expert_bytes/GiB,total/GiB,scale_bytes/GiB,embed_bytes/GiB,head_bytes/GiB,

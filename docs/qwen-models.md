@@ -26,21 +26,25 @@ every `qwen35.full_attention_interval`-th layer is instead full softmax GQA. Den
 every layer over the full (dense) FFN; MoE checkpoints route each token through a top-k subset of
 experts plus a shared expert.
 
-## Two different FP4/FP8 checkpoint families — don't confuse them
+## Three different FP4/FP8 checkpoint families — don't confuse them
 
-| | Official Qwen FP8 (`Qwen/Qwen3.5-*-FP8`, `Qwen/Qwen3.6-*-FP8`) | NVIDIA ModelOpt (`nvidia/Qwen3.6-35B-A3B-NVFP4`) |
-|---|---|---|
-| Quant | DeepSeek-V3-style per-128 block FP8 across the bulk Linears | **Mixed precision**: NVFP4 (E2M1 + block scale) for experts/shared-expert/LM-head, per-tensor FP8 for attention/GDN |
-| `config.json` | `quant_method: "fp8"` | `quant_method: "modelopt"` |
-| Why pick it | Reference-accuracy FP8, matches vLLM's serving numerics most closely | Smaller on-disk and resident footprint (4-bit experts dominate MoE param count), small extra accuracy cost |
-| fucina loader | `cuda/qwen35_fp8_loader.h` (same file) | `cuda/qwen35_fp8_loader.h` (same file, MIXED_PRECISION branch) |
+| | Official Qwen FP8 (`Qwen/Qwen3.5-*-FP8`, `Qwen/Qwen3.6-*-FP8`) | NVIDIA ModelOpt (`nvidia/Qwen3.6-35B-A3B-NVFP4`) | Unsloth compressed-tensors (`unsloth/Qwen3.6-35B-A3B-NVFP4[-Fast]`) |
+|---|---|---|---|
+| Quant | DeepSeek-V3-style per-128 block FP8 across bulk Linears | NVFP4 experts/shared/head, per-tensor FP8 attention/GDN | NVFP4 experts/shared, **per-output-channel FP8** attention/GDN/head; accurate variant leaves final expert layers FP8 |
+| `config.json` | `quant_method: "fp8"` | `quant_method: "modelopt"` | `quant_method: "compressed-tensors"` plus `nvfp4-pack-quantized` group |
+| Packed names | `<p>.weight` + `<p>.weight_scale_inv` | `<p>.weight` + `<p>.weight_scale` + `<p>.weight_scale_2` | `<p>.weight_packed` + `<p>.weight_scale` + `<p>.weight_global_scale` |
+| Why pick it | Reference-accuracy FP8 | Official NVIDIA 4-bit repack | Blackwell W4A4 expert checkpoint calibrated for coding/tool use; Fast is smaller/faster, standard upcasts more layers |
+| fucina loader | `cuda/qwen35_fp8_loader.h` | same loader, ModelOpt branch | same loader, compressed-tensors branch |
 
-Within the ModelOpt checkpoint, whether a given weight tensor is served as NVFP4 or FP8 is decided
-**per tensor**, by which scale sibling is present next to it — not by a global flag:
+The compressed-tensors details are correctness-critical: `weight_global_scale` is reciprocal and
+must be inverted, while its FP8 `weight_scale` is BF16 `[out,1]`, not a scalar. Fucina normalizes
+both producer conventions before entering its common runtime. Treating the first BF16 row scale as
+a tensor-wide scalar produces repeated-token corruption.
 
-- `<tensor>_scale_inv` (a grid) → native block-FP8.
-- `<tensor>_scale` (scalar E4M3) + `<tensor>_scale_2` → native NVFP4.
-- `<tensor>_scale` alone (scalar F8_E4M3) → per-tensor FP8.
+Tensor format is decided per tensor from the actual siblings. Native NVFP4 experts enter the
+CUTLASS grouped tensor-core decode path; wide prefill dequantizes the same resident FP4 slab once
+per layer and uses grouped BF16 cuBLAS, which remains faster on GB10 than forcing the FP4 grouped
+kernel at prompt width. Attention/GDN FP8 is requantized to the default packed Q4_K decode store.
 
 ## Checkpoint path resolution — read this before debugging a load failure
 
@@ -83,9 +87,10 @@ convention this repo's own test fixtures and golden-generation scripts use, e.g.
   on regardless of `--batch`/`FUCINA_BATCH`. If the paged-KV pool fails to allocate, startup fails
   fast: `fucina: Qwen3 requires paged KV but the pools are not active (allocation failed — lower
   --ctx or raise --gpu-mem-util)`.
-- **Perf default:** dense and MoE Qwen3.5/3.6 checkpoints get the attention/GDN mixer and
-  FFN/expert weights requanted to Q4_K at load (smaller resident set, faster decode than on-disk
-  FP8). `FUCINA_MOE_FP8=1` reverts to pure FP8.
+- **Perf default:** dense and MoE Qwen3.5/3.6 checkpoints get attention/GDN mixers requanted to
+  packed Q4_K at load. Official FP8 experts are requanted to grouped NVFP4; native ModelOpt and
+  Unsloth NVFP4 experts feed that same CUTLASS tensor-core decode path. `FUCINA_MOE_FP8=1` restores
+  pure FP8 where the checkpoint actually contains it.
 - **Speculative decoding inside the batch scheduler** is prompt-lookup only, and gated on
   `NExperts() == 0` — it runs automatically for dense Qwen checkpoints, is off for MoE. The Gemma-4
   MTP draft head (`--assistant`) is never exercised for Qwen (Qwen has no single-flight path to run
@@ -145,6 +150,7 @@ make gpu-gates          # Qwen3 dense/MoE parity + spec + prefix/suffix regressi
 make qwen35-detect-test # arch detection from GGUF metadata (host-only, no GPU)
 make qwen35-batch-test  # paged-batch + CUDA-graph decode gate
 make qwen35-burst-test  # diverse-prompt burst-admission + prefill-determinism gate
+make qwen36-unsloth-nvfp4-test # compressed-tensors loader + prefill/decode/graph parity
 ```
 
 The pure-Go dialect, tool-calling, and tokenizer tests run anywhere, no GPU required:

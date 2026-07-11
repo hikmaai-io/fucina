@@ -5196,7 +5196,8 @@ gemma4_engine_t* gemma4_engine_create(
             gemma4_apply_cfg(eng);   // derive layer_types / global_layer_indices / n_* from cfg
             is_fp8 = true;
             fprintf(stderr, "fucina: Qwen3.5 %s checkpoint detected → batched engine\n",
-                    fp8_layout.modelopt ? "ModelOpt NVFP4/FP8" : "block-FP8");
+                    fp8_layout.compressed ? "compressed-tensors NVFP4/FP8" :
+                    (fp8_layout.modelopt ? "ModelOpt NVFP4/FP8" : "block-FP8"));
         }
     }
     if (is_nvfp4 && !is_fp8) {
