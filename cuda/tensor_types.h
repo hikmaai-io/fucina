@@ -33,6 +33,7 @@ enum WeightFlags : uint16_t {
     WEIGHT_FLAG_PACKED  = 1u << 1,
     WEIGHT_FLAG_PRIMARY = 1u << 2,
     WEIGHT_FLAG_CACHE   = 1u << 3,
+    WEIGHT_FLAG_GROUPED = 1u << 4,
 };
 
 struct WeightRef {

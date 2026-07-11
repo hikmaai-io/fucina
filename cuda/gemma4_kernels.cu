@@ -4163,6 +4163,8 @@ struct gemma4_engine {
     uint8_t        *d_fp4m_gusf[GEMMA4_CAP_LAYERS];  // [E][fp4m_gu_sfB] swizzled ue4m3
     uint8_t        *d_fp4m_dn[GEMMA4_CAP_LAYERS];    // [E][H][EFFN/2]
     uint8_t        *d_fp4m_dnsf[GEMMA4_CAP_LAYERS];  // [E][fp4m_dn_sfB]
+    ExpertWeightRef ref_fp4m_gu[GEMMA4_CAP_LAYERS];
+    ExpertWeightRef ref_fp4m_dn[GEMMA4_CAP_LAYERS];
     float          *d_fp4m_gsw;                      // device [L·2] per-(layer,proj) global scales
     unsigned long long fp4m_gu_sfB, fp4m_dn_sfB;     // per-expert SF strides (SF elements)
     uint8_t        *d_fp4m_a,  *d_fp4m_asf;          // per-step activation E2M1 + padded SF (K=H)
@@ -9400,6 +9402,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                     cudaStream_t stream) {
     const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn;
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
+    const ExpertWeightRef &fp4_gu=eng->ref_fp4m_gu[l], &fp4_dn=eng->ref_fp4m_dn[l];
     // Diagnostic phase timing is deliberately synchronizing and opt-in only. Reuse two events
     // as a moving boundary; each mark drains the stream, attributes the completed interval, then
     // swaps start/stop. Normal serving creates no events and takes no timing branches past `timing`.
@@ -9453,12 +9456,12 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                 if (eng->moe_experts_fp4)   // NVFP4 slabs: gate/up halves of the fused gu slab, then dn
                     dequant_nvfp4_expert_slab_bf16_kernel<<<(unsigned)((ne / NVFP4_BLK + 255) / 256), 256, 0, stream>>>(
                         eng->d_moe_wbf[p],
-                        (p == 2) ? eng->d_fp4m_dn[l]   : eng->d_fp4m_gu[l],
-                        (p == 2) ? eng->d_fp4m_dnsf[l] : eng->d_fp4m_gusf[l],
-                        eng->d_fp4m_gsw + 2 * l + ((p == 2) ? 1 : 0),
+                        (const uint8_t*)((p == 2) ? fp4_dn.weight.data : fp4_gu.weight.data),
+                        (const uint8_t*)((p == 2) ? fp4_dn.weight.scale : fp4_gu.weight.scale),
+                        (const float*)((p == 2) ? fp4_dn.weight.global_scale : fp4_gu.weight.global_scale),
                         (p == 2) ? EFFN : H, (p == 2) ? H : EFFN,
                         (p == 1) ? EFFN : 0, (p == 2) ? H : 2 * EFFN,
-                        (p == 2) ? eng->fp4m_dn_sfB : eng->fp4m_gu_sfB, ne);
+                        (p == 2) ? fp4_dn.scale_stride : fp4_gu.scale_stride, ne);
                 else if (eng->moe_experts_q4k)   // Q4_K slabs: element-parallel natural-layout dequant
                     dequant_q4_k_slab_bf16_fast_kernel<<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(
                         eng->d_moe_wbf[p], ws[p], ne);
@@ -9501,7 +9504,6 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             // projection covers every expert (fused gate|up, then down). Serves decode AND
             // prefill — 2.1× the dp4a grouped GEMV weight bandwidth at 1 tok/expert, 11+ TFLOP/s
             // at prefill widths (test_dg_fp4_grouped on GB10).
-            const int GU = 2 * EFFN;
             auto g1 = [](size_t n){ return (unsigned)((n + 255) / 256); };
             const int nbH = H / NVFP4_BLK,    nbHp = nvfp4_pad(nbH, 4);
             const int nbF = EFFN / NVFP4_BLK, nbFp = nvfp4_pad(nbF, 4);
@@ -9517,8 +9519,9 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                   eng->d_fp4m_indptr, H, total, eng->d_fp4m_gsrow, eng->d_fp4m_a, eng->d_fp4m_asf,
                   sfA1, nbHp); }
             int rc = dg_fp4_moe_grouped(eng->d_fp4m_gu_out, eng->d_fp4m_a, eng->d_fp4m_asf,
-                eng->d_fp4m_gu[l], eng->d_fp4m_gusf[l], eng->d_fp4m_indptr,
-                E, GU, H, sfA1, eng->fp4m_gu_sfB, eng->d_fp4m_gsw + 2 * l, stream);
+                fp4_gu.weight.data, (const uint8_t*)fp4_gu.weight.scale, eng->d_fp4m_indptr,
+                fp4_gu.expert_count, fp4_gu.weight.out_dim, fp4_gu.weight.in_dim, sfA1, fp4_gu.scale_stride,
+                fp4_gu.weight.global_scale, stream);
             q35fp4_gu_silu_mul_kernel<<<g1((size_t)total * EFFN), 256, 0, stream>>>(
                 eng->d_moe_act, eng->d_fp4m_gu_out, eng->d_fp4m_gsrow, EFFN, (int64_t)total * EFFN);
             q35fp4_row_gs_kernel<<<total, 256, 0, stream>>>(eng->d_moe_act, EFFN, total, eng->d_fp4m_gsrow);
@@ -9527,8 +9530,9 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                   eng->d_fp4m_indptr, EFFN, total, eng->d_fp4m_gsrow, eng->d_fp4m_a2, eng->d_fp4m_a2sf,
                   sfA2, nbFp); }
             rc |= dg_fp4_moe_grouped(eng->d_fp4m_dn_out, eng->d_fp4m_a2, eng->d_fp4m_a2sf,
-                eng->d_fp4m_dn[l], eng->d_fp4m_dnsf[l], eng->d_fp4m_indptr,
-                E, H, EFFN, sfA2, eng->fp4m_dn_sfB, eng->d_fp4m_gsw + 2 * l + 1, stream);
+                fp4_dn.weight.data, (const uint8_t*)fp4_dn.weight.scale, eng->d_fp4m_indptr,
+                fp4_dn.expert_count, fp4_dn.weight.out_dim, fp4_dn.weight.in_dim, sfA2, fp4_dn.scale_stride,
+                fp4_dn.weight.global_scale, stream);
             q35fp4_dn_scale_kernel<<<g1((size_t)total * H), 256, 0, stream>>>(
                 eng->d_moe_oe, eng->d_fp4m_dn_out, eng->d_fp4m_gsrow, H, (uint64_t)total * H);
             if (rc) {   // never expected after a successful load-time build + warmup

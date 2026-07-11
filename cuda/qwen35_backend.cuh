@@ -1225,6 +1225,23 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     }
     if(!model_plan.finalize(plan_error)){ fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); for(void*x:tofree)free(x); return -2; }
     const size_t total=model_plan.bytes(AllocationClass::CORE_WEIGHTS);
+    if(moe&&eng->moe_experts_fp4){
+        for(int l=0;l<L;l++){
+            auto bind_expert=[&](ExpertWeightRef &ref,void *data,void *scale,float *global,
+                                 int out_dim,int in_dim,uint64_t expert_stride,uint64_t scale_stride){
+                ref.weight.data=(const uint8_t*)data; ref.weight.scale=scale; ref.weight.global_scale=global;
+                ref.expert_count=E; ref.weight.out_dim=out_dim; ref.weight.in_dim=in_dim;
+                ref.weight_stride=(int64_t)expert_stride; ref.scale_stride=(int64_t)scale_stride;
+                ref.weight.encoding=WeightEncoding::NVFP4_SWIZZLED;
+                ref.weight.layout=TensorLayout::NVFP4_SCALE_SWIZZLED;
+                ref.weight.flags=WEIGHT_FLAG_PRIMARY|WEIGHT_FLAG_PACKED|WEIGHT_FLAG_GROUPED;
+            };
+            bind_expert(eng->ref_fp4m_gu[l],eng->d_fp4m_gu[l],eng->d_fp4m_gusf[l],
+                        eng->d_fp4m_gsw+2*l,2*MI,H,(uint64_t)2*MI*(H/2),eng->fp4m_gu_sfB);
+            bind_expert(eng->ref_fp4m_dn[l],eng->d_fp4m_dn[l],eng->d_fp4m_dnsf[l],
+                        eng->d_fp4m_gsw+2*l+1,H,MI,(uint64_t)H*(MI/2),eng->fp4m_dn_sfB);
+        }
+    }
     if(const char *path=getenv("FUCINA_TENSOR_PLAN_JSON")){
         const std::string json=model_plan.json(); FILE *f=fopen(path,"wb");
         if(f){ fwrite(json.data(),1,json.size(),f); fputc('\n',f); fclose(f); }
