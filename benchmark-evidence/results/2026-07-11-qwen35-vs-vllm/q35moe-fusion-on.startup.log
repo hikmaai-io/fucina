@@ -1,0 +1,11 @@
+fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine
+fucina: qwen35 allocation decision: source=block-FP8 mixer=Q4_K experts=NVFP4 d_weights=0.88 GiB
+fucina: qwen35 Q4_K-MoE served via batched engine (40 layers, vocab 248320, H 2048, NKV 2, E-experts slabbed, 0.88 GiB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   free at start    :    54.26 GiB  (shared box: 65.43 GiB held by others)
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   our total        :    51.17 GiB  (within budget by 56.55 GiB)
+fucina: engine initialized (0.88 GB model, 25280 ctx, Q8_0)
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=8192 maxctx=25280 cuda-free=3.28 GiB available=86.41 GiB model-resident=23.13 GiB (ledger) workspace=2.18 GiB reserve/slot=0.19 GiB (max 0.51) physical-room=85.91 GiB budget-room=84.59 GiB chosen-room=84.59 GiB fit=437
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 5.23 GiB, cuda-free 3.48 GiB, available 83.38 GiB, physical=fit, budget=fit, reserved-before 8.20 GiB, room 84.59 GiB)
+2026/07/11 18:54:47 fucina: hybrid state-snapshot conversation cache enabled (budget 8192 MiB)
