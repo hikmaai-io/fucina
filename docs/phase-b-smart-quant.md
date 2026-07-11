@@ -41,14 +41,16 @@ python3 scripts/derive_precision_policy.py /tmp/model.imatrix.json \
 ```
 
 The policy keeps attention, GatedDeltaNet, router, shared experts, and norms at
-`fp8_or_bf16`; hot/warm routed experts use NVFP4. Cold experts also remain NVFP4 because fucina
+`fp8_block`; hot/warm routed experts use NVFP4. Cold experts also remain NVFP4 because fucina
 has no accepted INT2 kernel. `--sub4-kernel` exists only for the future kernel experiment and must
 not be used merely to claim a memory reduction. Every policy records the source sidecar hash,
 thresholds, capabilities, reasons, and exact per-tensor decisions.
 
-The output is currently **declarative**. The next B3 increment is checkpoint conversion/direct
-loader dispatch that applies multiple codecs. Uniform NVFP4 remains the runnable baseline until
-that lands and passes B4.
+Set `FUCINA_PRECISION_POLICY=/tmp/model.precision-policy.json` when loading the checkpoint. The
+Qwen safetensors loader preserves policy-marked core projections as block FP8 instead of its usual
+Q4_K serving requant, while routed experts remain on grouped NVFP4. Unsupported INT2 policies fail
+load rather than silently falling back. Without the environment variable the established default
+layout and numerics are unchanged.
 
 ## B4 — quality gate
 
@@ -63,6 +65,12 @@ python3 scripts/quality_gate.py baseline.md candidate.md \
 This gate intentionally fails closed on missing report fields. Tool-call quality alone is not a
 complete release gate; record coding and red-team task scores alongside it before changing a
 shipping default.
+
+The first applied policy gate on 2026-07-11 preserved **100/100 quality, 15/15 scenarios and zero
+errors** versus the 100/100 baseline. It kept 130 core projections in block FP8 (1.41 GiB core
+store versus 0.88 GiB Q4_K) and all routed experts in NVFP4. This proves loader dispatch and the
+quality gate, but does not beat the uniform serving layout on memory or latency; the policy remains
+opt-in while cold-expert sub-4-bit lacks a validated kernel.
 
 Unit tests:
 

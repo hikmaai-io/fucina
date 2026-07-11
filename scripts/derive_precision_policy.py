@@ -50,7 +50,7 @@ def derive(sidecar_path: Path, sub4_kernel: bool = False) -> dict[str, Any]:
     for name, score in importance.items():
         ident = expert_identity(name)
         if ident is None:
-            codec, tier, reason = "fp8_or_bf16", "critical", "attention/deltanet/shared/router/norm"
+            codec, tier, reason = "fp8_block", "critical", "attention/deltanet/shared/router/norm"
         else:
             es = expert_scores[ident]
             if es >= hot_cut:
@@ -69,7 +69,7 @@ def derive(sidecar_path: Path, sub4_kernel: bool = False) -> dict[str, Any]:
         "source_sha256": hashlib.sha256(sidecar_path.read_bytes()).hexdigest(),
         "model": sidecar.get("model", ""),
         "thresholds": {"cold_q20": cold_cut, "hot_q80": hot_cut},
-        "capabilities": {"nvfp4": True, "fp8_or_bf16": True, "int2": sub4_kernel},
+        "capabilities": {"nvfp4": True, "fp8_block": True, "int2": sub4_kernel},
         "codec_tensor_counts": dict(sorted(counts.items())),
         "tensor_policy": tensor_policy,
         "accuracy_gate_required": True,

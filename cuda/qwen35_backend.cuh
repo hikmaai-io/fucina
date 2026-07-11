@@ -666,6 +666,37 @@ static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::L
     return 0;
 }
 
+// Optional Phase-B precision policy. Parsing is load-once: locate an exact canonical
+// tensor key and read the codec from that JSON object's bounded span. No STL reaches decode.
+struct q35_precision_policy {
+    bool enabled=false;
+    std::string raw, path;
+    int kept_fp8=0, requant_q4k=0;
+    bool load() {
+        const char *p=getenv("FUCINA_PRECISION_POLICY"); if(!p||!*p) return true;
+        path=p; FILE *f=fopen(p,"rb"); if(!f){ fprintf(stderr,"fucina: cannot open precision policy %s\n",p); return false; }
+        fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+        if(n<=0||n>(64L<<20)){ fclose(f); fprintf(stderr,"fucina: invalid precision policy size\n"); return false; }
+        raw.resize((size_t)n); bool ok=fread(raw.data(),1,(size_t)n,f)==(size_t)n; fclose(f);
+        if(!ok||raw.find("fucina-precision-policy-v1")==std::string::npos){ fprintf(stderr,"fucina: invalid precision policy format\n"); return false; }
+        if(raw.find("\"codec\": \"int2\"")!=std::string::npos || raw.find("\"codec\":\"int2\"")!=std::string::npos){
+            fprintf(stderr,"fucina: precision policy requests INT2 but no accepted sub-4-bit kernel is available\n"); return false;
+        }
+        enabled=true; return true;
+    }
+    std::string codec(const std::string &checkpoint_key) const {
+        if(!enabled) return "";
+        size_t lp=checkpoint_key.find("layers.");
+        std::string key=lp==std::string::npos?checkpoint_key:checkpoint_key.substr(lp);
+        size_t p=raw.find("\""+key+"\""); if(p==std::string::npos) return "";
+        size_t end=raw.find('}',p),c=raw.find("\"codec\"",p);
+        if(end==std::string::npos||c==std::string::npos||c>end) return "";
+        c=raw.find(':',c); if(c==std::string::npos||c>end) return "";
+        size_t q1=raw.find('"',c),q2=q1==std::string::npos?q1:raw.find('"',q1+1);
+        return q1==std::string::npos||q2==std::string::npos||q2>end?"":raw.substr(q1+1,q2-q1-1);
+    }
+};
+
 static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
     const int H=eng->cfg.hidden_size, HD=M2_HEAD, NQ=eng->cfg.n_heads, NKV=eng->cfg.n_kv_global;
     const int CONVD=(2*M2_KEYD+eng->cfg.ssm_inner_size), INNER=eng->cfg.ssm_inner_size;
@@ -675,6 +706,8 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     cudaMemGetInfo(&fill_free_before, &fill_total);
     const q35_host_meminfo host_mem_before=q35_read_host_meminfo();
 
+    q35_precision_policy precision_policy;
+    if(!precision_policy.load()) return -1;
     std::vector<q35fp8_desc> D;
     std::vector<void*> tofree;          // host temporaries (bf16→f32 / bf16→Q8_0) freed after upload
     auto find=[&](const std::string&k)->const st::Tensor*{ return M.find(k); };
@@ -804,6 +837,12 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // FUCINA_MOE_FP8=1 = raw FP8.
     bool fp4_mode = q4k_mode && !getenv("FUCINA_MOE_Q4K");
     auto put_w=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int od,int idm)->bool{
+        std::string codec=precision_policy.codec(key);
+        if(codec=="fp8_block" || codec=="fp8_or_bf16") {
+            precision_policy.kept_fp8++;
+            return put_fp8(off,fmtp,key,od,idm);
+        }
+        if(q4k_mode) precision_policy.requant_q4k++;
         return q4k_mode ? put_q4k_from_fp8(off,fmtp,key,od,idm) : put_fp8(off,fmtp,key,od,idm);
     };
 
@@ -981,6 +1020,10 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     }
     // globals: output_norm (f32, +1), lm_head → Q8_0
     ok=ok && put_f32_from_bf16(&TS.output_norm, LO.final_norm_key, 1.0f,false);
+    if(precision_policy.enabled)
+        fprintf(stderr,"fucina: precision policy applied from %s (core FP8=%d, Q4_K=%d, routed experts=%s)\n",
+                precision_policy.path.c_str(),precision_policy.kept_fp8,precision_policy.requant_q4k,
+                fp4_mode?"NVFP4":"fallback");
     if(!ok){ for(void*p:tofree) free(p); return -2; }
     // At this point the persistent expert slabs are resident, while the descriptor-backed core
     // weights are still host-side. This checkpoint separates expert setup from the bulk upload.
@@ -1119,6 +1162,9 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     const q35_host_meminfo host_mem_final=q35_read_host_meminfo();
     const double GiB=1024.0*1024.0*1024.0;
     auto delta_gib=[&](size_t a,size_t b){ return ((double)a-(double)b)/GiB; };
+    const char *mixer_desc=precision_policy.enabled&&precision_policy.kept_fp8>0
+        ? (precision_policy.requant_q4k>0?"mixed-FP8/Q4_K":"policy-FP8")
+        : (q4k_mode?"Q4_K":"FP8");
     fprintf(stderr,
         "fucina: qwen35 allocation decision: source=%s mixer=%s experts=%s d_weights=%.2f GiB\n"
         "fucina: qwen35 allocation ledger: experts=%.2f core=%.2f scales=%.2f embed=%.2f "
@@ -1130,7 +1176,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         "fucina: qwen35 observed deltas: experts=%+.2f core=%+.2f embed/head=%+.2f "
         "moe-scratch=%+.2f fill-total=%+.2f ledger-residual=%+.2f GiB\n",
         LO.compressed?"compressed-NVFP4":(LO.modelopt?"ModelOpt-NVFP4":"block-FP8"),
-        q4k_mode?"Q4_K":"FP8",
+        mixer_desc,
         !moe?"n/a":(eng->moe_experts_fp4?"NVFP4":(eng->moe_experts_q4k?"Q4_K":"FP8")),
         total/GiB,
         expert_bytes/GiB,total/GiB,scale_bytes/GiB,embed_bytes/GiB,head_bytes/GiB,
@@ -1148,7 +1194,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         delta_gib(fill_free_before,fill_free_final),
         delta_gib(fill_free_before,fill_free_final)-ledger_bytes/GiB);
     fprintf(stderr,"fucina: qwen35 %s%s served via batched engine (%d layers, vocab %d, H %d, NKV %d%s, %.2f GiB)\n",
-            q4k_mode?"Q4_K-mixer":"FP8", moe?"-MoE":"-dense", L, VOC, H, NKV,
+            mixer_desc, moe?"-MoE":"-dense", L, VOC, H, NKV,
             moe?", E-experts slabbed":"", total/GiB);
     return 0;
 }
