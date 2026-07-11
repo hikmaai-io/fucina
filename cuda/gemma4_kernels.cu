@@ -9,6 +9,7 @@
 //   Output: logit softcapping at 30.0
 
 #include "gemma4_kernels.cuh"
+#include "tensor_types.h"
 #include "gemma4_detect.h"   // M0: runtime arch auto-detection (gemma4_detect_from_gguf/_config_json)
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -3688,6 +3689,9 @@ struct gemma4_engine {
             // (attn_v + ffn_down vary), so the bulk dispatch must read the tensor's own format
             // rather than the engine-wide eng->format. 0 = unset (e.g. global-layer attn_v).
             uint8_t fmt_q, fmt_k, fmt_v, fmt_o, fmt_gate, fmt_up, fmt_down;
+            // Canonical descriptors are populated alongside the compatibility offsets/format
+            // bytes. Qwen runtime paths migrate projection-family by projection-family.
+            WeightRef ref_q, ref_k, ref_v, ref_o;
 
             // ── Qwen3.5 hybrid gated-deltanet (LINEAR) layer tensors (GEMMA4_ARCH_QWEN3_5 only) ──
             // Zero on every other arch AND on the hybrid's FULL layers (those reuse attn_q/k/v/
@@ -3708,6 +3712,7 @@ struct gemma4_engine {
                 uint64_t norm;     // blk.l.ssm_norm.weight   gated RMSNorm gain [state_size]  F32
                 uint64_t out;      // blk.l.ssm_out.weight    out-proj  [inner→hidden]
                 uint8_t  fmt_in_qkv, fmt_in_z, fmt_in_a, fmt_in_b, fmt_out;
+                WeightRef ref_in_qkv, ref_in_z, ref_out;
             } ssm;
         } layers[GEMMA4_CAP_LAYERS];
 
@@ -4692,6 +4697,7 @@ static unsigned char* convert_q6k_to_q8_0(const unsigned char *src, int64_t n_el
 
 static int build_packed_q4(gemma4_engine_t *eng);  // FUCINA_PACKED: lazy/eager repack (body below)
 static int build_packed_q4k(gemma4_engine_t *eng); // PACKED Q4_K: in-place superblock repack (body below)
+static inline const unsigned char* weight_fp8(const gemma4_engine_t *eng, uint64_t tensor_offset);
 static void gemma4_engine_paged_selftest(gemma4_engine_t *eng);       // Phase 2 inc 3 (body below)
 static void gemma4_engine_paged_read_selftest(gemma4_engine_t *eng);  // Phase 2 inc 4 (body below)
 static void gemma4_engine_paged_e2e_selftest(gemma4_engine_t *eng);   // Phase 2 inc 4b (body below)
@@ -6587,6 +6593,39 @@ gemma4_engine_t* gemma4_engine_create(
         build_packed_q4k(eng);
     }
 
+    // GGUF Qwen descriptors are bound after all override conversion and in-place repacking. The
+    // safetensors loader binds the same fields in qwen35_fp8_fill_engine().
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+        auto bind_ref=[&](WeightRef &ref,uint64_t off,uint8_t fmt,int out_dim,int in_dim){
+            ref.data=weight_fp8(eng,off); ref.scale=nullptr; ref.global_scale=nullptr;
+            ref.out_dim=out_dim; ref.in_dim=in_dim;
+            ref.encoding=(fmt==FORMAT_Q4_K)?WeightEncoding::Q4_K:
+                         (fmt==FORMAT_Q8_0)?WeightEncoding::Q8_0:
+                         (fmt==FORMAT_Q4_0)?WeightEncoding::Q4_0:
+                         (fmt==FORMAT_Q6_K)?WeightEncoding::Q6_K:WeightEncoding::FP8_BLOCK_128;
+            ref.layout=(fmt==FORMAT_Q4_K && eng->q4k_packed)?TensorLayout::Q4K_PACKED:
+                       (fmt==FORMAT_FP8_BLOCK)?TensorLayout::ROW_MAJOR:TensorLayout::GGML_NATIVE;
+            ref.flags=WEIGHT_FLAG_PRIMARY |
+                      ((ref.layout==TensorLayout::Q4K_PACKED)?WEIGHT_FLAG_PACKED:0);
+        };
+        const int H=eng->cfg.hidden_size, HD=eng->cfg.head_dim, NQ=eng->cfg.n_heads;
+        const int NKV=eng->cfg.n_kv_global, INNER=eng->cfg.ssm_inner_size;
+        const int CONVD=2*eng->cfg.ssm_group_count*eng->cfg.ssm_state_size+INNER;
+        for(int l=0;l<eng->cfg.n_layers;l++){
+            auto &T=eng->tensors.layers[l];
+            if(eng->cfg.attn_kind[l]==GEMMA4_ATTN_FULL){
+                bind_ref(T.ref_q,T.attn_q,T.fmt_q,2*NQ*HD,H);
+                bind_ref(T.ref_k,T.attn_k,T.fmt_k,NKV*HD,H);
+                bind_ref(T.ref_v,T.attn_v,T.fmt_v,NKV*HD,H);
+                bind_ref(T.ref_o,T.attn_output,T.fmt_o,H,NQ*HD);
+            } else {
+                bind_ref(T.ssm.ref_in_qkv,T.ssm.in_qkv,T.ssm.fmt_in_qkv,CONVD,H);
+                bind_ref(T.ssm.ref_in_z,T.ssm.in_z,T.ssm.fmt_in_z,INNER,H);
+                bind_ref(T.ssm.ref_out,T.ssm.out,T.ssm.fmt_out,H,INNER);
+            }
+        }
+    }
+
     // Paged KV mirror validation (opt-in): decode a fixed run and assert the
     // paged pool matches the contiguous cache byte-for-byte. Non-fatal.
     if (getenv("FUCINA_PAGED_KV_SELFTEST"))   gemma4_engine_paged_selftest(eng);
@@ -6973,8 +7012,49 @@ static inline void gemv_w(
     }
 }
 
+static inline int weight_ref_format(const WeightRef &weight) {
+    switch (weight.encoding) {
+        case WeightEncoding::Q8_0:          return FORMAT_Q8_0;
+        case WeightEncoding::Q4_0:          return FORMAT_Q4_0;
+        case WeightEncoding::Q4_K:          return FORMAT_Q4_K;
+        case WeightEncoding::Q6_K:          return FORMAT_Q6_K;
+        case WeightEncoding::FP8_BLOCK_128: return FORMAT_FP8_BLOCK;
+        case WeightEncoding::NVFP4_LINEAR:
+        case WeightEncoding::NVFP4_SWIZZLED:return FORMAT_NVFP4;
+        default:                            return -1;
+    }
+}
+
+// Descriptor dispatch for migrated projections. Unlike the compatibility overload above, this
+// takes scale and packed-layout decisions directly from the tensor: no ptr→scale search and no
+// pointer-range format inference occur in the hot path.
+static inline void gemv_w(
+    const gemma4_engine_t *eng, float *out, const WeightRef &weight,
+    const float *x, cudaStream_t stream)
+{
+    const int fmt = weight_ref_format(weight);
+    if (fmt == FORMAT_FP8_BLOCK) {
+        fp8_block_gemv_launch(out, weight.data, (const __nv_bfloat16 *)weight.scale, x,
+                              weight.in_dim, weight.out_dim, stream);
+        return;
+    }
+    if (fmt == FORMAT_Q4_K) {
+        quantize_q8_1_kernel<<<weight.in_dim/32, 32, 0, stream>>>(
+            x, eng->d_qx, eng->d_dx, eng->d_sx, weight.in_dim);
+        if (weight.layout == TensorLayout::Q4K_PACKED)
+            mmvq_q4_k_packed_launch(out, weight.data, eng->d_qx, eng->d_dx, eng->d_sx,
+                                    weight.in_dim, weight.out_dim, stream);
+        else
+            mmvq_q4_k_launch(out, weight.data, eng->d_qx, eng->d_dx, eng->d_sx,
+                             weight.in_dim, weight.out_dim, stream);
+        return;
+    }
+    // Compatibility for encodings not yet migrated; data and dimensions still come from WeightRef.
+    gemv_w(eng, out, weight.data, x, weight.in_dim, weight.out_dim, stream, fmt);
+}
+
 // FORMAT_FP8_BLOCK: recover a weight's per-128 block-scale pointer (host binary search over the
-// sorted ptr→scale table the FP8 loader built — the offset scheme can't derive it).
+// sorted ptr→scale table the FP8 loader built — compatibility paths only).
 static inline const __nv_bfloat16 *wscale_fp8(const gemma4_engine_t *eng, const uint8_t *w) {
     int lo = 0, hi = eng->q35.fp8_scale_n - 1;
     while (lo <= hi) {
@@ -7033,6 +7113,38 @@ static inline void gemv_batched_w(
     }
     mmvq_batched_launch(out, weight, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b,
                         in_dim, out_dim, K, fmt, stream);
+}
+
+static inline void gemv_batched_w(
+    const gemma4_engine_t *eng, float *out, const WeightRef &weight,
+    const float *x, int K, cudaStream_t stream)
+{
+    const int fmt = weight_ref_format(weight);
+    if (fmt == FORMAT_FP8_BLOCK) {
+        fp8_block_gemm_launch(out, weight.data, (const __nv_bfloat16 *)weight.scale, x,
+                              weight.in_dim, weight.out_dim, K, stream);
+        return;
+    }
+    if (fmt == FORMAT_Q4_K) {
+        if (K > 1 && (weight.in_dim & 1023) == 0 &&
+            weight.layout == TensorLayout::Q4K_PACKED) {
+            quantize_q8_1t_kernel<<<(K*weight.in_dim)/32, 32, 0, stream>>>(
+                x, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b, weight.in_dim);
+            mmvq_q4_k_packedT_batched_launch(out, weight.data, eng->d_qx_b, eng->d_dx_b,
+                                             eng->d_sx_b, weight.in_dim, weight.out_dim, K, stream);
+            return;
+        }
+        quantize_q8_1_kernel<<<(K*weight.in_dim)/32, 32, 0, stream>>>(
+            x, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b, K*weight.in_dim);
+        if (weight.layout == TensorLayout::Q4K_PACKED)
+            mmvq_q4_k_packed_batched_launch(out, weight.data, eng->d_qx_b, eng->d_dx_b,
+                                             eng->d_sx_b, weight.in_dim, weight.out_dim, K, stream);
+        else
+            mmvq_q4_k_batched_launch(out, weight.data, eng->d_qx_b, eng->d_dx_b,
+                                      eng->d_sx_b, weight.in_dim, weight.out_dim, K, stream);
+        return;
+    }
+    gemv_batched_w(eng, out, weight.data, x, weight.in_dim, weight.out_dim, K, stream, fmt);
 }
 
 // Forward declarations: logits_head uses lmhead_w/embd_fmt (defined just below); the decode

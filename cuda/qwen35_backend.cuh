@@ -1041,6 +1041,37 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         }
     }
 
+    // Populate canonical mixer descriptors only after optional in-place Q4_K repacking, so layout
+    // is authoritative before any runtime path can observe it. Compatibility offsets/fmt bytes stay
+    // populated while the remaining projection families migrate.
+    auto bind_ref=[&](WeightRef &ref,uint64_t off,uint8_t fmt,int out_dim,int in_dim){
+        ref.data=eng->d_weights+off;
+        ref.scale=(fmt==FORMAT_FP8_BLOCK)?(const void*)wscale_fp8(eng,ref.data):nullptr;
+        ref.global_scale=nullptr;
+        ref.out_dim=out_dim; ref.in_dim=in_dim;
+        ref.encoding=(fmt==FORMAT_FP8_BLOCK)?WeightEncoding::FP8_BLOCK_128:
+                     (fmt==FORMAT_Q4_K)?WeightEncoding::Q4_K:
+                     (fmt==FORMAT_Q8_0)?WeightEncoding::Q8_0:
+                     (fmt==FORMAT_Q4_0)?WeightEncoding::Q4_0:WeightEncoding::Q6_K;
+        ref.layout=(fmt==FORMAT_Q4_K && eng->q4k_packed)?TensorLayout::Q4K_PACKED:
+                   (fmt==FORMAT_FP8_BLOCK)?TensorLayout::ROW_MAJOR:TensorLayout::GGML_NATIVE;
+        ref.flags=WEIGHT_FLAG_PRIMARY |
+                  ((ref.layout==TensorLayout::Q4K_PACKED)?WEIGHT_FLAG_PACKED:0);
+    };
+    for(int l=0;l<L;l++){
+        auto &T=TS.layers[l];
+        if(qwen35fp8::is_full(LO,l)){
+            bind_ref(T.ref_q,T.attn_q,T.fmt_q,2*NQ*HD,H);
+            bind_ref(T.ref_k,T.attn_k,T.fmt_k,NKV*HD,H);
+            bind_ref(T.ref_v,T.attn_v,T.fmt_v,NKV*HD,H);
+            bind_ref(T.ref_o,T.attn_output,T.fmt_o,H,NQ*HD);
+        } else {
+            bind_ref(T.ssm.ref_in_qkv,T.ssm.in_qkv,T.ssm.fmt_in_qkv,CONVD,H);
+            bind_ref(T.ssm.ref_in_z,T.ssm.in_z,T.ssm.fmt_in_z,INNER,H);
+            bind_ref(T.ssm.ref_out,T.ssm.out,T.ssm.fmt_out,H,INNER);
+        }
+    }
+
     // token_embd → Q8_0 (separate d_token_embd; embed_w reads it).
     const st::Tensor *embT=M.find(LO.embed_key);
     if(!embT){ return -5; }

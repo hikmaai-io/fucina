@@ -343,9 +343,9 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
         const auto &T = eng->tensors.layers[l];
         rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(T.attn_norm), H, B, eps);
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
-            gemv_batched_w(eng, qg, Wq(T.attn_q),      xn, H, 2*NQ*HD, B, st, T.fmt_q);
-            gemv_batched_w(eng, kb, Wq(T.attn_k),      xn, H, NKV*HD,  B, st, T.fmt_k);
-            gemv_batched_w(eng, vb, Wq(T.attn_v),      xn, H, NKV*HD,  B, st, T.fmt_v);
+            gemv_batched_w(eng, qg, T.ref_q, xn, B, st);
+            gemv_batched_w(eng, kb, T.ref_k, xn, B, st);
+            gemv_batched_w(eng, vb, T.ref_v, xn, B, st);
             m2_split_query_gate_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(qb, gate, qg, B, NQ);
             per_head_rms_norm_rows_kernel<<<dim3(NQ,B),256,32*sizeof(float),st>>>(qb, Wf(T.attn_q_norm), NQ, HD, B, eps);
             per_head_rms_norm_rows_kernel<<<dim3(NKV,B),256,32*sizeof(float),st>>>(kb, Wf(T.attn_k_norm), NKV, HD, B, eps);
@@ -365,11 +365,11 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
                     attn, eng->q35.part_m, eng->q35.part_l, eng->q35.part_o, B, S, NQ);
             }
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(attn, gate, B*NQ*HD);
-            gemv_batched_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, B, st, T.fmt_o);
+            gemv_batched_w(eng, mix, T.ref_o, attn, B, st);
         } else {
             // in_qkv requantized Q5_K→Q8_0 at load → native dp4a GEMV (P5), no per-step fp32 dequant.
-            gemv_batched_w(eng, qkv, Wq(T.ssm.in_qkv), xn, H, CONVD, B, st, T.ssm.fmt_in_qkv);
-            gemv_batched_w(eng, zc, Wq(T.ssm.in_z), xn, H, INNER, B, st, T.ssm.fmt_in_z);
+            gemv_batched_w(eng, qkv, T.ssm.ref_in_qkv, xn, B, st);
+            gemv_batched_w(eng, zc, T.ssm.ref_in_z, xn, B, st);
             if (eng->format == FORMAT_FP8_BLOCK) {   // in_a/in_b are f32 (oracle parity)
                 m2_gemm(ac, xn, Wf(T.ssm.in_a), B, H, TSR, st);   // alpha
                 m2_gemm(bc, xn, Wf(T.ssm.in_b), B, H, TSR, st);   // beta
@@ -385,7 +385,7 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             m2_decay_beta_kernel<<<grid1d((size_t)B*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), B, TSR);
             qwen35_b_gdn_kernel<<<dim3(NVH,B),256,smGDN,st>>>(core, qh, kh, vh, gg, bb, eng->q35.S[l], d_slot, B, eng->format==FORMAT_FP8_BLOCK, NVH);  // 256 thr: 2x lanes on the SD*SD state loops
             m2_gated_norm_kernel<<<dim3(NVH,B),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), B, NVH, INNER);
-            gemv_batched_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, B, st, T.ssm.fmt_out);
+            gemv_batched_w(eng, mix, T.ssm.ref_out, gnorm, B, st);
         }
         residual_add_kernel<<<grid1d((size_t)B*H),256,0,st>>>(x, mix, B*H);
         rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(T.ffn_norm), H, B, eps);
@@ -742,15 +742,16 @@ static int q35_fp4_setup(gemma4_engine_t *eng) {
 // per-tile dequant. l/slot index the per-projection weight stores (d_q35_fp4_w / d_q35_wc).
 static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fmt,
                           const float *x_f32, int in_dim, int out_dim, int T, cudaStream_t st,
-                          int l, int slot) {
-    const uint8_t *w = weight_fp8(eng, off);
+                          int l, int slot, const WeightRef *ref = nullptr) {
+    const uint8_t *w = ref ? ref->data : weight_fp8(eng, off);
+    if (ref) { fmt=weight_ref_format(*ref); in_dim=ref->in_dim; out_dim=ref->out_dim; }
     // Qwen3.5 block-FP8. Short tiles (≤2 GEMV chunks): the float-activation FP8 GEMM, weight
     // amortized across ≤FP8_MAXB rows. WIDE prefill tiles: dequant the projection to BF16 ONCE
     // (cached in the per-layer weight-cache slot when memory allows) and ride the tensor-core
     // BF16 GEMM — the chunked GEMV re-read the whole weight T/FP8_MAXB times per tile, which
     // was the dominant prefill cost (43.9 s TTFT at a ~2k prompt on the 35B MoE).
     if (fmt == FORMAT_FP8_BLOCK) {
-        const __nv_bfloat16 *sc = wscale_fp8(eng, w);
+        const __nv_bfloat16 *sc = ref ? (const __nv_bfloat16*)ref->scale : wscale_fp8(eng, w);
         if (T <= 2 * FP8_MAXB) {
             for (int b0 = 0; b0 < T; b0 += FP8_MAXB) {
                 int bb = (T - b0 < FP8_MAXB) ? (T - b0) : FP8_MAXB;
@@ -787,7 +788,7 @@ static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fm
         gemm_bf16(eng, wbf, eng->q35.xbf16, dst, in_dim, out_dim, T);
         return;
     }
-    bool packed = use_packed_q4k(eng, fmt, w);
+    bool packed = ref ? ref->layout==TensorLayout::Q4K_PACKED : use_packed_q4k(eng, fmt, w);
     const uint64_t n = (uint64_t)in_dim * out_dim;
     // activation → BF16 once (both the NVFP4 and BF16 GEMM paths consume it)
     f32_to_bf16_kernel<<<(unsigned)(((size_t)T * in_dim + 255) / 256), 256, 0, st>>>(
@@ -1030,9 +1031,9 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
         const auto &Tn = eng->tensors.layers[l];
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.attn_norm), H, T, eps);
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
-            q35_proj_gemm(eng, qg, Tn.attn_q, Tn.fmt_q, xn, H, 2*NQ*HD, T, st, l, WC_Q);
-            q35_proj_gemm(eng, kb, Tn.attn_k, Tn.fmt_k, xn, H, NKV*HD,  T, st, l, WC_K);
-            q35_proj_gemm(eng, vb, Tn.attn_v, Tn.fmt_v, xn, H, NKV*HD,  T, st, l, WC_V);
+            q35_proj_gemm(eng, qg, Tn.attn_q, Tn.fmt_q, xn, H, 2*NQ*HD, T, st, l, WC_Q, &Tn.ref_q);
+            q35_proj_gemm(eng, kb, Tn.attn_k, Tn.fmt_k, xn, H, NKV*HD,  T, st, l, WC_K, &Tn.ref_k);
+            q35_proj_gemm(eng, vb, Tn.attn_v, Tn.fmt_v, xn, H, NKV*HD,  T, st, l, WC_V, &Tn.ref_v);
             m2_split_query_gate_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(qb, gate, qg, T, NQ);
             per_head_rms_norm_rows_kernel<<<dim3(NQ,T),256,32*sizeof(float),st>>>(qb, Wf(Tn.attn_q_norm), NQ, HD, T, eps);
             per_head_rms_norm_rows_kernel<<<dim3(NKV,T),256,32*sizeof(float),st>>>(kb, Wf(Tn.attn_k_norm), NKV, HD, T, eps);
@@ -1054,12 +1055,12 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
                     attn, qb, eng->q35.Kc[l], eng->q35.Vc[l], d_pos, d_slot, maxctx, T, NKV, NQ);
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
-            q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st, l, WC_O);
+            q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st, l, WC_O, &Tn.ref_o);
         } else {
             // Weight-heavy projections via tensor-core BF16 GEMM (prefill is compute-bound). The
             // tiny alpha/beta projections (out_dim=TSR=32) stay on the dp4a GEMV — GEMM not worth it.
-            q35_proj_gemm(eng, qkv, Tn.ssm.in_qkv, Tn.ssm.fmt_in_qkv, xn, H, CONVD, T, st, l, WC_QKV);
-            q35_proj_gemm(eng, zc,  Tn.ssm.in_z,   Tn.ssm.fmt_in_z,   xn, H, INNER, T, st, l, WC_Z);
+            q35_proj_gemm(eng, qkv, Tn.ssm.in_qkv, Tn.ssm.fmt_in_qkv, xn, H, CONVD, T, st, l, WC_QKV, &Tn.ssm.ref_in_qkv);
+            q35_proj_gemm(eng, zc,  Tn.ssm.in_z,   Tn.ssm.fmt_in_z,   xn, H, INNER, T, st, l, WC_Z, &Tn.ssm.ref_in_z);
             if (eng->format == FORMAT_FP8_BLOCK) {   // in_a/in_b are f32 (oracle parity)
                 m2_gemm(ac, xn, Wf(Tn.ssm.in_a), T, H, TSR, st);   // alpha
                 m2_gemm(bc, xn, Wf(Tn.ssm.in_b), T, H, TSR, st);   // beta
@@ -1084,7 +1085,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 core, qh, kh, vh, gg, bb, eng->q35.S[l], eng->q35.chunk_scr, slot, T, NPAD,
                 eng->format==FORMAT_FP8_BLOCK, NVH);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T, NVH, VALD);
-            q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, l, WC_OUT);
+            q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, l, WC_OUT, &Tn.ssm.ref_out);
         }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.ffn_norm), H, T, eps);

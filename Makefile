@@ -54,7 +54,7 @@ lib: cuda/libfucina.a
 # a stale cubin built with the old flags into libfucina.a.
 
 cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh cuda/gemma4_config.h \
-                       cuda/gemma4_detect.h cuda/paged_kv.h cuda/paged_kv_device.cuh \
+                       cuda/tensor_types.h cuda/gemma4_detect.h cuda/paged_kv.h cuda/paged_kv_device.cuh \
                        cuda/paged_prefix.h cuda/safetensors.h cuda/nvfp4.h \
                        cuda/nvfp4_loader.h cuda/nvfp4_gemv.cuh cuda/fp8_block.cuh \
                        cuda/qwen35_fp8_loader.h cuda/qwen35_state.cuh cuda/qwen35_kernels.cuh \
