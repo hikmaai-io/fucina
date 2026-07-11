@@ -283,7 +283,11 @@ through descriptors and ownership APIs; moving code then becomes mechanical and 
   shape/dtype/scale preflight before engine CUDA allocations. Planned offsets are authoritative for
   the core upload arena, and planned core/scale/expert/embedding/head bytes feed the exact ledger.
   Recurrent/KV workspaces and optional prefill caches still need to move into the plan.
-- **Phases 3–6:** not started.
+- **Phase 3 — transactional allocation:** in progress. `DeviceAllocationSet` and the persistent
+  registry provide reverse-order rollback, one-owner teardown, slot nulling, exact byte totals, and
+  deterministic failure injection tests. The Qwen core arena is migrated; expert, scale,
+  embedding/head, scratch, and cache allocations remain on compatibility teardown.
+- **Phases 4–6:** not started.
 
 The performance KPI remains **>64 / >105 / >150 tok/s at 1/2/4 streams**. Descriptor-only changes
 must first preserve the `<1%` phase gate; kernel optimization remains sequenced after ownership work.

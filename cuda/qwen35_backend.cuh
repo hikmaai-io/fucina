@@ -798,6 +798,11 @@ static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::L
     return 0;
 }
 
+static int q35_cuda_allocate(void *,void **ptr,size_t bytes) {
+    return cudaMalloc(ptr,bytes)==cudaSuccess?0:1;
+}
+static void q35_cuda_release(void *,void *ptr) { if(ptr) cudaFree(ptr); }
+
 static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
     const int H=eng->cfg.hidden_size, HD=M2_HEAD, NQ=eng->cfg.n_heads, NKV=eng->cfg.n_kv_global;
     const int CONVD=(2*M2_KEYD+eng->cfg.ssm_inner_size), INNER=eng->cfg.ssm_inner_size;
@@ -1209,7 +1214,12 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     fprintf(stderr,"fucina: qwen35 tensor plan finalized: entries=%zu core=%.2f GiB scales=%.2f MiB\n",
             model_plan.tensors().size(),total/(1024.0*1024*1024),
             model_plan.bytes(AllocationClass::SCALES)/(1024.0*1024));
-    if(cudaMalloc(&eng->d_weights,total)!=cudaSuccess){ for(void*p:tofree) free(p); return -3; }
+    DeviceAllocationOps allocation_ops{nullptr,q35_cuda_allocate,q35_cuda_release};
+    if(!eng->device_allocations) eng->device_allocations=new DeviceAllocationRegistry(allocation_ops);
+    DeviceAllocationSet core_allocation(allocation_ops);
+    if(!core_allocation.allocate((void**)&eng->d_weights,total,"qwen_core_weights")){
+        for(void*p:tofree) free(p); return -3;
+    }
     eng->gguf_size=total;
     // scale table (built alongside), then sorted by weight ptr for wscale_fp8's binary search.
     eng->q35.fp8_scale_tab=(qwen35_runtime_state::fp8_scent*)malloc(D.size()*sizeof(qwen35_runtime_state::fp8_scent));
@@ -1398,6 +1408,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     fprintf(stderr,"fucina: qwen35 %s%s served via batched engine (%d layers, vocab %d, H %d, NKV %d%s, %.2f GiB)\n",
             q4k_mode?"Q4_K-mixer":"FP8", moe?"-MoE":"-dense", L, VOC, H, NKV,
             moe?", E-experts slabbed":"", total/GiB);
+    if(!core_allocation.commit(*eng->device_allocations)) return -8;
     return 0;
 }
 

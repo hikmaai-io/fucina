@@ -11,6 +11,7 @@
 #include "gemma4_kernels.cuh"
 #include "tensor_types.h"
 #include "model_plan.h"
+#include "device_allocation_set.h"
 #include "gemma4_detect.h"   // M0: runtime arch auto-detection (gemma4_detect_from_gguf/_config_json)
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -4172,6 +4173,9 @@ struct gemma4_engine {
     float          *d_fp4m_gsrow;                    // [A] per-row activation global scales
 
     // ─── LoRA adapter support ───────────────────────────────────────────
+
+    // Registry-owned allocations null their compatibility slots during teardown.
+    DeviceAllocationRegistry *device_allocations;
 };
 
 // ─── GGUF Parser ───────────────────────────────────────────────────────
@@ -6652,6 +6656,9 @@ gemma4_engine_t* gemma4_engine_create(
 
 void gemma4_engine_destroy(gemma4_engine_t *eng) {
     if (!eng) return;
+
+    delete eng->device_allocations;
+    eng->device_allocations = nullptr;
 
     if (eng->gguf_data && eng->gguf_data != MAP_FAILED) {
         munmap((void *)eng->gguf_data, eng->gguf_size);

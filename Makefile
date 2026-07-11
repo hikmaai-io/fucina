@@ -26,7 +26,7 @@ NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo --use_fast_math \
 CGO_CFLAGS   := -I$(CUDA_HOME)/include
 CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 
-.PHONY: all clean test cuda lib libdg fucina smoke profile model-plan-test nvfp4-test e4b-test \
+.PHONY: all clean test cuda lib libdg fucina smoke profile model-plan-test allocation-set-test nvfp4-test e4b-test \
         e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
         e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
@@ -615,8 +615,11 @@ fp4: fp4-probe fp4-gemm-test
 model-plan-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/model_plan_test.cc -o /tmp/model_plan_test && /tmp/model_plan_test
 
+allocation-set-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/device_allocation_set_test.cc -o /tmp/allocation_set_test && /tmp/allocation_set_test
+
 # NVFP4 safetensors loader unit tests (host + decode-kernel parity). Self-contained, no model.
-nvfp4-test: model-plan-test
+nvfp4-test: model-plan-test allocation-set-test
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/safetensors_test.cc   -o /tmp/st_test     && /tmp/st_test
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_test.cc          -o /tmp/nvfp4_test  && /tmp/nvfp4_test
 	g++ -std=c++17 -O2 -Wall -Wextra cuda/nvfp4_loader_test.cc   -o /tmp/nvfp4_ld    && /tmp/nvfp4_ld
