@@ -156,6 +156,14 @@ func main() {
 		return
 	}
 
+	if args.ExpertStore != "" {
+		if args.ExpertSlots < 1 || args.ExpertSlots > 4096 {
+			log.Fatal("fucina: --expert-slots must be between 1 and 4096")
+		}
+		os.Setenv("FUCINA_EXPERT_STREAM_SSD", args.ExpertStore)
+		os.Setenv("FUCINA_EXPERT_STREAM_SLOTS", fmt.Sprintf("%d", args.ExpertSlots))
+	}
+
 	// Paged multi-sequence KV pools are gated inside the C engine on the FUCINA_PAGED_KV
 	// env var, read at engine init. Promote the --paged-kv/--batch flags to that env var
 	// BEFORE NewEngine so the flag and the legacy env path converge on one code path.

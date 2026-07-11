@@ -59,6 +59,9 @@ extern "C" {
                              const float *dx, const int *sx, const int *coloff, const int *count,
                              int n_expert, int in_dim, int out_dim, cudaStream_t s);
     void dg_silu_mul(float *out, const float *gate, const float *up, int64_t n, cudaStream_t s);
+    int dg_fp4_moe_grouped_mapped(void* D,const void* A,const void* A_sf,const void* B,const void* B_sf,
+        const int* count,const int* coloff,const int* expert_slot,int groups,int N,int K,
+        unsigned long long sfA_stride,unsigned long long sfB_stride,const float* alpha,cudaStream_t stream);
 }
 
 #define GEMMA4_MOE_TMAX 2048  // max tokens per MoE chunk (decode B≤16, prefill loops in chunks)
@@ -4163,6 +4166,21 @@ struct gemma4_engine {
     uint8_t        *d_fp4m_gusf[GEMMA4_CAP_LAYERS];  // [E][fp4m_gu_sfB] swizzled ue4m3
     uint8_t        *d_fp4m_dn[GEMMA4_CAP_LAYERS];    // [E][H][EFFN/2]
     uint8_t        *d_fp4m_dnsf[GEMMA4_CAP_LAYERS];  // [E][fp4m_dn_sfB]
+    // Opt-in bounded-memory SSD streaming: transformed slabs live in one immutable file;
+    // compact host/device slot pools cache active logical (layer,expert) records.
+    uint8_t        *h_fp4m_stage_gu, *h_fp4m_stage_gusf, *h_fp4m_stage_dn, *h_fp4m_stage_dnsf;
+    uint8_t        *d_fp4m_stage_gu, *d_fp4m_stage_gusf, *d_fp4m_stage_dn, *d_fp4m_stage_dnsf;
+    int             fp4m_ssd_stream, fp4m_slots;
+    int            *d_fp4m_eslot;
+    int             fp4m_ssd_fd;
+    int64_t         fp4m_ssd_gu_off[GEMMA4_CAP_LAYERS], fp4m_ssd_gusf_off[GEMMA4_CAP_LAYERS];
+    int64_t         fp4m_ssd_dn_off[GEMMA4_CAP_LAYERS], fp4m_ssd_dnsf_off[GEMMA4_CAP_LAYERS];
+    uint64_t       *h_fp4m_ssd_hash; // [layer,expert,4] FNV-1a for gu/gusf/dn/dnsf records
+    uint8_t        *h_fp4m_ssd_verified;
+    int            *h_fp4m_slot_layer, *h_fp4m_slot_expert;
+    uint64_t       *h_fp4m_slot_age, fp4m_slot_clock;
+    uint64_t        fp4m_ssd_reads, fp4m_ssd_bytes, fp4m_ssd_checksum_fail;
+    uint64_t        fp4m_cache_hits, fp4m_cache_misses;
     float          *d_fp4m_gsw;                      // device [L·2] per-(layer,proj) global scales
     unsigned long long fp4m_gu_sfB, fp4m_dn_sfB;     // per-expert SF strides (SF elements)
     uint8_t        *d_fp4m_a,  *d_fp4m_asf;          // per-step activation E2M1 + padded SF (K=H)
@@ -6652,6 +6670,18 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
         CUDA_FREE(eng->d_fp4m_gu[i]); CUDA_FREE(eng->d_fp4m_gusf[i]);
         CUDA_FREE(eng->d_fp4m_dn[i]); CUDA_FREE(eng->d_fp4m_dnsf[i]);
     }
+    if (eng->h_fp4m_stage_gu) free(eng->h_fp4m_stage_gu);
+    if (eng->h_fp4m_stage_gusf) free(eng->h_fp4m_stage_gusf);
+    if (eng->h_fp4m_stage_dn) free(eng->h_fp4m_stage_dn);
+    if (eng->h_fp4m_stage_dnsf) free(eng->h_fp4m_stage_dnsf);
+    CUDA_FREE(eng->d_fp4m_stage_gu); CUDA_FREE(eng->d_fp4m_stage_gusf);
+    CUDA_FREE(eng->d_fp4m_stage_dn); CUDA_FREE(eng->d_fp4m_stage_dnsf); CUDA_FREE(eng->d_fp4m_eslot);
+    if (eng->fp4m_ssd_stream && eng->fp4m_ssd_fd >= 0) close(eng->fp4m_ssd_fd);
+    if (eng->h_fp4m_ssd_hash) free(eng->h_fp4m_ssd_hash);
+    if (eng->h_fp4m_ssd_verified) free(eng->h_fp4m_ssd_verified);
+    if (eng->h_fp4m_slot_layer) free(eng->h_fp4m_slot_layer);
+    if (eng->h_fp4m_slot_expert) free(eng->h_fp4m_slot_expert);
+    if (eng->h_fp4m_slot_age) free(eng->h_fp4m_slot_age);
     CUDA_FREE(eng->d_fp4m_gsw);
     CUDA_FREE(eng->d_fp4m_a);      CUDA_FREE(eng->d_fp4m_asf);
     CUDA_FREE(eng->d_fp4m_a2);     CUDA_FREE(eng->d_fp4m_a2sf);
@@ -9309,6 +9339,10 @@ __global__ void dequant_nvfp4ckpt_expert_slab_bf16_kernel(
     out16[1] = *(const uint4 *)&o[8];
 }
 
+static inline uint64_t q35_expert_hash_update(uint64_t h,const void *p,size_t n){
+    const uint8_t*b=(const uint8_t*)p;for(size_t i=0;i<n;i++){h^=b[i];h*=1099511628211ULL;}return h;
+}
+
 // out[t][i] += sigmoid(shlog[t]) · v[t][i] — the Qwen3.5-MoE shared-expert add (per-token
 // sigmoid-gated) into the MoE block output. One thread per element, token = blockIdx.y.
 __global__ void q35moe_b_shared_axpy_kernel(float *out, const float *v, const float *shlog, int H) {
@@ -9331,6 +9365,12 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                     cudaStream_t stream) {
     const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn;
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
+    const uint8_t *fp4_gu=eng->d_fp4m_gu[l], *fp4_gusf=eng->d_fp4m_gusf[l];
+    const uint8_t *fp4_dn=eng->d_fp4m_dn[l], *fp4_dnsf=eng->d_fp4m_dnsf[l];
+    if(eng->fp4m_ssd_stream) {   // full slabs were dropped at load; GEMMs read the slot pool
+        fp4_gu=eng->d_fp4m_stage_gu; fp4_gusf=eng->d_fp4m_stage_gusf;
+        fp4_dn=eng->d_fp4m_stage_dn; fp4_dnsf=eng->d_fp4m_stage_dnsf;
+    }
     // Diagnostic phase timing is deliberately synchronizing and opt-in only. Reuse two events
     // as a moving boundary; each mark drains the stream, attributes the completed interval, then
     // swaps start/stop. Normal serving creates no events and takes no timing branches past `timing`.
@@ -9349,7 +9389,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
     // tc prefill works for FP8, Q4_K AND NVFP4 slabs (each has a slab→BF16 dequant); wide calls
     // ride the grouped-batched cuBLAS BF16 GEMMs (measured faster than the CUTLASS NVFP4 grouped
     // GEMM at prefill widths: 2k TTFT 1.16 s vs 1.23 s), decode-sized calls keep CUTLASS NVFP4.
-    const int tc_ok = (eng->format == FORMAT_FP8_BLOCK);
+    const int tc_ok = (eng->format == FORMAT_FP8_BLOCK) && !eng->fp4m_ssd_stream;
     const float *router_w = (const float*)weight_fp8(eng, eng->moe_router[l]);
     const void  *gate_w   = (const void*)weight_fp8(eng, eng->moe_gate_exps[l]);
     const void  *up_w     = (const void*)weight_fp8(eng, eng->moe_up_exps[l]);
@@ -9384,8 +9424,8 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                 if (eng->moe_experts_fp4)   // NVFP4 slabs: gate/up halves of the fused gu slab, then dn
                     dequant_nvfp4_expert_slab_bf16_kernel<<<(unsigned)((ne / NVFP4_BLK + 255) / 256), 256, 0, stream>>>(
                         eng->d_moe_wbf[p],
-                        (p == 2) ? eng->d_fp4m_dn[l]   : eng->d_fp4m_gu[l],
-                        (p == 2) ? eng->d_fp4m_dnsf[l] : eng->d_fp4m_gusf[l],
+                        (p == 2) ? fp4_dn   : fp4_gu,
+                        (p == 2) ? fp4_dnsf : fp4_gusf,
                         eng->d_fp4m_gsw + 2 * l + ((p == 2) ? 1 : 0),
                         (p == 2) ? EFFN : H, (p == 2) ? H : EFFN,
                         (p == 1) ? EFFN : 0, (p == 2) ? H : 2 * EFFN,
@@ -9453,8 +9493,102 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
               q35fp4_quant_grp_kernel<<<g, b, 0, stream>>>(eng->d_moe_xe, eng->d_fp4m_t2e,
                   eng->d_fp4m_indptr, H, total, eng->d_fp4m_gsrow, eng->d_fp4m_a, eng->d_fp4m_asf,
                   sfA1, nbHp); }
-            int rc = dg_fp4_moe_grouped(eng->d_fp4m_gu_out, eng->d_fp4m_a, eng->d_fp4m_asf,
-                eng->d_fp4m_gu[l], eng->d_fp4m_gusf[l], eng->d_fp4m_indptr,
+            int rc=0;
+            std::vector<int> active_stream;
+            if(eng->fp4m_ssd_stream) {   // never graph-captured (host I/O) — sync is fine
+                std::vector<int> hc_stream(E);
+                cudaMemcpyAsync(hc_stream.data(),eng->d_moe_count,E*sizeof(int),cudaMemcpyDeviceToHost,stream);
+                cudaStreamSynchronize(stream);
+                for(int e=0;e<E;e++)if(hc_stream[e]>0)active_stream.push_back(e);
+            }
+            std::vector<int> cache_map(E,-1);
+            bool cache_ready=false;
+            auto ssd_cache_prepare=[&]()->int {
+                if(!eng->fp4m_ssd_stream || active_stream.size()>(size_t)eng->fp4m_slots)return -1;
+                const size_t gp=(size_t)GU*(H/2),gsp=(size_t)eng->fp4m_gu_sfB;
+                const size_t dp=(size_t)H*(EFFN/2),dsp=(size_t)eng->fp4m_dn_sfB;
+                std::vector<unsigned char> used((size_t)eng->fp4m_slots,0);
+                std::vector<int> missing;
+                for(int e:active_stream){int found=-1;for(int s=0;s<eng->fp4m_slots;s++)
+                    if(eng->h_fp4m_slot_layer[s]==l&&eng->h_fp4m_slot_expert[s]==e){found=s;break;}
+                    if(found>=0){cache_map[e]=found;used[found]=1;eng->h_fp4m_slot_age[found]=++eng->fp4m_slot_clock;eng->fp4m_cache_hits++;}
+                    else missing.push_back(e);}
+                if(!missing.empty())cudaStreamSynchronize(stream);
+                auto rd=[&](void*p,size_t n,int64_t at){uint8_t*b=(uint8_t*)p;size_t d=0;while(d<n){ssize_t r=pread(eng->fp4m_ssd_fd,b+d,n-d,at+(int64_t)d);if(r<=0)return false;d+=(size_t)r;}return true;};
+                for(int e:missing){int slot=-1;uint64_t oldest=~0ULL;
+                    for(int s=0;s<eng->fp4m_slots;s++)if(!used[s]&&eng->h_fp4m_slot_layer[s]<0){slot=s;break;}
+                    if(slot<0)for(int s=0;s<eng->fp4m_slots;s++)if(!used[s]&&eng->h_fp4m_slot_age[s]<oldest){oldest=eng->h_fp4m_slot_age[s];slot=s;}
+                    if(slot<0)return -11;used[slot]=1;cache_map[e]=slot;
+                    uint8_t*hg=eng->h_fp4m_stage_gu+(size_t)slot*gp,*hs=eng->h_fp4m_stage_gusf+(size_t)slot*gsp;
+                    uint8_t*hd=eng->h_fp4m_stage_dn+(size_t)slot*dp,*hds=eng->h_fp4m_stage_dnsf+(size_t)slot*dsp;
+                    if(!rd(hg,gp,eng->fp4m_ssd_gu_off[l]+(int64_t)e*gp)||!rd(hs,gsp,eng->fp4m_ssd_gusf_off[l]+(int64_t)e*gsp)
+                       ||!rd(hd,dp,eng->fp4m_ssd_dn_off[l]+(int64_t)e*dp)||!rd(hds,dsp,eng->fp4m_ssd_dnsf_off[l]+(int64_t)e*dsp))return -9;
+                    eng->fp4m_ssd_reads+=4;eng->fp4m_ssd_bytes+=gp+gsp+dp+dsp;
+                    const void*pp[4]={hg,hs,hd,hds};const size_t nn[4]={gp,gsp,dp,dsp};size_t z=((size_t)l*E+e)*4;
+                    for(int p=0;p<4;p++)if(!eng->h_fp4m_ssd_verified[z+p]){uint64_t hh=q35_expert_hash_update(1469598103934665603ULL,pp[p],nn[p]);
+                        if(hh!=eng->h_fp4m_ssd_hash[z+p]){eng->fp4m_ssd_checksum_fail++;return -10;}eng->h_fp4m_ssd_verified[z+p]=1;}
+                    cudaMemcpyAsync(eng->d_fp4m_stage_gu+(size_t)slot*gp,hg,gp,cudaMemcpyHostToDevice,stream);
+                    cudaMemcpyAsync(eng->d_fp4m_stage_gusf+(size_t)slot*gsp,hs,gsp,cudaMemcpyHostToDevice,stream);
+                    cudaMemcpyAsync(eng->d_fp4m_stage_dn+(size_t)slot*dp,hd,dp,cudaMemcpyHostToDevice,stream);
+                    cudaMemcpyAsync(eng->d_fp4m_stage_dnsf+(size_t)slot*dsp,hds,dsp,cudaMemcpyHostToDevice,stream);
+                    eng->h_fp4m_slot_layer[slot]=l;eng->h_fp4m_slot_expert[slot]=e;eng->h_fp4m_slot_age[slot]=++eng->fp4m_slot_clock;eng->fp4m_cache_misses++;
+                }
+                cudaMemcpyAsync(eng->d_fp4m_eslot,cache_map.data(),E*sizeof(int),cudaMemcpyHostToDevice,stream);
+                cache_ready=true;return 0;
+            };
+            auto ssd_gemm=[&](bool down)->int {
+                const int slots=eng->fp4m_slots;
+                const size_t wp=down?(size_t)H*(EFFN/2):(size_t)GU*(H/2);
+                const size_t sp=down?(size_t)eng->fp4m_dn_sfB:(size_t)eng->fp4m_gu_sfB;
+                uint8_t *hw=down?eng->h_fp4m_stage_dn:eng->h_fp4m_stage_gu;
+                uint8_t *hs=down?eng->h_fp4m_stage_dnsf:eng->h_fp4m_stage_gusf;
+                uint8_t *dw=down?eng->d_fp4m_stage_dn:eng->d_fp4m_stage_gu;
+                uint8_t *ds=down?eng->d_fp4m_stage_dnsf:eng->d_fp4m_stage_gusf;
+                int64_t wo=down?eng->fp4m_ssd_dn_off[l]:eng->fp4m_ssd_gu_off[l];
+                int64_t so=down?eng->fp4m_ssd_dnsf_off[l]:eng->fp4m_ssd_gusf_off[l];
+                auto rd=[&](void*p,size_t n,int64_t at){uint8_t*b=(uint8_t*)p;size_t d=0;while(d<n){ssize_t r=pread(eng->fp4m_ssd_fd,b+d,n-d,at+(int64_t)d);if(r<=0)return false;d+=(size_t)r;}return true;};
+                int out_rc=0;
+                for(size_t a0=0;a0<active_stream.size();a0+=slots) {
+                    int ns=(int)std::min((size_t)slots,active_stream.size()-a0);
+                    std::vector<int> map(E,-1);
+                    for(int s=0;s<ns;s++){int e=active_stream[a0+s];map[e]=s;
+                        if(!rd(hw+(size_t)s*wp,wp,wo+(int64_t)e*wp)||!rd(hs+(size_t)s*sp,sp,so+(int64_t)e*sp))return -9;
+                        eng->fp4m_ssd_reads+=2;eng->fp4m_ssd_bytes+=wp+sp;
+                        size_t z=((size_t)l*E+e)*4+(down?2:0);
+                        if(!eng->h_fp4m_ssd_verified[z]){
+                            uint64_t wh=q35_expert_hash_update(1469598103934665603ULL,hw+(size_t)s*wp,wp);
+                            if(wh!=eng->h_fp4m_ssd_hash[z]){eng->fp4m_ssd_checksum_fail++;return -10;}
+                            eng->h_fp4m_ssd_verified[z]=1;
+                        }
+                        if(!eng->h_fp4m_ssd_verified[z+1]){
+                            uint64_t sh=q35_expert_hash_update(1469598103934665603ULL,hs+(size_t)s*sp,sp);
+                            if(sh!=eng->h_fp4m_ssd_hash[z+1]){eng->fp4m_ssd_checksum_fail++;return -10;}
+                            eng->h_fp4m_ssd_verified[z+1]=1;
+                        }
+                    }
+                    cudaMemcpyAsync(dw,hw,(size_t)ns*wp,cudaMemcpyHostToDevice,stream);
+                    cudaMemcpyAsync(ds,hs,(size_t)ns*sp,cudaMemcpyHostToDevice,stream);
+                    cudaMemcpyAsync(eng->d_fp4m_eslot,map.data(),E*sizeof(int),cudaMemcpyHostToDevice,stream);
+                    out_rc|=dg_fp4_moe_grouped_mapped(
+                        down?(void*)eng->d_fp4m_dn_out:(void*)eng->d_fp4m_gu_out,
+                        down?(void*)eng->d_fp4m_a2:(void*)eng->d_fp4m_a,
+                        down?(void*)eng->d_fp4m_a2sf:(void*)eng->d_fp4m_asf,dw,ds,
+                        eng->d_moe_count,eng->d_moe_coloff,eng->d_fp4m_eslot,E,
+                        down?H:GU,down?EFFN:H,down?sfA2:sfA1,sp,
+                        eng->d_fp4m_gsw+2*l+(down?1:0),stream);
+                    cudaStreamSynchronize(stream);
+                }
+                for(int s=0;s<eng->fp4m_slots;s++){eng->h_fp4m_slot_layer[s]=-1;eng->h_fp4m_slot_expert[s]=-1;}
+                return out_rc;
+            };
+            if(eng->fp4m_ssd_stream) {
+                rc=ssd_cache_prepare();
+                if(rc==-1)rc=ssd_gemm(false);
+                else if(!rc)rc=dg_fp4_moe_grouped_mapped(eng->d_fp4m_gu_out,eng->d_fp4m_a,eng->d_fp4m_asf,
+                    fp4_gu,fp4_gusf,eng->d_moe_count,eng->d_moe_coloff,eng->d_fp4m_eslot,E,GU,H,
+                    sfA1,eng->fp4m_gu_sfB,eng->d_fp4m_gsw+2*l,stream);
+            } else rc = dg_fp4_moe_grouped(eng->d_fp4m_gu_out, eng->d_fp4m_a, eng->d_fp4m_asf,
+                fp4_gu, fp4_gusf, eng->d_fp4m_indptr,
                 E, GU, H, sfA1, eng->fp4m_gu_sfB, eng->d_fp4m_gsw + 2 * l, stream);
             q35fp4_gu_silu_mul_kernel<<<g1((size_t)total * EFFN), 256, 0, stream>>>(
                 eng->d_moe_act, eng->d_fp4m_gu_out, eng->d_fp4m_gsrow, EFFN, (int64_t)total * EFFN);
@@ -9464,11 +9598,17 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
               q35fp4_quant_grp_kernel<<<g, b, 0, stream>>>(eng->d_moe_act, eng->d_fp4m_t2e,
                   eng->d_fp4m_indptr, EFFN, total, eng->d_fp4m_gsrow, eng->d_fp4m_a2, eng->d_fp4m_a2sf,
                   sfA2, nbFp); }
-            rc |= dg_fp4_moe_grouped(eng->d_fp4m_dn_out, eng->d_fp4m_a2, eng->d_fp4m_a2sf,
-                eng->d_fp4m_dn[l], eng->d_fp4m_dnsf[l], eng->d_fp4m_indptr,
+            if(eng->fp4m_ssd_stream) {
+                if(cache_ready)rc|=dg_fp4_moe_grouped_mapped(eng->d_fp4m_dn_out,eng->d_fp4m_a2,eng->d_fp4m_a2sf,
+                    fp4_dn,fp4_dnsf,eng->d_moe_count,eng->d_moe_coloff,eng->d_fp4m_eslot,E,H,EFFN,
+                    sfA2,eng->fp4m_dn_sfB,eng->d_fp4m_gsw+2*l+1,stream);
+                else rc|=ssd_gemm(true);
+            } else rc |= dg_fp4_moe_grouped(eng->d_fp4m_dn_out, eng->d_fp4m_a2, eng->d_fp4m_a2sf,
+                fp4_dn, fp4_dnsf, eng->d_fp4m_indptr,
                 E, H, EFFN, sfA2, eng->fp4m_dn_sfB, eng->d_fp4m_gsw + 2 * l + 1, stream);
             q35fp4_dn_scale_kernel<<<g1((size_t)total * H), 256, 0, stream>>>(
                 eng->d_moe_oe, eng->d_fp4m_dn_out, eng->d_fp4m_gsrow, H, (uint64_t)total * H);
+            if(rc==-10){fprintf(stderr,"fucina: expert-store checksum failure at layer %d\n",l);abort();}
             if (rc) {   // never expected after a successful load-time build + warmup
                 static int warned = 0;
                 if (!warned) { warned = 1; fprintf(stderr, "fucina: dg_fp4_moe_grouped rc=%d — MoE output invalid\n", rc); }
@@ -15252,6 +15392,15 @@ void gemma4_engine_print_timing(const gemma4_engine_t *eng) {
         printf("Decode:   %d tokens in %.1f ms = %.1f t/s\n",
                 eng->n_decode_tokens, eng->decode_time_ms,
                 eng->n_decode_tokens / (eng->decode_time_ms / 1000.0f));
+    }
+    if (eng->fp4m_ssd_stream) {
+        double hr=(eng->fp4m_cache_hits+eng->fp4m_cache_misses)?
+            (double)eng->fp4m_cache_hits/(eng->fp4m_cache_hits+eng->fp4m_cache_misses):0.0;
+        printf("Experts:  SSD reads=%llu bytes=%.3f GiB checksum_failures=%llu slots=%d cache_hit=%.1f%% (%llu/%llu)\n",
+               (unsigned long long)eng->fp4m_ssd_reads,eng->fp4m_ssd_bytes/(1024.0*1024*1024),
+               (unsigned long long)eng->fp4m_ssd_checksum_fail,eng->fp4m_slots,100.0*hr,
+               (unsigned long long)eng->fp4m_cache_hits,
+               (unsigned long long)(eng->fp4m_cache_hits+eng->fp4m_cache_misses));
     }
 }
 

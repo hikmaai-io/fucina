@@ -18,27 +18,45 @@ The planner uses exact calibration route counts, stable tie-breaking, model geom
 effective NVFP4 bits-per-weight including scale overhead. Its manifest reports occupancy and the
 fraction of calibration routes served by VRAM, host, and SSD.
 
-`internal/engine/expertstore` implements the runtime-independent three-tier cache controller:
+An earlier generic Go three-tier cache controller (`internal/engine/expertstore`) was removed: it
+duplicated bookkeeping the CUDA runtime below implements directly at the layer where the copies and
+GEMMs happen, and nothing wired it to the engine.
 
-- immutable SSD records addressed by offset and length;
-- SHA-256 verification before promotion;
-- bounded host and VRAM LRU metadata;
-- an uploader interface for CUDA allocation/copy and eviction;
-- concurrent prefetch workers and cancellation-aware scheduling;
-- an online, bounded per-layer transition predictor over top-k expert IDs;
-- VRAM/host hit, SSD read, promotion, eviction, checksum, byte, occupancy, prefetch, and useful-prefetch metrics;
-- a hysteretic pressure controller that lowers prefetch depth, I/O workers, and admitted batch size
-  under sustained SSD latency/miss queues, then recovers gradually when prefetches are useful.
+## CUDA runtime integration
 
-The package is tested under an artificial one-expert VRAM cap, including host promotion, eviction,
-checksum failure, concurrent prefetch, useful-prefetch accounting, and transition prediction.
+The Qwen grouped-NVFP4 path has an opt-in bounded-memory SSD mode:
 
-## Remaining integration
+```bash
+FUCINA_EXPERT_STREAM_SSD=/fast-nvme/qwen-experts.bin \
+FUCINA_EXPERT_STREAM_SLOTS=512 \
+./fucina -m /path/to/Qwen3.5-35B-A3B-NVFP4 ...
+```
 
-The current Qwen CUDA loader still materializes grouped expert slabs at startup. The next C1/C2
-increment must expose a slot-based CUDA uploader and remap router expert IDs to resident slots,
-then connect the controller to lookahead prefetch. Until that integration, residency manifests are
-planning artifacts and the runtime status says so explicitly; no memory-saving claim is made.
+At startup it writes the transformed 16.88 GiB grouped-NVFP4 expert store, drops the full device
+slabs, and retains a configurable compact slot pool. After routing, logical expert IDs are mapped
+to slots; only active expert records are read and uploaded. The CUTLASS grouped GEMM consumes the
+slot map while retaining logical assignment offsets. If a prefill activates more experts than the
+slot cap, it processes deterministic chunks rather than exceeding the cap. A cross-layer LRU keeps
+hot `(layer,expert)` records resident across decode tokens. Every weight and scale record is
+checksummed on first use (mismatch aborts), and graph capture is disabled because SSD I/O is not
+capturable. Normal serving remains unchanged when the environment variable is not set. The CLI
+equivalents are `--expert-store <file>` and `--expert-slots <n>`.
+
+A host-RAM staging variant was tried and removed: GB10 CPU/GPU memory is physically unified, so
+staging from host memory saves nothing.
+
+### Measured gate
+
+On the local GB10 with eight slots, the SSD path reduced transformed expert device staging from
+16.88 GiB to about **0.01 GiB** and passed the Qwen3.6 NVFP4 oracle/self-test: 8/8 oracle tokens,
+24/24 batched row independence, graph-on/off fallback parity, and France→Paris 8/8. A 512-slot
+cache uses about 0.84 GiB and avoids reloading overlapping active experts. The mode is a constrained
+memory fallback, not the default throughput path; synchronous NVMe misses remain materially slower
+than full residency.
+
+The residency-plan manifest is not yet automatically loaded by the C engine. Runtime placement is
+demand-driven with an LRU slot budget; policy-seeded startup residency and asynchronous next-layer
+prefetch remain optimization work, not correctness blockers.
 
 Run the foundation gates with:
 

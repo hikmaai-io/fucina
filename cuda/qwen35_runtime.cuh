@@ -260,7 +260,7 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     }
     eng->q35.committed_bytes = eng->q35.workspace_bytes + eng->q35.jspace_bytes;
     eng->q35.peak_bytes = eng->q35.committed_bytes;
-    if (getenv("FUCINA_NO_BATCHED_GRAPH")) eng->q35.graph_enabled = 0;
+    if (getenv("FUCINA_NO_BATCHED_GRAPH") || eng->fp4m_ssd_stream) eng->q35.graph_enabled = 0;
     // Resident BF16 prefill-weight cache: kills the per-prefill ~45% dequant cost at the price of
     // ~2x(weight bytes) BF16 (≈18 GB for 9B). Default-on ONLY when device memory comfortably
     // allows (memory-constrained clients keep the per-tile dequant). Env force: 1=on, 0=off.
@@ -436,6 +436,7 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
 // Capture the B-row decode (want_argmax) once and instantiate it; replayed per step with the
 // per-step varying device inputs refreshed outside the capture (tokens/positions/row→slot).
 static int qwen35_ms_graph_ensure(gemma4_engine_t *eng, int B) {
+    if (eng->fp4m_ssd_stream) return -1; // SSD reads and staging copies are not graph-capturable
     if (B < 1 || B > eng->q35.capacity) return -1;
     if (eng->q35.graph[B]) return 0;
     if (eng->q35.graph_failed) return -1;

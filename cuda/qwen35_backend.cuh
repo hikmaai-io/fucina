@@ -531,6 +531,66 @@ static int q35_fp4_expert_slabs(gemma4_engine_t *eng, int l, int L,
     return ok ? 0 : -1;
 }
 
+// Persist transformed grouped-NVFP4 experts to SSD and retain only a compact LRU slot pool.
+static int q35_enable_ssd_expert_stream(gemma4_engine_t *eng, int L, int E, int MI, int H) {
+    const char *ssd=getenv("FUCINA_EXPERT_STREAM_SSD");
+    if(!ssd || !ssd[0] || !eng->moe_experts_fp4) return 0;
+    const size_t guB=(size_t)E*2*MI*(H/2), gusfB=(size_t)E*eng->fp4m_gu_sfB;
+    const size_t dnB=(size_t)E*H*(MI/2), dnsfB=(size_t)E*eng->fp4m_dn_sfB;
+    int slots=512;const char*s=getenv("FUCINA_EXPERT_STREAM_SLOTS");if(s)slots=atoi(s);if(slots<1)slots=1;if(slots>4096)slots=4096;
+    eng->fp4m_slots=slots;
+    eng->h_fp4m_slot_layer=(int*)malloc((size_t)slots*sizeof(int));
+    eng->h_fp4m_slot_expert=(int*)malloc((size_t)slots*sizeof(int));
+    eng->h_fp4m_slot_age=(uint64_t*)calloc((size_t)slots,sizeof(uint64_t));
+    for(int s=0;s<slots;s++){eng->h_fp4m_slot_layer[s]=-1;eng->h_fp4m_slot_expert[s]=-1;}
+    bool ok=eng->h_fp4m_slot_layer&&eng->h_fp4m_slot_expert&&eng->h_fp4m_slot_age
+         && cudaMalloc(&eng->d_fp4m_stage_gu,guB/E*slots)==cudaSuccess
+         && cudaMalloc(&eng->d_fp4m_stage_gusf,gusfB/E*slots)==cudaSuccess
+         && cudaMalloc(&eng->d_fp4m_stage_dn,dnB/E*slots)==cudaSuccess
+         && cudaMalloc(&eng->d_fp4m_stage_dnsf,dnsfB/E*slots)==cudaSuccess
+         && cudaMalloc(&eng->d_fp4m_eslot,(size_t)E*sizeof(int))==cudaSuccess;
+    if(ok) {
+        eng->fp4m_ssd_fd=open(ssd,O_CREAT|O_TRUNC|O_RDWR,0600); ok=eng->fp4m_ssd_fd>=0;
+        size_t hc=(size_t)(slots>E?slots:E);
+        eng->h_fp4m_stage_gu=(uint8_t*)malloc(guB/E*hc);eng->h_fp4m_stage_gusf=(uint8_t*)malloc(gusfB/E*hc);
+        eng->h_fp4m_stage_dn=(uint8_t*)malloc(dnB/E*hc);eng->h_fp4m_stage_dnsf=(uint8_t*)malloc(dnsfB/E*hc);
+        eng->h_fp4m_ssd_hash=(uint64_t*)malloc((size_t)L*E*4*sizeof(uint64_t));
+        eng->h_fp4m_ssd_verified=(uint8_t*)calloc((size_t)L*E*4,1);
+        ok=ok&&eng->h_fp4m_stage_gu&&eng->h_fp4m_stage_gusf&&eng->h_fp4m_stage_dn&&eng->h_fp4m_stage_dnsf&&eng->h_fp4m_ssd_hash&&eng->h_fp4m_ssd_verified;
+        const char hdr[16]="FUCINAEXPERT1\n"; if(ok) ok=pwrite(eng->fp4m_ssd_fd,hdr,sizeof(hdr),0)==(ssize_t)sizeof(hdr);
+    }
+    int64_t off=4096;
+    auto wr=[&](const void*p,size_t n,int64_t at){ const uint8_t*b=(const uint8_t*)p;size_t d=0;
+        while(d<n){ssize_t w=pwrite(eng->fp4m_ssd_fd,b+d,n-d,at+(int64_t)d);if(w<=0)return false;d+=(size_t)w;}return true;};
+    for(int l=0;l<L&&ok;l++) {
+        uint8_t *hg=eng->h_fp4m_stage_gu,*hs=eng->h_fp4m_stage_gusf;
+        uint8_t *hd=eng->h_fp4m_stage_dn,*hds=eng->h_fp4m_stage_dnsf;
+        ok=hg&&hs&&hd&&hds;
+        if(ok) ok=cudaMemcpy(hg,eng->d_fp4m_gu[l],guB,cudaMemcpyDeviceToHost)==cudaSuccess
+              && cudaMemcpy(hs,eng->d_fp4m_gusf[l],gusfB,cudaMemcpyDeviceToHost)==cudaSuccess
+              && cudaMemcpy(hd,eng->d_fp4m_dn[l],dnB,cudaMemcpyDeviceToHost)==cudaSuccess
+              && cudaMemcpy(hds,eng->d_fp4m_dnsf[l],dnsfB,cudaMemcpyDeviceToHost)==cudaSuccess;
+        if(ok){
+          const size_t gp=guB/E,gsp=gusfB/E,dp=dnB/E,dsp=dnsfB/E;
+          for(int e=0;e<E;e++){size_t z=((size_t)l*E+e)*4;
+            eng->h_fp4m_ssd_hash[z+0]=q35_expert_hash_update(1469598103934665603ULL,hg+(size_t)e*gp,gp);
+            eng->h_fp4m_ssd_hash[z+1]=q35_expert_hash_update(1469598103934665603ULL,hs+(size_t)e*gsp,gsp);
+            eng->h_fp4m_ssd_hash[z+2]=q35_expert_hash_update(1469598103934665603ULL,hd+(size_t)e*dp,dp);
+            eng->h_fp4m_ssd_hash[z+3]=q35_expert_hash_update(1469598103934665603ULL,hds+(size_t)e*dsp,dsp);}
+          eng->fp4m_ssd_gu_off[l]=off;ok=wr(hg,guB,off);off+=(int64_t)guB;
+          eng->fp4m_ssd_gusf_off[l]=off;ok=ok&&wr(hs,gusfB,off);off+=(int64_t)gusfB;
+          eng->fp4m_ssd_dn_off[l]=off;ok=ok&&wr(hd,dnB,off);off+=(int64_t)dnB;
+          eng->fp4m_ssd_dnsf_off[l]=off;ok=ok&&wr(hds,dnsfB,off);off+=(int64_t)dnsfB; }
+        if(ok) { cudaFree(eng->d_fp4m_gu[l]);cudaFree(eng->d_fp4m_gusf[l]);cudaFree(eng->d_fp4m_dn[l]);cudaFree(eng->d_fp4m_dnsf[l]);
+                 eng->d_fp4m_gu[l]=eng->d_fp4m_gusf[l]=eng->d_fp4m_dn[l]=eng->d_fp4m_dnsf[l]=NULL; }
+    }
+    if(ok){fsync(eng->fp4m_ssd_fd);posix_fadvise(eng->fp4m_ssd_fd,0,off,POSIX_FADV_DONTNEED);eng->fp4m_ssd_stream=1;}
+    if(!ok) { fprintf(stderr,"fucina: SSD expert streaming setup failed\n"); return -1; }
+    fprintf(stderr,"fucina: expert SSD streaming ON (slots=%d, device staging %.2f GiB, backing %.2f GiB)\n",
+            slots,(guB+gusfB+dnB+dnsfB)*(double)slots/E/(1024.0*1024*1024),L*(guB+gusfB+dnB+dnsfB)/(1024.0*1024*1024));
+    return 0;
+}
+
 // Requantize E consecutive FP8 experts (per-expert BF16 128x128 block scales) into ONE contiguous
 // Q4_K slab (E x (out*in/256) x 144 B), threaded across experts. The dominant decode bytes drop
 // 8 -> 4.5 bpw; quality is gated by greedy-match tests, not bitwise parity (double quantization).
@@ -1018,6 +1078,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             ok=ok && put_f32(&T.ssm.a_log, lk(l,"linear_attn.A_log"),       true);
         }
     }
+    if(ok && q35_enable_ssd_expert_stream(eng,L,E,MI,H)!=0) ok=false;
     // globals: output_norm (f32, +1), lm_head → Q8_0
     ok=ok && put_f32_from_bf16(&TS.output_norm, LO.final_norm_key, 1.0f,false);
     if(precision_policy.enabled)

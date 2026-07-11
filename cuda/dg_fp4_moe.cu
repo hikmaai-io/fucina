@@ -72,7 +72,8 @@ using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
 __global__ void dg_fp4_prepare(
     int num_groups, int N, int K,
-    const int* __restrict__ m_indptr,
+    const int* __restrict__ m_indptr, const int* __restrict__ m_count,
+    const int* __restrict__ m_coloff, const int* __restrict__ expert_slot,
     const ElementA* A_base, const ElementB* B_base, ElementD* D_base,
     const ElementSF* SFA_base, const ElementSF* SFB_base,
     size_t sfA_stride, size_t sfB_stride,
@@ -84,16 +85,19 @@ __global__ void dg_fp4_prepare(
 {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= num_groups) return;
-    int m_off = m_indptr[i], M = m_indptr[i+1] - m_off;
+    int mapped = expert_slot ? expert_slot[i] : i;
+    int m_off = m_count ? m_coloff[i] : m_indptr[i];
+    int M = m_count ? (mapped >= 0 ? m_count[i] : 0) : (m_indptr[i+1] - m_off);
+    if (mapped < 0) mapped = 0;
     problem_sizes[i] = typename ProblemShape::UnderlyingProblemShape(M, N, K);
     stride_A[i] = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
     stride_B[i] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
     stride_D[i] = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
     A_ptr[i] = A_base + (int64_t)m_off * (int64_t)(K/2);
-    B_ptr[i] = B_base + (int64_t)i     * (int64_t)N * (int64_t)(K/2);
+    B_ptr[i] = B_base + (int64_t)mapped * (int64_t)N * (int64_t)(K/2);
     D_ptr[i] = D_base + (int64_t)m_off * (int64_t)N;
     SFA_ptr[i] = SFA_base + (int64_t)i * (int64_t)sfA_stride;
-    SFB_ptr[i] = SFB_base + (int64_t)i * (int64_t)sfB_stride;
+    SFB_ptr[i] = SFB_base + (int64_t)mapped * (int64_t)sfB_stride;
     layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
     layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
 }
@@ -136,16 +140,15 @@ static bool ensure(int ng){
 // m_indptr[num_groups+1] (device, token prefix offsets). A/B packed E2M1; A_sf/B_sf per-expert
 // padded swizzled E4M3 (strides sfA_stride/sfB_stride in SF elements). alpha = gsA·gsB.
 // Returns 0 on success, <0 on failure (caller falls back to dp4a).
-extern "C" int dg_fp4_moe_grouped(
+static int dg_fp4_moe_grouped_impl(
     void* D, const void* A, const void* A_sf, const void* B, const void* B_sf,
-    const int* m_indptr, int num_groups, int N, int K,
-    unsigned long long sfA_stride, unsigned long long sfB_stride,
-    const float* alpha, cudaStream_t stream)   // alpha = device scalar (gsA·gsB) — no host sync
-{
+    const int* m_indptr, const int* m_count, const int* m_coloff, const int* expert_slot,
+    int num_groups, int N, int K, unsigned long long sfA_stride, unsigned long long sfB_stride,
+    const float* alpha, cudaStream_t stream) {
     if (!ensure(num_groups)) return -1;
     int t = num_groups < 256 ? num_groups : 256, b = (num_groups + t - 1)/t;
     dg_fp4_prepare<<<b,t,0,stream>>>(
-        num_groups, N, K, m_indptr,
+        num_groups, N, K, m_indptr, m_count, m_coloff, expert_slot,
         (const ElementA*)A, (const ElementB*)B, (ElementD*)D,
         (const ElementSF*)A_sf, (const ElementSF*)B_sf,
         (size_t)sfA_stride, (size_t)sfB_stride,
@@ -172,6 +175,24 @@ extern "C" int dg_fp4_moe_grouped(
     if (gemm.initialize(args, g.ws, stream) != cutlass::Status::kSuccess) return -4;
     if (gemm.run(stream) != cutlass::Status::kSuccess) return -5;
     return 0;
+}
+
+extern "C" int dg_fp4_moe_grouped(
+    void* D, const void* A, const void* A_sf, const void* B, const void* B_sf,
+    const int* m_indptr, int num_groups, int N, int K,
+    unsigned long long sfA_stride, unsigned long long sfB_stride,
+    const float* alpha, cudaStream_t stream) {
+    return dg_fp4_moe_grouped_impl(D,A,A_sf,B,B_sf,m_indptr,nullptr,nullptr,nullptr,
+        num_groups,N,K,sfA_stride,sfB_stride,alpha,stream);
+}
+
+extern "C" int dg_fp4_moe_grouped_mapped(
+    void* D, const void* A, const void* A_sf, const void* B, const void* B_sf,
+    const int* m_count, const int* m_coloff, const int* expert_slot,
+    int num_groups, int N, int K, unsigned long long sfA_stride, unsigned long long sfB_stride,
+    const float* alpha, cudaStream_t stream) {
+    return dg_fp4_moe_grouped_impl(D,A,A_sf,B,B_sf,nullptr,m_count,m_coloff,expert_slot,
+        num_groups,N,K,sfA_stride,sfB_stride,alpha,stream);
 }
 
 // Per-expert padded SF strides (SF elements) for a given shape — the engine sizes its

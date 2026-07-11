@@ -506,7 +506,7 @@ profile: fucina
 # cuda/libfucina.a, so `go test`/`go vet` there fails to build/link unless the
 # CUDA archive has been compiled with nvcc on a GB10 box. The server,
 # tokenizer, sampler and chat packages are pure Go and run anywhere.
-GO_TEST_PKGS := ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/ ./internal/engine/expertstore/
+GO_TEST_PKGS := ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 
 # cgo-dependent Go tests (cmd/fucina: CLI parsing tests). Requires
 # cuda/libfucina.a to link, hence the `lib` prerequisite.

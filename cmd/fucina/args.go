@@ -68,14 +68,16 @@ type CLIArgs struct {
 	ThreadsHTTP    int // alias of MaxConcurrent (llama --threads-http)
 
 	// System
-	System     string
-	Verbose    bool
-	Timings    bool
-	DeviceID   int
-	GPUMemUtil float64 // --gpu-mem-util: fraction of total device mem the engine may use (vLLM-style)
-	Memory     string
-	Debug      bool
-	LogLevel   string
+	System      string
+	Verbose     bool
+	Timings     bool
+	DeviceID    int
+	GPUMemUtil  float64 // --gpu-mem-util: fraction of total device mem the engine may use (vLLM-style)
+	Memory      string
+	ExpertStore string // --expert-store: transformed NVFP4 SSD expert backing file
+	ExpertSlots int    // --expert-slots: compact device-cache slots for SSD streaming
+	Debug       bool
+	LogLevel    string
 
 	// Debug-only Qwen3.5 Jacobian-lens tracing and steering.
 	JSpace      bool
@@ -207,6 +209,8 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.Float64Var(&a.GPUMemUtil, "gpu-mem-util", 0.90,
 		"Fraction of total GPU memory the engine may use (0<F<=1); caps ctx / drops the packed-Q4_0 copy to fit")
 	fs.StringVar(&a.Memory, "mlock", "", "mlock model in memory (unused on CUDA)")
+	fs.StringVar(&a.ExpertStore, "expert-store", "", "SSD backing file for bounded-VRAM Qwen NVFP4 expert streaming")
+	fs.IntVar(&a.ExpertSlots, "expert-slots", 512, "Device expert-cache slots used with --expert-store")
 	fs.BoolVar(&a.JSpace, "jspace", false,
 		"Debug: write per-generated-token Qwen3.5 Jacobian-lens readouts as JSONL")
 	fs.BoolVar(&a.JSpaceDebug, "jspace-debug", false,
