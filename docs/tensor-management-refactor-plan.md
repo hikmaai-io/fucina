@@ -277,12 +277,12 @@ through descriptors and ownership APIs; moving code then becomes mechanical and 
 - **Phase 1 — descriptor foundation:** complete. Canonical descriptor types are present and all
   Qwen attention, GDN, and dense-FFN projection paths use descriptors. Official FP8, GGUF, and both
   Unsloth variants pass oracle, graph, state, and long-context gates.
-- **Phase 2 — host model planner:** in progress. The immutable host-only `ModelPlan`, validation,
+- **Phase 2 — host model planner:** complete for Qwen. The immutable host-only `ModelPlan`, validation,
   alias handling, exact aligned arena totals, and deterministic JSON serialization are implemented.
   Official FP8, ModelOpt, and compressed-tensors source conventions now pass a complete host-only
   shape/dtype/scale preflight before engine CUDA allocations. Planned offsets are authoritative for
   the core upload arena, and planned core/scale/expert/embedding/head bytes feed the exact ledger.
-  Recurrent/KV workspaces and optional prefill caches still need to move into the plan.
+  Runtime capacity and cache policy is handled separately by the typed Phase-5 memory plan.
 - **Phase 3 — transactional allocation:** complete for model residency. `DeviceAllocationSet` and the persistent
   registry provide reverse-order rollback, one-owner teardown, slot nulling, exact byte totals, and
   deterministic Nth-allocation/Nth-upload failure injection tests. Qwen core, scale, embedding, head, candidate, logits,
