@@ -128,6 +128,32 @@ func runInteractive(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 			continue
 		}
 
+		// /save FILE | /load FILE — session persistence across process restarts.
+		if save, file, ok := parseSessionCommand(input); ok {
+			if file == "" {
+				fmt.Fprintln(os.Stderr, "fucina: usage: /save <file> | /load <file>")
+				continue
+			}
+			if save {
+				if err := denseSessionSave(kv, eng, args, history, thinkLevel, file); err != nil {
+					fmt.Fprintf(os.Stderr, "fucina: save: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "fucina: session saved to %s\n", file)
+				}
+			} else if hist, think, n, err := denseSessionLoad(kv, eng, args, file); err != nil {
+				fmt.Fprintf(os.Stderr, "fucina: load: %v\n", err)
+			} else {
+				history = hist
+				if think != "" {
+					thinkLevel = think
+				}
+				fmt.Fprintf(os.Stderr,
+					"fucina: session loaded from %s — %d tokens restored, %d messages, no re-prefill needed\n",
+					file, n, len(history))
+			}
+			continue
+		}
+
 		// A leading-slash token that looks like a command but matched none of the
 		// above is a typo, not chat input — report it instead of silently sending
 		// "/foo" to the model (which is what made unknown commands "not work").

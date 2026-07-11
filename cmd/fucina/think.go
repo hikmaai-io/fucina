@@ -12,6 +12,8 @@ import (
 // /help. Kept in one place so the banner and /help can never drift apart.
 const denseCommandsHelp = "  /thinking LEVEL  set reasoning: off|on|low|medium|high|xhigh\n" +
 	"  /reset           clear conversation\n" +
+	"  /save FILE       save the conversation + engine state to disk\n" +
+	"  /load FILE       resume a saved conversation (no re-prefill)\n" +
 	"  /stats           show KV cache hit rate\n" +
 	"  /help            show this help\n" +
 	"  /quit            exit (or Ctrl-D)\n"

@@ -10,6 +10,7 @@ import (
 	"github.com/hikmaai-io/fucina/internal/chat"
 	"github.com/hikmaai-io/fucina/internal/engine/cuda"
 	"github.com/hikmaai-io/fucina/internal/server/batch"
+	"github.com/hikmaai-io/fucina/internal/session"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
@@ -18,6 +19,8 @@ import (
 // so /stats shows the running context/turn counts instead of a hit rate.
 const pagedCommandsHelp = "  /thinking LEVEL  set reasoning: off|on|low|medium|high|xhigh\n" +
 	"  /reset           clear conversation\n" +
+	"  /save FILE       save the conversation + engine state to disk\n" +
+	"  /load FILE       resume a saved conversation (restores on the next turn)\n" +
 	"  /stats           show context usage\n" +
 	"  /help            show this help\n" +
 	"  /quit            exit (or Ctrl-D)\n"
@@ -51,6 +54,10 @@ func selectDialect(tok *tokenizer.Tokenizer) chat.Dialect {
 func runInteractivePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
 	dialect := selectDialect(tok)
 	var history []chat.RichMessage
+	// pendingSession is a /load-ed disk snapshot awaiting its first matching
+	// turn; every turn whose prompt extends it restores it into a fresh slot
+	// and prefills only the suffix (the restored prefix costs zero prefill).
+	var pendingSession *session.Snapshot
 	jtrace, err := newJSpaceTracer(eng, tok, args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fucina: %v\n", err)
@@ -124,6 +131,7 @@ func runInteractivePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArg
 			continue
 		case "/reset", "/clear":
 			history = history[:0]
+			pendingSession = nil
 			if args.System != "" {
 				history = append(history, chat.RichMessage{Role: "system", Content: args.System})
 			}
@@ -156,6 +164,33 @@ func runInteractivePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArg
 				thinkLevel, on, budget)
 			continue
 		}
+		// /save FILE | /load FILE — session persistence across process restarts.
+		if save, file, ok := parseSessionCommand(input); ok {
+			if file == "" {
+				fmt.Fprintln(os.Stderr, "fucina: usage: /save <file> | /load <file>")
+				continue
+			}
+			if save {
+				if err := pagedSessionSave(eng, tok, dialect, history, args, thinkLevel, file); err != nil {
+					fmt.Fprintf(os.Stderr, "fucina: save: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "fucina: session saved to %s\n", file)
+				}
+			} else if snap, hist, think, err := pagedSessionLoad(eng, args, file); err != nil {
+				fmt.Fprintf(os.Stderr, "fucina: load: %v\n", err)
+			} else {
+				pendingSession = snap
+				history = hist
+				if think != "" {
+					thinkLevel = think
+				}
+				fmt.Fprintf(os.Stderr,
+					"fucina: session loaded from %s — %d tokens, %d messages; restores on the next turn\n",
+					file, len(snap.Tokens), len(history))
+			}
+			continue
+		}
+
 		if looksLikeCommand(input) {
 			fmt.Fprintf(os.Stderr, "fucina: unknown command %q — type /help for the list\n",
 				strings.Fields(input)[0])
@@ -190,20 +225,21 @@ func runInteractivePaged(eng *cuda.Engine, tok *tokenizer.Tokenizer, args CLIArg
 		}
 
 		pfStart := time.Now()
-		slot, first, err := eng.SeqAdd(promptToks, params)
+		slot, first, restored, err := pagedSessionAdmit(eng, pendingSession, promptToks, params)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "fucina: prefill error: %v\n", err)
 			history = history[:len(history)-1] // undo user turn
 			continue
 		}
 		pfElapsed := time.Since(pfStart)
+		pfNew := len(promptToks) - restored
 		pfTPS := 0.0
 		if pfElapsed.Seconds() > 0 {
-			pfTPS = float64(len(promptToks)) / pfElapsed.Seconds()
+			pfTPS = float64(pfNew) / pfElapsed.Seconds()
 		}
 		fmt.Fprintf(os.Stderr,
-			"\033[2mfucina: prefill %d tokens %.2fs %.1f tok/s\033[0m\n",
-			len(promptToks), pfElapsed.Seconds(), pfTPS)
+			"\033[2mfucina: prefill %d tokens (%d from session, %d new) %.2fs %.1f tok/s\033[0m\n",
+			len(promptToks), restored, pfNew, pfElapsed.Seconds(), pfTPS)
 
 		fmt.Fprint(os.Stdout, "\033[1;34mAssistant:\033[0m ")
 
