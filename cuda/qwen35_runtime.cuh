@@ -1115,6 +1115,10 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
 
 static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t *tokens, int n,
                                   int base, int do_sample, int32_t *first_tok_out) {
+    if (getenv("FUCINA_P0_DIAG")) {
+        fprintf(stderr, "P0DIAG enter slot=%d tok0=%d n=%d base=%d\n", slot, tokens?tokens[0]:-1, n, base);
+        fflush(stderr);
+    }
     if (!eng || !eng->loaded || slot < 0 || slot >= eng->q35.capacity || !tokens || n <= 0) return -1;
     if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
     if (base + n > eng->q35.maxctx) return -1;
@@ -1166,6 +1170,10 @@ static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t 
     } else cudaStreamSynchronize(st);
     if (cudaGetLastError() != cudaSuccess) return -1;
     if (do_sample && first_tok_out) *first_tok_out = first;
+    if (getenv("FUCINA_P0_DIAG")) {
+        fprintf(stderr, "P0DIAG exit  slot=%d tok0=%d n=%d base=%d first=%d\n", slot, tokens?tokens[0]:-1, n, base, first);
+        fflush(stderr);
+    }
     return 0;
 }
 
