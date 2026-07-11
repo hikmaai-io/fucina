@@ -1,6 +1,6 @@
 # Tensor management refactor plan
 
-Status: proposed  
+Status: in progress  
 Scope: CUDA model loading, resident weight representation, scratch ownership, and dispatch  
 Primary target: Qwen3.5/3.6 on one GB10; design must remain usable by Gemma and diffusion
 
@@ -267,6 +267,39 @@ After descriptors and ownership are stable, split by responsibility:
 
 Do not start by physically splitting the 15K-line translation unit. First remove hidden dependencies
 through descriptors and ownership APIs; moving code then becomes mechanical and reviewable.
+
+## Execution status
+
+- **Phase 0 — evidence:** partial. Publication KPI, TTFT, allocation-ledger, and oracle artifacts are
+  pinned under `benchmark-evidence/results/`; deterministic official FP8, ModelOpt, Unsloth Fast,
+  and Unsloth accurate plans are pinned under `benchmark-evidence/tensor-plans/`. The synthetic
+  malformed-checkpoint startup matrix remains open.
+- **Phase 1 — descriptor foundation:** complete. Canonical descriptor types are present and all
+  Qwen attention, GDN, and dense-FFN projection paths use descriptors. Official FP8, GGUF, and both
+  Unsloth variants pass oracle, graph, state, and long-context gates.
+- **Phase 2 — host model planner:** complete for Qwen. The immutable host-only `ModelPlan`, validation,
+  alias handling, exact aligned arena totals, and deterministic JSON serialization are implemented.
+  Official FP8, ModelOpt, and compressed-tensors source conventions now pass a complete host-only
+  shape/dtype/scale preflight before engine CUDA allocations. Planned offsets are authoritative for
+  the core upload arena, and planned core/scale/expert/embedding/head bytes feed the exact ledger.
+  Runtime capacity and cache policy is handled separately by the typed Phase-5 memory plan.
+- **Phase 3 — transactional allocation:** complete for model residency. `DeviceAllocationSet` and the persistent
+  registry provide reverse-order rollback, one-owner teardown, slot nulling, exact byte totals, and
+  deterministic Nth-allocation/Nth-upload failure injection tests. Qwen core, scale, embedding, head, candidate, logits,
+  and expert-slab allocations now commit as one transaction. Scratch/cache ownership is intentionally
+  sequenced into Phase 5.
+- **Phase 4 — experts and alternate representations:** complete for Qwen. Producer-specific FP8/NVFP4
+  transforms and expert representations are explicit in the model plan, and NVFP4 grouped decode
+  and prefill dispatch use `ExpertWeightRef`; Q4_K and block-FP8 expert dispatch is descriptor-backed
+  as well. Lazy BF16 and NVFP4 prefill-cache variants now publish explicit `WeightRef` descriptors.
+- **Phase 5 — workspaces:** in progress. POD `WorkspaceRef` descriptors and workspace kinds are
+  defined; Qwen decode, projection-prefill, attention-partial, GDN, recurrent-state, and growable
+  KV arenas are bounds-described and consumed/published through typed descriptors. MoE workspace
+  fields remain to migrate.
+- **Phase 6 — decomposition and cleanup:** not started.
+
+The performance KPI remains **>64 / >105 / >150 tok/s at 1/2/4 streams**. Descriptor-only changes
+must first preserve the `<1%` phase gate; kernel optimization remains sequenced after ownership work.
 
 ## Phased execution plan
 

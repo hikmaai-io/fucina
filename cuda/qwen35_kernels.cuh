@@ -853,9 +853,9 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
             rms_norm_rows_kernel<<<1,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.layers[l].attn_norm), H, 1, eps);
             const auto &T = eng->tensors.layers[l];
             if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
-                gemv_w(eng, qg, Wq(T.attn_q),      xn, H, 2*NQ*HD, st, T.fmt_q);
-                gemv_w(eng, kb, Wq(T.attn_k),      xn, H, NKV*HD,  st, T.fmt_k);
-                gemv_w(eng, vb, Wq(T.attn_v),      xn, H, NKV*HD,  st, T.fmt_v);
+                gemv_w(eng, qg, T.ref_q, xn, st);
+                gemv_w(eng, kb, T.ref_k, xn, st);
+                gemv_w(eng, vb, T.ref_v, xn, st);
                 m2_split_query_gate_kernel<<<(NQ*HD+255)/256,256,0,st>>>(qb, gate, qg, 1, NQ);
                 per_head_rms_norm_rows_kernel<<<dim3(NQ,1),256,32*sizeof(float),st>>>(qb, Wf(T.attn_q_norm), NQ, HD, 1, eps);
                 per_head_rms_norm_rows_kernel<<<dim3(NKV,1),256,32*sizeof(float),st>>>(kb, Wf(T.attn_k_norm), NKV, HD, 1, eps);
@@ -865,18 +865,18 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                 cudaMemcpyAsync(Vc[l]+(size_t)p*NKV*HD, vb, (size_t)NKV*HD*sizeof(float), cudaMemcpyDeviceToDevice, st);
                 qwen35_attn_step_kernel<<<NQ,256,(size_t)(p+1)*sizeof(float),st>>>(attn, qb, Kc[l], Vc[l], p, NKV);
                 m2_sigmoid_gate_mul_kernel<<<(NQ*HD+255)/256,256,0,st>>>(attn, gate, NQ*HD);
-                gemv_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, st, T.fmt_o);
+                gemv_w(eng, mix, T.ref_o, attn, st);
             } else {
                 // GDN (LINEAR): in_qkv requantized Q5_K→Q8_0 at load → native dp4a gemv_w (P5), like
                 // every other projection (no per-step fp32 dequant). fmt_in_qkv is Q8_0 post-requant.
-                gemv_w(eng, qkv, Wq(T.ssm.in_qkv), xn, H, CONVD, st, T.ssm.fmt_in_qkv);
-                gemv_w(eng, zc, Wq(T.ssm.in_z), xn, H, INNER, st, T.ssm.fmt_in_z);
+                gemv_w(eng, qkv, T.ssm.ref_in_qkv, xn, st);
+                gemv_w(eng, zc, T.ssm.ref_in_z, xn, st);
                 if (eng->format == FORMAT_FP8_BLOCK) {   // in_a/in_b are f32 (oracle parity)
                     m2_gemm(ac, xn, Wf(T.ssm.in_a), 1, H, TSR);   // alpha
                     m2_gemm(bc, xn, Wf(T.ssm.in_b), 1, H, TSR);   // beta
                 } else {
-                    gemv_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   st, T.ssm.fmt_in_a);   // alpha
-                    gemv_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   st, T.ssm.fmt_in_b);   // beta
+                    gemv_w(eng, ac, T.ssm.ref_in_a, xn, st);   // alpha
+                    gemv_w(eng, bc, T.ssm.ref_in_b, xn, st);   // beta
                 }
                 qwen35_conv_step_kernel<<<(CONVD+127)/128,128,0,st>>>(conv_out, qkv, ring[l], Wf(T.ssm.conv1d), CONVD);
                 cudaMemcpyAsync(qh, conv_out,             (size_t)KEYD*sizeof(float),  cudaMemcpyDeviceToDevice, st);
@@ -893,7 +893,7 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
                 else
                     qwen35_gdn_step_kernel<<<NVH,128,smGDN,st>>>(core, qh, kh, vh, gg, bb, Sst[l]);
                 m2_gated_norm_kernel<<<dim3(NVH,1),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), 1, NVH, INNER);
-                gemv_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, st, T.ssm.fmt_out);
+                gemv_w(eng, mix, T.ssm.ref_out, gnorm, st);
             }
             qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(x, mix, H);
             // pre-FFN RMSNorm (post_attention_norm loaded into the ffn_norm slot) + FFN
@@ -901,10 +901,10 @@ extern "C" int qwen35_forward_greedy(gemma4_engine_t *eng, const int32_t *in_ids
             if (c->n_experts > 0) {   // Qwen3.5-MoE sparse block (experts + shared) → mix
                 moe_ffn(eng, l, xn, mix, 1, st);
             } else {
-                gemv_w(eng, ffn_g, Wq(T.ffn_gate), xn, H, I, st, T.fmt_gate);
-                gemv_w(eng, ffn_u, Wq(T.ffn_up),   xn, H, I, st, T.fmt_up);
+                gemv_w(eng, ffn_g, T.ref_gate, xn, st);
+                gemv_w(eng, ffn_u, T.ref_up, xn, st);
                 silu_glu_kernel<<<(I+255)/256,256,0,st>>>(ffn_a, ffn_g, ffn_u, I);
-                gemv_w(eng, mix, Wq(T.ffn_down), ffn_a, I, H, st, T.fmt_down);
+                gemv_w(eng, mix, T.ref_down, ffn_a, st);
             }
             qwen35_add_kernel<<<(H+255)/256,256,0,st>>>(x, mix, H);
         }

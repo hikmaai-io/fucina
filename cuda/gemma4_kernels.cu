@@ -9,6 +9,9 @@
 //   Output: logit softcapping at 30.0
 
 #include "gemma4_kernels.cuh"
+#include "tensor_types.h"
+#include "model_plan.h"
+#include "device_allocation_set.h"
 #include "gemma4_detect.h"   // M0: runtime arch auto-detection (gemma4_detect_from_gguf/_config_json)
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -3692,6 +3695,10 @@ struct gemma4_engine {
             // (attn_v + ffn_down vary), so the bulk dispatch must read the tensor's own format
             // rather than the engine-wide eng->format. 0 = unset (e.g. global-layer attn_v).
             uint8_t fmt_q, fmt_k, fmt_v, fmt_o, fmt_gate, fmt_up, fmt_down;
+            // Canonical descriptors are populated alongside the compatibility offsets/format
+            // bytes. Qwen runtime paths migrate projection-family by projection-family.
+            WeightRef ref_q, ref_k, ref_v, ref_o;
+            WeightRef ref_gate, ref_up, ref_down;
 
             // ── Qwen3.5 hybrid gated-deltanet (LINEAR) layer tensors (GEMMA4_ARCH_QWEN3_5 only) ──
             // Zero on every other arch AND on the hybrid's FULL layers (those reuse attn_q/k/v/
@@ -3712,6 +3719,7 @@ struct gemma4_engine {
                 uint64_t norm;     // blk.l.ssm_norm.weight   gated RMSNorm gain [state_size]  F32
                 uint64_t out;      // blk.l.ssm_out.weight    out-proj  [inner→hidden]
                 uint8_t  fmt_in_qkv, fmt_in_z, fmt_in_a, fmt_in_b, fmt_out;
+                WeightRef ref_in_qkv, ref_in_z, ref_in_a, ref_in_b, ref_out;
             } ssm;
         } layers[GEMMA4_CAP_LAYERS];
 
@@ -4182,6 +4190,11 @@ struct gemma4_engine {
     uint64_t       *h_fp4m_slot_age, fp4m_slot_clock;
     uint64_t        fp4m_ssd_reads, fp4m_ssd_bytes, fp4m_ssd_checksum_fail;
     uint64_t        fp4m_cache_hits, fp4m_cache_misses, fp4m_prefetch_advice;
+    ExpertWeightRef ref_fp4m_gu[GEMMA4_CAP_LAYERS];
+    ExpertWeightRef ref_fp4m_dn[GEMMA4_CAP_LAYERS];
+    ExpertWeightRef ref_moe_gate[GEMMA4_CAP_LAYERS];
+    ExpertWeightRef ref_moe_up[GEMMA4_CAP_LAYERS];
+    ExpertWeightRef ref_moe_down[GEMMA4_CAP_LAYERS];
     float          *d_fp4m_gsw;                      // device [L·2] per-(layer,proj) global scales
     unsigned long long fp4m_gu_sfB, fp4m_dn_sfB;     // per-expert SF strides (SF elements)
     uint8_t        *d_fp4m_a,  *d_fp4m_asf;          // per-step activation E2M1 + padded SF (K=H)
@@ -4192,6 +4205,9 @@ struct gemma4_engine {
     float          *d_fp4m_gsrow;                    // [A] per-row activation global scales
 
     // ─── LoRA adapter support ───────────────────────────────────────────
+
+    // Registry-owned allocations null their compatibility slots during teardown.
+    DeviceAllocationRegistry *device_allocations;
 };
 
 // ─── GGUF Parser ───────────────────────────────────────────────────────
@@ -4719,6 +4735,7 @@ static unsigned char* convert_q6k_to_q8_0(const unsigned char *src, int64_t n_el
 
 static int build_packed_q4(gemma4_engine_t *eng);  // FUCINA_PACKED: lazy/eager repack (body below)
 static int build_packed_q4k(gemma4_engine_t *eng); // PACKED Q4_K: in-place superblock repack (body below)
+static inline const unsigned char* weight_fp8(const gemma4_engine_t *eng, uint64_t tensor_offset);
 static void gemma4_engine_paged_selftest(gemma4_engine_t *eng);       // Phase 2 inc 3 (body below)
 static void gemma4_engine_paged_read_selftest(gemma4_engine_t *eng);  // Phase 2 inc 4 (body below)
 static void gemma4_engine_paged_e2e_selftest(gemma4_engine_t *eng);   // Phase 2 inc 4b (body below)
@@ -6614,6 +6631,46 @@ gemma4_engine_t* gemma4_engine_create(
         build_packed_q4k(eng);
     }
 
+    // GGUF Qwen descriptors are bound after all override conversion and in-place repacking. The
+    // safetensors loader binds the same fields in qwen35_fp8_fill_engine().
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
+        auto bind_ref=[&](WeightRef &ref,uint64_t off,uint8_t fmt,int out_dim,int in_dim){
+            ref.data=weight_fp8(eng,off); ref.scale=nullptr; ref.global_scale=nullptr;
+            ref.out_dim=out_dim; ref.in_dim=in_dim;
+            ref.encoding=(fmt==FORMAT_Q4_K)?WeightEncoding::Q4_K:
+                         (fmt==FORMAT_Q8_0)?WeightEncoding::Q8_0:
+                         (fmt==FORMAT_Q4_0)?WeightEncoding::Q4_0:
+                         (fmt==FORMAT_Q6_K)?WeightEncoding::Q6_K:WeightEncoding::FP8_BLOCK_128;
+            ref.layout=(fmt==FORMAT_Q4_K && eng->q4k_packed)?TensorLayout::Q4K_PACKED:
+                       (fmt==FORMAT_FP8_BLOCK)?TensorLayout::ROW_MAJOR:TensorLayout::GGML_NATIVE;
+            ref.flags=WEIGHT_FLAG_PRIMARY |
+                      ((ref.layout==TensorLayout::Q4K_PACKED)?WEIGHT_FLAG_PACKED:0);
+        };
+        const int H=eng->cfg.hidden_size, HD=eng->cfg.head_dim, NQ=eng->cfg.n_heads;
+        const int NKV=eng->cfg.n_kv_global, INNER=eng->cfg.ssm_inner_size;
+        const int CONVD=2*eng->cfg.ssm_group_count*eng->cfg.ssm_state_size+INNER;
+        for(int l=0;l<eng->cfg.n_layers;l++){
+            auto &T=eng->tensors.layers[l];
+            if(eng->cfg.attn_kind[l]==GEMMA4_ATTN_FULL){
+                bind_ref(T.ref_q,T.attn_q,T.fmt_q,2*NQ*HD,H);
+                bind_ref(T.ref_k,T.attn_k,T.fmt_k,NKV*HD,H);
+                bind_ref(T.ref_v,T.attn_v,T.fmt_v,NKV*HD,H);
+                bind_ref(T.ref_o,T.attn_output,T.fmt_o,H,NQ*HD);
+            } else {
+                bind_ref(T.ssm.ref_in_qkv,T.ssm.in_qkv,T.ssm.fmt_in_qkv,CONVD,H);
+                bind_ref(T.ssm.ref_in_z,T.ssm.in_z,T.ssm.fmt_in_z,INNER,H);
+                bind_ref(T.ssm.ref_in_a,T.ssm.in_a,T.ssm.fmt_in_a,eng->cfg.ssm_time_step_rank,H);
+                bind_ref(T.ssm.ref_in_b,T.ssm.in_b,T.ssm.fmt_in_b,eng->cfg.ssm_time_step_rank,H);
+                bind_ref(T.ssm.ref_out,T.ssm.out,T.ssm.fmt_out,H,INNER);
+            }
+            if(eng->cfg.n_experts==0){
+                bind_ref(T.ref_gate,T.ffn_gate,T.fmt_gate,eng->cfg.intermediate,H);
+                bind_ref(T.ref_up,T.ffn_up,T.fmt_up,eng->cfg.intermediate,H);
+                bind_ref(T.ref_down,T.ffn_down,T.fmt_down,H,eng->cfg.intermediate);
+            }
+        }
+    }
+
     // Paged KV mirror validation (opt-in): decode a fixed run and assert the
     // paged pool matches the contiguous cache byte-for-byte. Non-fatal.
     if (getenv("FUCINA_PAGED_KV_SELFTEST"))   gemma4_engine_paged_selftest(eng);
@@ -6631,6 +6688,9 @@ gemma4_engine_t* gemma4_engine_create(
 
 void gemma4_engine_destroy(gemma4_engine_t *eng) {
     if (!eng) return;
+
+    delete eng->device_allocations;
+    eng->device_allocations = nullptr;
 
     if (eng->gguf_data && eng->gguf_data != MAP_FAILED) {
         munmap((void *)eng->gguf_data, eng->gguf_size);
@@ -7015,8 +7075,49 @@ static inline void gemv_w(
     }
 }
 
+static inline int weight_ref_format(const WeightRef &weight) {
+    switch (weight.encoding) {
+        case WeightEncoding::Q8_0:          return FORMAT_Q8_0;
+        case WeightEncoding::Q4_0:          return FORMAT_Q4_0;
+        case WeightEncoding::Q4_K:          return FORMAT_Q4_K;
+        case WeightEncoding::Q6_K:          return FORMAT_Q6_K;
+        case WeightEncoding::FP8_BLOCK_128: return FORMAT_FP8_BLOCK;
+        case WeightEncoding::NVFP4_LINEAR:
+        case WeightEncoding::NVFP4_SWIZZLED:return FORMAT_NVFP4;
+        default:                            return -1;
+    }
+}
+
+// Descriptor dispatch for migrated projections. Unlike the compatibility overload above, this
+// takes scale and packed-layout decisions directly from the tensor: no ptr→scale search and no
+// pointer-range format inference occur in the hot path.
+static inline void gemv_w(
+    const gemma4_engine_t *eng, float *out, const WeightRef &weight,
+    const float *x, cudaStream_t stream)
+{
+    const int fmt = weight_ref_format(weight);
+    if (fmt == FORMAT_FP8_BLOCK) {
+        fp8_block_gemv_launch(out, weight.data, (const __nv_bfloat16 *)weight.scale, x,
+                              weight.in_dim, weight.out_dim, stream);
+        return;
+    }
+    if (fmt == FORMAT_Q4_K) {
+        quantize_q8_1_kernel<<<weight.in_dim/32, 32, 0, stream>>>(
+            x, eng->d_qx, eng->d_dx, eng->d_sx, weight.in_dim);
+        if (weight.layout == TensorLayout::Q4K_PACKED)
+            mmvq_q4_k_packed_launch(out, weight.data, eng->d_qx, eng->d_dx, eng->d_sx,
+                                    weight.in_dim, weight.out_dim, stream);
+        else
+            mmvq_q4_k_launch(out, weight.data, eng->d_qx, eng->d_dx, eng->d_sx,
+                             weight.in_dim, weight.out_dim, stream);
+        return;
+    }
+    // Compatibility for encodings not yet migrated; data and dimensions still come from WeightRef.
+    gemv_w(eng, out, weight.data, x, weight.in_dim, weight.out_dim, stream, fmt);
+}
+
 // FORMAT_FP8_BLOCK: recover a weight's per-128 block-scale pointer (host binary search over the
-// sorted ptr→scale table the FP8 loader built — the offset scheme can't derive it).
+// sorted ptr→scale table the FP8 loader built — compatibility paths only).
 static inline const __nv_bfloat16 *wscale_fp8(const gemma4_engine_t *eng, const uint8_t *w) {
     int lo = 0, hi = eng->q35.fp8_scale_n - 1;
     while (lo <= hi) {
@@ -7075,6 +7176,38 @@ static inline void gemv_batched_w(
     }
     mmvq_batched_launch(out, weight, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b,
                         in_dim, out_dim, K, fmt, stream);
+}
+
+static inline void gemv_batched_w(
+    const gemma4_engine_t *eng, float *out, const WeightRef &weight,
+    const float *x, int K, cudaStream_t stream)
+{
+    const int fmt = weight_ref_format(weight);
+    if (fmt == FORMAT_FP8_BLOCK) {
+        fp8_block_gemm_launch(out, weight.data, (const __nv_bfloat16 *)weight.scale, x,
+                              weight.in_dim, weight.out_dim, K, stream);
+        return;
+    }
+    if (fmt == FORMAT_Q4_K) {
+        if (K > 1 && (weight.in_dim & 1023) == 0 &&
+            weight.layout == TensorLayout::Q4K_PACKED) {
+            quantize_q8_1t_kernel<<<(K*weight.in_dim)/32, 32, 0, stream>>>(
+                x, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b, weight.in_dim);
+            mmvq_q4_k_packedT_batched_launch(out, weight.data, eng->d_qx_b, eng->d_dx_b,
+                                             eng->d_sx_b, weight.in_dim, weight.out_dim, K, stream);
+            return;
+        }
+        quantize_q8_1_kernel<<<(K*weight.in_dim)/32, 32, 0, stream>>>(
+            x, eng->d_qx_b, eng->d_dx_b, eng->d_sx_b, K*weight.in_dim);
+        if (weight.layout == TensorLayout::Q4K_PACKED)
+            mmvq_q4_k_packed_batched_launch(out, weight.data, eng->d_qx_b, eng->d_dx_b,
+                                             eng->d_sx_b, weight.in_dim, weight.out_dim, K, stream);
+        else
+            mmvq_q4_k_batched_launch(out, weight.data, eng->d_qx_b, eng->d_dx_b,
+                                      eng->d_sx_b, weight.in_dim, weight.out_dim, K, stream);
+        return;
+    }
+    gemv_batched_w(eng, out, weight.data, x, weight.in_dim, weight.out_dim, K, stream, fmt);
 }
 
 // Forward declarations: logits_head uses lmhead_w/embd_fmt (defined just below); the decode
@@ -9366,12 +9499,14 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                     cudaStream_t stream) {
     const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn;
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
-    const uint8_t *fp4_gu=eng->d_fp4m_gu[l], *fp4_gusf=eng->d_fp4m_gusf[l];
-    const uint8_t *fp4_dn=eng->d_fp4m_dn[l], *fp4_dnsf=eng->d_fp4m_dnsf[l];
-    if(eng->fp4m_ssd_stream) {   // full slabs were dropped at load; GEMMs read the slot pool
-        fp4_gu=eng->d_fp4m_stage_gu; fp4_gusf=eng->d_fp4m_stage_gusf;
-        fp4_dn=eng->d_fp4m_stage_dn; fp4_dnsf=eng->d_fp4m_stage_dnsf;
-    }
+    const int GU = 2 * EFFN;   // fused gate+up slab rows (SSD streaming pool geometry)
+    const ExpertWeightRef &fp4_gu=eng->ref_fp4m_gu[l], &fp4_dn=eng->ref_fp4m_dn[l];
+    const ExpertWeightRef &expert_gate=eng->ref_moe_gate[l], &expert_up=eng->ref_moe_up[l],
+                          &expert_down=eng->ref_moe_down[l];
+    // SSD streaming drops the full slabs at load; those GEMMs read the slot pool instead of the
+    // per-layer descriptors (which then hold no resident data for routed experts).
+    const uint8_t *stage_gu=eng->d_fp4m_stage_gu, *stage_gusf=eng->d_fp4m_stage_gusf;
+    const uint8_t *stage_dn=eng->d_fp4m_stage_dn, *stage_dnsf=eng->d_fp4m_stage_dnsf;
     // Diagnostic phase timing is deliberately synchronizing and opt-in only. Reuse two events
     // as a moving boundary; each mark drains the stream, attributes the completed interval, then
     // swaps start/stop. Normal serving creates no events and takes no timing branches past `timing`.
@@ -9392,12 +9527,12 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
     // GEMM at prefill widths: 2k TTFT 1.16 s vs 1.23 s), decode-sized calls keep CUTLASS NVFP4.
     const int tc_ok = (eng->format == FORMAT_FP8_BLOCK) && !eng->fp4m_ssd_stream;
     const float *router_w = (const float*)weight_fp8(eng, eng->moe_router[l]);
-    const void  *gate_w   = (const void*)weight_fp8(eng, eng->moe_gate_exps[l]);
-    const void  *up_w     = (const void*)weight_fp8(eng, eng->moe_up_exps[l]);
+    const void  *gate_w   = expert_gate.weight.data;
+    const void  *up_w     = expert_up.weight.data;
     // FP8: every expert proj is EFFN×H (or H×EFFN) E4M3 = the same bytes/expert; the BF16 block
     // scales sit in parallel per-expert slabs of (EFFN/128)·(H/128) elements (ceil for EFFN<128).
-    const int64_t fp8_wslab = (int64_t)EFFN * H;
-    const int64_t fp8_sslab = (int64_t)((EFFN + 127) / 128) * (H / 128);
+    const int64_t fp8_wslab = expert_gate.weight_stride;
+    const int64_t fp8_sslab = expert_gate.scale_stride / (int64_t)sizeof(__nv_bfloat16);
     // ── Tensor-core expert PREFILL (fp8, wide call): dequant the 3 expert slabs → BF16 once per
     // LAYER, then per-group cublas GEMMs replace the scalar-float grouped kernel (measured 71.6%
     // of a 2k-token prefill, ALU-bound at ~16 tok/expert). Decode-sized calls keep the FP8 kernel.
@@ -9419,24 +9554,25 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         if (!eng->moe_tc_off) {
             const uint64_t ne = (uint64_t)E * EFFN * H;
             const uint8_t *ws[3] = { (const uint8_t*)gate_w, (const uint8_t*)up_w,
-                                     weight_fp8(eng, eng->moe_down_exps[l]) };
-            const uint64_t so[3] = { eng->moe_gate_scales[l], eng->moe_up_scales[l], eng->moe_down_scales[l] };
+                                     expert_down.weight.data };
+            const void *scales[3] = { expert_gate.weight.scale, expert_up.weight.scale,
+                                      expert_down.weight.scale };
             for (int p = 0; p < 3; p++) {
                 if (eng->moe_experts_fp4)   // NVFP4 slabs: gate/up halves of the fused gu slab, then dn
                     dequant_nvfp4_expert_slab_bf16_kernel<<<(unsigned)((ne / NVFP4_BLK + 255) / 256), 256, 0, stream>>>(
                         eng->d_moe_wbf[p],
-                        (p == 2) ? fp4_dn   : fp4_gu,
-                        (p == 2) ? fp4_dnsf : fp4_gusf,
-                        eng->d_fp4m_gsw + 2 * l + ((p == 2) ? 1 : 0),
+                        (const uint8_t*)((p == 2) ? fp4_dn.weight.data : fp4_gu.weight.data),
+                        (const uint8_t*)((p == 2) ? fp4_dn.weight.scale : fp4_gu.weight.scale),
+                        (const float*)((p == 2) ? fp4_dn.weight.global_scale : fp4_gu.weight.global_scale),
                         (p == 2) ? EFFN : H, (p == 2) ? H : EFFN,
                         (p == 1) ? EFFN : 0, (p == 2) ? H : 2 * EFFN,
-                        (p == 2) ? eng->fp4m_dn_sfB : eng->fp4m_gu_sfB, ne);
+                        (p == 2) ? fp4_dn.scale_stride : fp4_gu.scale_stride, ne);
                 else if (eng->moe_experts_q4k)   // Q4_K slabs: element-parallel natural-layout dequant
                     dequant_q4_k_slab_bf16_fast_kernel<<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(
                         eng->d_moe_wbf[p], ws[p], ne);
                 else
                     dequant_fp8_expert_slab_bf16_kernel<<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(
-                        eng->d_moe_wbf[p], ws[p], (const __nv_bfloat16*)weight_fp8(eng, so[p]),
+                        eng->d_moe_wbf[p], ws[p], (const __nv_bfloat16*)scales[p],
                         (p == 2) ? EFFN : H, (p == 2) ? H : EFFN, ne);
             }
             tc = 1;
@@ -9479,7 +9615,6 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             // projection covers every expert (fused gate|up, then down). Serves decode AND
             // prefill — 2.1× the dp4a grouped GEMV weight bandwidth at 1 tok/expert, 11+ TFLOP/s
             // at prefill widths (test_dg_fp4_grouped on GB10).
-            const int GU = 2 * EFFN;
             auto g1 = [](size_t n){ return (unsigned)((n + 255) / 256); };
             const int nbH = H / NVFP4_BLK,    nbHp = nvfp4_pad(nbH, 4);
             const int nbF = EFFN / NVFP4_BLK, nbFp = nvfp4_pad(nbF, 4);
@@ -9595,11 +9730,12 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                 rc=ssd_cache_prepare();
                 if(rc==-1)rc=ssd_gemm(false);
                 else if(!rc)rc=dg_fp4_moe_grouped_mapped(eng->d_fp4m_gu_out,eng->d_fp4m_a,eng->d_fp4m_asf,
-                    fp4_gu,fp4_gusf,eng->d_moe_count,eng->d_moe_coloff,eng->d_fp4m_eslot,E,GU,H,
+                    stage_gu,stage_gusf,eng->d_moe_count,eng->d_moe_coloff,eng->d_fp4m_eslot,E,GU,H,
                     sfA1,eng->fp4m_gu_sfB,eng->d_fp4m_gsw+2*l,stream);
             } else rc = dg_fp4_moe_grouped(eng->d_fp4m_gu_out, eng->d_fp4m_a, eng->d_fp4m_asf,
-                fp4_gu, fp4_gusf, eng->d_fp4m_indptr,
-                E, GU, H, sfA1, eng->fp4m_gu_sfB, eng->d_fp4m_gsw + 2 * l, stream);
+                fp4_gu.weight.data, (const uint8_t*)fp4_gu.weight.scale, eng->d_fp4m_indptr,
+                fp4_gu.expert_count, fp4_gu.weight.out_dim, fp4_gu.weight.in_dim, sfA1, fp4_gu.scale_stride,
+                fp4_gu.weight.global_scale, stream);
             q35fp4_gu_silu_mul_kernel<<<g1((size_t)total * EFFN), 256, 0, stream>>>(
                 eng->d_moe_act, eng->d_fp4m_gu_out, eng->d_fp4m_gsrow, EFFN, (int64_t)total * EFFN);
             moe_profile_activation(eng, l, 3, eng->d_moe_act, (size_t)total*EFFN, stream);
@@ -9610,12 +9746,13 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                   sfA2, nbFp); }
             if(eng->fp4m_ssd_stream) {
                 if(cache_ready)rc|=dg_fp4_moe_grouped_mapped(eng->d_fp4m_dn_out,eng->d_fp4m_a2,eng->d_fp4m_a2sf,
-                    fp4_dn,fp4_dnsf,eng->d_moe_count,eng->d_moe_coloff,eng->d_fp4m_eslot,E,H,EFFN,
+                    stage_dn,stage_dnsf,eng->d_moe_count,eng->d_moe_coloff,eng->d_fp4m_eslot,E,H,EFFN,
                     sfA2,eng->fp4m_dn_sfB,eng->d_fp4m_gsw+2*l+1,stream);
                 else rc|=ssd_gemm(true);
             } else rc |= dg_fp4_moe_grouped(eng->d_fp4m_dn_out, eng->d_fp4m_a2, eng->d_fp4m_a2sf,
-                fp4_dn, fp4_dnsf, eng->d_fp4m_indptr,
-                E, H, EFFN, sfA2, eng->fp4m_dn_sfB, eng->d_fp4m_gsw + 2 * l + 1, stream);
+                fp4_dn.weight.data, (const uint8_t*)fp4_dn.weight.scale, eng->d_fp4m_indptr,
+                fp4_dn.expert_count, fp4_dn.weight.out_dim, fp4_dn.weight.in_dim, sfA2, fp4_dn.scale_stride,
+                fp4_dn.weight.global_scale, stream);
             q35fp4_dn_scale_kernel<<<g1((size_t)total * H), 256, 0, stream>>>(
                 eng->d_moe_oe, eng->d_fp4m_dn_out, eng->d_fp4m_gsrow, H, (uint64_t)total * H);
             if(rc==-10){fprintf(stderr,"fucina: expert-store checksum failure at layer %d\n",l);abort();}
@@ -9645,10 +9782,10 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             gemm_bf16_grouped(eng, eng->d_moe_wbf[2], (size_t)EFFN * H, eng->d_moe_xbf,
                               eng->d_moe_oe, hc, ho, E, EFFN, H, stream);
         } else if (fp8) {
-            const __nv_bfloat16 *gs = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_gate_scales[l]);
-            const __nv_bfloat16 *us = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_up_scales[l]);
-            const __nv_bfloat16 *ds = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_down_scales[l]);
-            const uint8_t *down_w = weight_fp8(eng, eng->moe_down_exps[l]);
+            const __nv_bfloat16 *gs = (const __nv_bfloat16*)expert_gate.weight.scale;
+            const __nv_bfloat16 *us = (const __nv_bfloat16*)expert_up.weight.scale;
+            const __nv_bfloat16 *ds = (const __nv_bfloat16*)expert_down.weight.scale;
+            const uint8_t *down_w = expert_down.weight.data;
             // FUSED gate+up+SiLU: one launch shares the x reads and routing lookups and writes
             // silu(gate)*up directly (no gate/up round-trip, no dg_silu_mul launch). Same math
             // order and __expf as the unfused trio → bit-identical.
@@ -9669,17 +9806,17 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             // (prefill chunks) keep the tile.
             const bool q4gemv = eng->moe_experts_q4k && cn <= 2 * FP8_MAXB;
             if (q4gemv) {
-                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
+                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_gate, gate_w, expert_gate.weight_stride,
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                     eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
-                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_up, up_w, eng->moe_up_slab,
+                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_up, up_w, expert_up.weight_stride,
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                     eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
             } else {
-            dg_mmq_q4_K_grouped(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
+            dg_mmq_q4_K_grouped(eng->d_moe_gate, gate_w, expert_gate.weight_stride,
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                 eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
-            dg_mmq_q4_K_grouped(eng->d_moe_up, up_w, eng->moe_up_slab,
+            dg_mmq_q4_K_grouped(eng->d_moe_up, up_w, expert_up.weight_stride,
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                 eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
             }
@@ -9692,13 +9829,13 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                     eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
             } else {
-                const void *down_w = (const void*)weight_fp8(eng, eng->moe_down_exps[l]);
+                const void *down_w = expert_down.weight.data;
                 if (q4gemv)
-                    mmvq_q4_k_grouped_gemv_launch(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
+                    mmvq_q4_k_grouped_gemv_launch(eng->d_moe_oe, down_w, expert_down.weight_stride,
                                         eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                         eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, EFFN, H, stream);
                 else
-                    dg_mmq_q4_K_grouped(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
+                    dg_mmq_q4_K_grouped(eng->d_moe_oe, down_w, expert_down.weight_stride,
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                     eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, EFFN, H, stream);
             }

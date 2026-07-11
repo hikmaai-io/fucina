@@ -661,7 +661,10 @@ static unsigned char *q35_fp8_experts_to_q4k(
 }
 
 // One descriptor per tensor placed into eng->d_weights.
-struct q35fp8_desc { uint64_t *off; uint8_t *fmtp; const void *host; size_t bytes; int fmt; const void *scale_host; size_t scale_bytes; };
+struct q35fp8_desc {
+    uint64_t *off; uint8_t *fmtp; const void *host; size_t bytes; int fmt;
+    const void *scale_host; size_t scale_bytes; std::string logical_name;
+};
 
 // Resolve a logical `<module>.weight` across block-FP8/ModelOpt and compressed-tensors. Packed
 // NVFP4 preserves the output dimension in shape[0] and halves only shape[1].
@@ -702,6 +705,127 @@ static inline bool qwen35_fp8_is_moe(st::Model &M, qwen35fp8::Layout &LO) {
     return q35_weight_tensor(M,LO,qwen35fp8::lkey(LO,0,"mlp.experts.0.gate_proj.weight")) != nullptr;
 }
 
+enum class q35_source_kind : uint8_t { FP8_BLOCK, FP8_SCALED, NVFP4 };
+
+static bool q35_shape_is(const st::Tensor *t,int64_t rows,int64_t cols) {
+    return t && t->shape.size()==2 && t->shape[0]==rows && t->shape[1]==cols;
+}
+
+// Producer adapter/preflight for one logical weight. This normalizes official block-FP8,
+// ModelOpt NVFP4, and compressed-tensors naming without allocating or selecting a CUDA kernel.
+static bool q35_validate_weight_source(st::Model &M,const qwen35fp8::Layout &LO,
+                                       const std::string &key,int out_dim,int in_dim,
+                                       q35_source_kind *kind,std::string &error) {
+    const st::Tensor *w=M.find(key), *inv=M.find(key+"_scale_inv");
+    if(w&&inv){
+        const size_t scale_bytes=(size_t)((out_dim+127)/128)*((in_dim+127)/128)*2;
+        if(w->dtype!=st::Dtype::F8_E4M3 || !q35_shape_is(w,out_dim,in_dim)) {
+            error=key+": expected F8_E4M3 [out,in]"; return false;
+        }
+        if(inv->dtype!=st::Dtype::BF16 || inv->nbytes!=scale_bytes) {
+            error=key+"_scale_inv: expected BF16 128x128 scale grid"; return false;
+        }
+        *kind=q35_source_kind::FP8_BLOCK; return true;
+    }
+    if(LO.mixed_nvfp4()){
+        q35_native_nv4 n4=q35_native_nv4_resolve(M,LO,key);
+        if((n4.packed&&n4.packed->dtype==st::Dtype::U8)||n4.global){
+            if(!n4.packed||!n4.scale||!n4.global || n4.packed->dtype!=st::Dtype::U8 ||
+               !q35_shape_is(n4.packed,out_dim,in_dim/2) || n4.packed->nbytes!=(size_t)out_dim*in_dim/2 ||
+               (n4.scale->dtype!=st::Dtype::U8 && n4.scale->dtype!=st::Dtype::F8_E4M3) || n4.scale->nbytes==0 ||
+               n4.global->dtype!=st::Dtype::F32 || n4.global->nbytes!=4 || n4.global_mul==0.f) {
+                error=key+": incomplete or malformed native NVFP4 weight/scale/global triplet"; return false;
+            }
+            *kind=q35_source_kind::NVFP4; return true;
+        }
+        const st::Tensor *scaled=M.find(key), *scale=M.find(key+"_scale");
+        if(!scaled||!scale || scaled->dtype!=st::Dtype::F8_E4M3 ||
+           !q35_shape_is(scaled,out_dim,in_dim) ||
+           (scale->dtype!=st::Dtype::F32 && scale->dtype!=st::Dtype::BF16) || scale->nbytes==0) {
+            error=key+": expected scaled FP8 weight and scale"; return false;
+        }
+        *kind=q35_source_kind::FP8_SCALED; return true;
+    }
+    error=key+": missing weight or scale"; return false;
+}
+
+static bool q35_validate_vector(st::Model &M,const std::string &key,int64_t elements,
+                                bool allow_f32,std::string &error) {
+    const st::Tensor *t=M.find(key);
+    int64_t count=1; if(t) for(int64_t d:t->shape) count*=d;
+    if(!t || count!=elements ||
+       (t->dtype!=st::Dtype::BF16 && (!allow_f32 || t->dtype!=st::Dtype::F32))) {
+        error=key+": wrong element count or dtype"; return false;
+    }
+    return true;
+}
+
+// Complete host-only schema pass. It runs from setup_cfg, before engine CUDA allocations begin.
+static bool q35_preflight(st::Model &M,qwen35fp8::Layout &LO,int H,int HD,int NQ,int NKV,
+                          int INNER,int TSR,int I,int VOC,int E,int MI,bool moe,std::string &error) {
+    q35_source_kind k;
+    const st::Tensor *embed=M.find(LO.embed_key), *head=M.find(LO.lmhead_key);
+    if(!embed || embed->dtype!=st::Dtype::BF16 || !q35_shape_is(embed,VOC,H)) {
+        error=LO.embed_key+": expected BF16 [vocab,hidden]"; return false;
+    }
+    if(!head){ error=LO.lmhead_key+": missing lm head"; return false; }
+    if(!LO.mixed_nvfp4() && (head->dtype!=st::Dtype::BF16 || !q35_shape_is(head,VOC,H))) {
+        error=LO.lmhead_key+": expected BF16 [vocab,hidden]"; return false;
+    }
+    if(!q35_validate_vector(M,LO.final_norm_key,H,false,error)) return false;
+    const int CONVD=2*M2_KEYD+INNER;
+    for(int l=0;l<LO.n_layers;l++){
+        auto lk=[&](const char *s){ return qwen35fp8::lkey(LO,l,s); };
+        if(!q35_validate_vector(M,lk("input_layernorm.weight"),H,false,error) ||
+           !q35_validate_vector(M,lk("post_attention_layernorm.weight"),H,false,error)) return false;
+        if(qwen35fp8::is_full(LO,l)){
+            if(!q35_validate_weight_source(M,LO,lk("self_attn.q_proj.weight"),2*NQ*HD,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("self_attn.k_proj.weight"),NKV*HD,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("self_attn.v_proj.weight"),NKV*HD,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("self_attn.o_proj.weight"),H,NQ*HD,&k,error) ||
+               !q35_validate_vector(M,lk("self_attn.q_norm.weight"),HD,false,error) ||
+               !q35_validate_vector(M,lk("self_attn.k_norm.weight"),HD,false,error)) return false;
+        } else {
+            if(!q35_validate_weight_source(M,LO,lk("linear_attn.in_proj_qkv.weight"),CONVD,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("linear_attn.in_proj_z.weight"),INNER,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("linear_attn.out_proj.weight"),H,INNER,&k,error) ||
+               !q35_validate_vector(M,lk("linear_attn.A_log"),TSR,true,error) ||
+               !q35_validate_vector(M,lk("linear_attn.dt_bias"),TSR,false,error) ||
+               !q35_validate_vector(M,lk("linear_attn.norm.weight"),M2_SD,true,error)) return false;
+            const st::Tensor *a=M.find(lk("linear_attn.in_proj_a.weight"));
+            const st::Tensor *b=M.find(lk("linear_attn.in_proj_b.weight"));
+            const st::Tensor *conv=M.find(lk("linear_attn.conv1d.weight"));
+            if(!a||!b||!conv || a->dtype!=st::Dtype::BF16 || b->dtype!=st::Dtype::BF16 ||
+               !q35_shape_is(a,TSR,H) || !q35_shape_is(b,TSR,H) ||
+               conv->dtype!=st::Dtype::BF16 || conv->nbytes!=(size_t)CONVD*M2_CK*2) {
+                error=lk("linear_attn")+": malformed a/b/conv tensors"; return false;
+            }
+        }
+        if(moe){
+            if(!q35_validate_vector(M,lk("mlp.shared_expert_gate.weight"),H,false,error) ||
+               !q35_validate_weight_source(M,LO,lk("mlp.shared_expert.gate_proj.weight"),I,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("mlp.shared_expert.up_proj.weight"),I,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("mlp.shared_expert.down_proj.weight"),H,I,&k,error)) return false;
+            const st::Tensor *router=M.find(lk("mlp.gate.weight"));
+            if(!router || router->dtype!=st::Dtype::BF16 || !q35_shape_is(router,E,H)) {
+                error=lk("mlp.gate.weight")+": malformed router"; return false;
+            }
+            q35_source_kind layer_kind=q35_source_kind::FP8_BLOCK; bool first=true;
+            const char *proj[3]={"gate_proj","up_proj","down_proj"};
+            for(int p=0;p<3;p++) for(int e=0;e<E;e++){
+                char name[96]; snprintf(name,sizeof(name),"mlp.experts.%d.%s.weight",e,proj[p]);
+                q35_source_kind ek; int od=p==2?H:MI, id=p==2?MI:H;
+                if(!q35_validate_weight_source(M,LO,lk(name),od,id,&ek,error)) return false;
+                if(first){ layer_kind=ek; first=false; }
+                else if(ek!=layer_kind){ error=lk("mlp.experts")+": mixed expert formats within layer"; return false; }
+            }
+        } else if(!q35_validate_weight_source(M,LO,lk("mlp.gate_proj.weight"),I,H,&k,error) ||
+                  !q35_validate_weight_source(M,LO,lk("mlp.up_proj.weight"),I,H,&k,error) ||
+                  !q35_validate_weight_source(M,LO,lk("mlp.down_proj.weight"),H,I,&k,error)) return false;
+    }
+    return true;
+}
+
 // Set eng->cfg from the FP8 checkpoint. H / NKV / vocab / FFN dims come from the tensor shapes
 // (9B dense: H=4096 NKV=4; 35B-A3B MoE: H=2048 NKV=2 E=256 top-8 MI=SI=512); the head/GDN geometry
 // is the shared M2_* baked set. Called EARLY (before the cfg-dependent scratch allocations); the
@@ -739,15 +863,23 @@ static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::L
     c->ssm_state_size=SD; c->ssm_conv_kernel=CK; c->ssm_inner_size=INNER; c->ssm_group_count=M2_NKH; c->ssm_time_step_rank=TSR;
     fprintf(stderr,"fucina: qwen35 geometry (runtime-derived) — NQ=%d NKV=%d NVH=%d INNER=%d CONVD=%d (M2 baked NQ%d/NVH%d/INNER%d)\n",
             NQ, NKV, NVH, INNER, 2*M2_KEYD+INNER, M2_NQ, M2_NVH, M2_VALD);
+    int E=0, MI=0;
     if (moe) {
         const st::Tensor *rgT=M.find(qwen35fp8::lkey(LO,0,"mlp.gate.weight"));
         const st::Tensor *egT=q35_weight_tensor(M,LO,qwen35fp8::lkey(LO,0,"mlp.experts.0.gate_proj.weight"));
         if(!rgT||!egT){ fprintf(stderr,"qwen35_fp8_engine: missing router/expert tensors\n"); return -1; }
-        c->n_experts=(int)rgT->shape[0]; c->expert_ffn=(int)egT->shape[0];
+        E=(int)rgT->shape[0]; MI=(int)egT->shape[0];
+        c->n_experts=E; c->expert_ffn=MI;
         long tk=8; qwen35fp8::cfg_int(M.config_json(),"\"num_experts_per_tok\"",tk);
         c->n_experts_used=(tk>0)?(int)tk:8;
         eng->moe_shared_inter=I;      // I above = shared_expert_intermediate for MoE
     }
+    std::string preflight_error;
+    if(!q35_preflight(M,LO,H,HD,NQ,NKV,INNER,TSR,I,VOC,E,MI,moe,preflight_error)){
+        fprintf(stderr,"qwen35_fp8_engine: preflight failed: %s\n",preflight_error.c_str());
+        return -1;
+    }
+    fprintf(stderr,"fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)\n");
     int nfull=0;
     for(int l=0;l<L;l++){ bool full=qwen35fp8::is_full(LO,l);
         c->attn_kind[l]=full?GEMMA4_ATTN_FULL:GEMMA4_ATTN_LINEAR; c->is_global[l]=full?1:0; nfull+=full?1:0; }
@@ -789,6 +921,14 @@ struct q35_precision_policy {
     }
 };
 
+static int q35_cuda_allocate(void *,void **ptr,size_t bytes) {
+    return cudaMalloc(ptr,bytes)==cudaSuccess?0:1;
+}
+static void q35_cuda_release(void *,void *ptr) { if(ptr) cudaFree(ptr); }
+static int q35_cuda_upload(void *,void *dst,const void *src,size_t bytes) {
+    return cudaMemcpy(dst,src,bytes,cudaMemcpyHostToDevice)==cudaSuccess?0:1;
+}
+
 static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
     const int H=eng->cfg.hidden_size, HD=M2_HEAD, NQ=eng->cfg.n_heads, NKV=eng->cfg.n_kv_global;
     const int CONVD=(2*M2_KEYD+eng->cfg.ssm_inner_size), INNER=eng->cfg.ssm_inner_size;
@@ -797,6 +937,9 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     size_t fill_free_after_core=0, fill_free_before_scratch=0, fill_free_after_scratch=0;
     cudaMemGetInfo(&fill_free_before, &fill_total);
     const q35_host_meminfo host_mem_before=q35_read_host_meminfo();
+    DeviceAllocationOps allocation_ops{nullptr,q35_cuda_allocate,q35_cuda_release,q35_cuda_upload};
+    if(!eng->device_allocations) eng->device_allocations=new DeviceAllocationRegistry(allocation_ops);
+    DeviceAllocationSet load_allocation(allocation_ops);
 
     q35_precision_policy precision_policy;
     if(!precision_policy.load()) return -1;
@@ -811,7 +954,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     //   consumers that do not yet have a direct FP4 projection (principally shared expert).
     auto put_fp8=[&](uint64_t*off,uint8_t*fmtp,const std::string&key,int out_dim,int in_dim)->bool{
         const st::Tensor*w=find(key), *s=find(key+"_scale_inv");
-        if(w&&s){ D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,s->data,s->nbytes}); return true; }
+        if(w&&s){ D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,s->data,s->nbytes,key}); return true; }
         if(LO.mixed_nvfp4()){
             const size_t gridb=(size_t)((out_dim+127)/128)*((in_dim+127)/128)*2;
             q35_native_nv4 n4=q35_native_nv4_resolve(M,LO,key);
@@ -822,7 +965,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                 uint8_t*w8=nullptr; uint16_t*sg=nullptr;
                 if(bf&&q35_bf16_to_fp8_block_host(bf,out_dim,in_dim,&w8,&sg)){
                     free(bf); tofree.push_back(w8); tofree.push_back(sg);
-                    D.push_back({off,fmtp,w8,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb});
+                    D.push_back({off,fmtp,w8,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb,key});
                     return true;
                 }
                 free(bf);
@@ -831,14 +974,14 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                 if(ps&&ps->nbytes==4){
                     uint16_t*sg=q35_synth_scale_grid(*(const float*)ps->data,out_dim,in_dim);
                     if(sg){ tofree.push_back(sg);
-                        D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb});
+                        D.push_back({off,fmtp,w->data,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb,key});
                         return true; }
                 } else if(ps){
                     uint16_t *bf=q35_fp8_scaled_to_bf16_host((const uint8_t*)w->data,ps,out_dim,in_dim);
                     uint8_t *w8=nullptr; uint16_t *sg=nullptr;
                     if(bf&&q35_bf16_to_fp8_block_host(bf,out_dim,in_dim,&w8,&sg)){
                         free(bf); tofree.push_back(w8); tofree.push_back(sg);
-                        D.push_back({off,fmtp,w8,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb});
+                        D.push_back({off,fmtp,w8,(size_t)out_dim*in_dim,FORMAT_FP8_BLOCK,sg,gridb,key});
                         return true;
                     }
                     free(bf);
@@ -853,7 +996,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         int64_t n=(int64_t)(t->nbytes/2); float*f=(float*)malloc((size_t)n*4);
         const uint16_t*src=(const uint16_t*)t->data;
         for(int64_t i=0;i<n;i++){ float v=q35_bf16_to_f32_host(src[i]); f[i]=neg_exp?(-expf(v)):(v+add); }
-        tofree.push_back(f); D.push_back({off,nullptr,f,(size_t)n*4,-1,nullptr,0}); return true;
+        tofree.push_back(f); D.push_back({off,nullptr,f,(size_t)n*4,-1,nullptr,0,key}); return true;
     };
     // A_log / linear_attn.norm → d_weights, optional neg_exp (ssm_a = -exp(A_log)). DTYPE-AWARE:
     // these ship as F32 (Qwen3.5-35B-A3B-FP8) OR BF16 (the Qwen3.6 repack). Read by the recorded
@@ -864,8 +1007,8 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         if(t->dtype==st::Dtype::BF16) return put_f32_from_bf16(off,key,0.0f,neg_exp);
         int64_t n=(int64_t)(t->nbytes/4);
         if(neg_exp){ float*f=(float*)malloc((size_t)n*4); const float*src=(const float*)t->data;
-            for(int64_t i=0;i<n;i++) f[i]=-expf(src[i]); tofree.push_back(f); D.push_back({off,nullptr,f,(size_t)n*4,-1,nullptr,0}); }
-        else D.push_back({off,nullptr,t->data,(size_t)n*4,-1,nullptr,0});
+            for(int64_t i=0;i<n;i++) f[i]=-expf(src[i]); tofree.push_back(f); D.push_back({off,nullptr,f,(size_t)n*4,-1,nullptr,0,key}); }
+        else D.push_back({off,nullptr,t->data,(size_t)n*4,-1,nullptr,0,key});
         return true;
     };
     // FP8 proj → Q4_K in d_weights (FUCINA_MOE_Q4K mixer requant: 8 → 4.5 bpw; served by the
@@ -889,7 +1032,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         free(requant); free(synth);
         if(!q4) return false;
         tofree.push_back(q4);
-        D.push_back({off,fmtp,q4,(size_t)((size_t)out_dim*in_dim/256)*144,FORMAT_Q4_K,nullptr,0});
+        D.push_back({off,fmtp,q4,(size_t)((size_t)out_dim*in_dim/256)*144,FORMAT_Q4_K,nullptr,0,key});
         return true;
     };
     // Raw-bytes descriptor (no format tag, no scale-table entry): builds the CONTIGUOUS per-layer
@@ -899,7 +1042,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     auto put_raw=[&](uint64_t*off,const std::string&key,size_t bytes)->bool{
         const st::Tensor*t=find(key);
         if(!t||(size_t)t->nbytes!=bytes){ fprintf(stderr,"qwen35_fp8_engine: missing/size %s\n",key.c_str()); return false; }
-        D.push_back({off,nullptr,t->data,bytes,-1,nullptr,0}); return true;
+        D.push_back({off,nullptr,t->data,bytes,-1,nullptr,0,key}); return true;
     };
     const bool moe = qwen35_fp8_is_moe(M, LO);
     const int E = eng->cfg.n_experts, MI = eng->cfg.expert_ffn, SI = eng->moe_shared_inter;
@@ -1046,6 +1189,18 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     fp4_mode=false;
                 }
             }
+            if(eng->moe_experts_fp4 && eng->d_fp4m_gu[l]){
+                if(l==0) ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_gsw,eng->d_fp4m_gsw,
+                                                       (size_t)L*2*sizeof(float),"expert_global_scales");
+                ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_gu[l],eng->d_fp4m_gu[l],
+                                              (size_t)E*2*MI*(H/2),"expert_gate_up_nvfp4");
+                ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_gusf[l],eng->d_fp4m_gusf[l],
+                                              (size_t)E*eng->fp4m_gu_sfB,"expert_gate_up_scales");
+                ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_dn[l],eng->d_fp4m_dn[l],
+                                              (size_t)E*H*(MI/2),"expert_down_nvfp4");
+                ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_dnsf[l],eng->d_fp4m_dnsf[l],
+                                              (size_t)E*eng->fp4m_dn_sfB,"expert_down_scales");
+            }
             if(!LO.mixed_nvfp4() && !fp4_mode && q4k_mode){
                 for(int p=0; p<3 && ok; p++){
                     int od = (p==2)? H : MI, idm = (p==2)? MI : H;
@@ -1063,7 +1218,9 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     unsigned char *slab=q35_fp8_experts_to_q4k(wpv.data(), spv.data(), E, od, idm);
                     if(!slab){ ok=false; break; }
                     tofree.push_back(slab);
-                    D.push_back({EX[p].woff,nullptr,slab,(size_t)E*((size_t)od*idm/256)*144,-1,nullptr,0});
+                    std::string slab_name=std::string("mlp.experts.")+EX[p].proj+".q4k_slab";
+                    D.push_back({EX[p].woff,nullptr,slab,(size_t)E*((size_t)od*idm/256)*144,-1,nullptr,0,
+                                 lk(l,slab_name.c_str())});
                 }
                 if(ok){
                     eng->moe_experts_q4k = 1;
@@ -1122,27 +1279,137 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // weights are still host-side. This checkpoint separates expert setup from the bulk upload.
     cudaMemGetInfo(&fill_free_after_experts, &fill_total);
 
-    // Lay out d_weights: 32-byte-aligned running offset; then one H2D copy per descriptor.
-    size_t total=0; for(auto&d:D){ total=(total+31)&~size_t(31); total+=d.bytes; }
-    total=(total+31)&~size_t(31);
-    if(cudaMalloc(&eng->d_weights,total)!=cudaSuccess){ for(void*p:tofree) free(p); return -3; }
+    // The immutable plan is now authoritative for core/scales layout. Descriptors are uploaded at
+    // their planned offsets; an accounting mismatch fails before the core cudaMalloc.
+    ModelPlan model_plan; std::vector<uint32_t> plan_ids; plan_ids.reserve(D.size());
+    std::string plan_error;
+    for(const auto &d:D){
+        PlannedTensor p; p.source.logical_name=d.logical_name; p.source.source_name=d.logical_name;
+        p.source.dtype=d.fmt==FORMAT_FP8_BLOCK?"F8_E4M3":(d.fmt==FORMAT_Q4_K?"F8_E4M3":"host");
+        p.source.bytes=d.bytes;
+        p.transform=d.fmt==FORMAT_Q4_K?TensorTransform::FP8_TO_Q4K:TensorTransform::COPY;
+        p.destination=d.fmt==FORMAT_FP8_BLOCK?WeightEncoding::FP8_BLOCK_128:
+                      (d.fmt==FORMAT_Q4_K?WeightEncoding::Q4_K:WeightEncoding::F32);
+        p.arena=AllocationClass::CORE_WEIGHTS; p.consumer="qwen_projection_or_metadata";
+        p.bytes=d.bytes; p.alignment=32;
+        plan_ids.push_back((uint32_t)model_plan.tensors().size());
+        if(!model_plan.add(std::move(p),plan_error)){ fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); for(void*x:tofree)free(x); return -2; }
+        if(d.scale_host){
+            PlannedTensor s; s.source.logical_name=d.logical_name+".runtime_scale";
+            s.source.source_name=s.source.logical_name; s.source.dtype="BF16"; s.source.bytes=d.scale_bytes;
+            s.transform=TensorTransform::COPY; s.destination=WeightEncoding::BF16;
+            s.arena=AllocationClass::SCALES; s.consumer="fp8_block_dispatch";
+            s.bytes=d.scale_bytes; s.alignment=1;
+            if(!model_plan.add(std::move(s),plan_error)){ fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); for(void*x:tofree)free(x); return -2; }
+        }
+    }
+    if(moe&&eng->moe_experts_fp4){
+        for(int l=0;l<L;l++){
+            const std::string sample=lk(l,"mlp.experts.0.gate_proj.weight");
+            q35_source_kind sk; if(!q35_validate_weight_source(M,LO,sample,MI,H,&sk,plan_error)) return -2;
+            const TensorTransform tr=sk==q35_source_kind::NVFP4?TensorTransform::NVFP4_REBASE:TensorTransform::FP8_TO_NVFP4;
+            const char *dtype=sk==q35_source_kind::NVFP4?"NVFP4":"F8_E4M3";
+            auto add_expert=[&](const char *suffix,size_t bytes,WeightEncoding dst,AllocationClass arena){
+                PlannedTensor p; p.source.logical_name=lk(l,suffix); p.source.source_name=sample;
+                p.source.dtype=dtype; p.source.bytes=bytes; p.transform=tr; p.destination=dst;
+                p.arena=arena; p.consumer="grouped_expert_decode"; p.bytes=bytes; p.alignment=1;
+                return model_plan.add(std::move(p),plan_error);
+            };
+            if((eng->d_fp4m_gu[l]&&!add_expert("mlp.experts.gate_up.nvfp4",(size_t)E*MI*H,WeightEncoding::NVFP4_LINEAR,AllocationClass::EXPERT_SLABS)) ||
+               (eng->d_fp4m_gusf[l]&&!add_expert("mlp.experts.gate_up.scale",(size_t)E*eng->fp4m_gu_sfB,WeightEncoding::FP8_ROW,AllocationClass::EXPERT_SLABS)) ||
+               (eng->d_fp4m_dn[l]&&!add_expert("mlp.experts.down.nvfp4",(size_t)E*H*(MI/2),WeightEncoding::NVFP4_LINEAR,AllocationClass::EXPERT_SLABS)) ||
+               (eng->d_fp4m_dnsf[l]&&!add_expert("mlp.experts.down.scale",(size_t)E*eng->fp4m_dn_sfB,WeightEncoding::FP8_ROW,AllocationClass::EXPERT_SLABS))){
+                fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); return -2;
+            }
+        }
+        PlannedTensor gs; gs.source.logical_name="mlp.experts.global_scales";
+        gs.source.source_name=gs.source.logical_name; gs.source.dtype="F32"; gs.source.bytes=(size_t)L*2*sizeof(float);
+        gs.transform=TensorTransform::COPY; gs.destination=WeightEncoding::F32;
+        gs.arena=AllocationClass::EXPERT_SLABS; gs.consumer="grouped_expert_decode";
+        gs.bytes=gs.source.bytes; gs.alignment=1;
+        if(!model_plan.add(std::move(gs),plan_error)){ fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); return -2; }
+    }
+    const size_t embed_elems=(size_t)VOC*H;
+    auto add_repr=[&](const char *logical,const std::string &source,const char *dtype,
+                      TensorTransform tr,WeightEncoding dst,AllocationClass arena,
+                      const char *consumer,size_t bytes){
+        PlannedTensor p; p.source.logical_name=logical; p.source.source_name=source;
+        p.source.dtype=dtype; p.source.bytes=bytes; p.transform=tr; p.destination=dst;
+        p.arena=arena; p.consumer=consumer; p.bytes=bytes; p.alignment=1;
+        return model_plan.add(std::move(p),plan_error);
+    };
+    if(!add_repr("token_embedding.q8",LO.embed_key,"BF16",TensorTransform::BF16_TO_Q8_0,
+                 WeightEncoding::Q8_0,AllocationClass::EMBEDDING_HEAD,"compat_embedding",(embed_elems/32)*34) ||
+       !add_repr("token_embedding.bf16",LO.embed_key,"BF16",TensorTransform::COPY,
+                 WeightEncoding::BF16,AllocationClass::EMBEDDING_HEAD,"decode_embedding",embed_elems*2) ||
+       !add_repr("token_embedding.f32",LO.embed_key,"BF16",TensorTransform::BF16_TO_F32,
+                 WeightEncoding::F32,AllocationClass::EMBEDDING_HEAD,"oracle_embedding",embed_elems*4) ||
+       !add_repr("lm_head.bf16",LO.lmhead_key,LO.mixed_nvfp4()?"quantized":"BF16",
+                 LO.mixed_nvfp4()?TensorTransform::QUANT_TO_BF16:TensorTransform::COPY,
+                 WeightEncoding::BF16,AllocationClass::EMBEDDING_HEAD,"exact_head_rescore",embed_elems*2) ||
+       !add_repr("lm_head.q8",LO.lmhead_key,"BF16",TensorTransform::BF16_TO_Q8_0,
+                 WeightEncoding::Q8_0,AllocationClass::EMBEDDING_HEAD,"approximate_head_search",(embed_elems/32)*34) ||
+       !add_repr("lm_head.candidates","runtime","I32",TensorTransform::COPY,
+                 WeightEncoding::F32,AllocationClass::EMBEDDING_HEAD,"exact_head_rescore",
+                 (size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int)) ||
+       !add_repr("lm_head.candidate_counts","runtime","I32",TensorTransform::COPY,
+                 WeightEncoding::F32,AllocationClass::EMBEDDING_HEAD,"exact_head_rescore",
+                 (size_t)GEMMA4_MAX_SEQS*sizeof(int)) ||
+       !add_repr("logits","runtime","F32",TensorTransform::COPY,
+                 WeightEncoding::F32,AllocationClass::WORKSPACE,"sampling",(size_t)VOC*sizeof(float))){
+        fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); for(void*x:tofree)free(x); return -2;
+    }
+    if(!model_plan.finalize(plan_error)){ fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); for(void*x:tofree)free(x); return -2; }
+    const size_t total=model_plan.bytes(AllocationClass::CORE_WEIGHTS);
+    if(moe&&eng->moe_experts_fp4){
+        for(int l=0;l<L;l++){
+            auto bind_expert=[&](ExpertWeightRef &ref,void *data,void *scale,float *global,
+                                 int out_dim,int in_dim,uint64_t expert_stride,uint64_t scale_stride){
+                ref.weight.data=(const uint8_t*)data; ref.weight.scale=scale; ref.weight.global_scale=global;
+                ref.expert_count=E; ref.weight.out_dim=out_dim; ref.weight.in_dim=in_dim;
+                ref.weight_stride=(int64_t)expert_stride; ref.scale_stride=(int64_t)scale_stride;
+                ref.weight.encoding=WeightEncoding::NVFP4_SWIZZLED;
+                ref.weight.layout=TensorLayout::NVFP4_SCALE_SWIZZLED;
+                ref.weight.flags=WEIGHT_FLAG_PRIMARY|WEIGHT_FLAG_PACKED|WEIGHT_FLAG_GROUPED;
+            };
+            bind_expert(eng->ref_fp4m_gu[l],eng->d_fp4m_gu[l],eng->d_fp4m_gusf[l],
+                        eng->d_fp4m_gsw+2*l,2*MI,H,(uint64_t)2*MI*(H/2),eng->fp4m_gu_sfB);
+            bind_expert(eng->ref_fp4m_dn[l],eng->d_fp4m_dn[l],eng->d_fp4m_dnsf[l],
+                        eng->d_fp4m_gsw+2*l+1,H,MI,(uint64_t)H*(MI/2),eng->fp4m_dn_sfB);
+        }
+    }
+    if(const char *path=getenv("FUCINA_TENSOR_PLAN_JSON")){
+        const std::string json=model_plan.json(); FILE *f=fopen(path,"wb");
+        if(f){ fwrite(json.data(),1,json.size(),f); fputc('\n',f); fclose(f); }
+    }
+    fprintf(stderr,"fucina: qwen35 tensor plan finalized: entries=%zu core=%.2f GiB scales=%.2f MiB\n",
+            model_plan.tensors().size(),total/(1024.0*1024*1024),
+            model_plan.bytes(AllocationClass::SCALES)/(1024.0*1024));
+    if(!load_allocation.allocate((void**)&eng->d_weights,total,"qwen_core_weights")){
+        for(void*p:tofree) free(p); return -3;
+    }
     eng->gguf_size=total;
     // scale table (built alongside), then sorted by weight ptr for wscale_fp8's binary search.
     eng->q35.fp8_scale_tab=(qwen35_runtime_state::fp8_scent*)malloc(D.size()*sizeof(qwen35_runtime_state::fp8_scent));
     eng->q35.fp8_scale_n=0;
-    size_t run=0;
-    for(auto&d:D){
-        run=(run+31)&~size_t(31);
-        *d.off = run;                                     // tdata_start=0 → offset is the byte pos
+    for(size_t i=0;i<D.size();i++){
+        auto &d=D[i]; const size_t run=model_plan.tensors()[plan_ids[i]].arena_offset;
+        *d.off = run;                                     // tdata_start=0 → planned byte position
         if(d.fmtp) *d.fmtp=(uint8_t)d.fmt;
-        cudaMemcpy(eng->d_weights+run, d.host, d.bytes, cudaMemcpyHostToDevice);
-        if(d.fmt==FORMAT_FP8_BLOCK && d.scale_host){
-            __nv_bfloat16 *ds=nullptr;
-            if(cudaMalloc(&ds,d.scale_bytes)!=cudaSuccess){ for(void*p:tofree) free(p); return -4; }
-            cudaMemcpy(ds,d.scale_host,d.scale_bytes,cudaMemcpyHostToDevice);
-            eng->q35.fp8_scale_tab[eng->q35.fp8_scale_n++]=(qwen35_runtime_state::fp8_scent){eng->d_weights+run,ds};
+        if(!load_allocation.upload(eng->d_weights+run,d.host,d.bytes)){
+            for(void*p:tofree) free(p); return -4;
         }
-        run+=d.bytes;
+        if(d.fmt==FORMAT_FP8_BLOCK && d.scale_host){
+            auto &entry=eng->q35.fp8_scale_tab[eng->q35.fp8_scale_n];
+            entry.w=eng->d_weights+run; entry.s=nullptr;
+            if(!load_allocation.allocate((void**)&entry.s,d.scale_bytes,"qwen_fp8_scale")){
+                for(void*p:tofree) free(p); return -4;
+            }
+            if(!load_allocation.upload((void*)entry.s,d.scale_host,d.scale_bytes)){
+                for(void*p:tofree) free(p); return -4;
+            }
+            eng->q35.fp8_scale_n++;
+        }
     }
     // insertion-sort the scale table by weight ptr (small: one entry per FP8 proj) for wscale_fp8's
     // binary search. std::sort would pull in <algorithm>; this avoids the include.
@@ -1177,18 +1444,80 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         }
     }
 
+    // Populate canonical mixer descriptors only after optional in-place Q4_K repacking, so layout
+    // is authoritative before any runtime path can observe it. Compatibility offsets/fmt bytes stay
+    // populated while the remaining projection families migrate.
+    auto bind_ref=[&](WeightRef &ref,uint64_t off,uint8_t fmt,int out_dim,int in_dim){
+        ref.data=eng->d_weights+off;
+        ref.scale=(fmt==FORMAT_FP8_BLOCK)?(const void*)wscale_fp8(eng,ref.data):nullptr;
+        ref.global_scale=nullptr;
+        ref.out_dim=out_dim; ref.in_dim=in_dim;
+        ref.encoding=(fmt==FORMAT_FP8_BLOCK)?WeightEncoding::FP8_BLOCK_128:
+                     (fmt==FORMAT_Q4_K)?WeightEncoding::Q4_K:
+                     (fmt==FORMAT_Q8_0)?WeightEncoding::Q8_0:
+                     (fmt==FORMAT_Q4_0)?WeightEncoding::Q4_0:WeightEncoding::Q6_K;
+        ref.layout=(fmt==FORMAT_Q4_K && eng->q4k_packed)?TensorLayout::Q4K_PACKED:
+                   (fmt==FORMAT_FP8_BLOCK)?TensorLayout::ROW_MAJOR:TensorLayout::GGML_NATIVE;
+        ref.flags=WEIGHT_FLAG_PRIMARY |
+                  ((ref.layout==TensorLayout::Q4K_PACKED)?WEIGHT_FLAG_PACKED:0);
+    };
+    for(int l=0;l<L;l++){
+        auto &T=TS.layers[l];
+        if(qwen35fp8::is_full(LO,l)){
+            bind_ref(T.ref_q,T.attn_q,T.fmt_q,2*NQ*HD,H);
+            bind_ref(T.ref_k,T.attn_k,T.fmt_k,NKV*HD,H);
+            bind_ref(T.ref_v,T.attn_v,T.fmt_v,NKV*HD,H);
+            bind_ref(T.ref_o,T.attn_output,T.fmt_o,H,NQ*HD);
+        } else {
+            bind_ref(T.ssm.ref_in_qkv,T.ssm.in_qkv,T.ssm.fmt_in_qkv,CONVD,H);
+            bind_ref(T.ssm.ref_in_z,T.ssm.in_z,T.ssm.fmt_in_z,INNER,H);
+            bind_ref(T.ssm.ref_out,T.ssm.out,T.ssm.fmt_out,H,INNER);
+        }
+        if(!moe){
+            bind_ref(T.ref_gate,T.ffn_gate,T.fmt_gate,I,H);
+            bind_ref(T.ref_up,T.ffn_up,T.fmt_up,I,H);
+            bind_ref(T.ref_down,T.ffn_down,T.fmt_down,H,I);
+        } else if(!eng->moe_experts_fp4){
+            auto bind_expert=[&](ExpertWeightRef &ref,uint64_t off,uint64_t scale_off,
+                                 int out_dim,int in_dim,int64_t weight_stride,int64_t scale_stride){
+                ref.weight.data=eng->d_weights+off;
+                ref.weight.scale=scale_off?(const void*)(eng->d_weights+scale_off):nullptr;
+                ref.weight.global_scale=nullptr;
+                ref.weight.out_dim=out_dim; ref.weight.in_dim=in_dim;
+                ref.weight.encoding=eng->moe_experts_q4k?WeightEncoding::Q4_K:WeightEncoding::FP8_BLOCK_128;
+                ref.weight.layout=eng->moe_experts_q4k?TensorLayout::GGML_NATIVE:TensorLayout::ROW_MAJOR;
+                ref.weight.flags=WEIGHT_FLAG_PRIMARY|WEIGHT_FLAG_GROUPED;
+                ref.expert_count=E; ref.weight_stride=weight_stride; ref.scale_stride=scale_stride;
+            };
+            const int64_t wstride=(int64_t)MI*H;
+            const int64_t sstride=(int64_t)((MI+127)/128)*(H/128)*sizeof(__nv_bfloat16);
+            bind_expert(eng->ref_moe_gate[l],eng->moe_gate_exps[l],eng->moe_gate_scales[l],MI,H,
+                        eng->moe_experts_q4k?eng->moe_gate_slab:wstride,sstride);
+            bind_expert(eng->ref_moe_up[l],eng->moe_up_exps[l],eng->moe_up_scales[l],MI,H,
+                        eng->moe_experts_q4k?eng->moe_up_slab:wstride,sstride);
+            bind_expert(eng->ref_moe_down[l],eng->moe_down_exps[l],eng->moe_down_scales[l],H,MI,
+                        eng->moe_experts_q4k?eng->moe_down_slab_q4k:wstride,sstride);
+        }
+    }
+
+    auto tx_upload=[&](void **slot,const void *host,size_t bytes,const char *label){
+        return load_allocation.allocate(slot,bytes,label) &&
+               load_allocation.upload(*slot,host,bytes);
+    };
+
     // token_embd → Q8_0 (separate d_token_embd; embed_w reads it).
     const st::Tensor *embT=M.find(LO.embed_key);
     if(!embT){ return -5; }
     { int64_t n=(int64_t)VOC*H; unsigned char*q8=q35_bf16_to_q8_0_host((const uint16_t*)embT->data,n);
-      if(!q8) return -5; eng->d_token_embd=(unsigned char*)q35fp8_up_bytes(q8,(size_t)(n/32)*34); free(q8);
-      if(!eng->d_token_embd) return -5; }
+      if(!q8) return -5;
+      bool uploaded=tx_upload((void**)&eng->d_token_embd,q8,(size_t)(n/32)*34,"token_embedding_q8");
+      free(q8); if(!uploaded) return -5; }
     // token_embd ALSO uploaded BF16 (d_embed_bf16); embed_w prefers it for FP8 (per-step input
     // precision matters for the recurrent GDN state). d_token_embd (Q8_0) stays for the != NULL gate.
-    eng->d_embed_bf16=(__nv_bfloat16*)q35fp8_up_bytes(embT->data, embT->nbytes);
-    if(!eng->d_embed_bf16) return -5;
-    eng->d_embed_f32 = q35fp8_up_bf16_f32(embT, 0.0f);   // exact per-step input (oracle uses f32)
-    if(!eng->d_embed_f32) return -5;
+    if(!tx_upload((void**)&eng->d_embed_bf16,embT->data,embT->nbytes,"token_embedding_bf16")) return -5;
+    if(!load_allocation.allocate((void**)&eng->d_embed_f32,embed_elems*sizeof(float),"token_embedding_f32")) return -5;
+    q35fp8_bf16_to_f32_kernel<<<(unsigned)((embed_elems+255)/256),256>>>(
+        eng->d_embed_f32,eng->d_embed_bf16,embed_elems,0.0f);
     // lm_head → BF16 (untied): the logits GEMV rides bf16_head_gemv_launch for the FP8 path (the
     // 248320-vocab argmax is Q8_0-sensitive). Uploaded verbatim from the checkpoint's BF16 head.
     { const st::Tensor *lmT=M.find(LO.lmhead_key);
@@ -1209,21 +1538,22 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
           if(!lm_deq){ fprintf(stderr,"qwen35_fp8_engine: quantized lm_head missing scales\n"); return -5; }
           lm_src=lm_deq;
       }
-      eng->d_lmhead_bf16=(__nv_bfloat16*)q35fp8_up_bytes(lm_src,(size_t)VOC*H*2);
-      if(!eng->d_lmhead_bf16){ free(lm_deq); return -5; }
+      if(!tx_upload((void**)&eng->d_lmhead_bf16,lm_src,(size_t)VOC*H*2,"lm_head_bf16")){
+          free(lm_deq); return -5;
+      }
       // Q8_0 copy for the exact two-pass greedy head (approx scan; BF16 stays for the rescore).
       { int64_t n=(int64_t)VOC*H; unsigned char*q8=q35_bf16_to_q8_0_host(lm_src,n);
-        if(q8){ eng->d_lmhead_q8=(unsigned char*)q35fp8_up_bytes(q8,(size_t)(n/32)*34); free(q8); }
-        if(eng->d_lmhead_q8){
-            if(cudaMalloc(&eng->d_head_cand,(size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int))!=cudaSuccess ||
-               cudaMalloc(&eng->d_head_cnt,(size_t)GEMMA4_MAX_SEQS*sizeof(int))!=cudaSuccess){
-                cudaGetLastError();
-                if(eng->d_head_cand){cudaFree(eng->d_head_cand);eng->d_head_cand=NULL;}
-                cudaFree((void*)eng->d_lmhead_q8); eng->d_lmhead_q8=NULL;
-            }
+        if(!q8){ free(lm_deq); return -5; }
+        bool uploaded=tx_upload((void**)&eng->d_lmhead_q8,q8,(size_t)(n/32)*34,"lm_head_q8");
+        free(q8); if(!uploaded){ free(lm_deq); return -5; }
+        if(!load_allocation.allocate((void**)&eng->d_head_cand,
+                                     (size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int),"lm_head_candidates") ||
+           !load_allocation.allocate((void**)&eng->d_head_cnt,
+                                     (size_t)GEMMA4_MAX_SEQS*sizeof(int),"lm_head_candidate_counts")){
+            free(lm_deq); return -5;
         } }
       free(lm_deq); }
-    if(cudaMalloc(&eng->d_logits,(size_t)VOC*sizeof(float))!=cudaSuccess) return -6;
+    if(!load_allocation.allocate((void**)&eng->d_logits,(size_t)VOC*sizeof(float),"logits")) return -6;
     cudaMemGetInfo(&fill_free_before_scratch, &fill_total);
     if(moe && moe_alloc_scratch(eng)!=0) return -6;
     cudaMemGetInfo(&fill_free_after_scratch, &fill_total);
@@ -1233,21 +1563,12 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // Exact allocation ledger for the FP8/NVFP4 model-load path. Unlike the historical
     // free-at-start minus free-now estimate, these bytes cannot be perturbed by another process
     // allocating or releasing unified memory while the CPU-heavy expert requantization runs.
-    size_t scale_bytes=0;
-    for(const auto &d:D) if(d.fmt==FORMAT_FP8_BLOCK && d.scale_host) scale_bytes += d.scale_bytes;
-    size_t expert_bytes = eng->d_fp4m_gsw ? (size_t)L*2*sizeof(float) : 0;
-    if(moe && eng->moe_experts_fp4) for(int l=0;l<L;l++) {
-        if(eng->d_fp4m_gu[l])   expert_bytes += (size_t)E*2*MI*(H/2);
-        if(eng->d_fp4m_gusf[l]) expert_bytes += (size_t)E*eng->fp4m_gu_sfB;
-        if(eng->d_fp4m_dn[l])   expert_bytes += (size_t)E*H*(MI/2);
-        if(eng->d_fp4m_dnsf[l]) expert_bytes += (size_t)E*eng->fp4m_dn_sfB;
-    }
-    const size_t embed_elems=(size_t)VOC*H;
-    size_t embed_bytes=(embed_elems/32)*34 + embed_elems*2 + embed_elems*4;
-    size_t head_bytes=embed_elems*2 + (eng->d_lmhead_q8 ? (embed_elems/32)*34 : 0);
-    if(eng->d_head_cand) head_bytes += (size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int);
-    if(eng->d_head_cnt)  head_bytes += (size_t)GEMMA4_MAX_SEQS*sizeof(int);
-    const size_t misc_bytes=(size_t)VOC*sizeof(float);
+    const size_t scale_bytes=model_plan.bytes(AllocationClass::SCALES);
+    const size_t expert_bytes=model_plan.bytes(AllocationClass::EXPERT_SLABS);
+    const size_t embed_bytes=(embed_elems/32)*34 + embed_elems*2 + embed_elems*4;
+    const size_t representation_bytes=model_plan.bytes(AllocationClass::EMBEDDING_HEAD);
+    const size_t head_bytes=representation_bytes-embed_bytes;
+    const size_t misc_bytes=model_plan.bytes(AllocationClass::WORKSPACE);
     const size_t ledger_bytes=expert_bytes + total + scale_bytes + embed_bytes + head_bytes +
                               eng->moe_scratch_bytes + misc_bytes;
     eng->q35.model_bytes=ledger_bytes;
@@ -1289,6 +1610,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     fprintf(stderr,"fucina: qwen35 %s%s served via batched engine (%d layers, vocab %d, H %d, NKV %d%s, %.2f GiB)\n",
             mixer_desc, moe?"-MoE":"-dense", L, VOC, H, NKV,
             moe?", E-experts slabbed":"", total/GiB);
+    if(!load_allocation.commit(*eng->device_allocations)) return -8;
     return 0;
 }
 
