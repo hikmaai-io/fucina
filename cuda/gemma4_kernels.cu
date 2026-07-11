@@ -4152,6 +4152,9 @@ struct gemma4_engine {
     // gemma4_engine_moe_profile_start; NULL keeps normal serving unchanged.
     unsigned long long *d_moe_profile_count;   // [layer,expert] selected-route count
     double             *d_moe_profile_weight;  // [layer,expert] selected-weight sum
+    double             *d_moe_profile_act_ss;  // [layer,5] activation sum-of-squares
+    unsigned long long *d_moe_profile_act_n;   // [layer,5] activation element count
+    unsigned int       *d_moe_profile_act_max; // [layer,5] max-abs float bits
 
     // NVFP4 grouped-CUTLASS experts (qwen3_5_moe DEFAULT): fused gate|up (N=2·EFFN) + down slabs
     // per layer, E2M1 packed + per-expert swizzled ue4m3 SF, consumed by dg_fp4_moe_grouped.
@@ -6642,6 +6645,8 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_moe_act);     CUDA_FREE(eng->d_moe_oe);    CUDA_FREE(eng->d_moe_shlog);
     CUDA_FREE(eng->d_moe_active);
     CUDA_FREE(eng->d_moe_profile_count); CUDA_FREE(eng->d_moe_profile_weight);
+    CUDA_FREE(eng->d_moe_profile_act_ss); CUDA_FREE(eng->d_moe_profile_act_n);
+    CUDA_FREE(eng->d_moe_profile_act_max);
     for (int i = 0; i < 3; i++) CUDA_FREE(eng->d_moe_wbf[i]);
     for (int i = 0; i < GEMMA4_CAP_LAYERS; i++) {
         CUDA_FREE(eng->d_fp4m_gu[i]); CUDA_FREE(eng->d_fp4m_gusf[i]);
@@ -9033,6 +9038,43 @@ int g_fucina_q35_scalar_cont_attn = 0;
 // thread t accumulates k = t + i·blockDim ascending (hoisting reorders loads, not adds; the
 // per-chunk k sequence i, i+256, …, i+7·256, i+2048, … is the same ascending sequence), then the
 // identical 256-wide tree reduction → bit-identical logits.
+enum { MOE_PROFILE_ACT_STAGES = 5 };
+
+// Calibration-only activation magnitude reduction. A bounded grid walks the complete
+// tensor, then contributes one sum/max per block; normal serving never launches it.
+__global__ void moe_profile_activation_kernel(const float *x, size_t n,
+                                               double *sum_squares,
+                                               unsigned long long *elements,
+                                               unsigned int *max_bits) {
+    __shared__ double ss[256];
+    __shared__ float mm[256];
+    double sum = 0.0; float mx = 0.0f;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += (size_t)gridDim.x * blockDim.x) {
+        float v = x[i], a = fabsf(v); sum += (double)v * v; mx = fmaxf(mx, a);
+    }
+    ss[threadIdx.x] = sum; mm[threadIdx.x] = mx; __syncthreads();
+    for (int d = 128; d; d >>= 1) {
+        if (threadIdx.x < d) { ss[threadIdx.x] += ss[threadIdx.x+d]; mm[threadIdx.x] = fmaxf(mm[threadIdx.x], mm[threadIdx.x+d]); }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(sum_squares, ss[0]);
+        atomicMax(max_bits, __float_as_uint(mm[0]));
+        if (blockIdx.x == 0) atomicAdd(elements, (unsigned long long)n);
+    }
+}
+
+static void moe_profile_activation(gemma4_engine_t *eng, int layer, int stage,
+                                   const float *x, size_t n, cudaStream_t stream) {
+    if (!eng->d_moe_profile_act_ss || !x || n == 0 || stage < 0 || stage >= MOE_PROFILE_ACT_STAGES) return;
+    int blocks = (int)((n + 255) / 256); if (blocks > 32) blocks = 32;
+    size_t i = (size_t)layer * MOE_PROFILE_ACT_STAGES + stage;
+    moe_profile_activation_kernel<<<blocks,256,0,stream>>>(x, n,
+        eng->d_moe_profile_act_ss + i, eng->d_moe_profile_act_n + i,
+        eng->d_moe_profile_act_max + i);
+}
+
 // Calibration-only top-k telemetry; never launched unless profiling was started.
 __global__ void moe_profile_accum_kernel(const int *idx, const float *weight,
                                          unsigned long long *counts, double *weight_sums,
@@ -9416,6 +9458,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                 E, GU, H, sfA1, eng->fp4m_gu_sfB, eng->d_fp4m_gsw + 2 * l, stream);
             q35fp4_gu_silu_mul_kernel<<<g1((size_t)total * EFFN), 256, 0, stream>>>(
                 eng->d_moe_act, eng->d_fp4m_gu_out, eng->d_fp4m_gsrow, EFFN, (int64_t)total * EFFN);
+            moe_profile_activation(eng, l, 3, eng->d_moe_act, (size_t)total*EFFN, stream);
             q35fp4_row_gs_kernel<<<total, 256, 0, stream>>>(eng->d_moe_act, EFFN, total, eng->d_fp4m_gsrow);
             { dim3 b(256), g((nbF + 255) / 256, total);
               q35fp4_quant_grp_kernel<<<g, b, 0, stream>>>(eng->d_moe_act, eng->d_fp4m_t2e,
@@ -9445,6 +9488,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             gemm_bf16_grouped(eng, eng->d_moe_wbf[1], (size_t)EFFN * H, eng->d_moe_xbf,
                               eng->d_moe_up, hc, ho, E, H, EFFN, stream);
             dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
+            moe_profile_activation(eng, l, 3, eng->d_moe_act, (size_t)total*EFFN, stream);
             f32_to_bf16_kernel<<<(unsigned)(((size_t)total * EFFN + 255) / 256), 256, 0, stream>>>(
                 eng->d_moe_xbf, eng->d_moe_act, (uint64_t)total * EFFN);
             // down: one grouped-batched GEMM over the active experts (in=EFFN, out=H).
@@ -9463,6 +9507,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                                           gs, us, fp8_sslab,
                                           eng->d_moe_xe, eng->d_moe_coloff, eng->d_moe_count,
                                           eng->d_moe_active, n_slot, E, H, EFFN, stream);
+            moe_profile_activation(eng, l, 3, eng->d_moe_act, (size_t)total*EFFN, stream);
             fp8_block_gemm_grouped_launch(eng->d_moe_oe, down_w, fp8_wslab, ds, fp8_sslab,
                                           eng->d_moe_act, eng->d_moe_coloff, eng->d_moe_count,
                                           eng->d_moe_active, n_slot, E, EFFN, H, stream);
@@ -9490,6 +9535,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             }
             // SiLU-GLU → quantize → grouped down (Q4_K native or Q8_0 requant).
             dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)EFFN * total, stream);
+            moe_profile_activation(eng, l, 3, eng->d_moe_act, (size_t)total*EFFN, stream);
             dg_quantize_q8_1(eng->d_moe_act, eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s, EFFN, total, stream);
             if (eng->moe_down_q8[l]) {
                 dg_mmq_q8_0_grouped(eng->d_moe_oe, eng->moe_down_q8[l], eng->moe_down_slab_q8,
@@ -9549,6 +9595,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                     gemm_bf16(eng, shbf,       eng->d_moe_xbf, eng->d_moe_gate, H, SI, cn);
                     gemm_bf16(eng, shbf + per, eng->d_moe_xbf, eng->d_moe_up,   H, SI, cn);
                     dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)SI * cn, stream);
+                    moe_profile_activation(eng, l, 4, eng->d_moe_act, (size_t)cn*SI, stream);
                     f32_to_bf16_kernel<<<(unsigned)(((size_t)cn * SI + 255)/256),256,0,stream>>>(
                         eng->d_moe_xbf, eng->d_moe_act, (uint64_t)cn * SI);
                     gemm_bf16(eng, shbf + 2*per, eng->d_moe_xbf, eng->d_moe_xe, SI, H, cn);
@@ -9565,6 +9612,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                                                h + (size_t)b0 * H, H, SI, bb, stream);
                 }
                 dg_silu_mul(eng->d_moe_act, eng->d_moe_gate, eng->d_moe_up, (int64_t)SI * cn, stream);
+                moe_profile_activation(eng, l, 4, eng->d_moe_act, (size_t)cn*SI, stream);
                 for (int b0 = 0; b0 < cn; b0 += FP8_MAXB) {
                     int bb = (cn - b0 < FP8_MAXB) ? (cn - b0) : FP8_MAXB;
                     fp8_block_gemm_launch(eng->d_moe_xe + (size_t)b0 * H, swd, wscale_fp8(eng, swd),
@@ -15240,8 +15288,16 @@ int gemma4_engine_moe_profile_start(gemma4_engine_t *eng) {
         cudaFree(eng->d_moe_profile_count); eng->d_moe_profile_count = NULL;
         return -1;
     }
+    const size_t na = (size_t)eng->cfg.n_layers * MOE_PROFILE_ACT_STAGES;
+    bool act_ok = (eng->d_moe_profile_act_ss || cudaMalloc(&eng->d_moe_profile_act_ss, na*sizeof(double)) == cudaSuccess)
+               && (eng->d_moe_profile_act_n || cudaMalloc(&eng->d_moe_profile_act_n, na*sizeof(unsigned long long)) == cudaSuccess)
+               && (eng->d_moe_profile_act_max || cudaMalloc(&eng->d_moe_profile_act_max, na*sizeof(unsigned int)) == cudaSuccess);
+    if (!act_ok) return -1;
     cudaMemsetAsync(eng->d_moe_profile_count, 0, n * sizeof(unsigned long long), eng->stream);
     cudaMemsetAsync(eng->d_moe_profile_weight, 0, n * sizeof(double), eng->stream);
+    cudaMemsetAsync(eng->d_moe_profile_act_ss, 0, na * sizeof(double), eng->stream);
+    cudaMemsetAsync(eng->d_moe_profile_act_n, 0, na * sizeof(unsigned long long), eng->stream);
+    cudaMemsetAsync(eng->d_moe_profile_act_max, 0, na * sizeof(unsigned int), eng->stream);
     return cudaStreamSynchronize(eng->stream) == cudaSuccess ? 0 : -1;
 }
 
@@ -15255,6 +15311,20 @@ int gemma4_engine_moe_profile_snapshot(gemma4_engine_t *eng,
                    cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
     if (cudaMemcpy(weight_sums, eng->d_moe_profile_weight, n * sizeof(double),
                    cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+    return 0;
+}
+
+int gemma4_engine_moe_profile_activation_snapshot(gemma4_engine_t *eng,
+                                       double *sum_squares, uint64_t *elements,
+                                       float *max_abs, size_t capacity) {
+    if (!eng || !sum_squares || !elements || !max_abs || !eng->d_moe_profile_act_ss) return -1;
+    const size_t n = (size_t)eng->cfg.n_layers * MOE_PROFILE_ACT_STAGES;
+    if (capacity < n || cudaStreamSynchronize(eng->stream) != cudaSuccess) return -1;
+    std::vector<unsigned int> bits(n);
+    if (cudaMemcpy(sum_squares, eng->d_moe_profile_act_ss, n*sizeof(double), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(elements, eng->d_moe_profile_act_n, n*sizeof(uint64_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(bits.data(), eng->d_moe_profile_act_max, n*sizeof(unsigned int), cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+    for (size_t i=0;i<n;i++) memcpy(max_abs+i, bits.data()+i, sizeof(float));
     return 0;
 }
 

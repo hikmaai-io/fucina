@@ -94,11 +94,14 @@ type Config struct {
 
 // MoEProfile is a calibration snapshot in row-major [layer][expert] order.
 type MoEProfile struct {
-	Layers     int
-	Experts    int
-	TopK       int
-	Counts     []uint64
-	WeightSums []float64
+	Layers             int
+	Experts            int
+	TopK               int
+	Counts             []uint64
+	WeightSums         []float64
+	ActivationSumSq    []float64 // [layer,5]
+	ActivationElements []uint64  // [layer,5]
+	ActivationMaxAbs   []float32 // [layer,5]
 }
 
 // MemoryStats is named engine memory accounting. Qwen fields are zero for other architectures.
@@ -204,6 +207,18 @@ func (e *Engine) NExperts() int {
 	return int(C.gemma4_engine_n_experts(e.ptr))
 }
 
+// SetPrefixCache enables or disables engine-level prefix reuse. Calibration disables
+// it so every corpus token contributes exactly once even when documents share prefixes.
+func (e *Engine) SetPrefixCache(enable bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	v := C.int(0)
+	if enable {
+		v = 1
+	}
+	C.gemma4_engine_set_prefix_cache(e.ptr, v)
+}
+
 // StartMoEProfile resets and enables calibration-only router telemetry. It is
 // intentionally explicit: ordinary serving does not launch the counter kernel.
 func (e *Engine) StartMoEProfile() error {
@@ -230,6 +245,16 @@ func (e *Engine) MoEProfile() (MoEProfile, error) {
 		(*C.uint64_t)(unsafe.Pointer(&p.Counts[0])), (*C.double)(unsafe.Pointer(&p.WeightSums[0])),
 		C.size_t(n)) != 0 {
 		return MoEProfile{}, fmt.Errorf("fucina: failed to snapshot MoE profile")
+	}
+	na := int(layers) * 5
+	p.ActivationSumSq = make([]float64, na)
+	p.ActivationElements = make([]uint64, na)
+	p.ActivationMaxAbs = make([]float32, na)
+	if C.gemma4_engine_moe_profile_activation_snapshot(e.ptr,
+		(*C.double)(unsafe.Pointer(&p.ActivationSumSq[0])),
+		(*C.uint64_t)(unsafe.Pointer(&p.ActivationElements[0])),
+		(*C.float)(unsafe.Pointer(&p.ActivationMaxAbs[0])), C.size_t(na)) != 0 {
+		return MoEProfile{}, fmt.Errorf("fucina: failed to snapshot MoE activation profile")
 	}
 	return p, nil
 }

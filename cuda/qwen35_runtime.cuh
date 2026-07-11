@@ -342,6 +342,7 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
     for (int l = 0; l < L; l++) {
         const auto &T = eng->tensors.layers[l];
         rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(T.attn_norm), H, B, eps);
+        moe_profile_activation(eng, l, 0, xn, (size_t)B*H, st);
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
             gemv_batched_w(eng, qg, Wq(T.attn_q),      xn, H, 2*NQ*HD, B, st, T.fmt_q);
             gemv_batched_w(eng, kb, Wq(T.attn_k),      xn, H, NKV*HD,  B, st, T.fmt_k);
@@ -365,6 +366,7 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
                     attn, eng->q35.part_m, eng->q35.part_l, eng->q35.part_o, B, S, NQ);
             }
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(attn, gate, B*NQ*HD);
+            moe_profile_activation(eng, l, 1, attn, (size_t)B*NQ*HD, st);
             gemv_batched_w(eng, mix, Wq(T.attn_output), attn, NQ*HD, H, B, st, T.fmt_o);
         } else {
             // in_qkv requantized Q5_K→Q8_0 at load → native dp4a GEMV (P5), no per-step fp32 dequant.
@@ -385,10 +387,12 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             m2_decay_beta_kernel<<<grid1d((size_t)B*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(T.ssm.a_log), Wf(T.ssm.dt_bias), B, TSR);
             qwen35_b_gdn_kernel<<<dim3(NVH,B),256,smGDN,st>>>(core, qh, kh, vh, gg, bb, eng->q35.S[l], d_slot, B, eng->format==FORMAT_FP8_BLOCK, NVH);  // 256 thr: 2x lanes on the SD*SD state loops
             m2_gated_norm_kernel<<<dim3(NVH,B),128,0,st>>>(gnorm, core, zc, Wf(T.ssm.norm), B, NVH, INNER);
+            moe_profile_activation(eng, l, 1, gnorm, (size_t)B*INNER, st);
             gemv_batched_w(eng, mix, Wq(T.ssm.out), gnorm, INNER, H, B, st, T.ssm.fmt_out);
         }
         residual_add_kernel<<<grid1d((size_t)B*H),256,0,st>>>(x, mix, B*H);
         rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(T.ffn_norm), H, B, eps);
+        moe_profile_activation(eng, l, 2, xn, (size_t)B*H, st);
         if (c->n_experts > 0) {   // Qwen3.5-MoE sparse block (experts + shared) → mix
             moe_ffn(eng, l, xn, mix, B, st);
         } else {
@@ -1029,6 +1033,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
     for (int l = 0; l < L; l++) {
         const auto &Tn = eng->tensors.layers[l];
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.attn_norm), H, T, eps);
+        moe_profile_activation(eng, l, 0, xn, (size_t)T*H, st);
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
             q35_proj_gemm(eng, qg, Tn.attn_q, Tn.fmt_q, xn, H, 2*NQ*HD, T, st, l, WC_Q);
             q35_proj_gemm(eng, kb, Tn.attn_k, Tn.fmt_k, xn, H, NKV*HD,  T, st, l, WC_K);
@@ -1054,6 +1059,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 qwen35_b_attn_kernel<<<dim3(NQ,T),256,smATT,st>>>(
                     attn, qb, eng->q35.Kc[l], eng->q35.Vc[l], d_pos, d_slot, maxctx, T, NKV, NQ);
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
+            moe_profile_activation(eng, l, 1, attn, (size_t)T*NQ*HD, st);
             q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st, l, WC_O);
         } else {
             // Weight-heavy projections via tensor-core BF16 GEMM (prefill is compute-bound). The
@@ -1084,10 +1090,12 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 core, qh, kh, vh, gg, bb, eng->q35.S[l], eng->q35.chunk_scr, slot, T, NPAD,
                 eng->format==FORMAT_FP8_BLOCK, NVH);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T, NVH, VALD);
+            moe_profile_activation(eng, l, 1, gnorm, (size_t)T*INNER, st);
             q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, l, WC_OUT);
         }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.ffn_norm), H, T, eps);
+        moe_profile_activation(eng, l, 2, xn, (size_t)T*H, st);
         if (c->n_experts > 0) {   // Qwen3.5-MoE sparse block (experts + shared) → mix
             moe_ffn(eng, l, xn, mix, T, st);
         } else {

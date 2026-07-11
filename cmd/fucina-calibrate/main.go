@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,18 +35,26 @@ type layerStat struct {
 	Experts     []expertStat `json:"experts"`
 }
 
+type activationStat struct {
+	Elements   uint64  `json:"elements"`
+	RMS        float64 `json:"rms"`
+	MaxAbs     float64 `json:"max_abs"`
+	Importance float64 `json:"importance"`
+}
+
 type sidecar struct {
-	Format           string             `json:"format"`
-	CreatedUTC       string             `json:"created_utc"`
-	Model            string             `json:"model"`
-	Corpus           string             `json:"corpus"`
-	Documents        int                `json:"documents"`
-	Tokens           int                `json:"tokens"`
-	Layers           int                `json:"layers"`
-	ExpertCount      int                `json:"expert_count"`
-	TopK             int                `json:"top_k"`
-	HeatMap          []layerStat        `json:"expert_heat_map"`
-	TensorImportance map[string]float64 `json:"tensor_importance"`
+	Format           string                    `json:"format"`
+	CreatedUTC       string                    `json:"created_utc"`
+	Model            string                    `json:"model"`
+	Corpus           string                    `json:"corpus"`
+	Documents        int                       `json:"documents"`
+	Tokens           int                       `json:"tokens"`
+	Layers           int                       `json:"layers"`
+	ExpertCount      int                       `json:"expert_count"`
+	TopK             int                       `json:"top_k"`
+	HeatMap          []layerStat               `json:"expert_heat_map"`
+	ActivationStats  map[string]activationStat `json:"activation_stats"`
+	TensorImportance map[string]float64        `json:"tensor_importance"`
 }
 
 func corpusText(line []byte) string {
@@ -92,7 +101,45 @@ func buildSidecar(model, corpus string, docs, tokens int, p cuda.MoEProfile) sid
 	o := sidecar{Format: "fucina-imatrix-v1", CreatedUTC: time.Now().UTC().Format(time.RFC3339),
 		Model: model, Corpus: corpus, Documents: docs, Tokens: tokens, Layers: p.Layers,
 		ExpertCount: p.Experts, TopK: p.TopK, HeatMap: make([]layerStat, p.Layers),
+		ActivationStats:  make(map[string]activationStat, p.Layers*5),
 		TensorImportance: make(map[string]float64, p.Layers*p.Experts*3)}
+	stageNames := []string{"mixer_input", "mixer_output_input", "moe_input", "expert_down_input", "shared_down_input"}
+	maxRMS, maxAbs := 0.0, 0.0
+	for l := 0; l < p.Layers; l++ {
+		for s, name := range stageNames {
+			i := l*len(stageNames) + s
+			if i >= len(p.ActivationElements) {
+				continue
+			}
+			n := p.ActivationElements[i]
+			rms := 0.0
+			if n > 0 {
+				rms = math.Sqrt(p.ActivationSumSq[i] / float64(n))
+			}
+			a := activationStat{Elements: n, RMS: rms, MaxAbs: float64(p.ActivationMaxAbs[i])}
+			o.ActivationStats[fmt.Sprintf("layers.%d.%s", l, name)] = a
+			if rms > maxRMS {
+				maxRMS = rms
+			}
+			if a.MaxAbs > maxAbs {
+				maxAbs = a.MaxAbs
+			}
+		}
+	}
+	for k, a := range o.ActivationStats {
+		r, m := 0.0, 0.0
+		if maxRMS > 0 {
+			r = a.RMS / maxRMS
+		}
+		if maxAbs > 0 {
+			m = a.MaxAbs / maxAbs
+		}
+		a.Importance = 0.8*r + 0.2*m
+		o.ActivationStats[k] = a
+	}
+	act := func(l, s int) float64 {
+		return o.ActivationStats[fmt.Sprintf("layers.%d.%s", l, stageNames[s])].Importance
+	}
 	for l := 0; l < p.Layers; l++ {
 		base := l * p.Experts
 		var total uint64
@@ -129,15 +176,31 @@ func buildSidecar(model, corpus string, docs, tokens int, p cuda.MoEProfile) sid
 			}
 			stats[i].Importance = 0.7*f + 0.3*w
 			e := stats[i].Expert
-			for _, proj := range []string{"gate_proj", "up_proj", "down_proj"} {
-				o.TensorImportance[fmt.Sprintf("layers.%d.mlp.experts.%d.%s.weight", l, e, proj)] = stats[i].Importance
+			for _, proj := range []string{"gate_proj", "up_proj"} {
+				o.TensorImportance[fmt.Sprintf("layers.%d.mlp.experts.%d.%s.weight", l, e, proj)] = stats[i].Importance * (0.5 + 0.5*act(l, 2))
 			}
+			o.TensorImportance[fmt.Sprintf("layers.%d.mlp.experts.%d.down_proj.weight", l, e)] = stats[i].Importance * (0.5 + 0.5*act(l, 3))
 		}
 		sort.Slice(stats, func(i, j int) bool { return stats[i].Count > stats[j].Count })
 		o.HeatMap[l] = layerStat{Layer: l, Assignments: total, Experts: stats}
-		for _, proj := range []string{"gate_proj", "up_proj", "down_proj"} {
-			o.TensorImportance[fmt.Sprintf("layers.%d.mlp.shared_expert.%s.weight", l, proj)] = 1
+		for _, proj := range []string{"gate_proj", "up_proj"} {
+			o.TensorImportance[fmt.Sprintf("layers.%d.mlp.shared_expert.%s.weight", l, proj)] = math.Max(0.9, act(l, 2))
 		}
+		o.TensorImportance[fmt.Sprintf("layers.%d.mlp.shared_expert.down_proj.weight", l)] = math.Max(0.9, act(l, 4))
+		o.TensorImportance[fmt.Sprintf("layers.%d.mlp.gate.weight", l)] = math.Max(0.9, act(l, 2))
+		if (l+1)%4 == 0 {
+			for _, pname := range []string{"q_proj", "k_proj", "v_proj"} {
+				o.TensorImportance[fmt.Sprintf("layers.%d.self_attn.%s.weight", l, pname)] = act(l, 0)
+			}
+			o.TensorImportance[fmt.Sprintf("layers.%d.self_attn.o_proj.weight", l)] = act(l, 1)
+		} else {
+			for _, pname := range []string{"in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"} {
+				o.TensorImportance[fmt.Sprintf("layers.%d.linear_attn.%s.weight", l, pname)] = act(l, 0)
+			}
+			o.TensorImportance[fmt.Sprintf("layers.%d.linear_attn.out_proj.weight", l)] = act(l, 1)
+		}
+		o.TensorImportance[fmt.Sprintf("layers.%d.input_layernorm.weight", l)] = 1
+		o.TensorImportance[fmt.Sprintf("layers.%d.post_attention_layernorm.weight", l)] = 1
 	}
 	return o
 }
@@ -189,6 +252,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer eng.Close()
+	eng.SetPrefixCache(false)
 	if err = eng.StartMoEProfile(); err != nil {
 		log.Fatal(err)
 	}

@@ -22,13 +22,17 @@ The sidecar contains, for every layer and expert:
 
 - selected-route count and frequency;
 - mean selected top-k router probability;
-- a normalized heat score projected onto the expert gate/up/down tensor names;
-- shared-expert tensor priority fixed at 1.0.
+- RMS and maximum activation magnitude for each layer's mixer input, mixer output-projection
+  input, MoE input, routed-expert down input, and shared-expert down input;
+- a normalized activation score projected onto attention, GatedDeltaNet, router, shared-expert,
+  and routed-expert tensor names;
+- norms pinned at priority 1.0 and shared experts kept at a minimum 0.9 priority.
 
-Profiling is explicit and has no normal-serving kernel overhead. The current v1 score is a
-**routing/residency signal**, not yet a complete activation-sensitivity matrix. Attention,
-GatedDeltaNet, norm, and shared-expert activation instrumentation remains the next B1 increment
-before the sidecar can drive mixed precision.
+Profiling is explicit and has no normal-serving kernel overhead. Tensor names sharing the same
+input activation (for example Q/K/V projections) intentionally share a magnitude score. Expert
+precision combines routing heat with the corresponding gate/up or down activation score. This is
+sufficient for a first measured precision/residency policy; per-channel sensitivity and
+perturbation-based error attribution are possible later refinements, not prerequisites for B1.
 
 ## Quality baseline and gate
 
@@ -46,3 +50,7 @@ Baseline captured on 2026-07-11 for `unsloth/Qwen3.6-35B-A3B-NVFP4` with
 `runs/calibration-baseline/2026/07/2026-07-11T12-57-32.616593Z_ab52d4ae.md`.
 The short suite is a fast regression gate; a candidate precision policy must also pass the full
 coding/red-team battery before becoming a default.
+
+After activation instrumentation landed, the same gate remained **100/100, 15/15, 30/30** with
+normal profiling disabled, confirming the calibration branches do not perturb serving numerics.
+Report: `runs/calibration-b1-activation/2026/07/2026-07-11T13-10-01.460992Z_2f135eb8.md`.

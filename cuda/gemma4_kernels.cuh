@@ -332,6 +332,12 @@ int gemma4_engine_moe_profile_shape(const gemma4_engine_t *eng,
 int gemma4_engine_moe_profile_snapshot(gemma4_engine_t *eng,
                                        uint64_t *counts, double *weight_sums,
                                        size_t capacity);
+// Five activation classes per layer: mixer projection input, mixer output-projection
+// input, MoE/shared gate-up input, routed-expert down input, shared-expert down input.
+// Each output array needs n_layers*5 elements.
+int gemma4_engine_moe_profile_activation_snapshot(gemma4_engine_t *eng,
+                                       double *sum_squares, uint64_t *elements,
+                                       float *max_abs, size_t capacity);
 
 // Timing accessors for speed logging
 float gemma4_engine_prefill_ms(const gemma4_engine_t *eng);
