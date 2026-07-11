@@ -411,6 +411,114 @@ func (c *KVCache) saveLive() {
 		n, float64(size)/(1<<20), len(c.saved), float64(c.snapBytes)/(1<<20))
 }
 
+// ─── Disk session persistence (internal/session format) ────────────────────
+//
+// These three methods are the KVCache side of session save/restore across
+// process restarts. The cache stays ignorant of the on-disk format: callers
+// (REPL /save, the server "session" request field) move the (tokens, state)
+// pair through internal/session themselves.
+
+// SessionSupported reports whether the engine can snapshot KV state at all
+// (the capability probe for /save and the server session field).
+func (c *KVCache) SessionSupported() bool { return c.snap != nil }
+
+// ExportSession snapshots the live sequence for persistence: the exact tokens
+// in the engine KV cache and the engine state bytes covering them. The live
+// sequence is untouched. The caller must hold Lock().
+func (c *KVCache) ExportSession() (tokens []int32, state []byte, err error) {
+	if c.snap == nil {
+		return nil, nil, errors.New("engine does not support KV snapshots")
+	}
+	n := len(c.cachedTokens)
+	if n == 0 {
+		return nil, nil, errors.New("no live conversation to save")
+	}
+	size := c.snap.KVStateSize(n)
+	if size <= 0 {
+		return nil, nil, errors.New("engine reports no snapshot state for the live sequence")
+	}
+	state = make([]byte, size)
+	if err := c.snap.KVSave(state, n); err != nil {
+		return nil, nil, err
+	}
+	tokens = make([]int32, n)
+	copy(tokens, c.cachedTokens)
+	return tokens, state, nil
+}
+
+// ImportSession replaces the live sequence with a previously exported session.
+// The state must be exactly the engine's layout for len(tokens) tokens —
+// anything else is rejected before the engine is touched. After a successful
+// import the next Prefill reuses the whole session as a prefix (an exactly
+// matching prompt still re-runs its final token: logits are not part of the
+// saved state). The caller must hold Lock().
+func (c *KVCache) ImportSession(tokens []int32, state []byte) error {
+	if c.snap == nil {
+		return errors.New("engine does not support KV snapshots")
+	}
+	if len(tokens) == 0 {
+		return errors.New("session has no tokens")
+	}
+	if want := c.snap.KVStateSize(len(tokens)); want <= 0 || want != len(state) {
+		return errors.New("session state size does not match the engine layout for its token count (different model, context, or a corrupt file)")
+	}
+	if err := c.snap.KVRestore(state, len(tokens)); err != nil {
+		// A failed restore may have partially overwritten the live KV.
+		c.engine.Reset()
+		c.cachedTokens = c.cachedTokens[:0]
+		return err
+	}
+	c.cachedTokens = append(c.cachedTokens[:0], tokens...)
+	return nil
+}
+
+// SeedSnapshot adds a loaded session to the snapshot pool WITHOUT touching the
+// live sequence: the session is restored lazily by the next Prefill whose
+// prompt it matches (the server resume path — an in-flight conversation is
+// never clobbered by another client's session load). Same validation as
+// ImportSession. The caller must hold Lock().
+func (c *KVCache) SeedSnapshot(tokens []int32, state []byte) error {
+	if c.snap == nil {
+		return errors.New("engine does not support KV snapshots")
+	}
+	if c.snapBudget <= 0 {
+		return errors.New("KV snapshotting is disabled (budget 0)")
+	}
+	if len(tokens) == 0 {
+		return errors.New("session has no tokens")
+	}
+	if want := c.snap.KVStateSize(len(tokens)); want <= 0 || want != len(state) {
+		return errors.New("session state size does not match the engine layout for its token count (different model, context, or a corrupt file)")
+	}
+	if int64(len(state)) > c.snapBudget {
+		return errors.New("session state exceeds the snapshot memory budget")
+	}
+	// A pooled snapshot already covering this sequence makes the seed a no-op.
+	for _, s := range c.saved {
+		if len(s.tokens) >= len(tokens) && longestCommonPrefix(s.tokens, tokens) == len(tokens) {
+			return nil
+		}
+	}
+	for c.snapBytes+int64(len(state)) > c.snapBudget && len(c.saved) > 0 {
+		lru := 0
+		for i, s := range c.saved {
+			if s.used < c.saved[lru].used {
+				lru = i
+			}
+		}
+		c.snapBytes -= int64(len(c.saved[lru].state))
+		c.saved = append(c.saved[:lru], c.saved[lru+1:]...)
+	}
+	c.snapClock++
+	toks := make([]int32, len(tokens))
+	copy(toks, tokens)
+	st := make([]byte, len(state))
+	copy(st, state)
+	c.saved = append(c.saved, &savedSeq{tokens: toks, state: st, used: c.snapClock})
+	c.snapBytes += int64(len(st))
+	return nil
+}
+
 // CurrentTokens returns a COPY of the token sequence currently held in the
 // engine KV cache (prompt + tokens generated so far this request). The caller
 // must hold Lock(). A copy is returned so the returned slice is safe to retain
