@@ -9,6 +9,7 @@ from pathlib import Path
 
 from build_calibration_corpus import build
 from derive_precision_policy import derive
+from derive_residency_plan import derive as derive_residency
 from quality_gate import compare, parse_report
 
 
@@ -43,6 +44,24 @@ class PhaseBTests(unittest.TestCase):
             self.assertEqual(safe["tensor_policy"]["layers.0.input_layernorm.weight"]["tier"], "critical")
             aggressive = derive(path, sub4_kernel=True)
             self.assertGreater(aggressive["codec_tensor_counts"].get("int2", 0), 0)
+
+    def test_residency_plan_prefers_hot_experts_and_respects_budgets(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "i.json"
+            heat = [{"layer": 0, "assignments": 100, "experts": [
+                {"expert": 0, "count": 70, "frequency": .7, "mean_weight": .8, "importance": 1},
+                {"expert": 1, "count": 20, "frequency": .2, "mean_weight": .5, "importance": .5},
+                {"expert": 2, "count": 10, "frequency": .1, "mean_weight": .2, "importance": .2}]}]
+            path.write_text(json.dumps({"format": "fucina-imatrix-v1", "model": "m",
+                                        "expert_heat_map": heat}))
+            # hidden=intermediate=16, 4 bits => 384 bytes/expert. Fit exactly one/tier.
+            gib = 384 / 1024**3
+            plan = derive_residency(path, gib, gib, hidden=16, intermediate=16, bits=4)
+            self.assertEqual(plan["placement"]["layers.0.experts.0"]["tier"], "vram")
+            self.assertEqual(plan["placement"]["layers.0.experts.1"]["tier"], "host")
+            self.assertEqual(plan["placement"]["layers.0.experts.2"]["tier"], "ssd")
+            self.assertEqual(plan["occupancy_bytes"]["vram"], 384)
+            self.assertAlmostEqual(plan["calibration_route_fraction"]["vram"], .7)
 
     def test_quality_gate(self):
         with tempfile.TemporaryDirectory() as td:
