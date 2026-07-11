@@ -374,8 +374,8 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
                 m2_gemm(ac, xn, Wf(T.ssm.in_a), B, H, TSR, st);   // alpha
                 m2_gemm(bc, xn, Wf(T.ssm.in_b), B, H, TSR, st);   // beta
             } else {
-                gemv_batched_w(eng, ac, Wq(T.ssm.in_a), xn, H, TSR,   B, st, T.ssm.fmt_in_a);   // alpha
-                gemv_batched_w(eng, bc, Wq(T.ssm.in_b), xn, H, TSR,   B, st, T.ssm.fmt_in_b);   // beta
+                gemv_batched_w(eng, ac, T.ssm.ref_in_a, xn, B, st);   // alpha
+                gemv_batched_w(eng, bc, T.ssm.ref_in_b, xn, B, st);   // beta
             }
             qwen35_b_conv_kernel<<<dim3(grid1d((size_t)CONVD),B),256,0,st>>>(
                 conv, qkv, eng->q35.ring[l], Wf(T.ssm.conv1d), d_slot, CONVD, B);
@@ -392,10 +392,10 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
         if (c->n_experts > 0) {   // Qwen3.5-MoE sparse block (experts + shared) → mix
             moe_ffn(eng, l, xn, mix, B, st);
         } else {
-            gemv_batched_w(eng, fg, Wq(T.ffn_gate), xn, H, I, B, st, T.fmt_gate);
-            gemv_batched_w(eng, fu, Wq(T.ffn_up),   xn, H, I, B, st, T.fmt_up);
+            gemv_batched_w(eng, fg, T.ref_gate, xn, B, st);
+            gemv_batched_w(eng, fu, T.ref_up, xn, B, st);
             silu_glu_kernel<<<grid1d((size_t)B*I),256,0,st>>>(fa, fg, fu, B*I);
-            gemv_batched_w(eng, mix, Wq(T.ffn_down), fa, I, H, B, st, T.fmt_down);
+            gemv_batched_w(eng, mix, T.ref_down, fa, B, st);
         }
         residual_add_kernel<<<grid1d((size_t)B*H),256,0,st>>>(x, mix, B*H);
         q35_jspace_after_layer(eng, x, B, l, st);
@@ -1065,8 +1065,8 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 m2_gemm(ac, xn, Wf(Tn.ssm.in_a), T, H, TSR, st);   // alpha
                 m2_gemm(bc, xn, Wf(Tn.ssm.in_b), T, H, TSR, st);   // beta
             } else {
-                q35_proj_gemm(eng, ac,  Tn.ssm.in_a,   Tn.ssm.fmt_in_a,   xn, H, TSR,   T, st, l, WC_A);   // alpha
-                q35_proj_gemm(eng, bc,  Tn.ssm.in_b,   Tn.ssm.fmt_in_b,   xn, H, TSR,   T, st, l, WC_B);   // beta
+                q35_proj_gemm(eng, ac,  Tn.ssm.in_a, Tn.ssm.fmt_in_a, xn, H, TSR, T, st, l, WC_A, &Tn.ssm.ref_in_a);   // alpha
+                q35_proj_gemm(eng, bc,  Tn.ssm.in_b, Tn.ssm.fmt_in_b, xn, H, TSR, T, st, l, WC_B, &Tn.ssm.ref_in_b);   // beta
             }
             // RECURRENT: causal conv1d ring — ONE batched launch over the whole T-row tile,
             // reading the per-slot ring for the CK-1 carry positions; then advance the ring.
@@ -1092,10 +1092,10 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
         if (c->n_experts > 0) {   // Qwen3.5-MoE sparse block (experts + shared) → mix
             moe_ffn(eng, l, xn, mix, T, st);
         } else {
-            q35_proj_gemm(eng, fg, Tn.ffn_gate, Tn.fmt_gate, xn, H, I, T, st, l, WC_GATE);
-            q35_proj_gemm(eng, fu, Tn.ffn_up,   Tn.fmt_up,   xn, H, I, T, st, l, WC_UP);
+            q35_proj_gemm(eng, fg, Tn.ffn_gate, Tn.fmt_gate, xn, H, I, T, st, l, WC_GATE, &Tn.ref_gate);
+            q35_proj_gemm(eng, fu, Tn.ffn_up,   Tn.fmt_up,   xn, H, I, T, st, l, WC_UP, &Tn.ref_up);
             silu_glu_kernel<<<grid1d((size_t)T*I),256,0,st>>>(fa, fg, fu, T*I);
-            q35_proj_gemm(eng, mix, Tn.ffn_down, Tn.fmt_down, fa, I, H, T, st, l, WC_DOWN);
+            q35_proj_gemm(eng, mix, Tn.ffn_down, Tn.fmt_down, fa, I, H, T, st, l, WC_DOWN, &Tn.ref_down);
         }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
         q35_jspace_after_layer(eng, x, T, l, st);

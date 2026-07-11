@@ -1070,6 +1070,11 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             bind_ref(T.ssm.ref_in_z,T.ssm.in_z,T.ssm.fmt_in_z,INNER,H);
             bind_ref(T.ssm.ref_out,T.ssm.out,T.ssm.fmt_out,H,INNER);
         }
+        if(!moe){
+            bind_ref(T.ref_gate,T.ffn_gate,T.fmt_gate,I,H);
+            bind_ref(T.ref_up,T.ffn_up,T.fmt_up,I,H);
+            bind_ref(T.ref_down,T.ffn_down,T.fmt_down,H,I);
+        }
     }
 
     // token_embd → Q8_0 (separate d_token_embd; embed_w reads it).

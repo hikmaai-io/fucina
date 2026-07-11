@@ -3692,6 +3692,7 @@ struct gemma4_engine {
             // Canonical descriptors are populated alongside the compatibility offsets/format
             // bytes. Qwen runtime paths migrate projection-family by projection-family.
             WeightRef ref_q, ref_k, ref_v, ref_o;
+            WeightRef ref_gate, ref_up, ref_down;
 
             // ── Qwen3.5 hybrid gated-deltanet (LINEAR) layer tensors (GEMMA4_ARCH_QWEN3_5 only) ──
             // Zero on every other arch AND on the hybrid's FULL layers (those reuse attn_q/k/v/
@@ -3712,7 +3713,7 @@ struct gemma4_engine {
                 uint64_t norm;     // blk.l.ssm_norm.weight   gated RMSNorm gain [state_size]  F32
                 uint64_t out;      // blk.l.ssm_out.weight    out-proj  [inner→hidden]
                 uint8_t  fmt_in_qkv, fmt_in_z, fmt_in_a, fmt_in_b, fmt_out;
-                WeightRef ref_in_qkv, ref_in_z, ref_out;
+                WeightRef ref_in_qkv, ref_in_z, ref_in_a, ref_in_b, ref_out;
             } ssm;
         } layers[GEMMA4_CAP_LAYERS];
 
@@ -6621,7 +6622,14 @@ gemma4_engine_t* gemma4_engine_create(
             } else {
                 bind_ref(T.ssm.ref_in_qkv,T.ssm.in_qkv,T.ssm.fmt_in_qkv,CONVD,H);
                 bind_ref(T.ssm.ref_in_z,T.ssm.in_z,T.ssm.fmt_in_z,INNER,H);
+                bind_ref(T.ssm.ref_in_a,T.ssm.in_a,T.ssm.fmt_in_a,eng->cfg.ssm_time_step_rank,H);
+                bind_ref(T.ssm.ref_in_b,T.ssm.in_b,T.ssm.fmt_in_b,eng->cfg.ssm_time_step_rank,H);
                 bind_ref(T.ssm.ref_out,T.ssm.out,T.ssm.fmt_out,H,INNER);
+            }
+            if(eng->cfg.n_experts==0){
+                bind_ref(T.ref_gate,T.ffn_gate,T.fmt_gate,eng->cfg.intermediate,H);
+                bind_ref(T.ref_up,T.ffn_up,T.fmt_up,eng->cfg.intermediate,H);
+                bind_ref(T.ref_down,T.ffn_down,T.fmt_down,H,eng->cfg.intermediate);
             }
         }
     }
