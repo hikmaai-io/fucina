@@ -802,6 +802,9 @@ static int q35_cuda_allocate(void *,void **ptr,size_t bytes) {
     return cudaMalloc(ptr,bytes)==cudaSuccess?0:1;
 }
 static void q35_cuda_release(void *,void *ptr) { if(ptr) cudaFree(ptr); }
+static int q35_cuda_upload(void *,void *dst,const void *src,size_t bytes) {
+    return cudaMemcpy(dst,src,bytes,cudaMemcpyHostToDevice)==cudaSuccess?0:1;
+}
 
 static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8::Layout &LO) {
     const int H=eng->cfg.hidden_size, HD=M2_HEAD, NQ=eng->cfg.n_heads, NKV=eng->cfg.n_kv_global;
@@ -811,7 +814,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     size_t fill_free_after_core=0, fill_free_before_scratch=0, fill_free_after_scratch=0;
     cudaMemGetInfo(&fill_free_before, &fill_total);
     const q35_host_meminfo host_mem_before=q35_read_host_meminfo();
-    DeviceAllocationOps allocation_ops{nullptr,q35_cuda_allocate,q35_cuda_release};
+    DeviceAllocationOps allocation_ops{nullptr,q35_cuda_allocate,q35_cuda_release,q35_cuda_upload};
     if(!eng->device_allocations) eng->device_allocations=new DeviceAllocationRegistry(allocation_ops);
     DeviceAllocationSet load_allocation(allocation_ops);
 
@@ -1240,14 +1243,18 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         auto &d=D[i]; const size_t run=model_plan.tensors()[plan_ids[i]].arena_offset;
         *d.off = run;                                     // tdata_start=0 → planned byte position
         if(d.fmtp) *d.fmtp=(uint8_t)d.fmt;
-        cudaMemcpy(eng->d_weights+run, d.host, d.bytes, cudaMemcpyHostToDevice);
+        if(!load_allocation.upload(eng->d_weights+run,d.host,d.bytes)){
+            for(void*p:tofree) free(p); return -4;
+        }
         if(d.fmt==FORMAT_FP8_BLOCK && d.scale_host){
             auto &entry=eng->q35.fp8_scale_tab[eng->q35.fp8_scale_n];
             entry.w=eng->d_weights+run; entry.s=nullptr;
             if(!load_allocation.allocate((void**)&entry.s,d.scale_bytes,"qwen_fp8_scale")){
                 for(void*p:tofree) free(p); return -4;
             }
-            cudaMemcpy((void*)entry.s,d.scale_host,d.scale_bytes,cudaMemcpyHostToDevice);
+            if(!load_allocation.upload((void*)entry.s,d.scale_host,d.scale_bytes)){
+                for(void*p:tofree) free(p); return -4;
+            }
             eng->q35.fp8_scale_n++;
         }
     }
@@ -1321,8 +1328,8 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     }
 
     auto tx_upload=[&](void **slot,const void *host,size_t bytes,const char *label){
-        if(!load_allocation.allocate(slot,bytes,label)) return false;
-        return cudaMemcpy(*slot,host,bytes,cudaMemcpyHostToDevice)==cudaSuccess;
+        return load_allocation.allocate(slot,bytes,label) &&
+               load_allocation.upload(*slot,host,bytes);
     };
 
     // token_embd → Q8_0 (separate d_token_embd; embed_w reads it).

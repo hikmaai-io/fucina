@@ -10,6 +10,7 @@ struct DeviceAllocationOps {
     void *context = nullptr;
     int (*allocate)(void *context, void **ptr, size_t bytes) = nullptr;
     void (*release)(void *context, void *ptr) = nullptr;
+    int (*upload)(void *context, void *dst, const void *src, size_t bytes) = nullptr;
 };
 
 struct DeviceAllocationRecord {
@@ -73,6 +74,18 @@ public:
         records_.push_back({slot, pointer, bytes, label});
         total_bytes_ += bytes;
         return true;
+    }
+
+    bool upload(void *destination, const void *source, size_t bytes) {
+        if (committed_ || !ops_.upload || !destination || !source || bytes == 0) return false;
+        bool owned = false;
+        for (const DeviceAllocationRecord &record : records_) {
+            const uintptr_t begin = (uintptr_t)record.pointer;
+            const uintptr_t end = begin + record.bytes;
+            const uintptr_t dst = (uintptr_t)destination;
+            if (dst >= begin && dst <= end && bytes <= end - dst) { owned = true; break; }
+        }
+        return owned && ops_.upload(ops_.context, destination, source, bytes) == 0;
     }
 
     void rollback() {
