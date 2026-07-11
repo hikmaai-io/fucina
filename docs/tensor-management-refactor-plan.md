@@ -293,8 +293,9 @@ through descriptors and ownership APIs; moving code then becomes mechanical and 
   and prefill dispatch use `ExpertWeightRef`; Q4_K and block-FP8 expert dispatch is descriptor-backed
   as well. Lazy BF16 and NVFP4 prefill-cache variants now publish explicit `WeightRef` descriptors.
 - **Phase 5 — workspaces:** in progress. POD `WorkspaceRef` descriptors and workspace kinds are
-  defined; Qwen projection prefill weight/input scratch is bounds-described and consumed through
-  typed descriptors. Decode, attention, recurrent/KV, and MoE workspaces remain to migrate.
+  defined; Qwen decode, projection-prefill, attention-partial, GDN, recurrent-state, and growable
+  KV arenas are bounds-described and consumed/published through typed descriptors. MoE workspace
+  fields remain to migrate.
 - **Phase 6 — decomposition and cleanup:** not started.
 
 The performance KPI remains **>64 / >105 / >150 tok/s at 1/2/4 streams**. Descriptor-only changes

@@ -8,6 +8,11 @@ static inline size_t q35_align_up(size_t n, size_t alignment = 256) {
     return (n + alignment - 1) & ~(alignment - 1);
 }
 
+static inline void bind_workspace(WorkspaceRef &ref,void *data,size_t bytes,WorkspaceKind kind) {
+    ref.data=(uint8_t*)data; ref.bytes=bytes; ref.alignment=256; ref.kind=kind;
+    ref.flags=0; ref.reserved=0;
+}
+
 static inline void q35_account_add(gemma4_engine_t *eng, size_t bytes) {
     eng->q35.committed_bytes += bytes;
     if (eng->q35.committed_bytes > eng->q35.reserved_bytes)
@@ -258,10 +263,23 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
         fprintf(stderr, "fucina: qwen35 M4 scratch alloc/opt-in failed — transaction rolled back\n");
         q35_workspace_rollback(eng); cudaGetLastError(); return -1;
     }
-    auto bind_workspace=[](WorkspaceRef &ref,void *data,size_t bytes,WorkspaceKind kind){
-        ref.data=(uint8_t*)data; ref.bytes=bytes; ref.alignment=256; ref.kind=kind;
-        ref.flags=0; ref.reserved=0;
-    };
+    bind_workspace(eng->q35.routing_workspace,eng->q35.rowslot,(size_t)PF*sizeof(int),WorkspaceKind::DECODE);
+    bind_workspace(eng->q35.gdn_workspace,eng->q35.chunk_scr,
+                   (size_t)NVH*Q35_GDN_SCR*sizeof(float),WorkspaceKind::RECURRENT_STATE);
+    bind_workspace(eng->q35.prefill_position_workspace,eng->q35.pf_pos,
+                   (size_t)PF*sizeof(int),WorkspaceKind::PREFILL);
+    bind_workspace(eng->q35.prefill_token_workspace,eng->q35.pf_tok,
+                   (size_t)PF*sizeof(int32_t),WorkspaceKind::PREFILL);
+    const size_t attention_partials=(size_t)MS*NQ*eng->q35.attn_splits;
+    bind_workspace(eng->q35.attention_workspace[0],eng->q35.part_m,
+                   attention_partials*sizeof(float),WorkspaceKind::ATTENTION);
+    bind_workspace(eng->q35.attention_workspace[1],eng->q35.part_l,
+                   attention_partials*sizeof(float),WorkspaceKind::ATTENTION);
+    bind_workspace(eng->q35.attention_workspace[2],eng->q35.part_o,
+                   attention_partials*M2_HEAD*sizeof(float),WorkspaceKind::ATTENTION);
+    for(int i=0;i<24;i++)
+        bind_workspace(eng->q35.decode_workspace[i],eng->q35.sb[i],
+                       (size_t)PF*SBSZ[i]*sizeof(float),WorkspaceKind::DECODE);
     bind_workspace(eng->q35.prefill_weight_workspace[0],eng->q35.wbf16[0],
                    wbf_max*sizeof(__nv_bfloat16),WorkspaceKind::PREFILL);
     bind_workspace(eng->q35.prefill_weight_workspace[1],eng->q35.wbf16[1],
@@ -335,16 +353,17 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
     auto Wf = [&](uint64_t off) -> const float*   {
         return (const float*)(eng->d_weights + (off - eng->tdata_start)); };
     int   *d_pos  = eng->d_ms_pos;
-    int   *d_slot = eng->q35.rowslot;
+    int   *d_slot = workspace_data<int>(eng->q35.routing_workspace);
     int32_t *d_tok = (int32_t*)eng->d_sb[0];
-    float *x=eng->q35.sb[Q35_X], *xn=eng->q35.sb[Q35_XN], *qg=eng->q35.sb[Q35_QG],
-          *qb=eng->q35.sb[Q35_QB], *gate=eng->q35.sb[Q35_GATE], *kb=eng->q35.sb[Q35_KB],
-          *vb=eng->q35.sb[Q35_VB], *attn=eng->q35.sb[Q35_ATTN], *mix=eng->q35.sb[Q35_MIX],
-          *qkv=eng->q35.sb[Q35_QKV], *conv=eng->q35.sb[Q35_CONV], *zc=eng->q35.sb[Q35_ZC],
-          *ac=eng->q35.sb[Q35_AC], *bc=eng->q35.sb[Q35_BC], *gg=eng->q35.sb[Q35_GG],
-          *bb=eng->q35.sb[Q35_BB], *qh=eng->q35.sb[Q35_QH], *kh=eng->q35.sb[Q35_KH],
-          *vh=eng->q35.sb[Q35_VH], *core=eng->q35.sb[Q35_CORE], *gnorm=eng->q35.sb[Q35_GNORM],
-          *fg=eng->q35.sb[Q35_FG], *fu=eng->q35.sb[Q35_FU], *fa=eng->q35.sb[Q35_FA];
+    auto ws=[&](int id){ return workspace_data<float>(eng->q35.decode_workspace[id]); };
+    float *x=ws(Q35_X), *xn=ws(Q35_XN), *qg=ws(Q35_QG),
+          *qb=ws(Q35_QB), *gate=ws(Q35_GATE), *kb=ws(Q35_KB),
+          *vb=ws(Q35_VB), *attn=ws(Q35_ATTN), *mix=ws(Q35_MIX),
+          *qkv=ws(Q35_QKV), *conv=ws(Q35_CONV), *zc=ws(Q35_ZC),
+          *ac=ws(Q35_AC), *bc=ws(Q35_BC), *gg=ws(Q35_GG),
+          *bb=ws(Q35_BB), *qh=ws(Q35_QH), *kh=ws(Q35_KH),
+          *vh=ws(Q35_VH), *core=ws(Q35_CORE), *gnorm=ws(Q35_GNORM),
+          *fg=ws(Q35_FG), *fu=ws(Q35_FU), *fa=ws(Q35_FA);
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
 
     embed_w(eng, x, eng->d_token_embd, d_tok, B, H, st);
@@ -370,9 +389,13 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
                 size_t smP = (size_t)eng->q35.attn_tile * sizeof(float);
                 qwen35_flash_partial_kernel<<<dim3(NQ,B,S),256,smP,st>>>(
                     qb, eng->q35.Kc[l], eng->q35.Vc[l], d_pos, d_slot, maxctx, B, NKV, S,
-                    eng->q35.part_m, eng->q35.part_l, eng->q35.part_o, NQ);
+                    workspace_data<float>(eng->q35.attention_workspace[0]),
+                    workspace_data<float>(eng->q35.attention_workspace[1]),
+                    workspace_data<float>(eng->q35.attention_workspace[2]), NQ);
                 qwen35_flash_combine_kernel<<<dim3(NQ,B),256,0,st>>>(
-                    attn, eng->q35.part_m, eng->q35.part_l, eng->q35.part_o, B, S, NQ);
+                    attn, workspace_data<float>(eng->q35.attention_workspace[0]),
+                    workspace_data<float>(eng->q35.attention_workspace[1]),
+                    workspace_data<float>(eng->q35.attention_workspace[2]), B, S, NQ);
             }
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)B*NQ*HD),256,0,st>>>(attn, gate, B*NQ*HD);
             gemv_batched_w(eng, mix, T.ref_o, attn, B, st);
@@ -426,7 +449,8 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
     } else if (eng->format == FORMAT_FP8_BLOCK) {  // BF16 untied head (lossy heads flip the argmax);
         // weight-read-ONCE batched GEMV in ≤16-row chunks: the 1 GB head is read ceil(B/16)× per
         // step instead of B× (2 passes at B=16 measured 10.5 ms/step — 17% of the decode step).
-        float *xt = eng->q35.sb[Q35_QG];   // per-layer scratch, free at head time; ≥ H·16 floats
+        float *xt = workspace_data<float>(eng->q35.decode_workspace[Q35_QG]);
+        // Per-layer scratch, free at head time; ≥ H·16 floats.
         for (int r0 = 0; r0 < B; r0 += 16) {
             int K = (B - r0 < 16) ? (B - r0) : 16;
             nvfp4_xT_launch(xt, xn + (size_t)r0 * H, H, K, st);
@@ -506,7 +530,8 @@ static int qwen35_ms_run(gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *
     }
     cudaMemcpyAsync((int32_t*)eng->d_sb[0], in_tok, (size_t)B*sizeof(int32_t), cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(eng->d_ms_pos, positions, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, st);
-    cudaMemcpyAsync(eng->q35.rowslot, h_slot, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(workspace_data<int>(eng->q35.routing_workspace),h_slot,
+                    (size_t)B*sizeof(int),cudaMemcpyHostToDevice,st);
     if (use_graph && want_sample && !any_sample && eng->q35.graph_enabled &&
         qwen35_ms_graph_ensure(eng, B) == 0) {
         if (cudaGraphLaunch(eng->q35.graph[B], st) == cudaSuccess) return 0;
@@ -912,6 +937,15 @@ static int q35_slot_state_ensure(gemma4_engine_t *eng, int slot) {
         cudaGetLastError();
         return -1;
     }
+    bind_workspace(eng->q35.recurrent_workspace[slot],eng->q35.recurrent_slab[slot],
+                   eng->q35.per_slot_recurrent_bytes,WorkspaceKind::RECURRENT_STATE);
+    const size_t kv_layer_bytes=(size_t)initial_kv*NKV*HD*sizeof(__half);
+    for(int l=0;l<c->n_layers;l++) if(c->attn_kind[l]==GEMMA4_ATTN_FULL){
+        bind_workspace(eng->q35.kv_key_workspace[l][slot],eng->q35.Kc_slot[l][slot],
+                       kv_layer_bytes,WorkspaceKind::KV_CACHE);
+        bind_workspace(eng->q35.kv_value_workspace[l][slot],eng->q35.Vc_slot[l][slot],
+                       kv_layer_bytes,WorkspaceKind::KV_CACHE);
+    }
     // Publish only after every allocation succeeded; graph kernels can never observe a partial slot.
     cudaStream_t st=eng->stream;
     for (int l=0; l<c->n_layers; l++) {
@@ -983,6 +1017,9 @@ static int q35_slot_kv_reserve(gemma4_engine_t *eng, int slot, int need_tokens) 
     for (int l=0; l<c->n_layers; l++) if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
         cudaFree(eng->q35.Kc_slot[l][slot]); cudaFree(eng->q35.Vc_slot[l][slot]);
         eng->q35.Kc_slot[l][slot]=newK[l]; eng->q35.Vc_slot[l][slot]=newV[l];
+        const size_t layer_bytes=(size_t)newcap*NKV*HD*sizeof(__half);
+        bind_workspace(eng->q35.kv_key_workspace[l][slot],newK[l],layer_bytes,WorkspaceKind::KV_CACHE);
+        bind_workspace(eng->q35.kv_value_workspace[l][slot],newV[l],layer_bytes,WorkspaceKind::KV_CACHE);
     }
     eng->q35.kv_capacity[slot]=newcap;
     q35_account_add(eng, new_bytes-old_bytes);
@@ -1039,17 +1076,18 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
     auto Wq = [&](uint64_t off) -> const uint8_t* { return weight_fp8(eng, off); };
     auto Wf = [&](uint64_t off) -> const float*   {
         return (const float*)(eng->d_weights + (off - eng->tdata_start)); };
-    int   *d_pos  = eng->q35.pf_pos;     // wide prefill-tile position array
-    int   *d_slot = eng->q35.rowslot;
-    int32_t *d_tok = eng->q35.pf_tok;    // wide prefill-tile token array
-    float *x=eng->q35.sb[Q35_X], *xn=eng->q35.sb[Q35_XN], *qg=eng->q35.sb[Q35_QG],
-          *qb=eng->q35.sb[Q35_QB], *gate=eng->q35.sb[Q35_GATE], *kb=eng->q35.sb[Q35_KB],
-          *vb=eng->q35.sb[Q35_VB], *attn=eng->q35.sb[Q35_ATTN], *mix=eng->q35.sb[Q35_MIX],
-          *qkv=eng->q35.sb[Q35_QKV], *conv=eng->q35.sb[Q35_CONV], *zc=eng->q35.sb[Q35_ZC],
-          *ac=eng->q35.sb[Q35_AC], *bc=eng->q35.sb[Q35_BC], *gg=eng->q35.sb[Q35_GG],
-          *bb=eng->q35.sb[Q35_BB], *qh=eng->q35.sb[Q35_QH], *kh=eng->q35.sb[Q35_KH],
-          *vh=eng->q35.sb[Q35_VH], *core=eng->q35.sb[Q35_CORE], *gnorm=eng->q35.sb[Q35_GNORM],
-          *fg=eng->q35.sb[Q35_FG], *fu=eng->q35.sb[Q35_FU], *fa=eng->q35.sb[Q35_FA];
+    int   *d_pos  = workspace_data<int>(eng->q35.prefill_position_workspace);
+    int   *d_slot = workspace_data<int>(eng->q35.routing_workspace);
+    int32_t *d_tok = workspace_data<int32_t>(eng->q35.prefill_token_workspace);
+    auto ws=[&](int id){ return workspace_data<float>(eng->q35.decode_workspace[id]); };
+    float *x=ws(Q35_X), *xn=ws(Q35_XN), *qg=ws(Q35_QG),
+          *qb=ws(Q35_QB), *gate=ws(Q35_GATE), *kb=ws(Q35_KB),
+          *vb=ws(Q35_VB), *attn=ws(Q35_ATTN), *mix=ws(Q35_MIX),
+          *qkv=ws(Q35_QKV), *conv=ws(Q35_CONV), *zc=ws(Q35_ZC),
+          *ac=ws(Q35_AC), *bc=ws(Q35_BC), *gg=ws(Q35_GG),
+          *bb=ws(Q35_BB), *qh=ws(Q35_QH), *kh=ws(Q35_KH),
+          *vh=ws(Q35_VH), *core=ws(Q35_CORE), *gnorm=ws(Q35_GNORM),
+          *fg=ws(Q35_FG), *fu=ws(Q35_FU), *fa=ws(Q35_FA);
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
     const int NPAD = ((T + M2_CHUNK - 1) / M2_CHUNK) * M2_CHUNK;   // GDN chunk-scan padded length
 
@@ -1110,7 +1148,8 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             // whole tile (CHUNK=64), carrying the per-slot fp32 state S in/out of the arena.
             // 512 threads: the O(SD*SD)=16384-element state/matmul loops stride over 4x the lanes.
             qwen35_b_gdn_chunk_kernel<<<NVH,512,smGDNchunk,st>>>(
-                core, qh, kh, vh, gg, bb, eng->q35.S[l], eng->q35.chunk_scr, slot, T, NPAD,
+                core, qh, kh, vh, gg, bb, eng->q35.S[l],
+                workspace_data<float>(eng->q35.gdn_workspace),slot,T,NPAD,
                 eng->format==FORMAT_FP8_BLOCK, NVH);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T, NVH, VALD);
             q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, l, WC_OUT, &Tn.ssm.ref_out);
@@ -1163,9 +1202,12 @@ static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t 
         int T = n - done; if (T > CH) T = CH;
         int b = base + done;
         for (int r = 0; r < T; r++) { h_slot[r] = slot; h_pos[r] = b + r; }
-        cudaMemcpyAsync(eng->q35.pf_tok,  tokens + done, (size_t)T*sizeof(int32_t), cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(eng->q35.pf_pos,  h_pos,         (size_t)T*sizeof(int),     cudaMemcpyHostToDevice, st);
-        cudaMemcpyAsync(eng->q35.rowslot, h_slot,        (size_t)T*sizeof(int),     cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(workspace_data<int32_t>(eng->q35.prefill_token_workspace),tokens+done,
+                        (size_t)T*sizeof(int32_t),cudaMemcpyHostToDevice,st);
+        cudaMemcpyAsync(workspace_data<int>(eng->q35.prefill_position_workspace),h_pos,
+                        (size_t)T*sizeof(int),cudaMemcpyHostToDevice,st);
+        cudaMemcpyAsync(workspace_data<int>(eng->q35.routing_workspace),h_slot,
+                        (size_t)T*sizeof(int),cudaMemcpyHostToDevice,st);
         int want = (do_sample && done + T >= n);   // sample only the final row of the final chunk
         qwen35_prefill_chunk_body(eng, slot, b, T, want, st);
         done += T;

@@ -46,25 +46,34 @@ struct qwen35_runtime_state {
     // Host ownership mirrors for reset/snapshot/teardown. All fixed recurrent state for one slot
     // is one aligned allocation; S_slot/ring_slot are non-owning views into recurrent_slab.
     uint8_t       *recurrent_slab[GEMMA4_MAX_SEQS];
+    WorkspaceRef   recurrent_workspace[GEMMA4_MAX_SEQS];
     __nv_bfloat16 *S_slot[GEMMA4_CAP_LAYERS][GEMMA4_MAX_SEQS];
     float         *ring_slot[GEMMA4_CAP_LAYERS][GEMMA4_MAX_SEQS];
     __half        *Kc_slot[GEMMA4_CAP_LAYERS][GEMMA4_MAX_SEQS];
     __half        *Vc_slot[GEMMA4_CAP_LAYERS][GEMMA4_MAX_SEQS];
+    WorkspaceRef   kv_key_workspace[GEMMA4_CAP_LAYERS][GEMMA4_MAX_SEQS];
+    WorkspaceRef   kv_value_workspace[GEMMA4_CAP_LAYERS][GEMMA4_MAX_SEQS];
     uint8_t        slot_allocated[GEMMA4_MAX_SEQS];
     int             kv_capacity[GEMMA4_MAX_SEQS];
     int             allocated_slots;
 
     // Shared decode/prefill workspace.
     int     *rowslot;
+    WorkspaceRef routing_workspace;
     float   *sb[24];
+    WorkspaceRef decode_workspace[24];
     float   *chunk_scr;
+    WorkspaceRef gdn_workspace;
     int     *pf_pos;
     int32_t *pf_tok;
+    WorkspaceRef prefill_position_workspace;
+    WorkspaceRef prefill_token_workspace;
     int      attn_splits;
     int      attn_tile;
     float   *part_m;
     float   *part_l;
     float   *part_o;
+    WorkspaceRef attention_workspace[3];
     __nv_bfloat16 *wbf16[2];
     __nv_bfloat16 *xbf16;
     WorkspaceRef   prefill_weight_workspace[2];

@@ -72,6 +72,12 @@ struct WorkspaceRef {
     uint16_t reserved;
 };
 
+template <typename T>
+inline T *workspace_data(const WorkspaceRef &ref, uint64_t elements = 0) {
+    if (elements && elements > ref.bytes / sizeof(T)) return nullptr;
+    return reinterpret_cast<T *>(ref.data);
+}
+
 static_assert(std::is_trivially_copyable<WeightRef>::value, "WeightRef must remain trivially copyable");
 static_assert(std::is_trivially_copyable<ExpertWeightRef>::value,
               "ExpertWeightRef must remain trivially copyable");
