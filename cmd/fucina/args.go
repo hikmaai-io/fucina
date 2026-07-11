@@ -44,6 +44,7 @@ type CLIArgs struct {
 	ThinkBudget  int     // server: reasoning-channel token budget (0=auto, <0=off)
 	Raw          bool    // -p: feed the prompt verbatim (no chat template) — base completion / benchmarks
 	KVSnapshotGB float64 // server: host-memory budget for saved KV sequences (0 = off)
+	SessionDir   string  // server: directory for disk-persisted sessions ("" = off)
 	CudaGraphs   bool    // --cuda-graphs (experimental, off by default)
 
 	// Server
@@ -148,6 +149,8 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 		"Server: max reasoning-channel tokens per turn before the thought channel is force-closed (0 = auto: half of max_tokens; negative = unlimited)")
 	fs.Float64Var(&a.KVSnapshotGB, "kv-snapshot-gb", 16,
 		"Server: host-memory budget (GiB) for snapshotted KV sequences so one client cannot evict another's cached conversation (0 = off)")
+	fs.StringVar(&a.SessionDir, "session-dir", "",
+		"Server: directory for disk-persisted sessions; requests with a \"session\" field resume from and save to <dir>/<name>.fcsess")
 	fs.BoolVar(&a.CudaGraphs, "cuda-graphs", false, "Enable CUDA graph support (experimental, allocates persistent prefill scratch)")
 	// Defaults follow the google/gemma-4-12B model card's standardized sampling
 	// configuration (temperature 1.0, top_p 0.95, top_k 64; no min-p). The GGUF

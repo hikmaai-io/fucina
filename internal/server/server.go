@@ -23,6 +23,7 @@ import (
 	"github.com/hikmaai-io/fucina/internal/grammar"
 	"github.com/hikmaai-io/fucina/internal/sampler"
 	"github.com/hikmaai-io/fucina/internal/server/batch"
+	"github.com/hikmaai-io/fucina/internal/session"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
 
@@ -73,6 +74,9 @@ type Server struct {
 	specEmitted  atomic.Int64
 	metrics      Metrics
 	httpServer   *http.Server
+	// Disk session persistence (see session.go). Empty sessionDir = disabled.
+	sessionDir   string
+	sessionIdent session.Identity
 
 	// jsonPieces caches the decoded UTF-8 bytes of every token id (control tokens →
 	// nil), built once and reused by every response_format request's grammar constraint.
@@ -249,6 +253,12 @@ type ChatRequest struct {
 	// additionally enforces the supplied schema (keys, types, enums — see grammar.NewJSONSchema).
 	// Malformed/unterminated JSON becomes structurally impossible (see internal/grammar).
 	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+
+	// Session names a disk session (a NAME inside --session-dir, not a path):
+	// before prefill the saved snapshot is seeded into the prefix cache so a
+	// matching prompt resumes without re-prefilling the saved prefix, and
+	// after generation the updated conversation is saved back. See session.go.
+	Session string `json:"session,omitempty"`
 }
 
 // ResponseFormat is the OpenAI response_format object.
@@ -994,6 +1004,17 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		return
 	}
 
+	// Session resume: validate the name (and that support is on) BEFORE any
+	// engine work so misuse is a fast 400, not a queued failure.
+	sessionPath := ""
+	if req.Session != "" {
+		sessionPath, err = s.sessionFilePath(req.Session)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
 	// Per-request summary so the client's real footprint is visible (system-prompt
 	// size, tool count, thinking, streaming). FUCINA_DEBUG=1 also dumps the full
 	// request body + rendered prompt to /tmp for inspecting exactly what a client
@@ -1182,6 +1203,22 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		return
 	}
 
+	// Seed the request's disk session (if any) into the snapshot pool so the
+	// prefill below restores it when the prompt matches. A corrupt or
+	// wrong-model file is a client-visible 400 with the precise reason — never
+	// a silent cold prefill the client cannot distinguish from a resume.
+	if sessionPath != "" {
+		if err := s.loadSessionIntoKV(sessionPath); err != nil {
+			if sse != nil {
+				sse.stopHeartbeat()
+				sse.errorEvent(fmt.Sprintf("session %s: %v", req.Session, err))
+			} else {
+				http.Error(w, fmt.Sprintf("session %s: %v", req.Session, err), http.StatusBadRequest)
+			}
+			return
+		}
+	}
+
 	// Cooperative prefill cancellation: a watcher trips the engine's abort flag
 	// when the client disconnects, so an ESC during a long prefill stops at the
 	// next chunk/layer boundary instead of grinding on with the lock held.
@@ -1280,6 +1317,11 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		s.streamResponse(r.Context(), sse, params, promptTokens, logits, wantTools)
 	} else {
 		s.generateResponse(r.Context(), w, params, promptTokens, logits, wantTools, legacy)
+	}
+	// Persist the updated conversation back to the request's session file
+	// (still under the kv lock, so the live sequence is exactly this request).
+	if sessionPath != "" {
+		s.saveSessionFromKV(sessionPath)
 	}
 	s.lastUsed.Store(int64(s.engine.NTokens()))
 	// Refresh the lock-free spec-decode mirror for /metrics (still under the kv lock).

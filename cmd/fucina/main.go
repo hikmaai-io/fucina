@@ -279,6 +279,15 @@ func main() {
 		srv.SetDraftK(args.DraftK)
 		srv.SetThinkBudget(args.ThinkBudget)
 		srv.SetKVSnapshotBudget(int64(args.KVSnapshotGB * (1 << 30)))
+		// Disk session persistence: requests naming a "session" resume from and
+		// save back to <session-dir>/<name>.fcsess (single-flight KVCache path).
+		if args.SessionDir != "" {
+			if err := srv.SetSessionDir(args.SessionDir, args.ModelPath); err != nil {
+				log.Printf("fucina: session persistence DISABLED: %v", err)
+			} else {
+				log.Printf("fucina: session persistence ON (%s)", args.SessionDir)
+			}
+		}
 		// Auth: flag wins, else FUCINA_API_KEY. Empty leaves auth disabled.
 		apiKey := args.APIKey
 		if apiKey == "" {
