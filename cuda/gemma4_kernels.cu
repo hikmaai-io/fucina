@@ -10,6 +10,7 @@
 
 #include "gemma4_kernels.cuh"
 #include "tensor_types.h"
+#include "model_plan.h"
 #include "gemma4_detect.h"   // M0: runtime arch auto-detection (gemma4_detect_from_gguf/_config_json)
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>

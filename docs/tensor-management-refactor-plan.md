@@ -271,16 +271,18 @@ through descriptors and ownership APIs; moving code then becomes mechanical and 
 ## Execution status
 
 - **Phase 0 — evidence:** partial. Publication KPI, TTFT, allocation-ledger, and oracle artifacts are
-  pinned under `benchmark-evidence/results/`; deterministic per-producer tensor snapshots and the
-  malformed-checkpoint matrix remain open.
+  pinned under `benchmark-evidence/results/`; deterministic official FP8, ModelOpt, Unsloth Fast,
+  and Unsloth accurate plans are pinned under `benchmark-evidence/tensor-plans/`. The synthetic
+  malformed-checkpoint startup matrix remains open.
 - **Phase 1 — descriptor foundation:** complete. Canonical descriptor types are present and all
   Qwen attention, GDN, and dense-FFN projection paths use descriptors. Official FP8, GGUF, and both
   Unsloth variants pass oracle, graph, state, and long-context gates.
 - **Phase 2 — host model planner:** in progress. The immutable host-only `ModelPlan`, validation,
   alias handling, exact aligned arena totals, and deterministic JSON serialization are implemented.
   Official FP8, ModelOpt, and compressed-tensors source conventions now pass a complete host-only
-  shape/dtype/scale preflight before engine CUDA allocations; making plan entries authoritative for
-  upload descriptors and exact ledger generation remains open.
+  shape/dtype/scale preflight before engine CUDA allocations. Planned offsets are authoritative for
+  the core upload arena, and planned core/scale/expert bytes feed the exact ledger. Embedding/head,
+  workspace, and cache representations still need to move into the plan.
 - **Phases 3–6:** not started.
 
 The performance KPI remains **>64 / >105 / >150 tok/s at 1/2/4 streams**. Descriptor-only changes
