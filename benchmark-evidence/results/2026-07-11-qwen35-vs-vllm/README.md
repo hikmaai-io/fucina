@@ -80,6 +80,30 @@ fucina 56.6 / 109.6 / 179.3 / 236.1 / 260.5 · vLLM 42.9 / 83.9 / 161.7 / 296.1 
 35B-A3B matches PROTOCOL baselines (32.2/58.2/101.7/154.6/206.0 @ N=1/2/4/8/16) within 1–2%;
 N=32 improved (291.7 vs old 212.6). verify-sample correctness passed.
 
+## N=32 baseline provenance (291.7 now vs 212.6 in PROTOCOL.md) — RESOLVED
+
+The `212.6` in `benchmark-evidence/PROTOCOL.md:50` is a **stale pre-optimization baseline**,
+explicitly labelled "the old N=32 result". `benchmark-evidence/results/2026-07-10-fucina-a43ab6d.md`
+documents the jump: `| 32 | 212.6 | 291.22 | +37.0% |` — commit **a43ab6d** (2026-07-10) raised
+N=32 from 212.6 → 291.2. Later runs cluster higher still: 293.7 (`rerun-fa982db`), 317–320
+(`tensor-refactor-phase1/5`), 333 (`unsloth-nvfp4`). This run's **291.7** matches the a43ab6d /
+rerun-fa982db cohort. So 291.7 is **not** a regression — PROTOCOL.md's N=32 figure is simply
+outdated (the frozen gate baselines it lists are N=1..16 only: 32.2/58.2/101.7/154.6/206.0, which
+this run matches within 1–2%). CAVEAT: phase5 reported 320.7 vs this run's 291.7 — a ~9% spread
+across nominally-identical protocol runs (prompt-mix / admission-order noise), which is why P3
+freezes baselines from a fresh contemporaneous quiescent-box run rather than trusting any single
+historical number.
+
+## Arrival model + TTFT statistic (review requirement)
+
+All concurrency cells above are **synchronized bursts** — the canonical `bench_serving.py` fires all
+N requests simultaneously with 16 cycled SHORT diverse prompts (~10–15 tok each), plus a separate
+`single_long` (3500-tok) probe. Consequently the N=32 TTFT of 1923 ms is dominated by *admission /
+scheduling* latency, not prefill compute (32×~15 tok ≈ sub-ms of prefill). TTFT here is the
+**median**; the archived JSONs store median only (the harness did not retain per-request arrays).
+**p95 TTFT baselines are frozen separately under `../` P3 with an enhanced harness** (a synchronized
+burst does NOT exercise fusion — see below — so this is an admission/scheduling metric).
+
 ## Fusion on/off is a STRUCTURAL NO-OP on Qwen3.5 (root cause of L1)
 
 Byte-identical ON vs OFF on both models AND both burst and staggered-decode workloads
