@@ -1,6 +1,6 @@
 # Tensor management refactor plan
 
-Status: proposed  
+Status: in progress  
 Scope: CUDA model loading, resident weight representation, scratch ownership, and dispatch  
 Primary target: Qwen3.5/3.6 on one GB10; design must remain usable by Gemma and diffusion
 
@@ -267,6 +267,22 @@ After descriptors and ownership are stable, split by responsibility:
 
 Do not start by physically splitting the 15K-line translation unit. First remove hidden dependencies
 through descriptors and ownership APIs; moving code then becomes mechanical and reviewable.
+
+## Execution status
+
+- **Phase 0 — evidence:** partial. Publication KPI, TTFT, allocation-ledger, and oracle artifacts are
+  pinned under `benchmark-evidence/results/`; deterministic per-producer tensor snapshots and the
+  malformed-checkpoint matrix remain open.
+- **Phase 1 — descriptor foundation:** complete. Canonical descriptor types are present and all
+  Qwen attention, GDN, and dense-FFN projection paths use descriptors. Official FP8, GGUF, and both
+  Unsloth variants pass oracle, graph, state, and long-context gates.
+- **Phase 2 — host model planner:** in progress. The immutable host-only `ModelPlan`, validation,
+  alias handling, exact aligned arena totals, and deterministic JSON serialization are implemented;
+  Qwen adapter/preflight integration remains open.
+- **Phases 3–6:** not started.
+
+The performance KPI remains **>64 / >105 / >150 tok/s at 1/2/4 streams**. Descriptor-only changes
+must first preserve the `<1%` phase gate; kernel optimization remains sequenced after ownership work.
 
 ## Phased execution plan
 
