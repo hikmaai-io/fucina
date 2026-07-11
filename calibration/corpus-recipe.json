@@ -1,0 +1,15 @@
+{
+  "format": "fucina-calibration-recipe-v1",
+  "description": "Agentic coding plus AI red-team calibration mix for Qwen sparse-MoE policy fitting.",
+  "seed": 35,
+  "target_tokens": 3000000,
+  "categories": {
+    "agentic_coding": 0.35,
+    "tool_calling": 0.15,
+    "red_team": 0.20,
+    "security_analysis": 0.15,
+    "math": 0.05,
+    "long_documents": 0.10
+  },
+  "sources": []
+}

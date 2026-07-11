@@ -14,6 +14,7 @@ func TestCorpusText(t *testing.T) {
 		{`{"text":"hello"}`, "hello"},
 		{`{"prompt":"audit this"}`, "audit this"},
 		{`{"messages":[{"role":"user","content":"find bug"},{"role":"assistant","content":"checking"}]}`, "find bug\nchecking"},
+		{`{"category":"agentic_coding","sample":{"prompt":"patch it"}}`, "patch it"},
 	}
 	for _, tc := range cases {
 		if got := corpusText([]byte(tc.in)); got != tc.want {

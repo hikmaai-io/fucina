@@ -33,7 +33,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test qwen3-fused-test gpu-gates \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
         qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
-        paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench \
+        paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench phase-b-test \
         dg dg-dequant-test dg-forward-test dg-generate
 
 # `make` with no arguments builds everything (CUDA archive + Go binary).
@@ -519,6 +519,9 @@ go-test-cgo: lib libdg
 
 go-test:
 	$(GO) test $(GO_TEST_PKGS) -count=1
+
+phase-b-test:
+	PYTHONPATH=scripts python3 -m unittest scripts/test_phase_b.py
 
 go-test-race:
 	$(GO) test $(GO_TEST_PKGS) -race -count=1

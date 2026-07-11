@@ -90,8 +90,10 @@ func extractText(v any) string {
 		if msgs, ok := x["messages"]; ok {
 			return extractText(msgs)
 		}
-		if c, ok := x["content"]; ok {
-			return extractText(c)
+		for _, k := range []string{"content", "sample"} {
+			if c, ok := x[k]; ok {
+				return extractText(c)
+			}
 		}
 	}
 	return ""
