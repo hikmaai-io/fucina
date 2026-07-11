@@ -610,6 +610,127 @@ static inline bool qwen35_fp8_is_moe(st::Model &M, qwen35fp8::Layout &LO) {
     return q35_weight_tensor(M,LO,qwen35fp8::lkey(LO,0,"mlp.experts.0.gate_proj.weight")) != nullptr;
 }
 
+enum class q35_source_kind : uint8_t { FP8_BLOCK, FP8_SCALED, NVFP4 };
+
+static bool q35_shape_is(const st::Tensor *t,int64_t rows,int64_t cols) {
+    return t && t->shape.size()==2 && t->shape[0]==rows && t->shape[1]==cols;
+}
+
+// Producer adapter/preflight for one logical weight. This normalizes official block-FP8,
+// ModelOpt NVFP4, and compressed-tensors naming without allocating or selecting a CUDA kernel.
+static bool q35_validate_weight_source(st::Model &M,const qwen35fp8::Layout &LO,
+                                       const std::string &key,int out_dim,int in_dim,
+                                       q35_source_kind *kind,std::string &error) {
+    const st::Tensor *w=M.find(key), *inv=M.find(key+"_scale_inv");
+    if(w&&inv){
+        const size_t scale_bytes=(size_t)((out_dim+127)/128)*((in_dim+127)/128)*2;
+        if(w->dtype!=st::Dtype::F8_E4M3 || !q35_shape_is(w,out_dim,in_dim)) {
+            error=key+": expected F8_E4M3 [out,in]"; return false;
+        }
+        if(inv->dtype!=st::Dtype::BF16 || inv->nbytes!=scale_bytes) {
+            error=key+"_scale_inv: expected BF16 128x128 scale grid"; return false;
+        }
+        *kind=q35_source_kind::FP8_BLOCK; return true;
+    }
+    if(LO.mixed_nvfp4()){
+        q35_native_nv4 n4=q35_native_nv4_resolve(M,LO,key);
+        if(n4.packed||n4.global){
+            if(!n4.packed||!n4.scale||!n4.global || n4.packed->dtype!=st::Dtype::U8 ||
+               !q35_shape_is(n4.packed,out_dim,in_dim/2) || n4.packed->nbytes!=(size_t)out_dim*in_dim/2 ||
+               (n4.scale->dtype!=st::Dtype::U8 && n4.scale->dtype!=st::Dtype::F8_E4M3) || n4.scale->nbytes==0 ||
+               n4.global->dtype!=st::Dtype::F32 || n4.global->nbytes!=4 || n4.global_mul==0.f) {
+                error=key+": incomplete or malformed native NVFP4 weight/scale/global triplet"; return false;
+            }
+            *kind=q35_source_kind::NVFP4; return true;
+        }
+        const st::Tensor *scaled=M.find(key), *scale=M.find(key+"_scale");
+        if(!scaled||!scale || scaled->dtype!=st::Dtype::F8_E4M3 ||
+           !q35_shape_is(scaled,out_dim,in_dim) ||
+           (scale->dtype!=st::Dtype::F32 && scale->dtype!=st::Dtype::BF16) || scale->nbytes==0) {
+            error=key+": expected scaled FP8 weight and scale"; return false;
+        }
+        *kind=q35_source_kind::FP8_SCALED; return true;
+    }
+    error=key+": missing weight or scale"; return false;
+}
+
+static bool q35_validate_vector(st::Model &M,const std::string &key,int64_t elements,
+                                bool allow_f32,std::string &error) {
+    const st::Tensor *t=M.find(key);
+    int64_t count=1; if(t) for(int64_t d:t->shape) count*=d;
+    if(!t || count!=elements ||
+       (t->dtype!=st::Dtype::BF16 && (!allow_f32 || t->dtype!=st::Dtype::F32))) {
+        error=key+": wrong element count or dtype"; return false;
+    }
+    return true;
+}
+
+// Complete host-only schema pass. It runs from setup_cfg, before engine CUDA allocations begin.
+static bool q35_preflight(st::Model &M,qwen35fp8::Layout &LO,int H,int HD,int NQ,int NKV,
+                          int INNER,int TSR,int I,int VOC,int E,int MI,bool moe,std::string &error) {
+    q35_source_kind k;
+    const st::Tensor *embed=M.find(LO.embed_key), *head=M.find(LO.lmhead_key);
+    if(!embed || embed->dtype!=st::Dtype::BF16 || !q35_shape_is(embed,VOC,H)) {
+        error=LO.embed_key+": expected BF16 [vocab,hidden]"; return false;
+    }
+    if(!head){ error=LO.lmhead_key+": missing lm head"; return false; }
+    if(!LO.mixed_nvfp4() && (head->dtype!=st::Dtype::BF16 || !q35_shape_is(head,VOC,H))) {
+        error=LO.lmhead_key+": expected BF16 [vocab,hidden]"; return false;
+    }
+    if(!q35_validate_vector(M,LO.final_norm_key,H,false,error)) return false;
+    const int CONVD=2*M2_KEYD+INNER;
+    for(int l=0;l<LO.n_layers;l++){
+        auto lk=[&](const char *s){ return qwen35fp8::lkey(LO,l,s); };
+        if(!q35_validate_vector(M,lk("input_layernorm.weight"),H,false,error) ||
+           !q35_validate_vector(M,lk("post_attention_layernorm.weight"),H,false,error)) return false;
+        if(qwen35fp8::is_full(LO,l)){
+            if(!q35_validate_weight_source(M,LO,lk("self_attn.q_proj.weight"),2*NQ*HD,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("self_attn.k_proj.weight"),NKV*HD,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("self_attn.v_proj.weight"),NKV*HD,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("self_attn.o_proj.weight"),H,NQ*HD,&k,error) ||
+               !q35_validate_vector(M,lk("self_attn.q_norm.weight"),HD,false,error) ||
+               !q35_validate_vector(M,lk("self_attn.k_norm.weight"),HD,false,error)) return false;
+        } else {
+            if(!q35_validate_weight_source(M,LO,lk("linear_attn.in_proj_qkv.weight"),CONVD,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("linear_attn.in_proj_z.weight"),INNER,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("linear_attn.out_proj.weight"),H,INNER,&k,error) ||
+               !q35_validate_vector(M,lk("linear_attn.A_log"),TSR,true,error) ||
+               !q35_validate_vector(M,lk("linear_attn.dt_bias"),TSR,false,error) ||
+               !q35_validate_vector(M,lk("linear_attn.norm.weight"),M2_SD,true,error)) return false;
+            const st::Tensor *a=M.find(lk("linear_attn.in_proj_a.weight"));
+            const st::Tensor *b=M.find(lk("linear_attn.in_proj_b.weight"));
+            const st::Tensor *conv=M.find(lk("linear_attn.conv1d.weight"));
+            if(!a||!b||!conv || a->dtype!=st::Dtype::BF16 || b->dtype!=st::Dtype::BF16 ||
+               !q35_shape_is(a,TSR,H) || !q35_shape_is(b,TSR,H) ||
+               conv->dtype!=st::Dtype::BF16 || conv->nbytes!=(size_t)CONVD*M2_CK*2) {
+                error=lk("linear_attn")+": malformed a/b/conv tensors"; return false;
+            }
+        }
+        if(moe){
+            if(!q35_validate_vector(M,lk("mlp.shared_expert_gate.weight"),H,false,error) ||
+               !q35_validate_weight_source(M,LO,lk("mlp.shared_expert.gate_proj.weight"),I,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("mlp.shared_expert.up_proj.weight"),I,H,&k,error) ||
+               !q35_validate_weight_source(M,LO,lk("mlp.shared_expert.down_proj.weight"),H,I,&k,error)) return false;
+            const st::Tensor *router=M.find(lk("mlp.gate.weight"));
+            if(!router || router->dtype!=st::Dtype::BF16 || !q35_shape_is(router,E,H)) {
+                error=lk("mlp.gate.weight")+": malformed router"; return false;
+            }
+            q35_source_kind layer_kind=q35_source_kind::FP8_BLOCK; bool first=true;
+            const char *proj[3]={"gate_proj","up_proj","down_proj"};
+            for(int p=0;p<3;p++) for(int e=0;e<E;e++){
+                char name[96]; snprintf(name,sizeof(name),"mlp.experts.%d.%s.weight",e,proj[p]);
+                q35_source_kind ek; int od=p==2?H:MI, id=p==2?MI:H;
+                if(!q35_validate_weight_source(M,LO,lk(name),od,id,&ek,error)) return false;
+                if(first){ layer_kind=ek; first=false; }
+                else if(ek!=layer_kind){ error=lk("mlp.experts")+": mixed expert formats within layer"; return false; }
+            }
+        } else if(!q35_validate_weight_source(M,LO,lk("mlp.gate_proj.weight"),I,H,&k,error) ||
+                  !q35_validate_weight_source(M,LO,lk("mlp.up_proj.weight"),I,H,&k,error) ||
+                  !q35_validate_weight_source(M,LO,lk("mlp.down_proj.weight"),H,I,&k,error)) return false;
+    }
+    return true;
+}
+
 // Set eng->cfg from the FP8 checkpoint. H / NKV / vocab / FFN dims come from the tensor shapes
 // (9B dense: H=4096 NKV=4; 35B-A3B MoE: H=2048 NKV=2 E=256 top-8 MI=SI=512); the head/GDN geometry
 // is the shared M2_* baked set. Called EARLY (before the cfg-dependent scratch allocations); the
@@ -647,15 +768,23 @@ static int qwen35_fp8_setup_cfg(gemma4_engine_t *eng, st::Model &M, qwen35fp8::L
     c->ssm_state_size=SD; c->ssm_conv_kernel=CK; c->ssm_inner_size=INNER; c->ssm_group_count=M2_NKH; c->ssm_time_step_rank=TSR;
     fprintf(stderr,"fucina: qwen35 geometry (runtime-derived) — NQ=%d NKV=%d NVH=%d INNER=%d CONVD=%d (M2 baked NQ%d/NVH%d/INNER%d)\n",
             NQ, NKV, NVH, INNER, 2*M2_KEYD+INNER, M2_NQ, M2_NVH, M2_VALD);
+    int E=0, MI=0;
     if (moe) {
         const st::Tensor *rgT=M.find(qwen35fp8::lkey(LO,0,"mlp.gate.weight"));
         const st::Tensor *egT=q35_weight_tensor(M,LO,qwen35fp8::lkey(LO,0,"mlp.experts.0.gate_proj.weight"));
         if(!rgT||!egT){ fprintf(stderr,"qwen35_fp8_engine: missing router/expert tensors\n"); return -1; }
-        c->n_experts=(int)rgT->shape[0]; c->expert_ffn=(int)egT->shape[0];
+        E=(int)rgT->shape[0]; MI=(int)egT->shape[0];
+        c->n_experts=E; c->expert_ffn=MI;
         long tk=8; qwen35fp8::cfg_int(M.config_json(),"\"num_experts_per_tok\"",tk);
         c->n_experts_used=(tk>0)?(int)tk:8;
         eng->moe_shared_inter=I;      // I above = shared_expert_intermediate for MoE
     }
+    std::string preflight_error;
+    if(!q35_preflight(M,LO,H,HD,NQ,NKV,INNER,TSR,I,VOC,E,MI,moe,preflight_error)){
+        fprintf(stderr,"qwen35_fp8_engine: preflight failed: %s\n",preflight_error.c_str());
+        return -1;
+    }
+    fprintf(stderr,"fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)\n");
     int nfull=0;
     for(int l=0;l<L;l++){ bool full=qwen35fp8::is_full(LO,l);
         c->attn_kind[l]=full?GEMMA4_ATTN_FULL:GEMMA4_ATTN_LINEAR; c->is_global[l]=full?1:0; nfull+=full?1:0; }

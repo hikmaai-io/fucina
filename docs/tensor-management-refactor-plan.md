@@ -277,8 +277,10 @@ through descriptors and ownership APIs; moving code then becomes mechanical and 
   Qwen attention, GDN, and dense-FFN projection paths use descriptors. Official FP8, GGUF, and both
   Unsloth variants pass oracle, graph, state, and long-context gates.
 - **Phase 2 — host model planner:** in progress. The immutable host-only `ModelPlan`, validation,
-  alias handling, exact aligned arena totals, and deterministic JSON serialization are implemented;
-  Qwen adapter/preflight integration remains open.
+  alias handling, exact aligned arena totals, and deterministic JSON serialization are implemented.
+  Official FP8, ModelOpt, and compressed-tensors source conventions now pass a complete host-only
+  shape/dtype/scale preflight before engine CUDA allocations; making plan entries authoritative for
+  upload descriptors and exact ledger generation remains open.
 - **Phases 3–6:** not started.
 
 The performance KPI remains **>64 / >105 / >150 tok/s at 1/2/4 streams**. Descriptor-only changes
