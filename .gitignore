@@ -1,6 +1,7 @@
 # ─── fucina build artifacts ──────────────────────────────────────────────
 # Compiled binary (built via `make`) — new and legacy names
 /fucina
+/fucina-calibrate
 /gem4d
 
 # CUDA object / archive artifacts (built via `make lib`)

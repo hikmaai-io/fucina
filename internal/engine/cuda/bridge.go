@@ -5,7 +5,7 @@
 
 package cuda
 
-// #cgo LDFLAGS: -L${SRCDIR}/../../../cuda -L/usr/local/cuda/lib64 -lfucina -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+// #cgo LDFLAGS: -L${SRCDIR}/../../../cuda -L/usr/local/cuda/lib64 -lfucina -ldg -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 // #cgo CFLAGS: -I/usr/local/cuda-13/include -I${SRCDIR}/../../../cuda
 //
 // #include "gemma4_kernels.cuh"
@@ -90,6 +90,15 @@ type Config struct {
 	ContextSize uint32  // --ctx
 	DeviceID    int     // --cuda-device
 	GPUMemUtil  float64 // --gpu-mem-util: fraction of total device mem the engine may use (vLLM-style; <=0 → 0.90)
+}
+
+// MoEProfile is a calibration snapshot in row-major [layer][expert] order.
+type MoEProfile struct {
+	Layers     int
+	Experts    int
+	TopK       int
+	Counts     []uint64
+	WeightSums []float64
 }
 
 // MemoryStats is named engine memory accounting. Qwen fields are zero for other architectures.
@@ -193,6 +202,36 @@ func (e *Engine) NExperts() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return int(C.gemma4_engine_n_experts(e.ptr))
+}
+
+// StartMoEProfile resets and enables calibration-only router telemetry. It is
+// intentionally explicit: ordinary serving does not launch the counter kernel.
+func (e *Engine) StartMoEProfile() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if C.gemma4_engine_moe_profile_start(e.ptr) != 0 {
+		return fmt.Errorf("fucina: MoE profiling requires a loaded sparse model")
+	}
+	return nil
+}
+
+// MoEProfile snapshots selected-expert counts and selected router-weight sums.
+func (e *Engine) MoEProfile() (MoEProfile, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var layers, experts, topK C.int
+	if C.gemma4_engine_moe_profile_shape(e.ptr, &layers, &experts, &topK) != 0 {
+		return MoEProfile{}, fmt.Errorf("fucina: model has no sparse-MoE profile shape")
+	}
+	n := int(layers) * int(experts)
+	p := MoEProfile{Layers: int(layers), Experts: int(experts), TopK: int(topK),
+		Counts: make([]uint64, n), WeightSums: make([]float64, n)}
+	if C.gemma4_engine_moe_profile_snapshot(e.ptr,
+		(*C.uint64_t)(unsafe.Pointer(&p.Counts[0])), (*C.double)(unsafe.Pointer(&p.WeightSums[0])),
+		C.size_t(n)) != 0 {
+		return MoEProfile{}, fmt.Errorf("fucina: failed to snapshot MoE profile")
+	}
+	return p, nil
 }
 
 // PrintInfo prints engine configuration to stderr.

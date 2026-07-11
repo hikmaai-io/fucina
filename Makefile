@@ -26,7 +26,7 @@ NVCCFLAGS := -arch=$(CUDA_ARCH) -O3 -lineinfo --use_fast_math \
 CGO_CFLAGS   := -I$(CUDA_HOME)/include
 CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 
-.PHONY: all clean test cuda lib libdg fucina smoke profile nvfp4-test e4b-test \
+.PHONY: all clean test cuda lib libdg fucina fucina-calibrate smoke profile nvfp4-test e4b-test \
         e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
         e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
@@ -96,6 +96,13 @@ fucina: cuda/libfucina.a cuda/libdg.a
 	@strings $@ | grep -q "uploading.*weights to device" \
 		&& echo "fucina: OK — device weight-upload path linked" \
 		|| { echo "fucina: ERROR — stale link, upload path missing"; exit 1; }
+
+# Calibration profiler: records per-layer expert heat/weight maps into a
+# versioned .imatrix-style JSON sidecar. It links the same CUDA engine archive.
+fucina-calibrate: cuda/libfucina.a cuda/libdg.a
+	CGO_CFLAGS="$(CGO_CFLAGS)" \
+	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
+	$(GO) build -a -o $@ ./cmd/fucina-calibrate/
 
 # ─── Standalone CUDA Test (without Go) ──────────────────────────────────
 cuda/test_engine: cuda/test_engine.cu cuda/libfucina.a
@@ -505,7 +512,7 @@ GO_TEST_PKGS := ./internal/server/ ./internal/server/batch/ ./internal/tokenizer
 # cuda/libfucina.a to link, hence the `lib` prerequisite.
 GO_TEST_CGO_PKGS := ./cmd/...
 
-go-test-cgo: lib
+go-test-cgo: lib libdg
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	$(GO) test $(GO_TEST_CGO_PKGS) -count=1

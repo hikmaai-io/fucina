@@ -4148,6 +4148,11 @@ struct gemma4_engine {
     int             moe_tc_off;      // 1 = tensor-core expert prefill unavailable (alloc failed)
     int             moe_experts_q4k; // 1 = experts requantized FP8→Q4_K at load (fewer decode bytes)
 
+    // Calibration-only router telemetry. Allocated lazily by
+    // gemma4_engine_moe_profile_start; NULL keeps normal serving unchanged.
+    unsigned long long *d_moe_profile_count;   // [layer,expert] selected-route count
+    double             *d_moe_profile_weight;  // [layer,expert] selected-weight sum
+
     // NVFP4 grouped-CUTLASS experts (qwen3_5_moe DEFAULT): fused gate|up (N=2·EFFN) + down slabs
     // per layer, E2M1 packed + per-expert swizzled ue4m3 SF, consumed by dg_fp4_moe_grouped.
     int             moe_experts_fp4;                 // 1 = experts requantized FP8→NVFP4 at load
@@ -6636,6 +6641,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_moe_xe);      CUDA_FREE(eng->d_moe_gate);  CUDA_FREE(eng->d_moe_up);
     CUDA_FREE(eng->d_moe_act);     CUDA_FREE(eng->d_moe_oe);    CUDA_FREE(eng->d_moe_shlog);
     CUDA_FREE(eng->d_moe_active);
+    CUDA_FREE(eng->d_moe_profile_count); CUDA_FREE(eng->d_moe_profile_weight);
     for (int i = 0; i < 3; i++) CUDA_FREE(eng->d_moe_wbf[i]);
     for (int i = 0; i < GEMMA4_CAP_LAYERS; i++) {
         CUDA_FREE(eng->d_fp4m_gu[i]); CUDA_FREE(eng->d_fp4m_gusf[i]);
@@ -9027,6 +9033,17 @@ int g_fucina_q35_scalar_cont_attn = 0;
 // thread t accumulates k = t + i·blockDim ascending (hoisting reorders loads, not adds; the
 // per-chunk k sequence i, i+256, …, i+7·256, i+2048, … is the same ascending sequence), then the
 // identical 256-wide tree reduction → bit-identical logits.
+// Calibration-only top-k telemetry; never launched unless profiling was started.
+__global__ void moe_profile_accum_kernel(const int *idx, const float *weight,
+                                         unsigned long long *counts, double *weight_sums,
+                                         int assignments) {
+    int i = (int)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= assignments) return;
+    int e = idx[i];
+    atomicAdd(counts + e, 1ULL);
+    atomicAdd(weight_sums + e, (double)weight[i]);
+}
+
 __global__ void moe_router_gemv_kernel(const float *__restrict__ W, const float *__restrict__ X,
                                        float *__restrict__ logits, int H, int n_expert, int cn) {
     const int e = blockIdx.x, t0 = blockIdx.y * 2;
@@ -9359,6 +9376,12 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         moe_router_gemv_kernel<<<dim3(E, (unsigned)((cn + 1) / 2)), 256, 0, stream>>>(
             router_w, h, eng->d_moe_rlogits, H, E, cn);
         dg_softmax_topk(eng->d_moe_rlogits, E, cn, U, eng->d_moe_tki, eng->d_moe_tkw, stream);
+        if (eng->d_moe_profile_count) {
+            moe_profile_accum_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+                eng->d_moe_tki, eng->d_moe_tkw,
+                eng->d_moe_profile_count + (size_t)l * E,
+                eng->d_moe_profile_weight + (size_t)l * E, total);
+        }
         int n_slot = (total < E) ? total : E;   // grid.y for active-expert grouped GEMMs
         dg_moe_route_inv(eng->d_moe_tki, eng->d_moe_tkw, eng->d_moe_ones, cn, U, E,
                          eng->d_moe_count, eng->d_moe_coloff, eng->d_moe_cursor,
@@ -15195,6 +15218,44 @@ int gemma4_engine_get_n_layers(const gemma4_engine_t *eng) {
 // tokens — it doesn't bring value on MoE, exactly the case the goal says to avoid.
 int gemma4_engine_n_experts(const gemma4_engine_t *eng) {
     return (eng && eng->loaded) ? eng->cfg.n_experts : 0;
+}
+
+int gemma4_engine_moe_profile_shape(const gemma4_engine_t *eng,
+                                    int *n_layers, int *n_experts, int *top_k) {
+    if (!eng || !eng->loaded || eng->cfg.n_experts <= 0) return -1;
+    if (n_layers) *n_layers = eng->cfg.n_layers;
+    if (n_experts) *n_experts = eng->cfg.n_experts;
+    if (top_k) *top_k = eng->cfg.n_experts_used;
+    return 0;
+}
+
+int gemma4_engine_moe_profile_start(gemma4_engine_t *eng) {
+    if (!eng || !eng->loaded || eng->cfg.n_experts <= 0) return -1;
+    const size_t n = (size_t)eng->cfg.n_layers * eng->cfg.n_experts;
+    if (!eng->d_moe_profile_count &&
+        cudaMalloc(&eng->d_moe_profile_count, n * sizeof(unsigned long long)) != cudaSuccess)
+        return -1;
+    if (!eng->d_moe_profile_weight &&
+        cudaMalloc(&eng->d_moe_profile_weight, n * sizeof(double)) != cudaSuccess) {
+        cudaFree(eng->d_moe_profile_count); eng->d_moe_profile_count = NULL;
+        return -1;
+    }
+    cudaMemsetAsync(eng->d_moe_profile_count, 0, n * sizeof(unsigned long long), eng->stream);
+    cudaMemsetAsync(eng->d_moe_profile_weight, 0, n * sizeof(double), eng->stream);
+    return cudaStreamSynchronize(eng->stream) == cudaSuccess ? 0 : -1;
+}
+
+int gemma4_engine_moe_profile_snapshot(gemma4_engine_t *eng,
+                                       uint64_t *counts, double *weight_sums,
+                                       size_t capacity) {
+    if (!eng || !counts || !weight_sums || !eng->d_moe_profile_count) return -1;
+    const size_t n = (size_t)eng->cfg.n_layers * eng->cfg.n_experts;
+    if (capacity < n || cudaStreamSynchronize(eng->stream) != cudaSuccess) return -1;
+    if (cudaMemcpy(counts, eng->d_moe_profile_count, n * sizeof(uint64_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+    if (cudaMemcpy(weight_sums, eng->d_moe_profile_weight, n * sizeof(double),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+    return 0;
 }
 
 // Detected architecture family. The Qwen3/Qwen3-MoE forward is served ONLY through
