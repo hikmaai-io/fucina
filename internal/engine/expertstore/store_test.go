@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeUploader struct {
@@ -96,6 +97,21 @@ func TestPrefetch(t *testing.T) {
 	}
 	if s.Metrics().PrefetchHits != 1 {
 		t.Fatalf("prefetch hit not recorded: %+v", s.Metrics())
+	}
+}
+
+func TestControllerDegradesAndRecoversWithHysteresis(t *testing.T) {
+	c := NewController(Limits{4, 4, 8}, Limits{1, 1, 1}, Limits{8, 8, 16}, 5*time.Millisecond)
+	c.Observe(PressureSample{SSDLatency: 10 * time.Millisecond, PendingMisses: 20})
+	got := c.Observe(PressureSample{SSDLatency: 10 * time.Millisecond, PendingMisses: 20})
+	if got != (Limits{3, 3, 4}) {
+		t.Fatalf("degraded limits=%+v", got)
+	}
+	for i := 0; i < 4; i++ {
+		got = c.Observe(PressureSample{SSDLatency: time.Millisecond, PrefetchUseful: true})
+	}
+	if got != (Limits{4, 4, 5}) {
+		t.Fatalf("recovered limits=%+v", got)
 	}
 }
 

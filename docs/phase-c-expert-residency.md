@@ -26,7 +26,9 @@ fraction of calibration routes served by VRAM, host, and SSD.
 - an uploader interface for CUDA allocation/copy and eviction;
 - concurrent prefetch workers and cancellation-aware scheduling;
 - an online, bounded per-layer transition predictor over top-k expert IDs;
-- VRAM/host hit, SSD read, promotion, eviction, checksum, byte, occupancy, prefetch, and useful-prefetch metrics.
+- VRAM/host hit, SSD read, promotion, eviction, checksum, byte, occupancy, prefetch, and useful-prefetch metrics;
+- a hysteretic pressure controller that lowers prefetch depth, I/O workers, and admitted batch size
+  under sustained SSD latency/miss queues, then recovers gradually when prefetches are useful.
 
 The package is tested under an artificial one-expert VRAM cap, including host promotion, eviction,
 checksum failure, concurrent prefetch, useful-prefetch accounting, and transition prediction.
