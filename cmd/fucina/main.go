@@ -162,6 +162,11 @@ func main() {
 		}
 		os.Setenv("FUCINA_EXPERT_STREAM_SSD", args.ExpertStore)
 		os.Setenv("FUCINA_EXPERT_STREAM_SLOTS", fmt.Sprintf("%d", args.ExpertSlots))
+		if args.ExpertResidency != "" {
+			os.Setenv("FUCINA_EXPERT_RESIDENCY_PLAN", args.ExpertResidency)
+		}
+	} else if args.ExpertResidency != "" {
+		log.Fatal("fucina: --expert-residency-plan requires --expert-store")
 	}
 
 	// Paged multi-sequence KV pools are gated inside the C engine on the FUCINA_PAGED_KV

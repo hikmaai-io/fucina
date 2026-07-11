@@ -64,10 +64,17 @@ func TestParseArgsDefaults(t *testing.T) {
 	if a.GPUMemUtil != 0.90 {
 		t.Errorf("GPUMemUtil = %v, want 0.90", a.GPUMemUtil)
 	}
+	if a.ExpertStore != "" || a.ExpertSlots != 512 || a.ExpertResidency != "" {
+		t.Errorf("expert streaming defaults = store %q slots %d plan %q", a.ExpertStore, a.ExpertSlots, a.ExpertResidency)
+	}
 
 	// --gpu-mem-util overrides the default.
 	if b, _ := mustParse(t, []string{"--gpu-mem-util", "0.20"}); b.GPUMemUtil != 0.20 {
 		t.Errorf("GPUMemUtil = %v, want 0.20", b.GPUMemUtil)
+	}
+
+	if b, _ := mustParse(t, []string{"--expert-store", "/nvme/e.bin", "--expert-slots", "64", "--expert-residency-plan", "r.json"}); b.ExpertStore != "/nvme/e.bin" || b.ExpertSlots != 64 || b.ExpertResidency != "r.json" {
+		t.Errorf("expert streaming flags not parsed: %+v", b)
 	}
 
 	// No test-flag dispatch by default.

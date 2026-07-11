@@ -83,6 +83,7 @@ static int moe_alloc_scratch(gemma4_engine_t *eng);          // defined with the
 #include "nvfp4_gemv.cuh"
 #include <thread>
 #include <atomic>
+#include <algorithm>
 #include "fp8_block.cuh"          // M5: DeepSeek block-fp8 decode GEMV (Qwen3.5-9B FP8)
 #include "qwen35_fp8_loader.h"    // M5: qwen35 FP8 safetensors → engine key mapping
 // =========================================================================
@@ -4180,7 +4181,7 @@ struct gemma4_engine {
     int            *h_fp4m_slot_layer, *h_fp4m_slot_expert;
     uint64_t       *h_fp4m_slot_age, fp4m_slot_clock;
     uint64_t        fp4m_ssd_reads, fp4m_ssd_bytes, fp4m_ssd_checksum_fail;
-    uint64_t        fp4m_cache_hits, fp4m_cache_misses;
+    uint64_t        fp4m_cache_hits, fp4m_cache_misses, fp4m_prefetch_advice;
     float          *d_fp4m_gsw;                      // device [L·2] per-(layer,proj) global scales
     unsigned long long fp4m_gu_sfB, fp4m_dn_sfB;     // per-expert SF strides (SF elements)
     uint8_t        *d_fp4m_a,  *d_fp4m_asf;          // per-step activation E2M1 + padded SF (K=H)
@@ -6676,7 +6677,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     if (eng->h_fp4m_stage_dnsf) free(eng->h_fp4m_stage_dnsf);
     CUDA_FREE(eng->d_fp4m_stage_gu); CUDA_FREE(eng->d_fp4m_stage_gusf);
     CUDA_FREE(eng->d_fp4m_stage_dn); CUDA_FREE(eng->d_fp4m_stage_dnsf); CUDA_FREE(eng->d_fp4m_eslot);
-    if (eng->fp4m_ssd_stream && eng->fp4m_ssd_fd >= 0) close(eng->fp4m_ssd_fd);
+    if (eng->fp4m_ssd_fd > 0) close(eng->fp4m_ssd_fd);
     if (eng->h_fp4m_ssd_hash) free(eng->h_fp4m_ssd_hash);
     if (eng->h_fp4m_ssd_verified) free(eng->h_fp4m_ssd_verified);
     if (eng->h_fp4m_slot_layer) free(eng->h_fp4m_slot_layer);
@@ -9500,6 +9501,15 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                 cudaMemcpyAsync(hc_stream.data(),eng->d_moe_count,E*sizeof(int),cudaMemcpyDeviceToHost,stream);
                 cudaStreamSynchronize(stream);
                 for(int e=0;e<E;e++)if(hc_stream[e]>0)active_stream.push_back(e);
+                const char *pf=getenv("FUCINA_EXPERT_PREFETCH");
+                if(!pf||pf[0]!='0') { // asynchronous page-cache lookahead for the next layer
+                    int nl=(l+1)%eng->cfg.n_layers;const size_t gp=(size_t)GU*(H/2),gsp=(size_t)eng->fp4m_gu_sfB;
+                    const size_t dp=(size_t)H*(EFFN/2),dsp=(size_t)eng->fp4m_dn_sfB;
+                    for(int e:active_stream){posix_fadvise(eng->fp4m_ssd_fd,eng->fp4m_ssd_gu_off[nl]+(int64_t)e*gp,(off_t)gp,POSIX_FADV_WILLNEED);
+                        posix_fadvise(eng->fp4m_ssd_fd,eng->fp4m_ssd_gusf_off[nl]+(int64_t)e*gsp,(off_t)gsp,POSIX_FADV_WILLNEED);
+                        posix_fadvise(eng->fp4m_ssd_fd,eng->fp4m_ssd_dn_off[nl]+(int64_t)e*dp,(off_t)dp,POSIX_FADV_WILLNEED);
+                        posix_fadvise(eng->fp4m_ssd_fd,eng->fp4m_ssd_dnsf_off[nl]+(int64_t)e*dsp,(off_t)dsp,POSIX_FADV_WILLNEED);eng->fp4m_prefetch_advice++;}
+                }
             }
             std::vector<int> cache_map(E,-1);
             bool cache_ready=false;
@@ -15396,11 +15406,12 @@ void gemma4_engine_print_timing(const gemma4_engine_t *eng) {
     if (eng->fp4m_ssd_stream) {
         double hr=(eng->fp4m_cache_hits+eng->fp4m_cache_misses)?
             (double)eng->fp4m_cache_hits/(eng->fp4m_cache_hits+eng->fp4m_cache_misses):0.0;
-        printf("Experts:  SSD reads=%llu bytes=%.3f GiB checksum_failures=%llu slots=%d cache_hit=%.1f%% (%llu/%llu)\n",
+        printf("Experts:  SSD reads=%llu bytes=%.3f GiB checksum_failures=%llu slots=%d cache_hit=%.1f%% (%llu/%llu) prefetch=%llu\n",
                (unsigned long long)eng->fp4m_ssd_reads,eng->fp4m_ssd_bytes/(1024.0*1024*1024),
                (unsigned long long)eng->fp4m_ssd_checksum_fail,eng->fp4m_slots,100.0*hr,
                (unsigned long long)eng->fp4m_cache_hits,
-               (unsigned long long)(eng->fp4m_cache_hits+eng->fp4m_cache_misses));
+               (unsigned long long)(eng->fp4m_cache_hits+eng->fp4m_cache_misses),
+               (unsigned long long)eng->fp4m_prefetch_advice);
     }
 }
 

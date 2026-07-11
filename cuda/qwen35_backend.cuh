@@ -531,6 +531,33 @@ static int q35_fp4_expert_slabs(gemma4_engine_t *eng, int l, int L,
     return ok ? 0 : -1;
 }
 
+struct q35_resident_seed { int l,e; double score; };
+static int q35_seed_ssd_residency(gemma4_engine_t *eng,const char *plan,int L,int E,int MI,int H) {
+    if(!plan||!*plan)return 0;FILE*f=fopen(plan,"rb");if(!f){fprintf(stderr,"fucina: cannot open residency plan %s\n",plan);return -1;}
+    fseek(f,0,SEEK_END);long n=ftell(f);fseek(f,0,SEEK_SET);std::string raw;
+    if(n<=0||n>(64L<<20)){fclose(f);return -1;}raw.resize((size_t)n);bool ok=fread(raw.data(),1,(size_t)n,f)==(size_t)n;fclose(f);
+    if(!ok||raw.find("fucina-expert-residency-v1")==std::string::npos){fprintf(stderr,"fucina: invalid residency plan\n");return -1;}
+    std::vector<q35_resident_seed> seeds;size_t p=0;
+    while((p=raw.find("\"layers.",p))!=std::string::npos){int l=-1,e=-1;if(sscanf(raw.c_str()+p+1,"layers.%d.experts.%d",&l,&e)!=2){p+=8;continue;}
+        size_t end=raw.find('}',p);if(end==std::string::npos)break;size_t tier=raw.find("\"tier\"",p);
+        if(tier<end&&raw.find("\"vram\"",tier)<end){double score=0;size_t ip=raw.find("\"importance\"",p);
+            if(ip<end){ip=raw.find(':',ip);if(ip<end)score=strtod(raw.c_str()+ip+1,nullptr);}if(l>=0&&l<L&&e>=0&&e<E)seeds.push_back({l,e,score});}p=end+1;}
+    std::sort(seeds.begin(),seeds.end(),[](const q35_resident_seed&a,const q35_resident_seed&b){if(a.score!=b.score)return a.score>b.score;if(a.l!=b.l)return a.l<b.l;return a.e<b.e;});
+    const size_t gp=(size_t)2*MI*(H/2),gsp=(size_t)eng->fp4m_gu_sfB,dp=(size_t)H*(MI/2),dsp=(size_t)eng->fp4m_dn_sfB;
+    auto rd=[&](void*x,size_t z,int64_t at){uint8_t*b=(uint8_t*)x;size_t d=0;while(d<z){ssize_t r=pread(eng->fp4m_ssd_fd,b+d,z-d,at+(int64_t)d);if(r<=0)return false;d+=(size_t)r;}return true;};
+    int loaded=0;for(const auto&s:seeds){if(loaded>=eng->fp4m_slots)break;int slot=loaded;
+        uint8_t*hg=eng->h_fp4m_stage_gu+(size_t)slot*gp,*hs=eng->h_fp4m_stage_gusf+(size_t)slot*gsp;
+        uint8_t*hd=eng->h_fp4m_stage_dn+(size_t)slot*dp,*hds=eng->h_fp4m_stage_dnsf+(size_t)slot*dsp;
+        if(!rd(hg,gp,eng->fp4m_ssd_gu_off[s.l]+(int64_t)s.e*gp)||!rd(hs,gsp,eng->fp4m_ssd_gusf_off[s.l]+(int64_t)s.e*gsp)
+          ||!rd(hd,dp,eng->fp4m_ssd_dn_off[s.l]+(int64_t)s.e*dp)||!rd(hds,dsp,eng->fp4m_ssd_dnsf_off[s.l]+(int64_t)s.e*dsp))return -1;
+        const void*pp[4]={hg,hs,hd,hds};const size_t nn[4]={gp,gsp,dp,dsp};size_t z=((size_t)s.l*E+s.e)*4;
+        for(int q=0;q<4;q++){uint64_t h=q35_expert_hash_update(1469598103934665603ULL,pp[q],nn[q]);if(h!=eng->h_fp4m_ssd_hash[z+q])return -1;eng->h_fp4m_ssd_verified[z+q]=1;}
+        cudaMemcpy(eng->d_fp4m_stage_gu+(size_t)slot*gp,hg,gp,cudaMemcpyHostToDevice);cudaMemcpy(eng->d_fp4m_stage_gusf+(size_t)slot*gsp,hs,gsp,cudaMemcpyHostToDevice);
+        cudaMemcpy(eng->d_fp4m_stage_dn+(size_t)slot*dp,hd,dp,cudaMemcpyHostToDevice);cudaMemcpy(eng->d_fp4m_stage_dnsf+(size_t)slot*dsp,hds,dsp,cudaMemcpyHostToDevice);
+        eng->h_fp4m_slot_layer[slot]=s.l;eng->h_fp4m_slot_expert[slot]=s.e;eng->h_fp4m_slot_age[slot]=++eng->fp4m_slot_clock;loaded++;}
+    fprintf(stderr,"fucina: residency plan seeded %d/%d expert slots from %s\n",loaded,eng->fp4m_slots,plan);return 0;
+}
+
 // Persist transformed grouped-NVFP4 experts to SSD and retain only a compact LRU slot pool.
 static int q35_enable_ssd_expert_stream(gemma4_engine_t *eng, int L, int E, int MI, int H) {
     const char *ssd=getenv("FUCINA_EXPERT_STREAM_SSD");
@@ -584,7 +611,12 @@ static int q35_enable_ssd_expert_stream(gemma4_engine_t *eng, int L, int E, int 
         if(ok) { cudaFree(eng->d_fp4m_gu[l]);cudaFree(eng->d_fp4m_gusf[l]);cudaFree(eng->d_fp4m_dn[l]);cudaFree(eng->d_fp4m_dnsf[l]);
                  eng->d_fp4m_gu[l]=eng->d_fp4m_gusf[l]=eng->d_fp4m_dn[l]=eng->d_fp4m_dnsf[l]=NULL; }
     }
-    if(ok){fsync(eng->fp4m_ssd_fd);posix_fadvise(eng->fp4m_ssd_fd,0,off,POSIX_FADV_DONTNEED);eng->fp4m_ssd_stream=1;}
+    if(ok){
+        fsync(eng->fp4m_ssd_fd);
+        if(q35_seed_ssd_residency(eng,getenv("FUCINA_EXPERT_RESIDENCY_PLAN"),L,E,MI,H)!=0)ok=false;
+        posix_fadvise(eng->fp4m_ssd_fd,0,off,POSIX_FADV_DONTNEED);
+        if(ok)eng->fp4m_ssd_stream=1;
+    }
     if(!ok) { fprintf(stderr,"fucina: SSD expert streaming setup failed\n"); return -1; }
     fprintf(stderr,"fucina: expert SSD streaming ON (slots=%d, device staging %.2f GiB, backing %.2f GiB)\n",
             slots,(guB+gusfB+dnB+dnsfB)*(double)slots/E/(1024.0*1024*1024),L*(guB+gusfB+dnB+dnsfB)/(1024.0*1024*1024));

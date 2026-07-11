@@ -29,6 +29,7 @@ The Qwen grouped-NVFP4 path has an opt-in bounded-memory SSD mode:
 ```bash
 FUCINA_EXPERT_STREAM_SSD=/fast-nvme/qwen-experts.bin \
 FUCINA_EXPERT_STREAM_SLOTS=512 \
+FUCINA_EXPERT_RESIDENCY_PLAN=/tmp/model.residency.json \
 ./fucina -m /path/to/Qwen3.5-35B-A3B-NVFP4 ...
 ```
 
@@ -40,7 +41,8 @@ slot cap, it processes deterministic chunks rather than exceeding the cap. A cro
 hot `(layer,expert)` records resident across decode tokens. Every weight and scale record is
 checksummed on first use (mismatch aborts), and graph capture is disabled because SSD I/O is not
 capturable. Normal serving remains unchanged when the environment variable is not set. The CLI
-equivalents are `--expert-store <file>` and `--expert-slots <n>`.
+equivalents are `--expert-store <file>`, `--expert-slots <n>`, and
+`--expert-residency-plan <manifest>`.
 
 A host-RAM staging variant was tried and removed: GB10 CPU/GPU memory is physically unified, so
 staging from host memory saves nothing.
@@ -54,9 +56,11 @@ cache uses about 0.84 GiB and avoids reloading overlapping active experts. The m
 memory fallback, not the default throughput path; synchronous NVMe misses remain materially slower
 than full residency.
 
-The residency-plan manifest is not yet automatically loaded by the C engine. Runtime placement is
-demand-driven with an LRU slot budget; policy-seeded startup residency and asynchronous next-layer
-prefetch remain optimization work, not correctness blockers.
+When supplied, the residency manifest seeds the slot pool with the highest-importance experts
+assigned to its VRAM tier. Demand routing then maintains the cross-layer LRU. After each router
+step, fucina issues asynchronous `POSIX_FADV_WILLNEED` hints for the same expert IDs in the next
+layer (`FUCINA_EXPERT_PREFETCH=0` disables this heuristic). Timing output reports SSD bytes,
+checksum failures, slot-cache hit ratio, and prefetch hints.
 
 Run the foundation gates with:
 
