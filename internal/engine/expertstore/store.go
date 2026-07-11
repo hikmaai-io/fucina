@@ -33,13 +33,15 @@ type cacheEntry struct {
 	bytes int
 }
 type deviceEntry struct {
-	key   Key
-	bytes int
+	key        Key
+	bytes      int
+	prefetched bool
 }
 
 type Metrics struct {
 	VRAMHits, HostHits, SSDReads, ChecksumFailures uint64
 	Promotions, Evictions, BytesRead               uint64
+	Prefetches, PrefetchHits                       uint64
 	VRAMBytes, HostBytes                           int64
 }
 
@@ -69,12 +71,19 @@ func New(reader io.ReaderAt, index map[Key]Record, uploader Uploader, vramBudget
 }
 
 // Ensure makes key device-resident, promoting from host or SSD and enforcing both budgets.
-func (s *Store) Ensure(key Key) error {
+func (s *Store) Ensure(key Key) error { return s.ensure(key, false) }
+
+func (s *Store) ensure(key Key, prefetch bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e := s.vram[key]; e != nil {
 		s.vramLRU.MoveToFront(e)
 		s.metrics.VRAMHits++
+		entry := e.Value.(*deviceEntry)
+		if !prefetch && entry.prefetched {
+			s.metrics.PrefetchHits++
+			entry.prefetched = false
+		}
 		return nil
 	}
 	rec, ok := s.index[key]
@@ -126,10 +135,13 @@ func (s *Store) Ensure(key Key) error {
 	if err := s.uploader.Upload(key, data); err != nil {
 		return fmt.Errorf("expertstore: upload %v: %w", key, err)
 	}
-	e := s.vramLRU.PushFront(&deviceEntry{key: key, bytes: len(data)})
+	e := s.vramLRU.PushFront(&deviceEntry{key: key, bytes: len(data), prefetched: prefetch})
 	s.vram[key] = e
 	s.metrics.VRAMBytes += int64(len(data))
 	s.metrics.Promotions++
+	if prefetch {
+		s.metrics.Prefetches++
+	}
 	return nil
 }
 
@@ -164,7 +176,7 @@ func (s *Store) Prefetch(done <-chan struct{}, keys []Key, workers int) <-chan e
 	worker := func() {
 		defer wg.Done()
 		for key := range jobs {
-			if err := s.Ensure(key); err != nil {
+			if err := s.ensure(key, true); err != nil {
 				select {
 				case errs <- err:
 				default:

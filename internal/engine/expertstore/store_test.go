@@ -88,7 +88,28 @@ func TestPrefetch(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(u.live) != 2 || s.Metrics().Promotions != 2 {
+	if len(u.live) != 2 || s.Metrics().Promotions != 2 || s.Metrics().Prefetches != 2 {
 		t.Fatalf("live=%d metrics=%+v", len(u.live), s.Metrics())
+	}
+	if err := s.Ensure(Key{0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if s.Metrics().PrefetchHits != 1 {
+		t.Fatalf("prefetch hit not recorded: %+v", s.Metrics())
+	}
+}
+
+func TestPredictorLearnsHotSuccessor(t *testing.T) {
+	p := NewPredictor(4)
+	for i := 0; i < 5; i++ {
+		p.Observe(3, []int{1, 2}, []int{7, 8})
+	}
+	p.Observe(3, []int{1}, []int{9})
+	got := p.Predict(3, []int{1}, 2)
+	if len(got) != 2 || got[0] != (Key{3, 7}) || got[1] != (Key{3, 8}) {
+		t.Fatalf("prediction=%v", got)
+	}
+	if other := p.Predict(4, []int{1}, 2); len(other) != 0 {
+		t.Fatalf("cross-layer prediction=%v", other)
 	}
 }
