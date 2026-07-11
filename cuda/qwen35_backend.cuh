@@ -1216,8 +1216,8 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             model_plan.bytes(AllocationClass::SCALES)/(1024.0*1024));
     DeviceAllocationOps allocation_ops{nullptr,q35_cuda_allocate,q35_cuda_release};
     if(!eng->device_allocations) eng->device_allocations=new DeviceAllocationRegistry(allocation_ops);
-    DeviceAllocationSet core_allocation(allocation_ops);
-    if(!core_allocation.allocate((void**)&eng->d_weights,total,"qwen_core_weights")){
+    DeviceAllocationSet load_allocation(allocation_ops);
+    if(!load_allocation.allocate((void**)&eng->d_weights,total,"qwen_core_weights")){
         for(void*p:tofree) free(p); return -3;
     }
     eng->gguf_size=total;
@@ -1230,10 +1230,13 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         if(d.fmtp) *d.fmtp=(uint8_t)d.fmt;
         cudaMemcpy(eng->d_weights+run, d.host, d.bytes, cudaMemcpyHostToDevice);
         if(d.fmt==FORMAT_FP8_BLOCK && d.scale_host){
-            __nv_bfloat16 *ds=nullptr;
-            if(cudaMalloc(&ds,d.scale_bytes)!=cudaSuccess){ for(void*p:tofree) free(p); return -4; }
-            cudaMemcpy(ds,d.scale_host,d.scale_bytes,cudaMemcpyHostToDevice);
-            eng->q35.fp8_scale_tab[eng->q35.fp8_scale_n++]=(qwen35_runtime_state::fp8_scent){eng->d_weights+run,ds};
+            auto &entry=eng->q35.fp8_scale_tab[eng->q35.fp8_scale_n];
+            entry.w=eng->d_weights+run; entry.s=nullptr;
+            if(!load_allocation.allocate((void**)&entry.s,d.scale_bytes,"qwen_fp8_scale")){
+                for(void*p:tofree) free(p); return -4;
+            }
+            cudaMemcpy((void*)entry.s,d.scale_host,d.scale_bytes,cudaMemcpyHostToDevice);
+            eng->q35.fp8_scale_n++;
         }
     }
     // insertion-sort the scale table by weight ptr (small: one entry per FP8 proj) for wscale_fp8's
@@ -1305,18 +1308,24 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         }
     }
 
+    auto tx_upload=[&](void **slot,const void *host,size_t bytes,const char *label){
+        if(!load_allocation.allocate(slot,bytes,label)) return false;
+        return cudaMemcpy(*slot,host,bytes,cudaMemcpyHostToDevice)==cudaSuccess;
+    };
+
     // token_embd → Q8_0 (separate d_token_embd; embed_w reads it).
     const st::Tensor *embT=M.find(LO.embed_key);
     if(!embT){ return -5; }
     { int64_t n=(int64_t)VOC*H; unsigned char*q8=q35_bf16_to_q8_0_host((const uint16_t*)embT->data,n);
-      if(!q8) return -5; eng->d_token_embd=(unsigned char*)q35fp8_up_bytes(q8,(size_t)(n/32)*34); free(q8);
-      if(!eng->d_token_embd) return -5; }
+      if(!q8) return -5;
+      bool uploaded=tx_upload((void**)&eng->d_token_embd,q8,(size_t)(n/32)*34,"token_embedding_q8");
+      free(q8); if(!uploaded) return -5; }
     // token_embd ALSO uploaded BF16 (d_embed_bf16); embed_w prefers it for FP8 (per-step input
     // precision matters for the recurrent GDN state). d_token_embd (Q8_0) stays for the != NULL gate.
-    eng->d_embed_bf16=(__nv_bfloat16*)q35fp8_up_bytes(embT->data, embT->nbytes);
-    if(!eng->d_embed_bf16) return -5;
-    eng->d_embed_f32 = q35fp8_up_bf16_f32(embT, 0.0f);   // exact per-step input (oracle uses f32)
-    if(!eng->d_embed_f32) return -5;
+    if(!tx_upload((void**)&eng->d_embed_bf16,embT->data,embT->nbytes,"token_embedding_bf16")) return -5;
+    if(!load_allocation.allocate((void**)&eng->d_embed_f32,embed_elems*sizeof(float),"token_embedding_f32")) return -5;
+    q35fp8_bf16_to_f32_kernel<<<(unsigned)((embed_elems+255)/256),256>>>(
+        eng->d_embed_f32,eng->d_embed_bf16,embed_elems,0.0f);
     // lm_head → BF16 (untied): the logits GEMV rides bf16_head_gemv_launch for the FP8 path (the
     // 248320-vocab argmax is Q8_0-sensitive). Uploaded verbatim from the checkpoint's BF16 head.
     { const st::Tensor *lmT=M.find(LO.lmhead_key);
@@ -1337,24 +1346,22 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
           if(!lm_deq){ fprintf(stderr,"qwen35_fp8_engine: quantized lm_head missing scales\n"); return -5; }
           lm_src=lm_deq;
       }
-      eng->d_lmhead_bf16=(__nv_bfloat16*)q35fp8_up_bytes(lm_src,(size_t)VOC*H*2);
-      if(!eng->d_lmhead_bf16){ free(lm_deq); return -5; }
+      if(!tx_upload((void**)&eng->d_lmhead_bf16,lm_src,(size_t)VOC*H*2,"lm_head_bf16")){
+          free(lm_deq); return -5;
+      }
       // Q8_0 copy for the exact two-pass greedy head (approx scan; BF16 stays for the rescore).
       { int64_t n=(int64_t)VOC*H; unsigned char*q8=q35_bf16_to_q8_0_host(lm_src,n);
-        if(q8){ eng->d_lmhead_q8=(unsigned char*)q35fp8_up_bytes(q8,(size_t)(n/32)*34); free(q8); }
-        if(eng->d_lmhead_q8){
-            if(cudaMalloc(&eng->d_head_cand,(size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int))!=cudaSuccess ||
-               cudaMalloc(&eng->d_head_cnt,(size_t)GEMMA4_MAX_SEQS*sizeof(int))!=cudaSuccess){
-                cudaGetLastError();
-                if(eng->d_head_cand){cudaFree(eng->d_head_cand);eng->d_head_cand=NULL;}
-                cudaFree((void*)eng->d_lmhead_q8); eng->d_lmhead_q8=NULL;
-            }
+        if(!q8){ free(lm_deq); return -5; }
+        bool uploaded=tx_upload((void**)&eng->d_lmhead_q8,q8,(size_t)(n/32)*34,"lm_head_q8");
+        free(q8); if(!uploaded){ free(lm_deq); return -5; }
+        if(!load_allocation.allocate((void**)&eng->d_head_cand,
+                                     (size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int),"lm_head_candidates") ||
+           !load_allocation.allocate((void**)&eng->d_head_cnt,
+                                     (size_t)GEMMA4_MAX_SEQS*sizeof(int),"lm_head_candidate_counts")){
+            free(lm_deq); return -5;
         } }
       free(lm_deq); }
-    if(!eng->d_lmhead_q8 || !eng->d_head_cand || !eng->d_head_cnt){
-        fprintf(stderr,"qwen35_fp8_engine: planned Q8 head representation allocation failed\n"); return -5;
-    }
-    if(cudaMalloc(&eng->d_logits,(size_t)VOC*sizeof(float))!=cudaSuccess) return -6;
+    if(!load_allocation.allocate((void**)&eng->d_logits,(size_t)VOC*sizeof(float),"logits")) return -6;
     cudaMemGetInfo(&fill_free_before_scratch, &fill_total);
     if(moe && moe_alloc_scratch(eng)!=0) return -6;
     cudaMemGetInfo(&fill_free_after_scratch, &fill_total);
@@ -1408,7 +1415,7 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     fprintf(stderr,"fucina: qwen35 %s%s served via batched engine (%d layers, vocab %d, H %d, NKV %d%s, %.2f GiB)\n",
             q4k_mode?"Q4_K-mixer":"FP8", moe?"-MoE":"-dense", L, VOC, H, NKV,
             moe?", E-experts slabbed":"", total/GiB);
-    if(!core_allocation.commit(*eng->device_allocations)) return -8;
+    if(!load_allocation.commit(*eng->device_allocations)) return -8;
     return 0;
 }
 
