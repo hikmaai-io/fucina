@@ -4165,6 +4165,9 @@ struct gemma4_engine {
     uint8_t        *d_fp4m_dnsf[GEMMA4_CAP_LAYERS];  // [E][fp4m_dn_sfB]
     ExpertWeightRef ref_fp4m_gu[GEMMA4_CAP_LAYERS];
     ExpertWeightRef ref_fp4m_dn[GEMMA4_CAP_LAYERS];
+    ExpertWeightRef ref_moe_gate[GEMMA4_CAP_LAYERS];
+    ExpertWeightRef ref_moe_up[GEMMA4_CAP_LAYERS];
+    ExpertWeightRef ref_moe_down[GEMMA4_CAP_LAYERS];
     float          *d_fp4m_gsw;                      // device [L·2] per-(layer,proj) global scales
     unsigned long long fp4m_gu_sfB, fp4m_dn_sfB;     // per-expert SF strides (SF elements)
     uint8_t        *d_fp4m_a,  *d_fp4m_asf;          // per-step activation E2M1 + padded SF (K=H)
@@ -9403,6 +9406,8 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
     const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn;
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
     const ExpertWeightRef &fp4_gu=eng->ref_fp4m_gu[l], &fp4_dn=eng->ref_fp4m_dn[l];
+    const ExpertWeightRef &expert_gate=eng->ref_moe_gate[l], &expert_up=eng->ref_moe_up[l],
+                          &expert_down=eng->ref_moe_down[l];
     // Diagnostic phase timing is deliberately synchronizing and opt-in only. Reuse two events
     // as a moving boundary; each mark drains the stream, attributes the completed interval, then
     // swaps start/stop. Normal serving creates no events and takes no timing branches past `timing`.
@@ -9423,12 +9428,12 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
     // GEMM at prefill widths: 2k TTFT 1.16 s vs 1.23 s), decode-sized calls keep CUTLASS NVFP4.
     const int tc_ok = (eng->format == FORMAT_FP8_BLOCK);
     const float *router_w = (const float*)weight_fp8(eng, eng->moe_router[l]);
-    const void  *gate_w   = (const void*)weight_fp8(eng, eng->moe_gate_exps[l]);
-    const void  *up_w     = (const void*)weight_fp8(eng, eng->moe_up_exps[l]);
+    const void  *gate_w   = expert_gate.weight.data;
+    const void  *up_w     = expert_up.weight.data;
     // FP8: every expert proj is EFFN×H (or H×EFFN) E4M3 = the same bytes/expert; the BF16 block
     // scales sit in parallel per-expert slabs of (EFFN/128)·(H/128) elements (ceil for EFFN<128).
-    const int64_t fp8_wslab = (int64_t)EFFN * H;
-    const int64_t fp8_sslab = (int64_t)((EFFN + 127) / 128) * (H / 128);
+    const int64_t fp8_wslab = expert_gate.weight_stride;
+    const int64_t fp8_sslab = expert_gate.scale_stride / (int64_t)sizeof(__nv_bfloat16);
     // ── Tensor-core expert PREFILL (fp8, wide call): dequant the 3 expert slabs → BF16 once per
     // LAYER, then per-group cublas GEMMs replace the scalar-float grouped kernel (measured 71.6%
     // of a 2k-token prefill, ALU-bound at ~16 tok/expert). Decode-sized calls keep the FP8 kernel.
@@ -9450,8 +9455,9 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         if (!eng->moe_tc_off) {
             const uint64_t ne = (uint64_t)E * EFFN * H;
             const uint8_t *ws[3] = { (const uint8_t*)gate_w, (const uint8_t*)up_w,
-                                     weight_fp8(eng, eng->moe_down_exps[l]) };
-            const uint64_t so[3] = { eng->moe_gate_scales[l], eng->moe_up_scales[l], eng->moe_down_scales[l] };
+                                     expert_down.weight.data };
+            const void *scales[3] = { expert_gate.weight.scale, expert_up.weight.scale,
+                                      expert_down.weight.scale };
             for (int p = 0; p < 3; p++) {
                 if (eng->moe_experts_fp4)   // NVFP4 slabs: gate/up halves of the fused gu slab, then dn
                     dequant_nvfp4_expert_slab_bf16_kernel<<<(unsigned)((ne / NVFP4_BLK + 255) / 256), 256, 0, stream>>>(
@@ -9467,7 +9473,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                         eng->d_moe_wbf[p], ws[p], ne);
                 else
                     dequant_fp8_expert_slab_bf16_kernel<<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(
-                        eng->d_moe_wbf[p], ws[p], (const __nv_bfloat16*)weight_fp8(eng, so[p]),
+                        eng->d_moe_wbf[p], ws[p], (const __nv_bfloat16*)scales[p],
                         (p == 2) ? EFFN : H, (p == 2) ? H : EFFN, ne);
             }
             tc = 1;
@@ -9560,10 +9566,10 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             gemm_bf16_grouped(eng, eng->d_moe_wbf[2], (size_t)EFFN * H, eng->d_moe_xbf,
                               eng->d_moe_oe, hc, ho, E, EFFN, H, stream);
         } else if (fp8) {
-            const __nv_bfloat16 *gs = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_gate_scales[l]);
-            const __nv_bfloat16 *us = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_up_scales[l]);
-            const __nv_bfloat16 *ds = (const __nv_bfloat16*)weight_fp8(eng, eng->moe_down_scales[l]);
-            const uint8_t *down_w = weight_fp8(eng, eng->moe_down_exps[l]);
+            const __nv_bfloat16 *gs = (const __nv_bfloat16*)expert_gate.weight.scale;
+            const __nv_bfloat16 *us = (const __nv_bfloat16*)expert_up.weight.scale;
+            const __nv_bfloat16 *ds = (const __nv_bfloat16*)expert_down.weight.scale;
+            const uint8_t *down_w = expert_down.weight.data;
             // FUSED gate+up+SiLU: one launch shares the x reads and routing lookups and writes
             // silu(gate)*up directly (no gate/up round-trip, no dg_silu_mul launch). Same math
             // order and __expf as the unfused trio → bit-identical.
@@ -9583,17 +9589,17 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
             // (prefill chunks) keep the tile.
             const bool q4gemv = eng->moe_experts_q4k && cn <= 2 * FP8_MAXB;
             if (q4gemv) {
-                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
+                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_gate, gate_w, expert_gate.weight_stride,
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                     eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
-                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_up, up_w, eng->moe_up_slab,
+                mmvq_q4_k_grouped_gemv_launch(eng->d_moe_up, up_w, expert_up.weight_stride,
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                     eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
             } else {
-            dg_mmq_q4_K_grouped(eng->d_moe_gate, gate_w, eng->moe_gate_slab,
+            dg_mmq_q4_K_grouped(eng->d_moe_gate, gate_w, expert_gate.weight_stride,
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                 eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
-            dg_mmq_q4_K_grouped(eng->d_moe_up, up_w, eng->moe_up_slab,
+            dg_mmq_q4_K_grouped(eng->d_moe_up, up_w, expert_up.weight_stride,
                                 eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                 eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, H, EFFN, stream);
             }
@@ -9605,13 +9611,13 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                     eng->d_moe_coloff, eng->d_moe_count, E, EFFN, H, stream);
             } else {
-                const void *down_w = (const void*)weight_fp8(eng, eng->moe_down_exps[l]);
+                const void *down_w = expert_down.weight.data;
                 if (q4gemv)
-                    mmvq_q4_k_grouped_gemv_launch(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
+                    mmvq_q4_k_grouped_gemv_launch(eng->d_moe_oe, down_w, expert_down.weight_stride,
                                         eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                         eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, EFFN, H, stream);
                 else
-                    dg_mmq_q4_K_grouped(eng->d_moe_oe, down_w, eng->moe_down_slab_q4k,
+                    dg_mmq_q4_K_grouped(eng->d_moe_oe, down_w, expert_down.weight_stride,
                                     eng->d_moe_q8, eng->d_moe_q8d, eng->d_moe_q8s,
                                     eng->d_moe_coloff, eng->d_moe_count, q4act, n_slot, E, EFFN, H, stream);
             }

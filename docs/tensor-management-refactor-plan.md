@@ -288,11 +288,12 @@ through descriptors and ownership APIs; moving code then becomes mechanical and 
   deterministic Nth-allocation/Nth-upload failure injection tests. Qwen core, scale, embedding, head, candidate, logits,
   and expert-slab allocations now commit as one transaction. Scratch/cache ownership is intentionally
   sequenced into Phase 5.
-- **Phase 4 — experts and alternate representations:** in progress. Producer-specific FP8/NVFP4
+- **Phase 4 — experts and alternate representations:** complete for Qwen. Producer-specific FP8/NVFP4
   transforms and expert representations are explicit in the model plan, and NVFP4 grouped decode
-  and prefill dispatch use `ExpertWeightRef`. Compatibility Q4_K/FP8 expert paths and prefill-cache
-  variants still need explicit descriptors.
-- **Phases 5–6:** not started.
+  and prefill dispatch use `ExpertWeightRef`; Q4_K and block-FP8 expert dispatch is descriptor-backed
+  as well. Lazy BF16 and NVFP4 prefill-cache variants now publish explicit `WeightRef` descriptors.
+- **Phase 5 — workspaces:** not started.
+- **Phase 6 — decomposition and cleanup:** not started.
 
 The performance KPI remains **>64 / >105 / >150 tok/s at 1/2/4 streams**. Descriptor-only changes
 must first preserve the `<1%` phase gate; kernel optimization remains sequenced after ownership work.

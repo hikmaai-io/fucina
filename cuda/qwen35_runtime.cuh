@@ -745,6 +745,13 @@ static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fm
                           int l, int slot, const WeightRef *ref = nullptr) {
     const uint8_t *w = ref ? ref->data : weight_fp8(eng, off);
     if (ref) { fmt=weight_ref_format(*ref); in_dim=ref->in_dim; out_dim=ref->out_dim; }
+    WeightRef &wc_ref=eng->q35.wc_ref[l][slot], &fp4_ref=eng->q35.fp4_ref[l][slot];
+    auto bind_variant=[&](WeightRef &variant,const void *data,const void *scale,const float *global,
+                          WeightEncoding encoding,TensorLayout layout,uint16_t flags){
+        variant.data=(const uint8_t*)data; variant.scale=scale; variant.global_scale=global;
+        variant.out_dim=out_dim; variant.in_dim=in_dim; variant.encoding=encoding;
+        variant.layout=layout; variant.flags=flags;
+    };
     // Qwen3.5 block-FP8. Short tiles (≤2 GEMV chunks): the float-activation FP8 GEMM, weight
     // amortized across ≤FP8_MAXB rows. WIDE prefill tiles: dequant the projection to BF16 ONCE
     // (cached in the per-layer weight-cache slot when memory allows) and ride the tensor-core
@@ -765,14 +772,16 @@ static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fm
             eng->q35.xbf16, x_f32, (uint64_t)T * in_dim);
         __nv_bfloat16 **wcslot = &eng->q35.wc[l][slot];
         const __nv_bfloat16 *wbf;
-        if (*wcslot) {
-            wbf = *wcslot;
+        if (wc_ref.data) {
+            wbf = (const __nv_bfloat16*)wc_ref.data;
         } else if (eng->q35.wcache_on) {
             __nv_bfloat16 *buf = NULL;
             if (cudaMalloc(&buf, nfp * sizeof(__nv_bfloat16)) == cudaSuccess) {
                 dequant_fp8_block_to_bf16_kernel<<<(unsigned)((nfp + 255) / 256), 256, 0, st>>>(
                     buf, w, sc, in_dim, nfp);
                 *wcslot = buf; wbf = buf;
+                bind_variant(wc_ref,buf,nullptr,nullptr,WeightEncoding::BF16,TensorLayout::ROW_MAJOR,
+                             WEIGHT_FLAG_CACHE);
                 q35_account_add(eng, nfp * sizeof(__nv_bfloat16));
             } else {
                 cudaGetLastError(); eng->q35.wcache_on = 0;
@@ -796,7 +805,7 @@ static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fm
     // ── NVFP4 path (4-bit tensor cores) ──
     if (eng->q35.fp4_on) {
         uint8_t **wslot = &eng->q35.fp4_w[l][slot], **wscslot = &eng->q35.fp4_wsc[l][slot];
-        if (!*wslot) {                                   // first touch: dequant→BF16→NVFP4-quantize once
+        if (!fp4_ref.data) {                                   // first touch: dequant→BF16→NVFP4-quantize once
             size_t pk = (size_t)out_dim * (in_dim/2);
             size_t sw = (size_t)nvfp4_pad(out_dim,128) * nvfp4_pad(in_dim/NVFP4_BLK,4);
             if (cudaMalloc(wslot, pk) == cudaSuccess && cudaMalloc(wscslot, sw) == cudaSuccess) {
@@ -805,27 +814,32 @@ static void q35_proj_gemm(gemma4_engine_t *eng, float *dst, uint64_t off, int fm
                 nvfp4_quantize(eng->q35.wbf16[0], out_dim, in_dim, *wslot,
                                (uint8_t*)eng->q35.wbf16[1], *wscslot,
                                eng->q35.fp4_gsw + (l*12+slot), eng->d_fp4_amax, st);
+                bind_variant(fp4_ref,*wslot,*wscslot,eng->q35.fp4_gsw+(l*12+slot),
+                             WeightEncoding::NVFP4_SWIZZLED,TensorLayout::NVFP4_SCALE_SWIZZLED,
+                             WEIGHT_FLAG_CACHE|WEIGHT_FLAG_PACKED);
                 q35_account_add(eng, pk + sw);
             } else {
                 if (*wslot) { cudaFree(*wslot); *wslot=NULL; }
                 if (*wscslot) { cudaFree(*wscslot); *wscslot=NULL; }
-                eng->q35.fp4_on = 0;                     // OOM → fall back to BF16 cache
+                fp4_ref={}; eng->q35.fp4_on = 0;                     // OOM → fall back to BF16 cache
             }
         }
-        if (*wslot && gemm_nvfp4_q35(eng, *wslot, *wscslot, eng->q35.fp4_gsw + (l*12+slot),
-                                     eng->q35.xbf16, dst, in_dim, out_dim, T, st))
+        if (fp4_ref.data && gemm_nvfp4_q35(eng, fp4_ref.data,(const uint8_t*)fp4_ref.scale,
+                                     fp4_ref.global_scale,eng->q35.xbf16,dst,in_dim,out_dim,T,st))
             return;
     }
     // ── BF16 weight-cache fallback ──
     __nv_bfloat16 **wcslot = &eng->q35.wc[l][slot];
     const __nv_bfloat16 *wbf;
-    if (*wcslot) {
-        wbf = *wcslot;
+    if (wc_ref.data) {
+        wbf = (const __nv_bfloat16*)wc_ref.data;
     } else if (eng->q35.wcache_on) {
         __nv_bfloat16 *buf = NULL;
         if (cudaMalloc(&buf, n * sizeof(__nv_bfloat16)) == cudaSuccess) {
             dequant_proj_to_bf16(buf, w, n, fmt, packed, st);
             *wcslot = buf; wbf = buf;
+            bind_variant(wc_ref,buf,nullptr,nullptr,WeightEncoding::BF16,TensorLayout::ROW_MAJOR,
+                         WEIGHT_FLAG_CACHE);
             q35_account_add(eng, n * sizeof(__nv_bfloat16));
         } else {
             eng->q35.wcache_on = 0;

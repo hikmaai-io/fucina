@@ -1341,6 +1341,26 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             bind_ref(T.ref_gate,T.ffn_gate,T.fmt_gate,I,H);
             bind_ref(T.ref_up,T.ffn_up,T.fmt_up,I,H);
             bind_ref(T.ref_down,T.ffn_down,T.fmt_down,H,I);
+        } else if(!eng->moe_experts_fp4){
+            auto bind_expert=[&](ExpertWeightRef &ref,uint64_t off,uint64_t scale_off,
+                                 int out_dim,int in_dim,int64_t weight_stride,int64_t scale_stride){
+                ref.weight.data=eng->d_weights+off;
+                ref.weight.scale=scale_off?(const void*)(eng->d_weights+scale_off):nullptr;
+                ref.weight.global_scale=nullptr;
+                ref.weight.out_dim=out_dim; ref.weight.in_dim=in_dim;
+                ref.weight.encoding=eng->moe_experts_q4k?WeightEncoding::Q4_K:WeightEncoding::FP8_BLOCK_128;
+                ref.weight.layout=eng->moe_experts_q4k?TensorLayout::GGML_NATIVE:TensorLayout::ROW_MAJOR;
+                ref.weight.flags=WEIGHT_FLAG_PRIMARY|WEIGHT_FLAG_GROUPED;
+                ref.expert_count=E; ref.weight_stride=weight_stride; ref.scale_stride=scale_stride;
+            };
+            const int64_t wstride=(int64_t)MI*H;
+            const int64_t sstride=(int64_t)((MI+127)/128)*(H/128)*sizeof(__nv_bfloat16);
+            bind_expert(eng->ref_moe_gate[l],eng->moe_gate_exps[l],eng->moe_gate_scales[l],MI,H,
+                        eng->moe_experts_q4k?eng->moe_gate_slab:wstride,sstride);
+            bind_expert(eng->ref_moe_up[l],eng->moe_up_exps[l],eng->moe_up_scales[l],MI,H,
+                        eng->moe_experts_q4k?eng->moe_up_slab:wstride,sstride);
+            bind_expert(eng->ref_moe_down[l],eng->moe_down_exps[l],eng->moe_down_scales[l],H,MI,
+                        eng->moe_experts_q4k?eng->moe_down_slab_q4k:wstride,sstride);
         }
     }
 

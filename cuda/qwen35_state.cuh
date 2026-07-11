@@ -85,9 +85,11 @@ struct qwen35_runtime_state {
 
     // Resident prefill weight caches.
     __nv_bfloat16 *wc[GEMMA4_CAP_LAYERS][12];
+    WeightRef      wc_ref[GEMMA4_CAP_LAYERS][12];
     int            wcache_on;
     uint8_t       *fp4_w[GEMMA4_CAP_LAYERS][12];
     uint8_t       *fp4_wsc[GEMMA4_CAP_LAYERS][12];
+    WeightRef      fp4_ref[GEMMA4_CAP_LAYERS][12];
     float         *fp4_gsw;
     int            fp4_on;
 
