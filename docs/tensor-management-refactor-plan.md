@@ -285,8 +285,8 @@ through descriptors and ownership APIs; moving code then becomes mechanical and 
   Recurrent/KV workspaces and optional prefill caches still need to move into the plan.
 - **Phase 3 — transactional allocation:** in progress. `DeviceAllocationSet` and the persistent
   registry provide reverse-order rollback, one-owner teardown, slot nulling, exact byte totals, and
-  deterministic failure injection tests. Qwen core, scale, embedding, head, candidate, and logits
-  allocations now commit as one transaction; expert slabs, scratch, and cache allocations remain
+  deterministic failure injection tests. Qwen core, scale, embedding, head, candidate, logits,
+  and expert-slab allocations now commit as one transaction; scratch and cache allocations remain
   on compatibility teardown.
 - **Phases 4–6:** not started.
 

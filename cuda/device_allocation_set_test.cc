@@ -31,10 +31,11 @@ int main(){
     f=Fake{}; DeviceAllocationRegistry registry(ops);
     { DeviceAllocationSet tx(ops);
       CHECK(tx.allocate(&a,7,"a")); CHECK(tx.allocate(&b,9,"b"));
+      c=malloc(5); CHECK(c); CHECK(tx.adopt(&c,c,5,"adopted"));
       CHECK(tx.commit(registry)); CHECK(!tx.commit(registry)); }
-    CHECK(a&&b&&registry.size()==2&&registry.bytes()==16&&f.released.empty());
-    registry.reset(); CHECK(!a&&!b&&registry.size()==0&&registry.bytes()==0);
-    CHECK(f.released.size()==2);
+    CHECK(a&&b&&c&&registry.size()==3&&registry.bytes()==21&&f.released.empty());
+    registry.reset(); CHECK(!a&&!b&&!c&&registry.size()==0&&registry.bytes()==0);
+    CHECK(f.released.size()==3);
     puts("device allocation rollback/commit/registry teardown: OK");
     return 0;
 }

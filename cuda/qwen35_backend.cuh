@@ -811,6 +811,9 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     size_t fill_free_after_core=0, fill_free_before_scratch=0, fill_free_after_scratch=0;
     cudaMemGetInfo(&fill_free_before, &fill_total);
     const q35_host_meminfo host_mem_before=q35_read_host_meminfo();
+    DeviceAllocationOps allocation_ops{nullptr,q35_cuda_allocate,q35_cuda_release};
+    if(!eng->device_allocations) eng->device_allocations=new DeviceAllocationRegistry(allocation_ops);
+    DeviceAllocationSet load_allocation(allocation_ops);
 
     std::vector<q35fp8_desc> D;
     std::vector<void*> tofree;          // host temporaries (bf16→f32 / bf16→Q8_0) freed after upload
@@ -1052,6 +1055,18 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
                     fp4_mode=false;
                 }
             }
+            if(eng->moe_experts_fp4 && eng->d_fp4m_gu[l]){
+                if(l==0) ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_gsw,eng->d_fp4m_gsw,
+                                                       (size_t)L*2*sizeof(float),"expert_global_scales");
+                ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_gu[l],eng->d_fp4m_gu[l],
+                                              (size_t)E*2*MI*(H/2),"expert_gate_up_nvfp4");
+                ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_gusf[l],eng->d_fp4m_gusf[l],
+                                              (size_t)E*eng->fp4m_gu_sfB,"expert_gate_up_scales");
+                ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_dn[l],eng->d_fp4m_dn[l],
+                                              (size_t)E*H*(MI/2),"expert_down_nvfp4");
+                ok=ok&&load_allocation.adopt((void**)&eng->d_fp4m_dnsf[l],eng->d_fp4m_dnsf[l],
+                                              (size_t)E*eng->fp4m_dn_sfB,"expert_down_scales");
+            }
             if(!LO.mixed_nvfp4() && !fp4_mode && q4k_mode){
                 for(int p=0; p<3 && ok; p++){
                     int od = (p==2)? H : MI, idm = (p==2)? MI : H;
@@ -1214,9 +1229,6 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     fprintf(stderr,"fucina: qwen35 tensor plan finalized: entries=%zu core=%.2f GiB scales=%.2f MiB\n",
             model_plan.tensors().size(),total/(1024.0*1024*1024),
             model_plan.bytes(AllocationClass::SCALES)/(1024.0*1024));
-    DeviceAllocationOps allocation_ops{nullptr,q35_cuda_allocate,q35_cuda_release};
-    if(!eng->device_allocations) eng->device_allocations=new DeviceAllocationRegistry(allocation_ops);
-    DeviceAllocationSet load_allocation(allocation_ops);
     if(!load_allocation.allocate((void**)&eng->d_weights,total,"qwen_core_weights")){
         for(void*p:tofree) free(p); return -3;
     }

@@ -68,6 +68,13 @@ public:
         return true;
     }
 
+    bool adopt(void **slot, void *pointer, size_t bytes, const char *label) {
+        if (committed_ || !slot || !pointer || bytes == 0 || *slot != pointer) return false;
+        records_.push_back({slot, pointer, bytes, label});
+        total_bytes_ += bytes;
+        return true;
+    }
+
     void rollback() {
         if (committed_) return;
         for (size_t i = records_.size(); i > 0; --i) {
