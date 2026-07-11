@@ -1348,6 +1348,9 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 	s.telEngine += time.Since(t0)
 	s.telSteps++
 	s.telBatch += int64(len(slots))
+	if os.Getenv("FUCINA_P0_DIAG") != "" && len(slots) > 1 {
+		log.Printf("P0DIAG stepbatch slots=%v inputs=%v out=%v", slots, inputs, out)
+	}
 	if err != nil {
 		// A batched step failed for the whole batch: there is no per-row error
 		// signal, so fail every active sequence rather than silently dropping
