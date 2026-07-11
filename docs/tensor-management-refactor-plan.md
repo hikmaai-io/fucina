@@ -281,8 +281,8 @@ through descriptors and ownership APIs; moving code then becomes mechanical and 
   alias handling, exact aligned arena totals, and deterministic JSON serialization are implemented.
   Official FP8, ModelOpt, and compressed-tensors source conventions now pass a complete host-only
   shape/dtype/scale preflight before engine CUDA allocations. Planned offsets are authoritative for
-  the core upload arena, and planned core/scale/expert bytes feed the exact ledger. Embedding/head,
-  workspace, and cache representations still need to move into the plan.
+  the core upload arena, and planned core/scale/expert/embedding/head bytes feed the exact ledger.
+  Recurrent/KV workspaces and optional prefill caches still need to move into the plan.
 - **Phases 3–6:** not started.
 
 The performance KPI remains **>64 / >105 / >150 tok/s at 1/2/4 streams**. Descriptor-only changes

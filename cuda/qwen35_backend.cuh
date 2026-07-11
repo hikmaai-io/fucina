@@ -1170,6 +1170,36 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
         gs.bytes=gs.source.bytes; gs.alignment=1;
         if(!model_plan.add(std::move(gs),plan_error)){ fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); return -2; }
     }
+    const size_t embed_elems=(size_t)VOC*H;
+    auto add_repr=[&](const char *logical,const std::string &source,const char *dtype,
+                      TensorTransform tr,WeightEncoding dst,AllocationClass arena,
+                      const char *consumer,size_t bytes){
+        PlannedTensor p; p.source.logical_name=logical; p.source.source_name=source;
+        p.source.dtype=dtype; p.source.bytes=bytes; p.transform=tr; p.destination=dst;
+        p.arena=arena; p.consumer=consumer; p.bytes=bytes; p.alignment=1;
+        return model_plan.add(std::move(p),plan_error);
+    };
+    if(!add_repr("token_embedding.q8",LO.embed_key,"BF16",TensorTransform::BF16_TO_Q8_0,
+                 WeightEncoding::Q8_0,AllocationClass::EMBEDDING_HEAD,"compat_embedding",(embed_elems/32)*34) ||
+       !add_repr("token_embedding.bf16",LO.embed_key,"BF16",TensorTransform::COPY,
+                 WeightEncoding::BF16,AllocationClass::EMBEDDING_HEAD,"decode_embedding",embed_elems*2) ||
+       !add_repr("token_embedding.f32",LO.embed_key,"BF16",TensorTransform::BF16_TO_F32,
+                 WeightEncoding::F32,AllocationClass::EMBEDDING_HEAD,"oracle_embedding",embed_elems*4) ||
+       !add_repr("lm_head.bf16",LO.lmhead_key,LO.mixed_nvfp4()?"quantized":"BF16",
+                 LO.mixed_nvfp4()?TensorTransform::QUANT_TO_BF16:TensorTransform::COPY,
+                 WeightEncoding::BF16,AllocationClass::EMBEDDING_HEAD,"exact_head_rescore",embed_elems*2) ||
+       !add_repr("lm_head.q8",LO.lmhead_key,"BF16",TensorTransform::BF16_TO_Q8_0,
+                 WeightEncoding::Q8_0,AllocationClass::EMBEDDING_HEAD,"approximate_head_search",(embed_elems/32)*34) ||
+       !add_repr("lm_head.candidates","runtime","I32",TensorTransform::COPY,
+                 WeightEncoding::F32,AllocationClass::EMBEDDING_HEAD,"exact_head_rescore",
+                 (size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int)) ||
+       !add_repr("lm_head.candidate_counts","runtime","I32",TensorTransform::COPY,
+                 WeightEncoding::F32,AllocationClass::EMBEDDING_HEAD,"exact_head_rescore",
+                 (size_t)GEMMA4_MAX_SEQS*sizeof(int)) ||
+       !add_repr("logits","runtime","F32",TensorTransform::COPY,
+                 WeightEncoding::F32,AllocationClass::WORKSPACE,"sampling",(size_t)VOC*sizeof(float))){
+        fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); for(void*x:tofree)free(x); return -2;
+    }
     if(!model_plan.finalize(plan_error)){ fprintf(stderr,"qwen35 model plan: %s\n",plan_error.c_str()); for(void*x:tofree)free(x); return -2; }
     const size_t total=model_plan.bytes(AllocationClass::CORE_WEIGHTS);
     if(const char *path=getenv("FUCINA_TENSOR_PLAN_JSON")){
@@ -1311,6 +1341,9 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
             }
         } }
       free(lm_deq); }
+    if(!eng->d_lmhead_q8 || !eng->d_head_cand || !eng->d_head_cnt){
+        fprintf(stderr,"qwen35_fp8_engine: planned Q8 head representation allocation failed\n"); return -5;
+    }
     if(cudaMalloc(&eng->d_logits,(size_t)VOC*sizeof(float))!=cudaSuccess) return -6;
     cudaMemGetInfo(&fill_free_before_scratch, &fill_total);
     if(moe && moe_alloc_scratch(eng)!=0) return -6;
@@ -1323,12 +1356,10 @@ static int qwen35_fp8_fill_engine(gemma4_engine_t *eng, st::Model &M, qwen35fp8:
     // allocating or releasing unified memory while the CPU-heavy expert requantization runs.
     const size_t scale_bytes=model_plan.bytes(AllocationClass::SCALES);
     const size_t expert_bytes=model_plan.bytes(AllocationClass::EXPERT_SLABS);
-    const size_t embed_elems=(size_t)VOC*H;
-    size_t embed_bytes=(embed_elems/32)*34 + embed_elems*2 + embed_elems*4;
-    size_t head_bytes=embed_elems*2 + (eng->d_lmhead_q8 ? (embed_elems/32)*34 : 0);
-    if(eng->d_head_cand) head_bytes += (size_t)GEMMA4_MAX_SEQS*Q8HEAD_MAXCAND*sizeof(int);
-    if(eng->d_head_cnt)  head_bytes += (size_t)GEMMA4_MAX_SEQS*sizeof(int);
-    const size_t misc_bytes=(size_t)VOC*sizeof(float);
+    const size_t embed_bytes=(embed_elems/32)*34 + embed_elems*2 + embed_elems*4;
+    const size_t representation_bytes=model_plan.bytes(AllocationClass::EMBEDDING_HEAD);
+    const size_t head_bytes=representation_bytes-embed_bytes;
+    const size_t misc_bytes=model_plan.bytes(AllocationClass::WORKSPACE);
     const size_t ledger_bytes=expert_bytes + total + scale_bytes + embed_bytes + head_bytes +
                               eng->moe_scratch_bytes + misc_bytes;
     eng->q35.model_bytes=ledger_bytes;

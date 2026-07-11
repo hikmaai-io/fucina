@@ -18,6 +18,7 @@ enum class TensorTransform : uint8_t {
     FP8_TO_NVFP4,
     NVFP4_REBASE,
     BF16_TO_Q8_0,
+    QUANT_TO_BF16,
 };
 
 enum class AllocationClass : uint8_t {
@@ -150,6 +151,7 @@ private:
             case TensorTransform::FP8_TO_NVFP4: return "FP8_TO_NVFP4";
             case TensorTransform::NVFP4_REBASE: return "NVFP4_REBASE";
             case TensorTransform::BF16_TO_Q8_0: return "BF16_TO_Q8_0";
+            case TensorTransform::QUANT_TO_BF16: return "QUANT_TO_BF16";
         }
         return "UNKNOWN";
     }
