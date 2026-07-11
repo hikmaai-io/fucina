@@ -1,6 +1,9 @@
 # Qwen3.5-only: prune + beat vLLM on every configuration
 
-Status: ACTIVE (2026-07-11, supersedes the sweep-planning in qwen35-beat-vllm-plan.md)
+Status: ACTIVE, rev 2 (2026-07-11, supersedes the sweep-planning in qwen35-beat-vllm-plan.md)
+Rev 2: folds in adversarial review (gpt-5.6-sol): profile-before-implement for P1, P3
+moved ahead of P1, dual-sided gate, expanded correctness matrix, causality demoted to
+hypothesis. Original rev 1 verdict was NO-GO as written.
 Evidence: fucina-vs-vLLM head-to-head on 41a1b99 (post-tensor-refactor-merge), both
 Qwen3.5-35B-A3B-FP8 and Qwen3.5-9B-FP8, concs 1–32, results in the claude-fucina job dir
 (to be copied into benchmark-evidence/).
@@ -24,11 +27,20 @@ vLLM 42.9/83.9/161.7/296.1/501.9 @ N=2/4/8/16/32.
 **Lost:** (L1) TTFT under concurrency — MoE 2.9× worse at N=32; (L2) dense aggregate
 N≥16 — −93% at N=32; (L3) MoE N=32 aggregate — −4%, within noise but not a win.
 
-**Root cause found (code-confirmed):** Stage-18 fused prefill+decode was only ever wired
-for `GEMMA4_IS_QWEN3_FAMILY = QWEN3 || QWEN3MOE`. Qwen3.5 loads the separate M4 batched
+**Code-confirmed fact:** Stage-18 fused prefill+decode was only ever wired for
+`GEMMA4_IS_QWEN3_FAMILY = QWEN3 || QWEN3MOE`. Qwen3.5 loads the separate M4 batched
 engine and the fused ABI returns -2 → `FUCINA_NO_FUSED_PREFILL` is a structural no-op on
-Qwen3.5. Every fusion benefit measured to date (~13× decode-during-ingestion) applies
-only to the architecture we are deleting. **L1 is unaddressed engineering, not physics.**
+Qwen3.5.
+
+**Hypothesis (NOT yet proven causality — review finding #1):** that the missing fusion
+explains the N=32 TTFT loss. The legacy 13× win was decode-during-ingestion; if 32
+requests arrive together with no decode active, co-batching gives no initial benefit,
+and N=32 TTFT may instead be dominated by serial prompt admission, lack of batched
+prefill, launch overhead, or GDN scan behavior. **P0 profiling must attribute the 1923 ms
+before any implementation.** Similarly, "decode is bandwidth-saturated" (proven only for
+the grouped-expert GEMM at ~81% of peak) does not preclude losses from batch shapes,
+state movement, kernel gaps, or synchronization — the dense N=32 −93% needs a timeline,
+not a bandwidth assertion.
 
 **Merge check:** 41a1b99 matches PROTOCOL gate baselines within 1–2%, N=32 improved
 (291.7 vs 212.6). Tensor-refactor merge is clean.
@@ -52,47 +64,59 @@ reordered form):
 - **Keep:** Gemma/diffusion/e4b engines (different product surface), `dg_fp4_moe`
   including `_mapped` (Phase-C SSD streaming), shared mmvq kernels (call-graph audit
   first), all `qwen35_*`, internal/dist, session persistence.
-- **Acceptance:** full make + all remaining gates green; Qwen3.5 bench numbers unchanged
-  pre/post-prune (same binary protocol); `rg 'qwen3moe'` only in comments/history docs.
+- **Acceptance (review-strengthened):** full make + all remaining gates green,
+  explicitly including the Gemma, diffusion, and e4b suites (legacy-qwen3 test deletion
+  must not drop coverage of shared mmvq/routing/cache paths those engines use — verify
+  via call-graph/symbol audit, not grep); Qwen3.5 bench numbers unchanged pre/post-prune
+  (same binary protocol, isolated benchmarked series); grep is a smoke check only.
 
-## Part 2 — beat vLLM on every configuration (ranked by measured gap)
+## Part 2 — beat vLLM on every configuration (re-sequenced per review)
 
-- **P1. Port fused prefill+decode + chunked prefill into the qwen35 batched engine**
-  (closes L1, the 2.9× TTFT-under-load loss — the single biggest lever).
-  - Chunk arriving prefills (vLLM-style chunked prefill) and co-batch each chunk with
-    active decode rows in one `decode_multiseq_forward`-equivalent on the M4 engine.
-    The GDN recurrent state makes this different from the legacy port: a prefill chunk
-    advances deltanet state sequentially per-sequence — chunk boundaries are natural
-    (the GDN kernels are already chunked scans).
-  - TDD gate first: Qwen3.5 fused == standalone byte-identical (decode rows AND
-    prefilled seq's first token + 20-token continuation), on 35B-A3B and 9B.
-  - Exit: N=32 TTFT ≤ vLLM's ~670 ms band while N=1–16 throughput stays in the
-    protection band; expected side effect: closes L3 (fusion removes the decode
-    stall that also costs aggregate).
-- **P2. Dense N≥16 aggregate scaling** (closes L2). Diagnose before building: profile
-  a dense N=32 step — if decode is bandwidth-saturated like the MoE, the gap is
-  scheduler/stall time, and P1's fusion likely closes most of it for free. Only if a
-  real kernel gap remains after P1, scope it separately. Do not tune kernels first —
-  three prior kernel levers were debunked (roadmap history).
-- **P3. Protection-band CI gate.** One script: both models, N=1–32, TTFT + decode +
-  aggregate, asserting no metric regresses >5% vs the recorded baseline and printing
-  the vLLM delta. Run before every merge to main (this is how "every configuration"
-  stays won once flipped).
-- **P4. Copy the head-to-head evidence** from the job dir into
-  `benchmark-evidence/results/2026-07-11-qwen35-vs-vllm/` with the run protocol, so
-  the scoreboard above is reproducible.
+- **P4. Evidence archive** into `benchmark-evidence/results/2026-07-11-qwen35-vs-vllm/`:
+  raw logs, exact commits/flags, metric definitions (TTFT statistic: report median AND
+  p95; synchronized vs staggered arrivals stated per table). Must resolve the N=32
+  baseline provenance question (291.7 current vs 212.6 in the older gate doc — protocol
+  or commit mismatch, identify which).
+- **P3. Protection gate — BEFORE P1, dual-sided.** One script, both models, N=1–32,
+  TTFT(median+p95) + decode + aggregate. Two assertions per cell: (a) absolute floor —
+  no metric regresses >5% vs frozen raw baseline; (b) competitive margin — in cells we
+  claim as wins, fucina must beat a contemporaneous protocol-matched vLLM run, not a
+  historical number. Runs before every merge to main.
+- **P0. Profile N=32 TTFT + dense N≥16 decode (NEW, gates P1's design).**
+  CPU/GPU timeline of a 32-burst arrival: prefill admission order, active decode rows
+  during ingestion, kernel gaps, per-request TTFT distribution; dense: bytes/token and
+  batch-shape utilization vs vLLM. Output: attribution of the 1923 ms into
+  admission-serialization vs missing-fusion vs launch overhead vs GDN scan — this
+  decides whether P1 needs chunked scheduling, batched prefill, fusion, or all three.
+- **P1. Implement what P0 proves** (likely some combination of chunked prefill
+  scheduling + fused prefill/decode on the M4 engine, behind a rollback env toggle).
+  - Correctness matrix (review-expanded, replaces the too-narrow byte-identical pair):
+    chunk sizes {1, odd, prompt_len−1, default}, heterogeneous batches, repeated
+    prefill/decode interleaving, GDN recurrent+conv state and KV snapshot/restore
+    across chunk boundaries, cancellation mid-prefill, session save/load interaction,
+    numerical comparison vs an independent standalone reference. Exact byte equality
+    asserted only where identical operation order is genuinely promised; tolerance
+    bounds elsewhere (changed batching legitimately reorders FP reductions).
+  - Exit: N=32 TTFT(median) into the vLLM band measured contemporaneously (not the
+    historical 664 ms), p95 reported, ALL of N=1–32 inside the P3 gate on both models.
+- **P2. Dense N≥16 residual gap.** Diagnosis starts in P0 (not after P1). Kernel
+  changes remain NO-GO until profiling names a specific residual bottleneck.
 
-## Sequencing
+## Sequencing (rev 2)
 
-P4 (evidence, minutes) → P1 gate + implementation (the lever) → P3 (lock it in) →
-R1–R3 prune (fast follow, protected by P3) → P2 (measure-first, only if a gap survives P1).
+P4 (evidence + baseline-provenance fix) → P3 (harness + frozen baselines) →
+P0 (profiling/attribution) → P1 (implement what P0 proves, gated by P3) →
+P2 (residual dense gap) → R1–R3 prune (separately benchmarked series, protected by P3).
 
-Rationale: prune AFTER P1 lands — the legacy fused-path code is the reference
-implementation for the port; deleting it first throws away the working example.
+Rationale: the guardrail exists before the lever is pulled; the lever is designed from
+attribution, not assumption; prune last — the legacy fused path is the port's reference
+implementation AND pruning mid-push would complicate bisects.
 
 ## Non-goals
 
-- No decode-kernel tuning on the MoE grouped GEMM / mixer / LM head — measured at
-  hardware floors (~81% of LPDDR5X peak), three consecutive debunks.
+- No decode-kernel tuning on the MoE grouped-expert GEMM — measured at ~81% of LPDDR5X
+  bandwidth peak. Mixer/LM-head are deprioritized on weaker evidence (one failed
+  experiment each, not a measured floor — review finding); they may re-enter only via
+  P0 profiling naming them.
 - No spec-on-MoE until P1 lands and acceptance is measured (deferred, unchanged).
 - Distributed (Phase E) continues independently; not a lever for single-node vLLM parity.
