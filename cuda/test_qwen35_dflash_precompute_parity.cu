@@ -68,6 +68,19 @@ __global__ void k_headnorm(float* K, const float* w, int rows, int NKV, int HD, 
     double inv=1.0/sqrt(ss/HD+eps);
     for(int i=threadIdx.x;i<HD;i+=blockDim.x) v[i]=(float)((double)v[i]*inv*(double)w[i]);
 }
+// Neox RoPE on each K head-vector [rows, NKV*HD], per-row absolute position pos[r], base theta.
+// Neox pairs dim i with i+HD/2: (x_i, x_j) -> (x_i c - x_j s, x_i s + x_j c), angle = pos*theta^(-2i/HD).
+__global__ void k_rope(float* K, const int* pos, int rows, int NKV, int HD, double theta){
+    int r=blockIdx.x; int h=blockIdx.y; if(r>=rows||h>=NKV) return;
+    float* v=K+((size_t)r*NKV+h)*HD; int half=HD/2; double p=(double)pos[r];
+    for(int i=threadIdx.x;i<half;i+=blockDim.x){
+        double freq=pow(theta, -2.0*(double)i/(double)HD);
+        double ang=p*freq, c=cos(ang), s=sin(ang);
+        double x=v[i], y=v[i+half];
+        v[i]     =(float)(x*c - y*s);
+        v[i+half]=(float)(x*s + y*c);
+    }
+}
 
 int main(int argc,char**argv){
     const char* def="/opt/spark/models/models--z-lab--Qwen3.5-9B-DFlash/"
@@ -89,7 +102,9 @@ int main(int argc,char**argv){
     std::vector<float> hn=to_f32(hn_t);
 
     // Device buffers reused across layers.
-    float *dX,*dHN,*dNormed,*dW,*dK,*dV,*dKN;
+    const double theta=10000000.0;
+    float *dX,*dHN,*dNormed,*dW,*dK,*dV,*dKN; int *dPos;
+    std::vector<int> ctxpos(num_ctx); for(int r=0;r<num_ctx;r++) ctxpos[r]=17+r;  // arbitrary abs positions
     CUDA_OK(cudaMalloc(&dX,(size_t)num_ctx*H*4));
     CUDA_OK(cudaMalloc(&dHN,(size_t)H*4));
     CUDA_OK(cudaMalloc(&dNormed,(size_t)num_ctx*H*4));
@@ -97,6 +112,8 @@ int main(int argc,char**argv){
     CUDA_OK(cudaMalloc(&dK,(size_t)num_ctx*kv*4));
     CUDA_OK(cudaMalloc(&dV,(size_t)num_ctx*kv*4));
     CUDA_OK(cudaMalloc(&dKN,(size_t)HD*4));
+    CUDA_OK(cudaMalloc(&dPos,(size_t)num_ctx*sizeof(int)));
+    CUDA_OK(cudaMemcpy(dPos,ctxpos.data(),(size_t)num_ctx*sizeof(int),cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(dX,X.data(),(size_t)num_ctx*H*4,cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(dHN,hn.data(),(size_t)H*4,cudaMemcpyHostToDevice));
 
@@ -129,6 +146,8 @@ int main(int argc,char**argv){
         k_proj<<<g,256>>>(dNormed,dW,dV,num_ctx,H,kv);
         CUDA_OK(cudaMemcpy(dKN,kn.data(),(size_t)HD*4,cudaMemcpyHostToDevice));
         dim3 gh(num_ctx,NKV); k_headnorm<<<gh,128>>>(dK,dKN,num_ctx,NKV,HD,eps);
+        // RoPE stage on K (the last precompute step before cache insert).
+        k_rope<<<gh,64>>>(dK,dPos,num_ctx,NKV,HD,theta);
         CUDA_OK(cudaDeviceSynchronize());
         std::vector<float> Kd((size_t)num_ctx*kv), Vd((size_t)num_ctx*kv);
         CUDA_OK(cudaMemcpy(Kd.data(),dK,(size_t)num_ctx*kv*4,cudaMemcpyDeviceToHost));
@@ -149,8 +168,17 @@ int main(int argc,char**argv){
             for(int h=0;h<NKV;h++){
                 double ss=0; for(int i=0;i<HD;i++){ double x=Kh[h*HD+i]; ss+=x*x; }
                 double inv=1.0/std::sqrt(ss/HD+eps);
-                double rss=0; std::vector<double> ref(HD);
-                for(int i=0;i<HD;i++){ ref[i]=Kh[h*HD+i]*inv*(double)kn[i]; rss+=ref[i]*ref[i]; }
+                std::vector<double> nrm(HD);
+                for(int i=0;i<HD;i++) nrm[i]=Kh[h*HD+i]*inv*(double)kn[i];
+                // Neox RoPE reference on the normed head vector.
+                int half=HD/2; double p=(double)ctxpos[r]; std::vector<double> ref(HD); double rss=0;
+                for(int i=0;i<half;i++){
+                    double freq=std::pow(theta,-2.0*(double)i/(double)HD);
+                    double ang=p*freq, c=std::cos(ang), s=std::sin(ang);
+                    double x=nrm[i], y=nrm[i+half];
+                    ref[i]=x*c-y*s; ref[i+half]=x*s+y*c;
+                }
+                for(int i=0;i<HD;i++) rss+=ref[i]*ref[i];
                 double scale=std::sqrt(rss/HD)+1e-12;
                 for(int i=0;i<HD;i++){
                     double dk=Kd[(size_t)r*kv+h*HD+i];
@@ -159,7 +187,7 @@ int main(int argc,char**argv){
             }
         }
     }
-    cudaFree(dX);cudaFree(dHN);cudaFree(dNormed);cudaFree(dW);cudaFree(dK);cudaFree(dV);cudaFree(dKN);
+    cudaFree(dX);cudaFree(dHN);cudaFree(dNormed);cudaFree(dW);cudaFree(dK);cudaFree(dV);cudaFree(dKN);cudaFree(dPos);
 
     printf("precompute parity on real weights: max_rel K=%.3e V=%.3e (L=%d num_ctx=%d)\n",
            max_rel_k, max_rel_v, L, num_ctx);
@@ -167,7 +195,7 @@ int main(int argc,char**argv){
     // dominates; a few 1e-4 relative is expected. Fail only on a real divergence.
     const double TOL=2e-3;
     if(max_rel_k>TOL || max_rel_v>TOL){ printf("FAIL — precompute parity exceeds tol %.1e\n",TOL); return 1; }
-    printf("PASS — DFlash context-KV precompute (RMSNorm + fused KV proj + grouped K-norm) matches "
-           "host double reference on real weights within %.1e\n",TOL);
+    printf("PASS — DFlash context-KV precompute (RMSNorm + fused KV proj + grouped K-norm + neox "
+           "RoPE) matches host double reference on real weights within %.1e\n",TOL);
     return 0;
 }
