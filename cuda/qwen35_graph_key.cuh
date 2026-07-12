@@ -26,10 +26,22 @@ static inline q35_graph_key q35_make_spec_key(int num_reqs, int tokens_per_req) 
     return q35_graph_key{ num_reqs * tokens_per_req, num_reqs, tokens_per_req };
 }
 
+// Exact-match dispatch: a captured graph serves a runtime shape ONLY when every dimension is
+// equal. This is the dispatch the decode path MUST use today: fucina runs exactly key.num_tokens
+// rows of REAL work and does NOT pad per-step inputs to a larger capture's row count, so a bigger
+// graph replaying a smaller batch would process the extra rows at full cost (~8× waste for a
+// 31-row graph on a 4-row step). Exact-match is both correct and performant here.
+static inline bool q35_graph_exact_match(const q35_graph_key &cap, const q35_graph_key &want) {
+    return cap.num_tokens == want.num_tokens &&
+           cap.num_reqs == want.num_reqs &&
+           cap.uniform_token_count == want.uniform_token_count;
+}
+
 // Dominance dispatch: a captured graph with key `cap` can serve a runtime shape `want` when it
-// covers it in every dimension. Captures are exact-shape until S2a pads device buffers to max
-// shapes; then `>=` lets one larger capture serve smaller uniform batches. uniform_token_count
-// must match exactly (it changes the per-request query layout, not just a row count).
+// covers it in every dimension. This is ONLY valid once inputs are padded to the capture's row
+// count — the FUTURE S1/DFlash path, which pads every device buffer to max shapes. Until that
+// padding exists the decode path uses q35_graph_exact_match instead (see runtime q35_graph_lookup).
+// uniform_token_count must match exactly (it changes the per-request query layout, not a row count).
 static inline bool q35_graph_dominates(const q35_graph_key &cap, const q35_graph_key &want) {
     return cap.uniform_token_count == want.uniform_token_count &&
            cap.num_tokens >= want.num_tokens &&

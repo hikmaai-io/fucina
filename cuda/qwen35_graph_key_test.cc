@@ -53,6 +53,28 @@ int main() {
         CHECK(!q35_graph_dominates(small, big), "8 does not dominate 16");
     }
 
+    // ── EXACT-match dispatch (the decode path): a larger graph must NOT serve a smaller batch ──
+    // Regression lock for the S2b perf bug: dominance let a 31-row graph replay a 4-row decode
+    // step (fucina runs num_tokens REAL rows, no input padding), ~8× waste. Decode dispatch is
+    // exact-match; only a padded future S1 path may use dominance.
+    {
+        q35_graph_key big = q35_make_decode_key(31);
+        q35_graph_key small = q35_make_decode_key(4);
+        CHECK(!q35_graph_exact_match(big, small), "31-row graph must NOT match a 4-row step");
+        CHECK(!q35_graph_exact_match(small, big), "4-row graph must NOT match a 31-row step");
+        CHECK(q35_graph_exact_match(big, big), "exact-match is reflexive");
+        for (int B = 1; B <= 32; B++) {
+            q35_graph_key k = q35_make_decode_key(B);
+            CHECK(q35_graph_exact_match(k, k), "decode key exact self-match");
+            if (B < 32) CHECK(!q35_graph_exact_match(q35_make_decode_key(B + 1), k),
+                              "B+1 graph must not serve B step");
+        }
+        // exact-match must also separate a decode key from a spec key of equal num_tokens.
+        q35_graph_key dec8 = q35_make_decode_key(8);     // (8,8,1)
+        q35_graph_key spec = q35_make_spec_key(4, 2);    // (8,4,2)
+        CHECK(!q35_graph_exact_match(dec8, spec), "decode(8) must not match spec(4x2) at equal tokens");
+    }
+
     // ── decode-first ordering: pure 1-token decode is the identity permutation ──
     {
         int qlen[8]; for (int i = 0; i < 8; i++) qlen[i] = 1;

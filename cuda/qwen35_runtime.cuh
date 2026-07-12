@@ -491,11 +491,18 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
 
 // ── S2b: keyed CUDA-graph cache ────────────────────────────────────────────────────────
 // Key semantics (q35_make_decode_key / q35_graph_dominates) live in qwen35_graph_key.cuh.
-// Look up a replayable graph whose captured shape dominates `want`. Returns NULL on miss.
+// Look up a replayable graph for `want`. Dispatch is EXACT-match: the captured body runs
+// exactly key.num_tokens rows of REAL work — fucina does not pad per-step inputs to a larger
+// capture's row count — so a bigger graph cannot serve a smaller batch (it would process the
+// extra rows at full cost; ~8× waste for a 31-row graph replaying a 4-row step). Dominance
+// dispatch (q35_graph_dominates) is retained in the header as the primitive for the FUTURE
+// S1/DFlash path, which WILL pad every device buffer to max shapes — only then does a larger
+// capture correctly (and cheaply) serve a smaller uniform batch. Until that padding exists,
+// exact-match is the only correct AND performant dispatch.
 static cudaGraphExec_t q35_graph_lookup(gemma4_engine_t *eng, const q35_graph_key &want) {
     for (int i = 0; i < eng->q35.graph_count; i++) {
         const q35_graph_entry &e = eng->q35.graph_cache[i];
-        if (e.exec && q35_graph_dominates(e.key, want)) return e.exec;
+        if (e.exec && q35_graph_exact_match(e.key, want)) return e.exec;
     }
     return NULL;
 }
