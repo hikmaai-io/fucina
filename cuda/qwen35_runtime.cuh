@@ -453,9 +453,14 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
         // verify step is active and this target layer is configured. Gated + additive: a no-op
         // (single branch, no launch) when capture is inactive, so plain decode is byte-identical.
         if (eng->q35.dflash_capture_active && eng->q35.dflash_capture_layer[l]) {
-            int slot = eng->q35.dflash_capture_slot[l];
-            cudaMemcpyAsync(eng->q35.dflash_aux + (size_t)slot * H,
-                            x + (size_t)(B - 1) * H, (size_t)H * sizeof(float),
+            // Capture ALL B rows' residual at this configured target layer into the aux buffer,
+            // laid out [feature_slot][row][H] so the drafter reads per-position aux (context + query
+            // rows) as concat(F) per row. dflash_aux is sized F * capture_maxrows * H.
+            int fslot = eng->q35.dflash_capture_slot[l];
+            int maxr = eng->q35.dflash_capture_maxrows;
+            int rr = (B < maxr) ? B : maxr;
+            cudaMemcpyAsync(eng->q35.dflash_aux + (size_t)fslot * maxr * H,
+                            x, (size_t)rr * H * sizeof(float),
                             cudaMemcpyDeviceToDevice, st);
         }
     }

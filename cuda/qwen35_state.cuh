@@ -81,9 +81,10 @@ struct qwen35_runtime_state {
     // stays byte-identical to plain decode. dflash_capture_nfeat counts configured layers (== F).
     int            dflash_capture_active;             // 1 while a verify step captures aux-hidden
     int            dflash_capture_nfeat;              // number of captured target layers (F)
+    int            dflash_capture_maxrows;            // max rows captured per step (>= 1+K)
     uint8_t        dflash_capture_layer[GEMMA4_CAP_LAYERS];  // 1 => capture this target layer
     int            dflash_capture_slot[GEMMA4_CAP_LAYERS];   // target layer -> feature slot [0,F)
-    float         *dflash_aux;                        // [F * H] device concat buffer (last row)
+    float         *dflash_aux;                        // [F * maxrows * H] device: [slot][row][H]
 
     // S1a P3/P4 resident draft model (opaque handles; real types in qwen35_dflash_forward.cuh).
     // Loaded lazily on the first enabled verify step from FUCINA_QWEN35_DFLASH_PATH; NULL when the

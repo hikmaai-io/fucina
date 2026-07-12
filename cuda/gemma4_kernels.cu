@@ -5092,6 +5092,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->q35.dflash_mode = q35_dflash_mode_from_env(getenv("FUCINA_QWEN35_DFLASH"));
     eng->q35.dflash_critical_batch = 0;
     eng->q35.dflash_capture_active = 0; eng->q35.dflash_capture_nfeat = 0;
+    eng->q35.dflash_capture_maxrows = 0;
     eng->q35.dflash_aux = NULL;
     for (int i = 0; i < GEMMA4_CAP_LAYERS; i++) { eng->q35.dflash_capture_layer[i] = 0; eng->q35.dflash_capture_slot[i] = 0; }
     eng->q35.dflash_residency = NULL; eng->q35.dflash_drafter = NULL;
@@ -15756,8 +15757,12 @@ static int q35_dflash_ensure_loaded(gemma4_engine_t *eng) {
             if (v >= 0 && v < GEMMA4_CAP_LAYERS) { eng->q35.dflash_capture_layer[v] = 1; eng->q35.dflash_capture_slot[v] = slot++; }
         }
     } }
+    // Aux buffer sized F * maxrows * H, where maxrows covers the largest context+query span we
+    // capture in one verify forward (bounded by GEMMA4_MAX_SEQS rows per chunked forward).
+    eng->q35.dflash_capture_maxrows = GEMMA4_MAX_SEQS;
     if (!eng->q35.dflash_aux)
-        cudaMalloc(&eng->q35.dflash_aux, (size_t)R->geom.num_target_features * eng->cfg.hidden_size * sizeof(float));
+        cudaMalloc(&eng->q35.dflash_aux, (size_t)R->geom.num_target_features *
+                   eng->q35.dflash_capture_maxrows * eng->cfg.hidden_size * sizeof(float));
 
     eng->q35.dflash_residency = R; eng->q35.dflash_drafter = D; eng->q35.dflash_loaded = 1;
     fprintf(stderr, "fucina: DFlash draft model resident (%d layers, K=%d, %d aux features)\n",
