@@ -27,17 +27,20 @@ Remaining losses to close:
 - **L-moe-ttft**: MoE N=32 TTFT 866 vs 664 ms (last TTFT hold-out).
 - **L-moe-lowc**: MoE N=2/4 cells (small-batch efficiency).
 
-## Finishing the in-flight work (do first)
+## Finishing the in-flight work — DONE (2026-07-12, merged to main 27b686f)
 
-- **P2 F1+F2** — implement the two designed, byte-identical-by-construction
-  kernels: F1 extend `bf16_head_gemv_batched<K,R>` to K≤32 (head read once),
-  F2 mixer Q4_K weight-read-once for 8<K≤32. Gate: determinism +
-  qwen35-multiseq-prefill-test + protection_gate.py; bench N=8/16/32. Push
-  `perf/qwen35-dense-decode`. Expected: dense B=30 step 91→~40 ms → closes most
-  of L-dense.
-- **Prune acceptance** — run the e4b/diffusion + Gemma GPU gate suite on
-  `chore/prune-legacy-qwen3`; if green, it merges after P2 (avoid a churny
-  double-rebase; prune is CPU-side and independent).
+- **P2 F1+F2 — SHIPPED** (`f6c5634` head, `0ea4604` mixer). Measured on
+  Qwen3.5-9B-FP8 vs the 1cc35ed baseline, 96-step apples-to-apples:
+  **B=30 (the served avgB, 3-pass ladder case): 330.6 → 425.0 tok/s (+28.6%)**,
+  step 91.6 → 70.6 ms; B=32 +4.4%, B=16 +2.0%. Both fixes bitwise-identical by
+  construction; losslessness gate PASS (dense logit rel ≤0.0029 unchanged). This
+  closes most of L-dense at the batch that matters for serving.
+- **Prune acceptance — GREEN, merged** (`chore/prune-legacy-qwen3`, 4 commits):
+  diffusion kernel gates + Gemma e2e + qwen35 determinism all PASS; the two
+  suite flags (dg-bf16 transient contention, e4b-MTP-checkpoint detector) proven
+  model-availability not code. fucina is now Qwen3.5-only.
+- Merged main 27b686f: full build green, Go tests green, multiseq-prefill gate
+  PASS, pushed. Baselines re-freeze pending a fresh serving sweep.
 
 ## The SOTA levers (from the vLLM analysis, ranked by measured leverage)
 
