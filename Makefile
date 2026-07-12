@@ -777,6 +777,11 @@ qwen35-dflash-plan-test:
 qwen35-dflash-commit-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_commit_test.cc -o /tmp/dflash_commit && /tmp/dflash_commit
 
+# Host-only DFlash probabilistic distribution-preservation (S1a P1): Monte-Carlo proof that the
+# rejection sampler emits tokens distributed as the TARGET (temperature sampling), draft != target.
+qwen35-dflash-prob-dist-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_prob_dist_test.cc -o /tmp/dflash_probdist && /tmp/dflash_probdist
+
 # Host-only DFlash verify-pipeline integration (S1a): composes planner -> shared-key draft sampling
 # -> rejection -> commit assembly end to end on synthetic logits (the seams around the two device
 # forwards). Weights-free; proves the deterministic glue before the draft forward exists.
