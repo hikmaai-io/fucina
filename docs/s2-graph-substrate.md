@@ -118,5 +118,55 @@ Both must land green + gated before push.
 The graph body captured is unchanged; only the host-side cache index changed
 (array subscript → small linear probe over ≤64 entries, once per distinct shape,
 then a pointer replay). No per-token host work added inside the hot loop.
+
+### S2a — GPU-native input splicing (LANDED, `eb850fc`)
+
+- New device kernels (`cuda/qwen35_kernels.cuh`, one thread/row, distinct slots):
+  - `qwen35_splice_inputs_kernel` — gather `in_tok[r]=slot_tok[rowslot[r]]`,
+    `pos[r]=slot_pos[rowslot[r]]`. Runs INSIDE the captured graph, at the top of
+    `qwen35_decode_multiseq_body`, so replay derives inputs with no host token.
+  - `qwen35_writeback_slot_state_kernel` — `slot_tok[slot]=out_tok[r]`,
+    `slot_pos[slot]+=1`. In-graph on the greedy path (after argmax); post-sampler
+    in `qwen35_ms_run` on the sampled path. Skips sentinel `out_tok<0` rows.
+  - `qwen35_seed_slot_state_kernel` — scatter host inputs into slot state before
+    a step (outside the graph). Makes the in-graph splice reproduce exactly the
+    old host-copy `(tok,pos)`.
+- `qwen35_state.cuh`: persistent `int32_t *d_slot_tok` / `int *d_slot_pos`
+  (capacity-indexed) + `int gpu_splice_enabled` toggle
+  (`FUCINA_QWEN35_NO_GPU_SPLICE=1` → legacy host-copy path). Allocated in
+  `ensure_q35_scratch`, freed in `gemma4_engine_destroy`.
+- `qwen35_runtime.cuh`: `qwen35_decode_multiseq_body` and `qwen35_ms_run` take a
+  `splice` flag; `qwen35_ms_graph_ensure` captures WITH splice+writeback so the
+  graph is a self-contained `splice(state)→forward→argmax→writeback(state)` step.
+  `qwen35_step_batch` seeds slot state each step then runs spliced. The sequential
+  prefill paths (`seq_add`, `seq_prefill_chunk`) pass `splice=0` (their
+  per-position tokens are not in slot state).
+- **Determinism**: with splice on, `step_batch` still computes the host
+  `in2[]/positions[]` exactly as before and *seeds* slot state from them; the
+  in-graph splice re-derives identical `(tok,pos)`. The writeback mutation is
+  authoritatively overwritten by the next step's seed. Every step's inputs are
+  therefore byte-identical to the host-copy path — proven by the multiseq-prefill
+  gate holding its EXACT prior bounds.
+- **Zero-sync primitive proven**: new self-chain gate seeds slot state ONCE, then
+  replays the captured greedy graph 24× with NO host token feedback; the graph's
+  in-body writeback→splice advances `(token, position)` device-side and the
+  produced tokens byte-match the host-fed reference. This is the S1/DFlash
+  zero-sync draft-loop prerequisite, validated.
+- **Gates**: batch selftest `self-chain=PASS graph-on==off=PASS
+  row-independence=PASS M3-parity 8/8 sampling=PASS`; multiseq-prefill PASS with
+  **unchanged** bounds (MoE ≤0.0946, dense ≤0.0029); `make lib libdg fucina`
+  green.
+- **Performance**: neutral by construction — adds two int-only kernels over B≤32
+  rows (a gather and a scatter), both captured in the same graph; the ~33 ms/step
+  weight traffic is untouched. On the greedy graph path S2a REMOVES two per-step
+  host→device copies (input tokens + positions), a small latency win.
+
+## Protection gate
+
+S2 changes no kernel math and adds only negligible int-shuffle work, so serving
+throughput is expected neutral. The `scripts/protection_gate.py` sweep requires a
+quiescent box (a contended GPU makes throughput numbers invalid). Status recorded
+in the completion note below; determinism + parity gates (the correctness
+contract) are fully green.
 </content>
 </invoke>
