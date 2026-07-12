@@ -56,6 +56,21 @@ __global__ void q35df_attn(const float* Q,const float* K,const float* V,float* O
     __syncthreads();
     for(int i=threadIdx.x;i<HD;i+=blockDim.x){ double acc=0; for(int t=0;t<ctx;t++){ const float* v=V+((size_t)t*NKV+g)*HD; acc+=sh[t]*(double)v[i]; } O[((size_t)r*NQ+h)*HD+i]=(float)(acc/sm); }
 }
+// Combined non-causal GQA: each query row attends the concatenation of context K/V [ctx,NKV,HD]
+// and the query block's own K/V [rows,NKV,HD]. Softmax over (ctx+rows) positions; O[rows,NQ,HD].
+__global__ void q35df_attn_ctx(const float* Q,const float* Kc,const float* Vc,const float* Kq,const float* Vq,
+                               float* O,int rows,int ctx,int NQ,int NKV,int HD){
+    int r=blockIdx.x; int h=blockIdx.y; if(r>=rows||h>=NQ) return; int g=h/(NQ/NKV);
+    const float* q=Q+((size_t)r*NQ+h)*HD; extern __shared__ double sh[]; int tot=ctx+rows; double scale=1.0/sqrt((double)HD);
+    for(int t=threadIdx.x;t<tot;t+=blockDim.x){
+        const float* k = (t<ctx) ? Kc+((size_t)t*NKV+g)*HD : Kq+((size_t)(t-ctx)*NKV+g)*HD;
+        double d=0; for(int i=0;i<HD;i++) d+=(double)q[i]*(double)k[i]; sh[t]=d*scale;
+    }
+    __syncthreads(); __shared__ double sm;
+    if(threadIdx.x==0){ double m=-1e300; for(int t=0;t<tot;t++) if(sh[t]>m) m=sh[t]; double s=0; for(int t=0;t<tot;t++){ sh[t]=exp(sh[t]-m); s+=sh[t]; } sm=s; }
+    __syncthreads();
+    for(int i=threadIdx.x;i<HD;i+=blockDim.x){ double acc=0; for(int t=0;t<tot;t++){ const float* v=(t<ctx)?Vc+((size_t)t*NKV+g)*HD:Vq+((size_t)(t-ctx)*NKV+g)*HD; acc+=sh[t]*(double)v[i]; } O[((size_t)r*NQ+h)*HD+i]=(float)(acc/sm); }
+}
 __global__ void q35df_residual(float* x,const float* d,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) x[i]+=d[i]; }
 __global__ void q35df_siluglu(const float* g,const float* u,float* o,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n){ double x=g[i]; o[i]=(float)((x/(1.0+exp(-x)))*(double)u[i]); } }
 
@@ -146,6 +161,41 @@ static inline void q35_dflash_precompute_context_kv(const q35_dflash_residency& 
         q35df_headnorm<<<dim3(num_ctx,NKV),128,0,st>>>(ctxK[l],w.k_norm,num_ctx,NKV,HD,eps);
         q35df_rope<<<dim3(num_ctx,NKV),64,0,st>>>(ctxK[l],ctx_pos,num_ctx,NKV,HD,theta);
     }
+}
+
+// Full DFlash query forward: the (1+K) query rows attend the precomputed context K/V (ctxK/ctxV
+// per layer) PLUS their own query-block K/V, non-causally, through all draft layers + final norm.
+// This is the true DFlash drafting forward. x [rows,H] is the query embedding (mutated in place);
+// dpos [rows] absolute positions; ctxK[l]/ctxV[l] the context K/V from precompute; num_ctx context
+// rows. out receives the final-normed hidden. Reads resident BF16 weights.
+static inline void q35_dflash_query_forward(const q35_dflash_residency& R, q35_dflash_fwd_scratch& s,
+        float* x, const int* dpos, int num_ctx, float* const* ctxK, float* const* ctxV,
+        double theta, float eps, cudaStream_t st){
+    const qwen35dflash::Geometry& g=R.geom;
+    const int H=g.H,I=g.I,HD=g.HD,NQ=g.NQ,NKV=g.NKV,qd=g.q_dim(),kvd=g.kv_dim(),rows=s.rows;
+    auto gr=[&](int n){ return (unsigned)((n+255)/256); };
+    size_t smem=(size_t)(num_ctx+rows)*sizeof(double);
+    for(int l=0;l<g.L;l++){
+        const q35_dflash_layer_w& w=R.layers[l];
+        q35df_rmsnorm<<<rows,256,0,st>>>(x,w.input_norm,s.h1,H,rows,eps);
+        q35df_matmul<<<dim3(rows,(qd+255)/256),256,0,st>>>(s.h1,w.q_proj,s.q,rows,H,qd);
+        q35df_matmul<<<dim3(rows,(kvd+255)/256),256,0,st>>>(s.h1,w.k_proj,s.k,rows,H,kvd);
+        q35df_matmul<<<dim3(rows,(kvd+255)/256),256,0,st>>>(s.h1,w.v_proj,s.v,rows,H,kvd);
+        q35df_headnorm<<<dim3(rows,NQ),128,0,st>>>(s.q,w.q_norm,rows,NQ,HD,eps);
+        q35df_headnorm<<<dim3(rows,NKV),128,0,st>>>(s.k,w.k_norm,rows,NKV,HD,eps);
+        q35df_rope<<<dim3(rows,NQ),64,0,st>>>(s.q,dpos,rows,NQ,HD,theta);
+        q35df_rope<<<dim3(rows,NKV),64,0,st>>>(s.k,dpos,rows,NKV,HD,theta);
+        q35df_attn_ctx<<<dim3(rows,NQ),128,smem,st>>>(s.q,ctxK[l],ctxV[l],s.k,s.v,s.attn,rows,num_ctx,NQ,NKV,HD);
+        q35df_matmul<<<dim3(rows,(H+255)/256),256,0,st>>>(s.attn,w.o_proj,s.mix,rows,qd,H);
+        q35df_residual<<<gr(rows*H),256,0,st>>>(x,s.mix,rows*H);
+        q35df_rmsnorm<<<rows,256,0,st>>>(x,w.post_norm,s.h2,H,rows,eps);
+        q35df_matmul<<<dim3(rows,(I+255)/256),256,0,st>>>(s.h2,w.gate_proj,s.g,rows,H,I);
+        q35df_matmul<<<dim3(rows,(I+255)/256),256,0,st>>>(s.h2,w.up_proj,s.u,rows,H,I);
+        q35df_siluglu<<<gr(rows*I),256,0,st>>>(s.g,s.u,s.ff,rows*I);
+        q35df_matmul<<<dim3(rows,(H+255)/256),256,0,st>>>(s.ff,w.down_proj,s.mix,rows,I,H);
+        q35df_residual<<<gr(rows*H),256,0,st>>>(x,s.mix,rows*H);
+    }
+    q35df_rmsnorm<<<rows,256,0,st>>>(x,R.final_norm,s.out,H,rows,eps);
 }
 
 #endif // FUCINA_QWEN35_DFLASH_FORWARD_CUH
