@@ -65,7 +65,30 @@ gated on the real weights (device fp32 vs host double, signal-relative error):
   graph-on==off + M3-parity + self-chain); P0 GDN rollback byte-identical for all
   j in 0..K; full `make lib libdg fucina` + Go tests green.
 
-### Real end-to-end status (2026-07-12): greedy LOSSLESS proven; acceptance = 0 (open)
+### Real speculation WORKING (2026-07-12): measured accept 6.78-7.71/step, one losslessness bug open
+
+After fixing the aux data-flow bugs (query embeds token ids; aux = residual
+stream at layer id-1; SWA draft layers causal; **and the two that unblocked it:**
+the aux-capture hook was missing from the verify chunk-body path, and the engine
+`target_layer_ids` parser broke on the config's NEWLINES so ZERO capture layers
+were set), the real draft now PREDICTS the target. Measured on the FP8 target +
+real z-lab draft:
+
+- prompt 0 ("The capital of France is"): lossless, **6.78 accepted+emitted/step**.
+- prompt 1: lossless, **7.71/step**.
+- prompt 2 (numeric ids): **losslessness FAILS at the tail** under many rejections
+  — a real bug (`qwen35-dflash-measure-test` returns nonzero, kept honest).
+
+Ruled out for the prompt-2 bug: verify-block per-row argmax (proven 17/17 == seq
+decode at K=16 on the same numeric prompt); Q8-vs-BF16 head (Q8 head is exact by
+design). The failure is in the MULTI-STEP accumulation path, not the verify math
+— prime suspects: draft-forward corrupting shared FP8 engine scratch (d_sb/cublas
+workspace) or a KV/context growth interaction at high position. This MUST be fixed
+before S1A_VALIDATED: losslessness is absolute. No speedup claimed (the reference
+draft kernels are unoptimized fp64-accum; wall-clock is not yet favorable and is
+reported honestly as such).
+
+### (superseded) earlier status: greedy LOSSLESS proven; acceptance = 0
 
 The integrated `gemma4_engine_q35_dflash_real_step` drives the resident real draft
 model through the full loop (draft -> verify -> accept -> commit) and its emitted

@@ -758,6 +758,17 @@ qwen35-dflash-real-e2e-test: lib libdg
 # GGUF has no BF16 tables. Override DFLASH_TARGET to point at the FP8 checkpoint.
 DFLASH_TARGET ?= /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8
 
+# DFlash acceptance + throughput measurement over multiple prompts. Asserts losslessness (byte-
+# identical to greedy) per prompt and reports MEASURED mean accepted length + coarse wall-clock.
+# NOTE: currently EXPOSES a real losslessness bug on the 3rd (numeric-id) prompt under many
+# rejections -- kept as an honest diagnostic (returns nonzero) until that bug is fixed; prompts 0/1
+# are lossless at high acceptance (6.78 / 7.71 tokens/step measured).
+qwen35-dflash-measure-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_measure.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dflash_measure \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "FUCINA_QWEN35_DFLASH_PATH=$(DFLASH_PATH) /tmp/fucina_dflash_measure $(DFLASH_TARGET)"
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:
