@@ -330,6 +330,12 @@ qwen35-fp8-engine-test: lib libdg
 # ─── Qwen3.5-35B-A3B MoE FP8 served through the REAL batched engine (not the B=1 oracle) (GPU) ───
 # Same gate as qwen35-fp8-engine-test but for the qwen3_5_moe checkpoint: runtime H=2048/NKV=2,
 # per-layer 256-expert FP8 slabs (grouped FP8 GEMM), shared expert, softmax-top8-renorm router.
+qwen35-multiseq-prefill-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_multiseq_prefill.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_multiseq_prefill \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_multiseq_prefill $(if $(MODEL),$(MODEL),$(QWEN35_MOE_FP8_MODEL)) $(QWEN35_FP8_MODEL)"
+
 qwen35-moe-fp8-engine-test: lib libdg
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_moe_fp8_engine.cu \
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_moe_fp8_engine \

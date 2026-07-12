@@ -9497,6 +9497,12 @@ static void m2_gemm(float *out, const float *x, const float *w, int T, int in_di
 // bit-identical). Caller adds out_f32 to the residual. All-device (CUDA-graph-capturable).
 static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_f32, int n,
                     cudaStream_t stream) {
+    // P1 unification (see q35_proj_gemm): force the WIDE tensor-core expert path even for short
+    // token counts so a short prompt's experts compute identically standalone (n<=32) and inside a
+    // batched multi-seq prefill (n>32) — otherwise the scalar-grouped vs tensor-core-grouped split
+    // breaks batched==standalone. FUCINA_UNIFY_BF16 lowers the n>2*FP8_MAXB thresholds to always.
+    static int moe_unify = -1;
+    if (moe_unify < 0) moe_unify = (getenv("FUCINA_NO_UNIFY") != NULL) ? 0 : 1;   // default ON (deterministic keeper)
     const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn;
     const int E = eng->cfg.n_experts, U = eng->cfg.n_experts_used;
     const int GU = 2 * EFFN;   // fused gate+up slab rows (SSD streaming pool geometry)
@@ -9537,7 +9543,11 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
     // LAYER, then per-group cublas GEMMs replace the scalar-float grouped kernel (measured 71.6%
     // of a 2k-token prefill, ALU-bound at ~16 tok/expert). Decode-sized calls keep the FP8 kernel.
     int tc = 0;
-    if (tc_ok && n > 2 * FP8_MAXB && E <= 256 && !eng->moe_tc_off) {
+    // Under unify, SUPPRESS the tensor-core bf16 grouped path (cublas per-expert GEMMs pick an
+    // atomic split-K algo at batched token counts → NONDETERMINISTIC run-to-run) and keep the
+    // custom FP8-native fp8_block_grouped path (deterministic, FP8-precision) for ALL n, so short
+    // and batched experts compute identically. See determinism gate.
+    if (tc_ok && !moe_unify && n > 2 * FP8_MAXB && E <= 256 && !eng->moe_tc_off) {
         if (!eng->d_moe_xbf) {
             int xmax = (H > EFFN) ? H : EFFN;
             size_t wb = (size_t)E * EFFN * H * sizeof(__nv_bfloat16);
@@ -9587,7 +9597,7 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         // Router → softmax-E → top-U → renorm-to-sum-1 → counting-sort route (pes = ones[E]).
         // Wide (prefill) calls ride a cublas SGEMM — the block-per-(expert,token) GEMV re-walks
         // the router per token and measured 314 ms per 2.9k-token pass (11.6% of prefill).
-        if (cn > 2 * FP8_MAXB) {
+        if (moe_unify || cn > 2 * FP8_MAXB) {
             const float alf = 1.0f, bet = 0.0f;
             cublasSgemm(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, E, cn, H,
                         &alf, router_w, H, h, H, &bet, eng->d_moe_rlogits, E);
@@ -12440,6 +12450,10 @@ static int decode_multiseq_forward(
 static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_prompt,
                           int32_t *first_token_out, float temp, int top_k, float top_p,
                           float min_p, uint64_t seed);
+static int qwen35_seq_add_multiseq(gemma4_engine_t *eng, const int32_t *tokens_flat,
+                          const int *lens, int M, const float *temps, const int *topks,
+                          const float *topps, const float *minps, const uint64_t *seeds,
+                          int *out_slots, int32_t *out_first);
 static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
                              const int32_t *in_tokens, int B, int32_t *out_tokens);
 static int qwen35_seq_open(gemma4_engine_t *eng, float temp, int top_k, float top_p,
@@ -12617,6 +12631,38 @@ extern "C" int gemma4_engine_seq_add(
         prefix_register(&eng->glob_prefix, prompt, n_prompt / PAGED_KV_BLOCK_TOKENS, s->glob_bt.blocks);
     if (first_token_out) *first_token_out = last_tok;
     return slot;
+}
+
+// P1: BATCHED multi-sequence admission-prefill (Qwen3.5 only). Admits M prompts in ONE forward
+// (weights amortized across all rows) instead of M serial single-seq prefills — the fix for the
+// measured N=32 TTFT (32 x ~52 ms). Returns M (all admitted, out_slots/out_first filled), 0 when
+// the engine does not support it (caller falls back to serial AddSeq), or -1 on error. Rollback
+// on error frees any slots taken. Toggle off with FUCINA_NO_BATCHED_PREFILL.
+extern "C" int gemma4_engine_seq_add_multiseq(
+    gemma4_engine_t *eng, const int32_t *tokens_flat, const int *lens, int M,
+    const float *temps, const int *topks, const float *topps, const float *minps,
+    const uint64_t *seeds, int *out_slots, int32_t *out_first)
+{
+    if (!eng || !eng->loaded) return -1;
+    if (eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return 0;   // unsupported → caller serial-admits
+    static int disabled = -1;
+    if (disabled < 0) disabled = (getenv("FUCINA_NO_BATCHED_PREFILL") != NULL);
+    if (disabled) return 0;
+    return qwen35_seq_add_multiseq(eng, tokens_flat, lens, M, temps, topks, topps, minps, seeds,
+                                   out_slots, out_first);
+}
+
+// DEBUG (test-only): copy the just-computed first-token logits. nrows==1 → single-seq d_logits
+// (VOC floats, as left by gemma4_engine_seq_add); nrows>1 → the batched head output d_sb[11]
+// (nrows*VOC, as left by gemma4_engine_seq_add_multiseq). Used by the multiseq gate to measure
+// the batched-vs-standalone logit-difference distribution that justifies the tolerance bound.
+extern "C" int gemma4_engine_debug_logits(gemma4_engine_t *eng, float *out, int nrows) {
+    if (!eng || !eng->loaded || nrows < 1 || !out) return -1;
+    int VOC = eng->cfg.vocab_size;
+    const float *src = (nrows == 1) ? eng->d_logits : eng->d_sb[11];
+    if (!src) return -1;
+    cudaMemcpy(out, src, (size_t)nrows * VOC * sizeof(float), cudaMemcpyDeviceToHost);
+    return (cudaGetLastError() == cudaSuccess) ? VOC : -1;   // returns VOC on success
 }
 
 // ─── Chunked prefill (interleaved with decode) ───────────────────────────────

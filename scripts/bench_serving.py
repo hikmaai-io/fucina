@@ -110,7 +110,14 @@ def concurrency(base_url, model, prompt, max_tokens, ignore_eos, N, diverse=Fals
     agg_tps = total_decode / wall
     ttfts = [r["ttft"] * 1000 for r in results if r]
     per_tps = [r["decode_tps"] for r in results if r]
+    def _p95(xs):
+        if not xs: return float("nan")
+        s = sorted(xs)
+        # nearest-rank p95 (clamped); stable for small N
+        k = max(0, min(len(s) - 1, int(round(0.95 * (len(s) - 1)))))
+        return s[k]
     out = {"N": N, "agg_decode_tps": agg_tps, "median_ttft_ms": statistics.median(ttfts),
+           "p95_ttft_ms": _p95(ttfts), "ttfts_ms_raw": sorted(round(x, 2) for x in ttfts),
            "median_per_stream_tps": statistics.median(per_tps), "wall_s": wall}
     if verify_sample:
         out["samples"] = [{"prompt": prompts[i][:60], "text": (results[i] or {}).get("text", "")[:150]}
