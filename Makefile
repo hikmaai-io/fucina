@@ -621,6 +621,11 @@ qwen35-dflash-loader-test:
 qwen35-dflash-plan-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_plan_test.cc -o /tmp/dflash_plan && /tmp/dflash_plan
 
+# Host-only DFlash verify->commit assembly (P4 orchestration): maps a rejection result to the exact
+# P0 commit token sequence + next-step input token + emitted count. Weights-free, deterministic.
+qwen35-dflash-commit-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_commit_test.cc -o /tmp/dflash_commit && /tmp/dflash_commit
+
 # CUDA<->CPU parity for the DFlash RNG + rejection sampler (P1 of S1a). Self-contained, no model;
 # runs the shared __host__ __device__ header on-GPU and asserts bit-identical results vs the host.
 qwen35-dflash-parity-test:
