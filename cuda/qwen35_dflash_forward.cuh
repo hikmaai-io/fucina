@@ -240,6 +240,41 @@ static inline void q35_dflash_sample_greedy(const float* sampled_hidden, const _
     q35df_head_argmax<<<K,256,0,st>>>(sampled_hidden, lm_head, H, vocab, out_tok);
 }
 
+// ── Greedy verify-accept over the target logit block ──
+// Given target logits for the (1+K) verify rows [rows, vocab] and the K draft tokens, compute the
+// greedy accepted length j and the emitted token at position j (target argmax at the first mismatch,
+// or the bonus argmax if all K match). Matches q35_dflash_verify_greedy bit-for-bit. Row t of the
+// logits block is the target's prediction for the token AFTER query offset t; draft[i] is compared
+// against argmax(row i) for i in [0,K). Single block: one thread-team argmaxes each needed row.
+// out_accept[0] = j; out_emit[0] = emitted token. Deterministic (lowest index wins ties).
+__global__ void q35df_verify_argmax(const float* logits, int rows, int vocab, int32_t* row_argmax){
+    // Each block handles one row's argmax; grid.x = rows.
+    __shared__ double bv[256]; __shared__ int bi[256];
+    int row=blockIdx.x; const float* lr=logits+(size_t)row*vocab;
+    double lv=-1e300; int li=0;
+    for(int o=threadIdx.x;o<vocab;o+=blockDim.x){ double v=lr[o]; if(v>lv || (v==lv && o<li)){ lv=v; li=o; } }
+    bv[threadIdx.x]=lv; bi[threadIdx.x]=li; __syncthreads();
+    for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s){ if(bv[threadIdx.x+s]>bv[threadIdx.x] || (bv[threadIdx.x+s]==bv[threadIdx.x] && bi[threadIdx.x+s]<bi[threadIdx.x])){ bv[threadIdx.x]=bv[threadIdx.x+s]; bi[threadIdx.x]=bi[threadIdx.x+s]; } } __syncthreads(); }
+    if(threadIdx.x==0) row_argmax[row]=bi[0];
+}
+// Reduce the per-row argmaxes (in row_argmax[rows]) + draft to accepted_len + emitted (single thread).
+__global__ void q35df_verify_reduce(const int32_t* row_argmax, const int32_t* draft, int K,
+                                    int* out_accept, int32_t* out_emit){
+    if(threadIdx.x||blockIdx.x) return;
+    int j=0;
+    for(int i=0;i<K;i++){ if(row_argmax[i]==draft[i]) j++; else break; }
+    // emitted: target argmax at position j (row j is the bonus row when j==K).
+    *out_accept=j; *out_emit=row_argmax[j];
+}
+
+// Host-side driver: rows must be K+1 (K draft rows + 1 bonus row). row_argmax scratch [rows] int32.
+static inline void q35_dflash_verify_greedy_device(const float* logits, int rows, int vocab,
+        const int32_t* draft, int K, int32_t* row_argmax, int* out_accept, int32_t* out_emit,
+        cudaStream_t st){
+    q35df_verify_argmax<<<rows,256,0,st>>>(logits, rows, vocab, row_argmax);
+    q35df_verify_reduce<<<1,1,0,st>>>(row_argmax, draft, K, out_accept, out_emit);
+}
+
 // ── Single drafting entry point (the verify loop calls this) ──
 // Owns all drafting scratch + per-layer context K/V buffers for one request's draft step. Produced
 // once per residency; reused across steps (fixed (1+K) query shape, variable context length up to a
