@@ -40,9 +40,6 @@
 // cfg.arch so Gemma-4 stays byte-identical. Detected from general.architecture in the GGUF.
 enum {
     GEMMA4_ARCH_GEMMA4   = 0,   // Gemma-4 (sliding+global, V=K on global, geglu, softcap, baked attn scale)
-    GEMMA4_ARCH_QWEN3    = 1,   // Qwen3 dense (full-causal all layers, separate V, silu-glu, no softcap)
-    GEMMA4_ARCH_QWEN3MOE = 2,   // Qwen3 MoE (qwen3moe): IDENTICAL attention/norm/rope/KV to Qwen3 dense,
-                                // but the dense FFN becomes a 128-expert top-8 SiLU-GLU mixture.
     GEMMA4_ARCH_QWEN3_5  = 3,   // Qwen3.5 hybrid (qwen35): per-layer mix of FULL softmax-GQA (output-gated,
                                 // partial-RoPE, q/k norm) and LINEAR gated-deltanet (SSM) layers, period-4
                                 // full at (i+1)%full_attention_interval==0; SwiGLU MLP, untied lm_head.
@@ -79,7 +76,7 @@ typedef struct gemma4_model_config_t {
     uint8_t is_global[GEMMA4_CAP_LAYERS];
     int   n_global;          // count of global layers (8 / 10)
 
-    // ── Sparse-MoE (GEMMA4_ARCH_QWEN3MOE) ───────────────────────────────────────────────────────
+    // ── Sparse-MoE FFN ──────────────────────────────────────────────────────────────────────
     // Zero for dense archs. n_experts = total expert count (128), n_experts_used = top-k routed
     // per token (8), expert_ffn = per-expert FFN intermediate (768). The router is a plain
     // hidden→n_experts GEMV (softmax over all experts, top-k, renormalize the k weights to sum 1).
