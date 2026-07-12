@@ -128,6 +128,19 @@ static inline void q35_dflash_backbone_forward(const q35_dflash_residency& R, q3
     q35df_rmsnorm<<<rows,256,0,st>>>(x,R.final_norm,s.out,H,rows,eps);
 }
 
+// ── Aux-hidden combine (the target->draft input interface) ──
+// When use_aux_hidden, the draft's input hidden for each row is fc(concat of F target-layer hidden
+// states), fc: [H, F*H]. This is the exact interface the target engine feeds: it gathers the F
+// configured target layers' hidden states, concatenates them per row [rows, F*H], and projects
+// through the BF16 fc weight to [rows, H]. Matmul reuses q35df_matmul. This produces the input to
+// precompute_context_kv (for context rows) and to the query forward (for the query rows).
+static inline void q35_dflash_combine_aux(const q35_dflash_residency& R, const float* concat_aux,
+        float* out, int rows, cudaStream_t st){
+    const qwen35dflash::Geometry& g=R.geom;
+    // fc: out[rows,H] = concat_aux[rows, F*H] @ fc^T ; fc is [H, F*H].
+    q35df_matmul<<<dim3(rows,(g.H+255)/256),256,0,st>>>(concat_aux, R.fc, out, rows, g.fc_in(), g.H);
+}
+
 // ── Context-KV precompute (the DFlash cross-attention trick) ──
 // The draft never re-runs its layers over the context. The TARGET model's hidden states for the
 // context rows are projected into EACH draft layer's K/V once: hidden RMSNorm -> per-layer K/V
