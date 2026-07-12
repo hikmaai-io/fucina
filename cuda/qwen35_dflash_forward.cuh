@@ -240,4 +240,72 @@ static inline void q35_dflash_sample_greedy(const float* sampled_hidden, const _
     q35df_head_argmax<<<K,256,0,st>>>(sampled_hidden, lm_head, H, vocab, out_tok);
 }
 
+// ── Single drafting entry point (the verify loop calls this) ──
+// Owns all drafting scratch + per-layer context K/V buffers for one request's draft step. Produced
+// once per residency; reused across steps (fixed (1+K) query shape, variable context length up to a
+// cap). C-style: no per-token host allocation; buffers sized at init to the context cap.
+struct q35_dflash_drafter {
+    q35_dflash_ctx_scratch ctx;
+    q35_dflash_fwd_scratch fwd;
+    float **ctxK;                 // [L] each [ctx_cap*NKV*HD]
+    float **ctxV;
+    float  *ctx_hidden;           // [ctx_cap, H] fc-combined context input
+    float  *query_hidden;         // [1+K, H]  fc-combined query input (mutated by forward)
+    int    *ctx_pos;              // [ctx_cap]
+    int    *query_pos;            // [1+K]
+    int     ctx_cap;
+    int     K;
+    int     ready;
+};
+
+static inline bool q35_dflash_drafter_init(q35_dflash_drafter* D, const q35_dflash_residency& R,
+                                           int K, int ctx_cap){
+    const qwen35dflash::Geometry& g=R.geom; const int kvd=g.kv_dim(), H=g.H, rows=1+K;
+    *D=q35_dflash_drafter{}; D->K=K; D->ctx_cap=ctx_cap;
+    bool ok=q35_dflash_ctx_scratch_alloc(&D->ctx,g,ctx_cap) && q35_dflash_fwd_scratch_alloc(&D->fwd,g,rows);
+    D->ctxK=new float*[g.L]; D->ctxV=new float*[g.L];
+    for(int l=0;l<g.L;l++){ ok = ok && cudaMalloc(&D->ctxK[l],(size_t)ctx_cap*kvd*4)==cudaSuccess;
+                            ok = ok && cudaMalloc(&D->ctxV[l],(size_t)ctx_cap*kvd*4)==cudaSuccess; }
+    ok = ok && cudaMalloc(&D->ctx_hidden,(size_t)ctx_cap*H*4)==cudaSuccess;
+    ok = ok && cudaMalloc(&D->query_hidden,(size_t)rows*H*4)==cudaSuccess;
+    ok = ok && cudaMalloc(&D->ctx_pos,(size_t)ctx_cap*sizeof(int))==cudaSuccess;
+    ok = ok && cudaMalloc(&D->query_pos,(size_t)rows*sizeof(int))==cudaSuccess;
+    if(!ok) cudaGetLastError();
+    D->ready=ok?1:0; return ok;
+}
+static inline void q35_dflash_drafter_free(q35_dflash_drafter* D, const q35_dflash_residency& R){
+    if(D->ctxK){ for(int l=0;l<R.geom.L;l++){ if(D->ctxK[l]) cudaFree(D->ctxK[l]); if(D->ctxV[l]) cudaFree(D->ctxV[l]); } delete[] D->ctxK; delete[] D->ctxV; }
+    q35_dflash_ctx_scratch_free(&D->ctx); q35_dflash_fwd_scratch_free(&D->fwd);
+    if(D->ctx_hidden) cudaFree(D->ctx_hidden); if(D->query_hidden) cudaFree(D->query_hidden);
+    if(D->ctx_pos) cudaFree(D->ctx_pos); if(D->query_pos) cudaFree(D->query_pos);
+    *D=q35_dflash_drafter{};
+}
+
+// One draft step. ctx_concat_aux [num_ctx, F*H] and query_concat_aux [1+K, F*H] are the target's
+// aux-hidden features (already gathered + concatenated by the caller). ctx_positions [num_ctx] and
+// query_positions [1+K] are absolute positions. Produces K greedy draft tokens into out_draft (K).
+// Steps: fc combine (both) -> precompute context K/V -> query forward -> LM-head argmax on the K
+// mask rows (query offsets 1..K). All validated stages; deterministic. lm_head is the shared target
+// BF16 [vocab,H]. num_ctx must be <= ctx_cap.
+static inline int q35_dflash_draft_greedy(const q35_dflash_residency& R, q35_dflash_drafter& D,
+        const float* ctx_concat_aux, const int* ctx_positions, int num_ctx,
+        const float* query_concat_aux, const int* query_positions,
+        const __nv_bfloat16* lm_head, int vocab, int32_t* out_draft,
+        double theta, float eps, cudaStream_t st){
+    if(!D.ready || num_ctx>D.ctx_cap) return -1;
+    const qwen35dflash::Geometry& g=R.geom; const int H=g.H, rows=1+D.K;
+    D.ctx.num_ctx=num_ctx;
+    cudaMemcpyAsync(D.ctx_pos, ctx_positions, (size_t)num_ctx*sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(D.query_pos, query_positions, (size_t)rows*sizeof(int), cudaMemcpyHostToDevice, st);
+    // fc combine both context and query aux features -> input hidden.
+    q35_dflash_combine_aux(R, ctx_concat_aux, D.ctx_hidden, num_ctx, st);
+    q35_dflash_combine_aux(R, query_concat_aux, D.query_hidden, rows, st);
+    // precompute context K/V, then query forward.
+    q35_dflash_precompute_context_kv(R, D.ctx, D.ctx_hidden, D.ctx_pos, D.ctxK, D.ctxV, theta, eps, st);
+    q35_dflash_query_forward(R, D.fwd, D.query_hidden, D.query_pos, num_ctx, D.ctxK, D.ctxV, theta, eps, st);
+    // sample the K mask rows (query offsets 1..K) from the final-normed query output.
+    q35_dflash_sample_greedy(D.fwd.out + (size_t)1*H, lm_head, D.K, H, vocab, out_draft, st);
+    return 0;
+}
+
 #endif // FUCINA_QWEN35_DFLASH_FORWARD_CUH
