@@ -30,18 +30,30 @@ Status: **P0–P2 + planner delivered green; P3/P4 stop at the real-weights boun
   `qwen35-batch` gate (row-independence + graph-on==off + M3-parity + self-chain)
   stays PASS, so decode is byte-identical to current main.
 
-## Remaining, gated on the real draft checkpoint (NOT downloaded)
+## Real-weights progress (checkpoint downloaded + SHA-verified 2026-07-12)
 
-P3 (dense draft context-KV precompute + fixed `(1+K)` query forward) and P4 (the
-target `(1+K)` verify serving path wiring P0 rollback + P1 rejection) require the
-2.58 GB draft weights
-(`z-lab/Qwen3.5-9B-DFlash`, SHA-256
-`0a42274b32554f48de1faa0d42824e9c2ceda649c30ae0a731cddf410dd698c7`). Writing
-those forward/verify kernels without the weights would produce untested code and
-no honest acceptance/performance number, which the mission forbids. Work stops
-here pending an explicit decision to fetch that exact artifact. The primitives
-those phases depend on (rollback, RNG/rejection, loader schema, planner) are all
-implemented and independently gated above.
+The draft checkpoint `z-lab/Qwen3.5-9B-DFlash` (2,583,816,465 bytes, SHA-256
+`0a42274b32554f48de1faa0d42824e9c2ceda649c30ae0a731cddf410dd698c7`) was
+approved, downloaded into the standard hub cache under `/opt/spark/models`, and
+its on-disk hash verified byte-for-byte. The entire P3 numerical stack is now
+validated against it (device fp32 vs host double reference):
+
+- Real 69-tensor loader gate — exact geometry pinned (`747a7ab`).
+- Context-KV precompute: hidden RMSNorm -> fused KV projection -> grouped K-norm
+  -> neox RoPE, all 6 layers, 4.3e-7 (`e2840bf`, `23c5885`).
+- Non-causal GQA query attention (32 q / 8 kv), 9.0e-8 (`0d622b6`).
+- Full DFlash decoder-layer forward composed end to end, 1.3e-6 (`e0e5c8a`).
+
+### Remaining for S1A_VALIDATED (structural engine integration, no new math)
+
+- Wire the validated kernels into `gemma4_engine` as a persistent draft model:
+  BF16 weight upload, draft KV cache, per-layer cache insert, 6-layer forward,
+  mask-token embedding, shared LM head; fixed `(1+K)` query forward, S2-graphed.
+- P4 target `(1+K)` verify pass wiring P0 rollback + P1 rejection + P4 commit,
+  zero-host-feedback, N+1 lookahead, concurrency-gated.
+- End-to-end gates: DFlash-off byte-identical; greedy DFlash token-identical to
+  greedy baseline (losslessness proof); measured acceptance length + tok/s at
+  B=1/2/4 vs the non-spec baseline on the same checkpoint (real numbers only).
 
 ---
 
