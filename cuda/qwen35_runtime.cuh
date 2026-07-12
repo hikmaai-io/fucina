@@ -1856,6 +1856,90 @@ static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
     return 0;
 }
 
+// ─── P0 (S1a): lossless GDN snapshot / rewind / commit for DFlash (1+K) verification ─────
+//
+// The hybrid slot's mutable decode state is (a) the FIXED-size GDN delta-rule matrix S + causal
+// conv ring for every LINEAR layer, laid out as ONE contiguous recurrent_slab[slot]; and (b) the
+// FULL-layer K/V cache, which is ABSOLUTE-POSITION-indexed. A DFlash verify pass advances the live
+// slot through (1+K) candidate tokens to score them, but only the first j are accepted. Losslessly
+// continuing requires the slot to end up EXACTLY as if only those j tokens had been decoded one at
+// a time.
+//
+// Design (deterministic BY CONSTRUCTION): snapshot copies recurrent_slab[slot] byte-for-byte and
+// records the absolute token count n0. commit(accepted, j) restores that snapshot, resets
+// n_tokens=n0, then REPLAYS the j accepted tokens through the ordinary single-token decode path
+// (qwen35_step_batch). Because commit literally re-executes the standard sequential decode, the
+// resulting GDN/conv state is bit-identical to j one-by-one decodes, and the next-token logits are
+// produced by the same kernels in the same order. The FULL-layer K/V cache needs no snapshot: the
+// replay overwrites positions [n0, n0+j) and attention never reads past n_tokens, so the stale
+// speculative positions [n0+j, n0+K) are inert (same invariant as qwen35_slot_reset). rewind is
+// commit with j=0: pure restore to the pre-verify snapshot.
+//
+// Reuses the S2 persistent per-slot arenas; adds only one device scratch slab per slot (lazy).
+// No host allocation or STL in the hot path; the replay loop is a fixed j<=K count of int steps.
+
+static int q35_gdn_snapshot(gemma4_engine_t *eng, int slot) {
+    if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -1;
+    if (slot < 0 || slot >= eng->q35.capacity || !eng->slots[slot].used) return -1;
+    if (!eng->q35.slot_allocated[slot]) return -1;
+    const size_t bytes = eng->q35.per_slot_recurrent_bytes;
+    if (bytes == 0 || !eng->q35.recurrent_slab[slot]) return -1;
+    if (!eng->q35.gdn_snap_slab[slot]) {
+        if (cudaMalloc(&eng->q35.gdn_snap_slab[slot], bytes) != cudaSuccess) {
+            cudaGetLastError(); return -1;
+        }
+    }
+    cudaStream_t st = eng->stream;
+    cudaMemcpyAsync(eng->q35.gdn_snap_slab[slot], eng->q35.recurrent_slab[slot],
+                    bytes, cudaMemcpyDeviceToDevice, st);
+    if (cudaStreamSynchronize(st) != cudaSuccess) return -1;
+    eng->q35.gdn_snap_ntokens[slot] = eng->slots[slot].n_tokens;
+    return 0;
+}
+
+// Restore the recurrent slab to the last snapshot and reset the slot's token count to n0. Does not
+// touch the FULL-layer K/V arenas (absolute-position-indexed; overwritten on replay, never read
+// stale). Internal helper shared by rewind and commit.
+static int q35_gdn_restore_snapshot(gemma4_engine_t *eng, int slot) {
+    if (slot < 0 || slot >= eng->q35.capacity || !eng->slots[slot].used) return -1;
+    if (eng->q35.gdn_snap_ntokens[slot] < 0 || !eng->q35.gdn_snap_slab[slot]) return -1;
+    if (!eng->q35.recurrent_slab[slot]) return -1;
+    const size_t bytes = eng->q35.per_slot_recurrent_bytes;
+    cudaStream_t st = eng->stream;
+    cudaMemcpyAsync(eng->q35.recurrent_slab[slot], eng->q35.gdn_snap_slab[slot],
+                    bytes, cudaMemcpyDeviceToDevice, st);
+    if (cudaStreamSynchronize(st) != cudaSuccess) return -1;
+    gemma4_seq *s = &eng->slots[slot];
+    s->n_tokens  = eng->q35.gdn_snap_ntokens[slot];
+    s->n_sampled = 0;
+    s->mtp_h_valid = 0;
+    return 0;
+}
+
+// commit(accepted, j): restore the pre-verify snapshot, then replay exactly the j accepted tokens
+// through the standard decode path so the slot ends byte-identical to j sequential single-token
+// decodes. `accepted[i]` is the input token fed at replay step i (i.e. the token decoded at
+// absolute position n0+i). Optionally returns each replay step's next-token argmax in out_next.
+// j==0 is a pure rewind. Returns 0 on success. The live snapshot is consumed (ntokens reset to -1)
+// so a stale snapshot can never be silently reused.
+static int q35_gdn_commit(gemma4_engine_t *eng, int slot, const int32_t *accepted, int j,
+                          int32_t *out_next) {
+    if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -1;
+    if (slot < 0 || slot >= eng->q35.capacity || !eng->slots[slot].used) return -1;
+    if (j < 0) return -1;
+    if (q35_gdn_restore_snapshot(eng, slot) != 0) return -1;
+    for (int i = 0; i < j; i++) {
+        int sl = slot; int32_t in = accepted[i], out = -1;
+        if (qwen35_step_batch(eng, &sl, &in, 1, &out) != 0) {
+            eng->q35.gdn_snap_ntokens[slot] = -1;
+            return -1;
+        }
+        if (out_next) out_next[i] = out;
+    }
+    eng->q35.gdn_snap_ntokens[slot] = -1;
+    return 0;
+}
+
 // ── M4 gate self-test (qwen35) ─────────────────────────────────────────────────────────
 // Drives the qwen35 continuous-batching ABI (seq_add prefill + step_batch decode) and asserts
 //   (1) B-row batched decode (graph ON) is BIT-IDENTICAL per row to that row run alone B=1

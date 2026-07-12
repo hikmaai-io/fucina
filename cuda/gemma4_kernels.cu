@@ -5125,6 +5125,7 @@ gemma4_engine_t* gemma4_engine_create(
     for (int s = 0; s < GEMMA4_MAX_SEQS; s++) {
         eng->q35.recurrent_slab[s] = NULL;
         eng->q35.slot_allocated[s] = 0; eng->q35.kv_capacity[s] = 0;
+        eng->q35.gdn_snap_slab[s] = NULL; eng->q35.gdn_snap_ntokens[s] = -1;
     }
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
         eng->q35.S[l] = NULL; eng->q35.ring[l] = NULL;
@@ -6696,6 +6697,9 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
         CUDA_FREE(eng->q35.Kc[l]); CUDA_FREE(eng->q35.Vc[l]);
     }
     for (int s = 0; s < GEMMA4_MAX_SEQS; s++) CUDA_FREE(eng->q35.recurrent_slab[s]);
+    for (int s = 0; s < GEMMA4_MAX_SEQS; s++) {   // P0 GDN rollback snapshots
+        CUDA_FREE(eng->q35.gdn_snap_slab[s]); eng->q35.gdn_snap_ntokens[s] = -1;
+    }
     for (int i = 0; i < 24; i++) CUDA_FREE(eng->q35.sb[i]);
     CUDA_FREE(eng->q35.rowslot);
     CUDA_FREE(eng->q35.chunk_scr);
@@ -15644,3 +15648,18 @@ void gemma4_engine_abort_prefill(gemma4_engine_t *eng) {
 #include "qwen35_jspace.cuh"
 #include "qwen35_runtime.cuh"
 #include "qwen35_backend.cuh"
+
+// ─── P0 (S1a) GDN rollback ABI ───────────────────────────────────────────────────────
+// Thin extern "C" wrappers around the q35_gdn_* statics, so the DFlash verify path (and the P0
+// lossless-rollback gate) can snapshot -> speculatively advance -> commit(accepted_len) a slot's
+// GDN recurrent state. Byte-identical continuation is proven by test_qwen35_gdn_rollback.
+extern "C" int gemma4_engine_q35_gdn_snapshot(gemma4_engine_t *eng, int slot) {
+    return q35_gdn_snapshot(eng, slot);
+}
+extern "C" int gemma4_engine_q35_gdn_commit(gemma4_engine_t *eng, int slot,
+                                            const int32_t *accepted, int j, int32_t *out_next) {
+    return q35_gdn_commit(eng, slot, accepted, j, out_next);
+}
+extern "C" int gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot) {
+    return q35_gdn_commit(eng, slot, nullptr, 0, nullptr);
+}

@@ -55,6 +55,19 @@ struct qwen35_runtime_state {
     int32_t       *d_slot_tok;
     int           *d_slot_pos;
 
+    // P0 (S1a) — per-slot GDN/conv recurrent-state snapshot for lossless DFlash (1+K)
+    // verification. gdn_snap_slab[slot] is a device buffer of per_slot_recurrent_bytes holding a
+    // byte-exact copy of recurrent_slab[slot] taken at snapshot time; gdn_snap_ntokens[slot] is the
+    // slot's absolute token count at that instant (-1 = no live snapshot). A verify pass advances
+    // the live slot through (1+K) candidate tokens; commit(j) restores this snapshot and replays
+    // exactly the j accepted tokens through the normal decode path, so the resulting GDN state is
+    // byte-identical to having decoded only those j tokens one-by-one. Allocated lazily on first
+    // snapshot, freed in gemma4_engine_destroy. The FULL-layer K/V cache needs no snapshot: it is
+    // absolute-position-indexed, so replay overwrites positions [n0..n0+j) and attention never
+    // reads past n_tokens. Determinism is preserved because commit IS the sequential decode path.
+    uint8_t       *gdn_snap_slab[GEMMA4_MAX_SEQS];
+    int            gdn_snap_ntokens[GEMMA4_MAX_SEQS];
+
     // Stable device pointer tables indexed by slot. Individual slot allocations are created on
     // first admission and retained for reuse; graphs dereference these tables at replay time.
     __nv_bfloat16 **S[GEMMA4_CAP_LAYERS];

@@ -239,6 +239,18 @@ qwen35-state-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_state $(QWEN35_MODEL)"
 
+# ─── S1a P0: lossless GDN snapshot/rewind/commit gate (GPU) ───
+# The DFlash (1+K) verification prerequisite. Asserts that for every accepted length j in 0..K,
+# snapshot -> speculatively advance K -> commit(j) leaves the slot's full hybrid state (GDN
+# recurrent slab + FULL-layer K/V) BYTE-IDENTICAL to j sequential single-token decodes, and the
+# committed next token matches the sequential reference. j=0 (pure rewind) and j=K (full accept)
+# are included. Byte-identical, not within-a-bound: commit re-runs the exact sequential path.
+qwen35-gdn-rollback-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_gdn_rollback.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_gdn_rollback \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_gdn_rollback $(QWEN35_MODEL)"
+
 # ─── Qwen3.5 hybrid (qwen35) P1 BATCHED single-pass prefill gate (GPU) ───
 # Drives the continuous-batching ABI (seq_add → qwen35_prefill_batched, then step_batch) and
 # asserts: (1) the integrated batched prefill reproduces the qwen35_forward_greedy oracle's
