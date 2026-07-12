@@ -611,6 +611,11 @@ qwen35-graph-key-test:
 qwen35-dflash-rng-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_rng_test.cc -o /tmp/dflash_rng && /tmp/dflash_rng
 
+# Host-only DFlash draft loader schema (P2 of S1a): config geometry + tensor validation and
+# hostile-input rejection (mismatched shapes/dtypes/vocab) BEFORE any CUDA allocation. No model.
+qwen35-dflash-loader-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_loader_test.cc -o /tmp/dflash_ld && /tmp/dflash_ld
+
 # CUDA<->CPU parity for the DFlash RNG + rejection sampler (P1 of S1a). Self-contained, no model;
 # runs the shared __host__ __device__ header on-GPU and asserts bit-identical results vs the host.
 qwen35-dflash-parity-test:
