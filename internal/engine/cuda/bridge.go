@@ -875,6 +875,60 @@ func (e *Engine) SeqAdd(prompt []int32, p batch.SeqParams) (slot int, first int3
 	return int(id), int32(firstTok), nil
 }
 
+// SeqAddMultiseq admits M prompts in ONE batched prefill forward (P1: kills the serial
+// short-prompt admission cost). Returns per-seq slots and first tokens. Returns
+// (nil,nil,nil) when the engine does not support it (Qwen3.5-only) so the caller can
+// serial-admit, or an error on failure (no slots / prefill error). len(prompts) must
+// equal len(params).
+func (e *Engine) SeqAddMultiseq(prompts [][]int32, params []batch.SeqParams) (slots []int, firsts []int32, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	M := len(prompts)
+	if M == 0 || M != len(params) {
+		return nil, nil, fmt.Errorf("fucina: seq_add_multiseq: %d prompts vs %d params", M, len(params))
+	}
+	var toks []int32
+	lens := make([]C.int, M)
+	temps := make([]C.float, M)
+	topks := make([]C.int, M)
+	topps := make([]C.float, M)
+	minps := make([]C.float, M)
+	seeds := make([]C.uint64_t, M)
+	for i, p := range prompts {
+		if len(p) == 0 {
+			return nil, nil, fmt.Errorf("fucina: seq_add_multiseq: empty prompt %d", i)
+		}
+		toks = append(toks, p...)
+		lens[i] = C.int(len(p))
+		temps[i] = C.float(params[i].Temperature)
+		topks[i] = C.int(params[i].TopK)
+		topps[i] = C.float(params[i].TopP)
+		minps[i] = C.float(params[i].MinP)
+		seeds[i] = C.uint64_t(params[i].Seed)
+	}
+	outSlots := make([]C.int, M)
+	outFirst := make([]C.int32_t, M)
+	rc := C.gemma4_engine_seq_add_multiseq(
+		e.ptr,
+		(*C.int32_t)(unsafe.Pointer(&toks[0])), &lens[0], C.int(M),
+		&temps[0], &topks[0], &topps[0], &minps[0], &seeds[0],
+		&outSlots[0], &outFirst[0],
+	)
+	if int(rc) == 0 {
+		return nil, nil, nil // unsupported arch / disabled → caller serial-admits
+	}
+	if int(rc) != M {
+		return nil, nil, fmt.Errorf("fucina: seq_add_multiseq failed (rc %d, want %d)", int(rc), M)
+	}
+	slots = make([]int, M)
+	firsts = make([]int32, M)
+	for i := 0; i < M; i++ {
+		slots[i] = int(outSlots[i])
+		firsts[i] = int32(outFirst[i])
+	}
+	return slots, firsts, nil
+}
+
 // SeqOpen reserves a fresh paged slot with empty KV and stores the per-sequence
 // sampling params, WITHOUT prefilling. Pair it with SeqPrefillChunk to fill the prompt
 // in bounded chunks (chunked prefill interleaved with decode). Returns the slot id, or
@@ -1491,6 +1545,18 @@ func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int3
 	}
 	a.active++
 	return slot, first, nil
+}
+
+// SeqAddMultiseq admits M prompts in ONE batched prefill (P1). Returns (nil,nil,nil) when
+// the engine does not support it (caller serial-admits). Bypasses the turn-2 state-snapshot
+// cache — the burst-admit path it serves is fresh short prompts, which rarely hit that cache.
+func (a *BatchAdapter) SeqAddMultiseq(prompts [][]int32, params []batch.SeqParams) ([]int, []int32, error) {
+	slots, firsts, err := a.eng.SeqAddMultiseq(prompts, params)
+	if err != nil || slots == nil {
+		return slots, firsts, err
+	}
+	a.active += len(slots)
+	return slots, firsts, nil
 }
 
 // StepBatch runs one batched decode step over active slots and returns a token

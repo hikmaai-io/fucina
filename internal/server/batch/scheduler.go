@@ -184,6 +184,17 @@ type FusedPrefillEngine interface {
 	MaxFusedRows() int
 }
 
+// MultiseqAdmitEngine is the optional batched-admission extension (P1). When implemented, an
+// idle-batch burst of short prompts is prefilled in ONE forward (weights amortized across all
+// rows) instead of one blocking SeqAdd per prompt — the fix for the measured N=32 admission
+// TTFT (32 serial single-seq prefills ~= 52 ms each). Engines that don't implement it (or return
+// nil,nil,nil) fall back to serial SeqAdd, so this is purely additive.
+type MultiseqAdmitEngine interface {
+	// SeqAddMultiseq prefills all prompts in one forward and returns their slots + first tokens.
+	// Returns (nil,nil,nil) when unsupported (caller serial-admits) or an error on failure.
+	SeqAddMultiseq(prompts [][]int32, params []SeqParams) (slots []int, firsts []int32, err error)
+}
+
 // PrefixCacheStatsEngine is the optional observability hook for the cross-request
 // prefix cache: an engine that can report cumulative reuse counters. The scheduler
 // snapshots them lock-free for /metrics.
@@ -869,6 +880,14 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 	oneShotCap := maxOneShotAdmitsPerPass
 	if len(active) == 0 && len(*prefill) == 0 {
 		oneShotCap = s.engine.Capacity()
+		// P1: batched multi-seq admission. The burst above still admits one-per-loop-iteration
+		// with a BLOCKING single-seq SeqAdd each (measured 32x~52 ms serial). When the engine
+		// supports it, prefill the leading run of short prompts in ONE forward instead.
+		if ma, ok := s.engine.(MultiseqAdmitEngine); ok {
+			if s.admitBatched(active, waiting, ma) {
+				admitted = true
+			}
+		}
 	}
 	w := *waiting
 	// A prefilling sequence also holds a slot, so it counts against capacity —
@@ -943,6 +962,60 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 	}
 	*waiting = w
 	return admitted
+}
+
+// admitBatched prefills the leading run of waiting SHORT prompts in ONE forward (P1). It only
+// fires from the idle-batch burst path (no decode to starve). It collects consecutive one-shot
+// prompts (short enough to skip the chunked path, not cancelled) up to capacity and a token
+// budget, prefills them together, and delivers each first token. Returns true if it admitted
+// anything. Any unsupported/failed batch falls back to the serial loop (returns false), so this
+// is purely additive. Chunked (long) prompts and the turn-2 snapshot cache stay on the serial path.
+func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma MultiseqAdmitEngine) bool {
+	const maxBatchTokens = 4096 // stay well under the engine's prefill tile
+	w := *waiting
+	capacity := s.engine.Capacity()
+	var reqs []Request
+	var prompts [][]int32
+	var params []SeqParams
+	ttot := 0
+	for len(reqs) < capacity && len(reqs) < len(w) {
+		req := w[len(reqs)]
+		if req.Ctx != nil && req.Ctx.Err() != nil {
+			break // let the serial loop reply-cancel this one
+		}
+		if s.chunk != nil && len(req.Tokens) > s.chunkMin {
+			break // long prompt → chunked interleave path, not one-shot
+		}
+		if len(req.Tokens) == 0 {
+			break
+		}
+		if ttot+len(req.Tokens) > maxBatchTokens {
+			break
+		}
+		reqs = append(reqs, req)
+		prompts = append(prompts, req.Tokens)
+		params = append(params, req.Params)
+		ttot += len(req.Tokens)
+	}
+	if len(reqs) < 2 {
+		return false // not worth a batched call; serial handles a lone prompt
+	}
+	slots, firsts, err := ma.SeqAddMultiseq(prompts, params)
+	if err != nil {
+		log.Printf("batch: SeqAddMultiseq failed (%d seqs): %v — serial fallback", len(reqs), err)
+		return false
+	}
+	if slots == nil {
+		return false // engine declined (unsupported) → serial path
+	}
+	*waiting = w[len(reqs):]
+	for i, req := range reqs {
+		sq := s.newSeq(req, slots[i])
+		if s.deliver(active, sq, firsts[i]) {
+			active[slots[i]] = sq
+		}
+	}
+	return true
 }
 
 // newSeq builds the scheduler's per-sequence state for an admitted request bound to
