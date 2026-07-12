@@ -626,6 +626,12 @@ qwen35-dflash-plan-test:
 qwen35-dflash-commit-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_commit_test.cc -o /tmp/dflash_commit && /tmp/dflash_commit
 
+# Host-only DFlash verify-pipeline integration (S1a): composes planner -> shared-key draft sampling
+# -> rejection -> commit assembly end to end on synthetic logits (the seams around the two device
+# forwards). Weights-free; proves the deterministic glue before the draft forward exists.
+qwen35-dflash-pipeline-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_pipeline_test.cc -o /tmp/dflash_pipe && /tmp/dflash_pipe
+
 # CUDA<->CPU parity for the DFlash RNG + rejection sampler (P1 of S1a). Self-contained, no model;
 # runs the shared __host__ __device__ header on-GPU and asserts bit-identical results vs the host.
 qwen35-dflash-parity-test:
