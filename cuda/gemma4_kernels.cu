@@ -15750,7 +15750,7 @@ static int q35_dflash_ensure_loaded(gemma4_engine_t *eng) {
     { size_t p = cj.find("\"target_layer_ids\""); if (p != std::string::npos) {
         size_t b = cj.find('[', p), e = cj.find(']', b); int slot = 0;
         for (size_t i = b + 1; i < e && slot < GEMMA4_CAP_LAYERS; ) {
-            while (i < e && (cj[i] == ' ' || cj[i] == ',')) i++;
+            while (i < e && (cj[i] == ' ' || cj[i] == ',' || cj[i] == '\n' || cj[i] == '\t' || cj[i] == '\r')) i++;
             if (i >= e || cj[i] < '0' || cj[i] > '9') break;
             int v = atoi(cj.c_str() + i);
             while (i < e && cj[i] >= '0' && cj[i] <= '9') i++;
@@ -15770,6 +15770,11 @@ static int q35_dflash_ensure_loaded(gemma4_engine_t *eng) {
     eng->q35.dflash_residency = R; eng->q35.dflash_drafter = D; eng->q35.dflash_loaded = 1;
     fprintf(stderr, "fucina: DFlash draft model resident (%d layers, K=%d, %d aux features)\n",
             R->geom.L, K, R->geom.num_target_features);
+    if (getenv("FUCINA_DFLASH_DIAG")) {
+        fprintf(stderr, "DFLASHDIAG capture layers:");
+        for (int i = 0; i < GEMMA4_CAP_LAYERS; i++) if (eng->q35.dflash_capture_layer[i]) fprintf(stderr, " L%d->slot%d", i, eng->q35.dflash_capture_slot[i]);
+        fprintf(stderr, " (nfeat=%d maxrows=%d aux=%p)\n", eng->q35.dflash_capture_nfeat, eng->q35.dflash_capture_maxrows, (void*)eng->q35.dflash_aux);
+    }
     return 0;
 }
 

@@ -1281,6 +1281,16 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
         }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
         q35_jspace_after_layer(eng, x, T, l, st);
+        // S1a P4: DFlash aux-hidden capture in the CHUNK body (the verify_block path runs here with
+        // want_logits=2). Same gated, additive hook as the decode body: capture ALL T rows' residual
+        // at configured target layers into dflash_aux [feature_slot][row][H]. No-op when inactive.
+        if (eng->q35.dflash_capture_active && eng->q35.dflash_capture_layer[l]) {
+            int fslot = eng->q35.dflash_capture_slot[l];
+            int maxr = eng->q35.dflash_capture_maxrows;
+            int rr = (T < maxr) ? T : maxr;
+            cudaMemcpyAsync(eng->q35.dflash_aux + (size_t)fslot * maxr * H,
+                            x, (size_t)rr * H * sizeof(float), cudaMemcpyDeviceToDevice, st);
+        }
     }
 
     if (want_logits == 1) {
