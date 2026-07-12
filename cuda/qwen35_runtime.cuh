@@ -451,12 +451,14 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
             eng->d_head_cand, eng->d_head_cnt, H, eng->d_ms_outtok);
         return;
     } else if (eng->format == FORMAT_FP8_BLOCK) {  // BF16 untied head (lossy heads flip the argmax);
-        // weight-read-ONCE batched GEMV in ≤16-row chunks: the 1 GB head is read ceil(B/16)× per
-        // step instead of B× (2 passes at B=16 measured 10.5 ms/step — 17% of the decode step).
+        // weight-read-ONCE batched GEMV in ≤32-row chunks (P2): one pass reads the 2 GB head ONCE
+        // for the whole decode batch (was ceil(B/16)× — 18.5 ms of a 91.6 ms B=30 step). The K≤32
+        // kernel narrows the warp row-tile instead of splitting the batch; per-(token,row) k-order
+        // is unchanged ⇒ logits bitwise-identical to the 16-row chunking this replaces.
         float *xt = workspace_data<float>(eng->q35.decode_workspace[Q35_QG]);
-        // Per-layer scratch, free at head time; ≥ H·16 floats.
-        for (int r0 = 0; r0 < B; r0 += 16) {
-            int K = (B - r0 < 16) ? (B - r0) : 16;
+        // Per-layer scratch, free at head time; ≥ H·32 floats (Q35_QG row is 2·NQ·HD ≥ 2H, PF≥MS rows).
+        for (int r0 = 0; r0 < B; r0 += 32) {
+            int K = (B - r0 < 32) ? (B - r0) : 32;
             nvfp4_xT_launch(xt, xn + (size_t)r0 * H, H, K, st);
             bf16_head_gemv_batched_launch(eng->d_sb[11] + (size_t)r0 * VOC,
                                           eng->d_lmhead_bf16, xt, H, VOC, K, st);
