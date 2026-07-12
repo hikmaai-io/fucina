@@ -68,6 +68,12 @@ struct qwen35_runtime_state {
     uint8_t       *gdn_snap_slab[GEMMA4_MAX_SEQS];
     int            gdn_snap_ntokens[GEMMA4_MAX_SEQS];
 
+    // S1a DFlash feature gate (FUCINA_QWEN35_DFLASH): 0=off (default), 1=on, 2=auto. Read once at
+    // engine create; the verify serving path consults q35_dflash_gate() with this + the batch size.
+    // OFF leaves every code path byte-identical to plain decode (no DFlash work is scheduled).
+    int            dflash_mode;
+    int            dflash_critical_batch;   // concurrency disable threshold (0 => conservative default)
+
     // Stable device pointer tables indexed by slot. Individual slot allocations are created on
     // first admission and retained for reuse; graphs dereference these tables at replay time.
     __nv_bfloat16 **S[GEMMA4_CAP_LAYERS];

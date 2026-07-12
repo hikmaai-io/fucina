@@ -616,6 +616,11 @@ qwen35-dflash-rng-test:
 qwen35-dflash-loader-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_loader_test.cc -o /tmp/dflash_ld && /tmp/dflash_ld
 
+# Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
+# S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
+qwen35-dflash-plan-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_plan_test.cc -o /tmp/dflash_plan && /tmp/dflash_plan
+
 # CUDA<->CPU parity for the DFlash RNG + rejection sampler (P1 of S1a). Self-contained, no model;
 # runs the shared __host__ __device__ header on-GPU and asserts bit-identical results vs the host.
 qwen35-dflash-parity-test:
