@@ -74,6 +74,17 @@ struct qwen35_runtime_state {
     int            dflash_mode;
     int            dflash_critical_batch;   // concurrency disable threshold (0 => conservative default)
 
+    // S1a P4 target aux-hidden capture: when dflash_capture_active, the decode body copies the
+    // residual stream at each configured target layer (dflash_capture_layer[l]==1) into
+    // dflash_aux[feature_slot * H .. ] for the LAST row, forming the concat(F target hidden) the
+    // draft's fc consumes. Purely additive + gated: when inactive the hook is a no-op and decode
+    // stays byte-identical to plain decode. dflash_capture_nfeat counts configured layers (== F).
+    int            dflash_capture_active;             // 1 while a verify step captures aux-hidden
+    int            dflash_capture_nfeat;              // number of captured target layers (F)
+    uint8_t        dflash_capture_layer[GEMMA4_CAP_LAYERS];  // 1 => capture this target layer
+    int            dflash_capture_slot[GEMMA4_CAP_LAYERS];   // target layer -> feature slot [0,F)
+    float         *dflash_aux;                        // [F * H] device concat buffer (last row)
+
     // Stable device pointer tables indexed by slot. Individual slot allocations are created on
     // first admission and retained for reuse; graphs dereference these tables at replay time.
     __nv_bfloat16 **S[GEMMA4_CAP_LAYERS];

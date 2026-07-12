@@ -449,6 +449,15 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
         }
         residual_add_kernel<<<grid1d((size_t)B*H),256,0,st>>>(x, mix, B*H);
         q35_jspace_after_layer(eng, x, B, l, st);
+        // S1a P4: capture this layer's residual (last row) into the draft aux-hidden concat when a
+        // verify step is active and this target layer is configured. Gated + additive: a no-op
+        // (single branch, no launch) when capture is inactive, so plain decode is byte-identical.
+        if (eng->q35.dflash_capture_active && eng->q35.dflash_capture_layer[l]) {
+            int slot = eng->q35.dflash_capture_slot[l];
+            cudaMemcpyAsync(eng->q35.dflash_aux + (size_t)slot * H,
+                            x + (size_t)(B - 1) * H, (size_t)H * sizeof(float),
+                            cudaMemcpyDeviceToDevice, st);
+        }
     }
 
     rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, B, eps);

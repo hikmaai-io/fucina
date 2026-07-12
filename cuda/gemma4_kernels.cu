@@ -5089,6 +5089,9 @@ gemma4_engine_t* gemma4_engine_create(
     // conservative default (0) until a GB10 sweep measures the real crossover.
     eng->q35.dflash_mode = q35_dflash_mode_from_env(getenv("FUCINA_QWEN35_DFLASH"));
     eng->q35.dflash_critical_batch = 0;
+    eng->q35.dflash_capture_active = 0; eng->q35.dflash_capture_nfeat = 0;
+    eng->q35.dflash_aux = NULL;
+    for (int i = 0; i < GEMMA4_CAP_LAYERS; i++) { eng->q35.dflash_capture_layer[i] = 0; eng->q35.dflash_capture_slot[i] = 0; }
     eng->q35.d_slot_tok = NULL; eng->q35.d_slot_pos = NULL;
     eng->q35.rowslot = NULL; eng->q35.chunk_scr = NULL;
     eng->q35.pf_pos = NULL; eng->q35.pf_tok = NULL;
@@ -6706,6 +6709,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     for (int s = 0; s < GEMMA4_MAX_SEQS; s++) {   // P0 GDN rollback snapshots
         CUDA_FREE(eng->q35.gdn_snap_slab[s]); eng->q35.gdn_snap_ntokens[s] = -1;
     }
+    CUDA_FREE(eng->q35.dflash_aux);   // S1a P4 target aux-hidden capture buffer
     for (int i = 0; i < 24; i++) CUDA_FREE(eng->q35.sb[i]);
     CUDA_FREE(eng->q35.rowslot);
     CUDA_FREE(eng->q35.chunk_scr);
