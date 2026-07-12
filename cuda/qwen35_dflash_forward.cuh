@@ -338,7 +338,9 @@ struct q35_dflash_drafter {
     int     K;
     int     ready;
     int     ctxlen;               // rows of valid accumulated context in ctxK/ctxV (B=1 serving)
-    float  *ctx_aux_concat;       // [1+K, F*H] scratch: gathered+? aux for the committed rows
+    int     ctx_aux_cap;          // rows of context aux held (== ctx_cap)
+    float  *ctx_aux_concat;       // [ctx_aux_cap, F*H]: accumulated per-token target aux (context)
+    int    *ctx_abs_pos;          // [ctx_aux_cap] host: absolute position of each context row
 };
 
 static inline bool q35_dflash_drafter_init(q35_dflash_drafter* D, const q35_dflash_residency& R,
@@ -354,7 +356,11 @@ static inline bool q35_dflash_drafter_init(q35_dflash_drafter* D, const q35_dfla
     ok = ok && cudaMalloc(&D->ctx_pos,(size_t)ctx_cap*sizeof(int))==cudaSuccess;
     ok = ok && cudaMalloc(&D->query_pos,(size_t)rows*sizeof(int))==cudaSuccess;
     ok = ok && cudaMalloc(&D->query_ids,(size_t)rows*sizeof(int32_t))==cudaSuccess;
-    ok = ok && cudaMalloc(&D->ctx_aux_concat,(size_t)rows*g.fc_in()*4)==cudaSuccess;
+    // Hold the full accumulated context aux up to the context cap (config sliding window bounds it).
+    D->ctx_aux_cap = ctx_cap;
+    ok = ok && cudaMalloc(&D->ctx_aux_concat,(size_t)ctx_cap*g.fc_in()*4)==cudaSuccess;
+    D->ctx_abs_pos = (int*)malloc(sizeof(int)*ctx_cap);
+    ok = ok && (D->ctx_abs_pos != nullptr);
     D->ctxlen=0;
     if(!ok) cudaGetLastError();
     D->ready=ok?1:0; return ok;
@@ -366,6 +372,7 @@ static inline void q35_dflash_drafter_free(q35_dflash_drafter* D, const q35_dfla
     if(D->ctx_pos) cudaFree(D->ctx_pos); if(D->query_pos) cudaFree(D->query_pos);
     if(D->query_ids) cudaFree(D->query_ids);
     if(D->ctx_aux_concat) cudaFree(D->ctx_aux_concat);
+    if(D->ctx_abs_pos) free(D->ctx_abs_pos);
     *D=q35_dflash_drafter{};
 }
 

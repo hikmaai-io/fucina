@@ -65,6 +65,27 @@ gated on the real weights (device fp32 vs host double, signal-relative error):
   graph-on==off + M3-parity + self-chain); P0 GDN rollback byte-identical for all
   j in 0..K; full `make lib libdg fucina` + Go tests green.
 
+### Real end-to-end status (2026-07-12): greedy LOSSLESS proven; acceptance = 0 (open)
+
+The integrated `gemma4_engine_q35_dflash_real_step` drives the resident real draft
+model through the full loop (draft -> verify -> accept -> commit) and its emitted
+stream is BYTE-IDENTICAL to plain greedy decode over 32 steps on the FP8 target
+(`qwen35-dflash-real-e2e-test`). This proves the losslessness contract with the
+real drafter. However the MEASURED mean accepted drafts/step is **0.000** — the
+draft currently proposes nothing the target accepts. This is honest: the loop is
+lossless by construction; the zero means the aux CONTENT fed to the draft does not
+yet match what the checkpoint was trained on.
+
+Ruled out so far (each fixed, still 0): draft context size (now full accumulated
+context, not a 17-row window); context RoPE positions (now absolute per-token, not
+[0..n)). The remaining open question is the exact aux SEMANTICS the draft's `fc`
+expects: which residual tensor at each `target_layer_id` (pre- vs post-norm, which
+of the FP8 target's 32 hybrid layers maps to the id), and whether the draft
+requires the target's aux at the QUERY positions too (not just context). Resolving
+this needs a per-tensor cross-check of one target-layer aux against a reference,
+not more loop iterations. **No speedup is claimed; acceptance is not yet
+demonstrated.**
+
 ### Remaining for S1A_VALIDATED (the final serving-step orchestration)
 
 - The verify serving step: run the target `(1+K)` forward over [last accepted ++

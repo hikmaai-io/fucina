@@ -15831,30 +15831,24 @@ extern "C" int gemma4_engine_q35_dflash_real_step(gemma4_engine_t *eng, int slot
     qids[0] = bonus; for (int i = 1; i <= K; i++) qids[i] = R->geom.mask_token_id;
     for (int i = 0; i <= K; i++) qpos[i] = base + i;
 
-    // 2) Draft K tokens with the real draft model over the accumulated context (D->ctxlen rows).
-    //    Context positions are [0 .. ctxlen). num_ctx may be 0 (cold start) -> weak draft, still lossless.
+    // 2) Draft K tokens with the real draft model over the FULL accumulated context (D->ctxlen rows,
+    //    absolute positions [0..ctxlen)). num_ctx may be 0 (cold start) -> weak draft, still lossless.
     int32_t draft[GEMMA4_MAX_SEQS];
     {
         int num_ctx = D->ctxlen;
-        // Gather context aux (already stored per-row in D->ctx_aux_concat by prior steps) — for the
-        // cold path num_ctx==0 we still must call the drafter with a valid (empty) context. The
-        // drafter reads ctx_concat_aux [num_ctx, F*H]; we keep it in D->ctx_aux_concat sized (1+K),
-        // so for num_ctx>1+K we cap the visible context to the most recent (1+K) rows (sliding).
-        int vis = num_ctx; if (vis > 1 + K) vis = 1 + K;
-        int cstart = num_ctx - vis;
-        int cpos[GEMMA4_MAX_SEQS]; for (int i = 0; i < vis; i++) cpos[i] = cstart + i;
-        int *dqpos = qpos; // host arrays; drafter copies H2D internally
-        int32_t *dqids = qids;
-        if (vis <= 0) {
+        if (num_ctx <= 0) {
             // Cold start: no context. Draft from a single zero context row so attention is defined.
             static float *zero_aux = nullptr; static int zeros_for = 0;
             if (!zero_aux || zeros_for < F*H) { if (zero_aux) cudaFree(zero_aux); cudaMalloc(&zero_aux,(size_t)F*H*4); cudaMemset(zero_aux,0,(size_t)F*H*4); zeros_for=F*H; }
             int one_pos[1] = {0};
-            q35_dflash_draft_greedy(*R, *D, zero_aux, one_pos, 1, dqids, dqpos,
+            q35_dflash_draft_greedy(*R, *D, zero_aux, one_pos, 1, qids, qpos,
                                     eng->d_embed_bf16, eng->d_lmhead_bf16, VOC, draft, theta, eps, st);
         } else {
-            q35_dflash_draft_greedy(*R, *D, D->ctx_aux_concat + (size_t)cstart*F*H, cpos, vis,
-                                    dqids, dqpos, eng->d_embed_bf16, eng->d_lmhead_bf16, VOC, draft, theta, eps, st);
+            // Context rows carry their ABSOLUTE positions (ctx_abs_pos), so context-K RoPE matches
+            // the query positions [base..base+K]. Using [0..num_ctx) would misalign RoPE and destroy
+            // acceptance.
+            q35_dflash_draft_greedy(*R, *D, D->ctx_aux_concat, D->ctx_abs_pos, num_ctx,
+                                    qids, qpos, eng->d_embed_bf16, eng->d_lmhead_bf16, VOC, draft, theta, eps, st);
         }
         cudaStreamSynchronize(st);
     }
@@ -15869,18 +15863,13 @@ extern "C" int gemma4_engine_q35_dflash_real_step(gemma4_engine_t *eng, int slot
     // 4) Append the committed rows' aux to the draft context cache. The verify block was
     //    [bonus, d1..dK]; we committed 1+j rows (j = *out_n - 1). Gather those rows' aux from
     //    dflash_aux [F][row][H] into D->ctx_aux_concat at the current ctxlen (sliding window cap).
-    int commit_rows = *out_n;   // 1 + accepted
+    int commit_rows = *out_n;   // 1 + accepted; committed rows occupy absolute positions base..base+commit_rows-1
     for (int r = 0; r < commit_rows; r++) {
-        int dst = D->ctxlen + r; if (dst >= 1 + K) { // slide: keep the most recent (1+K) rows
-            // shift-down by one row
-            for (int s2 = 1; s2 < 1 + K; s2++)
-                cudaMemcpyAsync(D->ctx_aux_concat + (size_t)(s2-1)*F*H, D->ctx_aux_concat + (size_t)s2*F*H, (size_t)F*H*4, cudaMemcpyDeviceToDevice, st);
-            dst = K;
-            D->ctxlen = K; // capped
-        }
-        // gather row r of dflash_aux [F][r][H] -> ctx_aux_concat[dst][F*H]
-        q35_dflash_aux_gather(eng->q35.dflash_aux, D->ctx_aux_concat + (size_t)dst*F*H, F, maxr, H, r, 1, st);
-        if (D->ctxlen < 1 + K) D->ctxlen++;
+        if (D->ctxlen >= D->ctx_aux_cap) break;   // context full (bounded by config sliding window)
+        // gather row r of dflash_aux [F][row][H] -> ctx_aux_concat[ctxlen][F*H]; record abs position.
+        q35_dflash_aux_gather(eng->q35.dflash_aux, D->ctx_aux_concat + (size_t)D->ctxlen*F*H, F, maxr, H, r, 1, st);
+        D->ctx_abs_pos[D->ctxlen] = base + r;
+        D->ctxlen++;
     }
     cudaStreamSynchronize(st);
     return 0;
