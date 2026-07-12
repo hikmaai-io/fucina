@@ -606,6 +606,18 @@ model-plan-test:
 qwen35-graph-key-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda -x c++ cuda/qwen35_graph_key_test.cc -o /tmp/q35_graph_key_test && /tmp/q35_graph_key_test
 
+# Host-only DFlash counter-RNG + rejection-sampler oracle (P1 of S1a). Self-contained, no model.
+# Determinism, domain/position independence, uniform range, greedy + probabilistic rejection math.
+qwen35-dflash-rng-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_rng_test.cc -o /tmp/dflash_rng && /tmp/dflash_rng
+
+# CUDA<->CPU parity for the DFlash RNG + rejection sampler (P1 of S1a). Self-contained, no model;
+# runs the shared __host__ __device__ header on-GPU and asserts bit-identical results vs the host.
+qwen35-dflash-parity-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_parity.cu -o /tmp/dflash_parity \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_parity"
+
 allocation-set-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/device_allocation_set_test.cc -o /tmp/allocation_set_test && /tmp/allocation_set_test
 
