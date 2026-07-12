@@ -45,3 +45,4 @@ coverage.out
 coverage.html
 __debug_bin*
 *.gguf
+.pi-loop.json*

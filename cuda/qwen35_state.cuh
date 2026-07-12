@@ -44,6 +44,16 @@ struct qwen35_runtime_state {
     int maxctx;
     int reserved_context;
     int graph_enabled;
+    int gpu_splice_enabled;   // S2a: derive next-step input_ids/positions on-GPU from slot state
+
+    // S2a — persistent per-slot decode state (device). d_slot_tok[slot] holds the last
+    // sampled/accepted token id (== the next step's input_id for that slot); d_slot_pos[slot]
+    // holds that slot's next absolute position. A splice kernel reads these through the row→slot
+    // map to build d_sb[0]/d_ms_pos ON-GPU, and a writeback kernel advances them from the
+    // sampler output — so a decode step replays with no host knowledge of the sampled token.
+    // Pure function of state ⇒ determinism unaffected. Indexed by stable slot id (capacity-sized).
+    int32_t       *d_slot_tok;
+    int           *d_slot_pos;
 
     // Stable device pointer tables indexed by slot. Individual slot allocations are created on
     // first admission and retained for reuse; graphs dereference these tables at replay time.

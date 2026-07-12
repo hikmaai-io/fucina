@@ -962,6 +962,52 @@ enum {
     Q35_GNORM, Q35_FG, Q35_FU, Q35_FA
 };
 
+// S2a — GPU-native input splice. Derive this decode step's per-row input token + absolute
+// position from the PERSISTENT per-slot state, given only the row→slot map (a scheduler
+// decision, not a sampled value). in_tok[r] = slot_tok[rowslot[r]]; pos[r] = slot_pos[rowslot[r]].
+// One thread per row. Runs inside the replayable region: replay needs no host knowledge of the
+// previously sampled token. Pure gather ⇒ deterministic.
+__global__ void qwen35_splice_inputs_kernel(int32_t *in_tok, int *pos,
+                                            const int32_t *slot_tok, const int *slot_pos,
+                                            const int *rowslot, int B) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= B) return;
+    int slot = rowslot[r];
+    in_tok[r] = slot_tok[slot];
+    pos[r]    = slot_pos[slot];
+}
+
+// S2a — scatter-seed persistent slot state for a batch of rows from host-uploaded staging.
+// d_slot_tok[rowslot[r]] = row_tok[r]; d_slot_pos[rowslot[r]] = row_pos[r]. Rows carry distinct
+// slots (step_batch rejects dup slots). Runs OUTSIDE the captured graph, right before a step, so
+// the in-graph splice re-derives (d_sb[0], d_ms_pos) from exactly these values — byte-identical to
+// the old host-copy path, while the graph self-chains (writeback→splice) on repeated replay.
+__global__ void qwen35_seed_slot_state_kernel(int32_t *slot_tok, int *slot_pos,
+                                              const int32_t *row_tok, const int *row_pos,
+                                              const int *rowslot, int B) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= B) return;
+    int slot = rowslot[r];
+    slot_tok[slot] = row_tok[r];
+    slot_pos[slot] = row_pos[r];
+}
+
+// S2a — writeback: advance persistent per-slot state from the sampler output, device-side.
+// slot_tok[slot] = out_tok[r] (the token just produced, next step's input); slot_pos[slot] += 1.
+// One thread per row. Rows carry distinct slots (step_batch rejects dup slots), so writes never
+// collide. Skips rows that produced a sentinel (out_tok < 0 = ctx-full / no-op row).
+__global__ void qwen35_writeback_slot_state_kernel(int32_t *slot_tok, int *slot_pos,
+                                                   const int32_t *out_tok, const int *rowslot,
+                                                   int B) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= B) return;
+    int32_t t = out_tok[r];
+    if (t < 0) return;
+    int slot = rowslot[r];
+    slot_tok[slot] = t;
+    slot_pos[slot] = slot_pos[slot] + 1;
+}
+
 // Partial NEOX RoPE on the first ROT dims of each head for B rows, each at its OWN absolute
 // position pos[row]. x is [B][n_heads][HEAD] row-major. Bit-identical to M3 qwen35_rope_pos.
 __global__ void qwen35_b_rope_kernel(float *x, int n_heads, const int *pos, int B) {

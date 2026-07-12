@@ -5081,6 +5081,9 @@ gemma4_engine_t* gemma4_engine_create(
     // qwen35 M4 batched-decode arenas (lazy; allocated on first qwen35 seq_add).
     eng->q35.ready = 0; eng->q35.capacity = requested_seq_capacity();
     eng->q35.maxctx = 0; eng->q35.reserved_context = 0; eng->q35.graph_enabled = 1;
+    // S2a GPU input-splicing default-on; FUCINA_QWEN35_NO_GPU_SPLICE=1 forces the host-copy path.
+    eng->q35.gpu_splice_enabled = getenv("FUCINA_QWEN35_NO_GPU_SPLICE") ? 0 : 1;
+    eng->q35.d_slot_tok = NULL; eng->q35.d_slot_pos = NULL;
     eng->q35.rowslot = NULL; eng->q35.chunk_scr = NULL;
     eng->q35.pf_pos = NULL; eng->q35.pf_tok = NULL;
     eng->q35.attn_splits = 0; eng->q35.attn_tile = 0;
@@ -6699,6 +6702,8 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->q35.part_m); CUDA_FREE(eng->q35.part_l); CUDA_FREE(eng->q35.part_o);
     CUDA_FREE(eng->q35.pf_pos);
     CUDA_FREE(eng->q35.pf_tok);
+    CUDA_FREE(eng->q35.d_slot_tok);   // S2a persistent per-slot decode state
+    CUDA_FREE(eng->q35.d_slot_pos);
     CUDA_FREE(eng->q35.wbf16[0]);
     CUDA_FREE(eng->q35.wbf16[1]);
     CUDA_FREE(eng->q35.xbf16);

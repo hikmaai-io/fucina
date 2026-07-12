@@ -126,6 +126,9 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     ok = ok && cudaMalloc(&eng->q35.chunk_scr, (size_t)NVH * Q35_GDN_SCR * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->q35.pf_pos, (size_t)PF * sizeof(int)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->q35.pf_tok, (size_t)PF * sizeof(int32_t)) == cudaSuccess;
+    // S2a persistent per-slot decode state (last token id + next position), capacity-indexed.
+    ok = ok && cudaMalloc(&eng->q35.d_slot_tok, (size_t)MS * sizeof(int32_t)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->q35.d_slot_pos, (size_t)MS * sizeof(int)) == cudaSuccess;
     // Flash-decoding attention split count S: capture-stable, derived from q35_maxctx only (target
     // ~512 positions/split so each block's serial loop is short and NQ*S fills the 48 SMs at B=1).
     {
@@ -340,7 +343,8 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
 // Kernel-launch-only B-row hybrid forward (all per-step inputs DEVICE-resident → graph-safe).
 // Advances each row's per-slot GDN state / conv ring / FULL-layer K/V; leaves B logit rows in
 // d_sb[11]; when want_argmax, appends the per-row greedy argmax into d_ms_outtok.
-static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_argmax, cudaStream_t st) {
+static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_argmax,
+                                        int splice, cudaStream_t st) {
     const gemma4_model_config_t *c = &eng->cfg;
     const int H=c->hidden_size, HD=M2_HEAD, NQ=c->n_heads, NKV=c->n_kv_global;
     const int INNER=c->ssm_inner_size, CONVD=(2*M2_KEYD+c->ssm_inner_size), NKH=M2_NKH, NVH=(c->ssm_inner_size/M2_SD), SD=M2_SD, TSR=c->ssm_time_step_rank, ROT=M2_ROT;
@@ -365,6 +369,15 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
           *vh=ws(Q35_VH), *core=ws(Q35_CORE), *gnorm=ws(Q35_GNORM),
           *fg=ws(Q35_FG), *fu=ws(Q35_FU), *fa=ws(Q35_FA);
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
+
+    // S2a — GPU-native input splice: derive this step's input_ids/positions from persistent
+    // per-slot state through the row→slot map, ON-GPU, so the step (below) replays with no host
+    // knowledge of the previously sampled token. The host still uploads d_slot (the scheduler's
+    // batch membership); it no longer needs to supply the sampled value. Pure gather ⇒ the spliced
+    // (tok,pos) is bit-identical to what the host copy path would have written.
+    if (splice)
+        qwen35_splice_inputs_kernel<<<grid1d((size_t)B),256,0,st>>>(
+            d_tok, d_pos, eng->q35.d_slot_tok, eng->q35.d_slot_pos, d_slot, B);
 
     embed_w(eng, x, eng->d_token_embd, d_tok, B, H, st);
 
@@ -467,6 +480,13 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
         gemv_batched_w(eng, eng->d_sb[11], Wq(eng->tensors.output_weight), xn, H, VOC, B, st, eng->tensors.output_fmt);
     if (want_argmax)
         argmax_rows_kernel<<<B,1024,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, B, VOC);
+    // S2a — writeback persistent per-slot state from the argmax output, device-side, so the NEXT
+    // step's splice reads the token/position this step produced. In-graph on the greedy path
+    // (want_argmax): the whole decode step is now a self-contained replayable graph. The sampled
+    // path writes back in qwen35_ms_run after the sampler instead.
+    if (splice && want_argmax)
+        qwen35_writeback_slot_state_kernel<<<grid1d((size_t)B),256,0,st>>>(
+            eng->q35.d_slot_tok, eng->q35.d_slot_pos, eng->d_ms_outtok, d_slot, B);
 }
 
 // ── S2b: keyed CUDA-graph cache ────────────────────────────────────────────────────────
@@ -492,7 +512,10 @@ static cudaGraphExec_t qwen35_ms_graph_ensure(gemma4_engine_t *eng, const q35_gr
     cudaStream_t cs = NULL; cudaGraph_t g = NULL; cudaGraphExec_t exec = NULL;
     int ok = cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) == cudaSuccess;
     if (ok && cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
-        qwen35_decode_multiseq_body(eng, key.num_tokens, /*want_argmax=*/1, cs);
+        // Capture WITH the GPU input-splice + writeback so the graph is a self-contained decode
+        // step: splice(state)→forward→argmax→writeback(state). Replay needs only the row→slot map.
+        qwen35_decode_multiseq_body(eng, key.num_tokens, /*want_argmax=*/1,
+                                    /*splice=*/eng->q35.gpu_splice_enabled, cs);
         ok = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != NULL;
     } else ok = 0;
     if (ok) ok = cudaGraphInstantiate(&exec, g, 0) == cudaSuccess;
@@ -561,16 +584,23 @@ static void qwen35_sample_rows(gemma4_engine_t *eng, gemma4_seq **slv,
 
 // Refresh per-step inputs, then run one B-row forward. All-greedy batches use the captured graph;
 // sampled or mixed batches use the same forward kernels followed by the on-device sampler.
+// splice (S2a): when set, this step's input_ids/positions are derived ON-GPU from persistent
+// per-slot state (d_slot_tok/d_slot_pos) — in_tok/positions are then ignored and NOT uploaded, and
+// the sampled path's slot-state writeback happens here (the greedy path writes back in-graph).
+// splice=0 keeps the legacy host-copy behavior (used by the sequential prefill path, whose
+// per-position tokens are not in slot state). The row→slot map is always uploaded.
 static int qwen35_ms_run(gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *in_tok,
-                         const int *positions, int B, int want_sample, int use_graph) {
+                         const int *positions, int B, int want_sample, int use_graph, int splice) {
     cudaStream_t st = eng->stream;
     int h_slot[GEMMA4_MAX_SEQS], any_sample = 0;
     for (int r = 0; r < B; r++) {
         h_slot[r] = (int)(slv[r] - eng->slots);
         if (slv[r]->samp_temp > 0.f) any_sample = 1;
     }
-    cudaMemcpyAsync((int32_t*)eng->d_sb[0], in_tok, (size_t)B*sizeof(int32_t), cudaMemcpyHostToDevice, st);
-    cudaMemcpyAsync(eng->d_ms_pos, positions, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, st);
+    if (!splice) {   // legacy: host supplies the input token + position for every row
+        cudaMemcpyAsync((int32_t*)eng->d_sb[0], in_tok, (size_t)B*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(eng->d_ms_pos, positions, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, st);
+    }
     cudaMemcpyAsync(workspace_data<int>(eng->q35.routing_workspace),h_slot,
                     (size_t)B*sizeof(int),cudaMemcpyHostToDevice,st);
     if (use_graph && want_sample && !any_sample && eng->q35.graph_enabled) {
@@ -583,8 +613,16 @@ static int qwen35_ms_run(gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *
             fprintf(stderr, "fucina: qwen35 M4 graph replay failed — per-kernel launches\n");
         }
     }
-    qwen35_decode_multiseq_body(eng, B, want_sample && !any_sample, st);
-    if (want_sample && any_sample) qwen35_sample_rows(eng, slv, eng->d_sb[11], B, st);
+    qwen35_decode_multiseq_body(eng, B, want_sample && !any_sample, splice, st);
+    if (want_sample && any_sample) {
+        qwen35_sample_rows(eng, slv, eng->d_sb[11], B, st);
+        // Sampled path: body ran with want_argmax=0 (no in-graph writeback) — advance slot state
+        // here from the sampler output so the next step's splice sees this step's token/position.
+        if (splice)
+            qwen35_writeback_slot_state_kernel<<<((unsigned)B+255)/256,256,0,st>>>(
+                eng->q35.d_slot_tok, eng->q35.d_slot_pos, eng->d_ms_outtok,
+                workspace_data<int>(eng->q35.routing_workspace), B);
+    }
     return 0;
 }
 
@@ -1489,7 +1527,7 @@ static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_pro
     gemma4_seq *one[1] = { s };
     for (int i = 0; i < n_prompt; i++) {   // sequential prefill (GDN recurrence is per-position)
         int pos = i; int32_t tok = prompt[i]; int want = (i == n_prompt - 1);
-        qwen35_ms_run(eng, one, &tok, &pos, 1, want, /*use_graph=*/0);
+        qwen35_ms_run(eng, one, &tok, &pos, 1, want, /*use_graph=*/0, /*splice=*/0);
     }
     int32_t first = 0;
     cudaMemcpyAsync(&first, eng->d_ms_outtok, sizeof(int32_t), cudaMemcpyDeviceToHost, st);
@@ -1609,7 +1647,7 @@ static int qwen35_seq_prefill_chunk(gemma4_engine_t *eng, int slot, const int32_
     gemma4_seq *one[1] = { s };
     for (int i = 0; i < n; i++) {
         int pos = s->n_tokens + i; int32_t tok = tokens[i]; int want = (do_sample && i == n - 1);
-        qwen35_ms_run(eng, one, &tok, &pos, 1, want, /*use_graph=*/0);
+        qwen35_ms_run(eng, one, &tok, &pos, 1, want, /*use_graph=*/0, /*splice=*/0);
     }
     int32_t first = 0;
     if (do_sample) cudaMemcpyAsync(&first, eng->d_ms_outtok, sizeof(int32_t), cudaMemcpyDeviceToHost, st);
@@ -1777,7 +1815,24 @@ static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
         slv[Bv] = s; positions[Bv] = s->n_tokens; in2[Bv] = in_tokens[r]; rowmap[Bv] = r; Bv++;
     }
     if (Bv == 0) return 0;
-    qwen35_ms_run(eng, slv, in2, positions, Bv, /*want_argmax=*/1, /*use_graph=*/1);
+    cudaStream_t st = eng->stream;
+    const int splice = eng->q35.gpu_splice_enabled;
+    if (splice) {
+        // S2a — seed persistent per-slot state from this step's host inputs, device-side, then the
+        // in-graph splice re-derives (d_sb[0], d_ms_pos) from slot state. The row→slot map upload
+        // happens inside qwen35_ms_run. Byte-identical to the host-copy path; enables graph
+        // self-chaining (writeback→splice) for a future zero-sync draft loop.
+        int h_slot2[GEMMA4_MAX_SEQS];
+        for (int v = 0; v < Bv; v++) h_slot2[v] = (int)(slv[v] - eng->slots);
+        cudaMemcpyAsync(eng->q35.pf_tok, in2, (size_t)Bv*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(eng->q35.pf_pos, positions, (size_t)Bv*sizeof(int), cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(workspace_data<int>(eng->q35.routing_workspace), h_slot2,
+                        (size_t)Bv*sizeof(int), cudaMemcpyHostToDevice, st);
+        qwen35_seed_slot_state_kernel<<<((unsigned)Bv+255)/256,256,0,st>>>(
+            eng->q35.d_slot_tok, eng->q35.d_slot_pos, eng->q35.pf_tok, eng->q35.pf_pos,
+            workspace_data<int>(eng->q35.routing_workspace), Bv);
+    }
+    qwen35_ms_run(eng, slv, in2, positions, Bv, /*want_argmax=*/1, /*use_graph=*/1, splice);
     int32_t outs[GEMMA4_MAX_SEQS];
     cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)Bv*sizeof(int32_t), cudaMemcpyDeviceToHost, eng->stream);
     cudaStreamSynchronize(eng->stream);
@@ -1959,13 +2014,64 @@ extern "C" int qwen35_batch_selftest(gemma4_engine_t *eng) {
     for (int q = 0; q < NSEQ; q++) for (int k = 0; k < SK; k++)
         if (sref[q][k] != sbat[q][k]) sample_ok = 0;
 
-    int pass = indep_ok && graph_ok && m3_ok && (m3_agree == GATE) && sample_ok;
+    // (F) S2a self-chaining gate: seed the persistent per-slot state ONCE, then replay the captured
+    // greedy decode graph KSTEP times with NO host token feedback between steps — the graph's
+    // in-body writeback→splice must advance (token, position) device-side. The produced tokens
+    // must byte-match the host-fed batched reference `bat` from section (B). This proves the whole
+    // decode step is a self-contained replayable graph (the S1 zero-sync draft-loop prerequisite).
+    // Only runs when GPU splicing + graphs are enabled (the default); otherwise trivially passes.
+    int chain_ok = 1;
+    if (eng->q35.gpu_splice_enabled && eng->q35.graph_enabled && !eng->q35.graph_failed) {
+        int sl[NSEQ]; int32_t cur[NSEQ];
+        for (int q = 0; q < NSEQ; q++) {
+            sl[q] = gemma4_engine_seq_add(eng, prompt[q], NPq[q], &cur[q], 0.f, 0, 0.f, 0.f, 0);
+            if (sl[q] < 0) { fprintf(stderr, "qwen35 M4 self-chain: seq_add failed\n"); return 1; }
+        }
+        cudaStream_t st = eng->stream;
+        int h_slot[NSEQ]; int32_t h_tok[NSEQ]; int h_pos[NSEQ];
+        for (int q = 0; q < NSEQ; q++) {
+            h_slot[q] = sl[q]; h_tok[q] = cur[q]; h_pos[q] = eng->slots[sl[q]].n_tokens;
+        }
+        // Seed slot state + row→slot map ONCE, on the same stream as the graph.
+        cudaMemcpyAsync(eng->q35.pf_tok, h_tok, (size_t)NSEQ*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(eng->q35.pf_pos, h_pos, (size_t)NSEQ*sizeof(int), cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(workspace_data<int>(eng->q35.routing_workspace), h_slot,
+                        (size_t)NSEQ*sizeof(int), cudaMemcpyHostToDevice, st);
+        qwen35_seed_slot_state_kernel<<<1,256,0,st>>>(
+            eng->q35.d_slot_tok, eng->q35.d_slot_pos, eng->q35.pf_tok, eng->q35.pf_pos,
+            workspace_data<int>(eng->q35.routing_workspace), NSEQ);
+        q35_graph_key key = q35_make_decode_key(NSEQ);
+        cudaGraphExec_t exec = qwen35_ms_graph_ensure(eng, key);
+        if (!exec) { fprintf(stderr, "qwen35 M4 self-chain: graph ensure failed\n"); chain_ok = 0; }
+        int32_t chain[NSEQ][KSTEP];
+        for (int k = 0; k < KSTEP && exec; k++) {
+            // Row 0's produced token this step is the SEEDED input (the graph writes back AFTER
+            // argmax), so read slot_tok BEFORE replay to capture step k's input == bat[q][k].
+            int32_t seen[NSEQ];
+            cudaMemcpyAsync(seen, eng->q35.d_slot_tok, (size_t)NSEQ*sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, st); // slot ids 0..NSEQ-1 are contiguous here
+            cudaStreamSynchronize(st);
+            for (int q = 0; q < NSEQ; q++) chain[q][k] = seen[sl[q]];
+            if (cudaGraphLaunch(exec, st) != cudaSuccess) { chain_ok = 0; break; }
+            cudaStreamSynchronize(st);
+            // Keep host seq bookkeeping in step with the device-advanced positions.
+            for (int q = 0; q < NSEQ; q++) { eng->slots[sl[q]].n_tokens++; eng->slots[sl[q]].n_sampled++; }
+        }
+        for (int q = 0; q < NSEQ && chain_ok; q++)
+            for (int k = 0; k < KSTEP; k++)
+                if (chain[q][k] != bat[q][k]) { chain_ok = 0; break; }
+        for (int q = 0; q < NSEQ; q++) gemma4_engine_seq_remove(eng, sl[q]);
+        fprintf(stderr, "qwen35 M4 self-chain (seed-once, %d graph replays, no host feedback): %s\n",
+                KSTEP, chain_ok ? "PASS" : "FAIL");
+    }
+
+    int pass = indep_ok && graph_ok && m3_ok && (m3_agree == GATE) && sample_ok && chain_ok;
     fprintf(stderr,
         "qwen35 M4 batched-decode gate: row-independence=%s graph-on==off=%s "
-        "M3-parity=%s(%d/%d) sampling=%s — %s\n",
+        "M3-parity=%s(%d/%d) sampling=%s self-chain=%s — %s\n",
         indep_ok ? "PASS" : "FAIL", graph_ok ? "PASS" : "FAIL",
         (m3_ok && m3_agree == GATE) ? "PASS" : "FAIL", m3_agree, GATE,
-        sample_ok ? "PASS" : "FAIL", pass ? "PASS" : "FAIL");
+        sample_ok ? "PASS" : "FAIL", chain_ok ? "PASS" : "FAIL", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
 
