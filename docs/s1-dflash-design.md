@@ -44,16 +44,37 @@ validated against it (device fp32 vs host double reference):
 - Non-causal GQA query attention (32 q / 8 kv), 9.0e-8 (`0d622b6`).
 - Full DFlash decoder-layer forward composed end to end, 1.3e-6 (`e0e5c8a`).
 
-### Remaining for S1A_VALIDATED (structural engine integration, no new math)
+### Drafting side + engine substrate DONE and validated on real weights
 
-- Wire the validated kernels into `gemma4_engine` as a persistent draft model:
-  BF16 weight upload, draft KV cache, per-layer cache insert, 6-layer forward,
-  mask-token embedding, shared LM head; fixed `(1+K)` query forward, S2-graphed.
-- P4 target `(1+K)` verify pass wiring P0 rollback + P1 rejection + P4 commit,
-  zero-host-feedback, N+1 lookahead, concurrency-gated.
-- End-to-end gates: DFlash-off byte-identical; greedy DFlash token-identical to
-  greedy baseline (losslessness proof); measured acceptance length + tok/s at
-  B=1/2/4 vs the non-spec baseline on the same checkpoint (real numbers only).
+Every drafting-side compute path and the engine substrate are implemented and
+gated on the real weights (device fp32 vs host double, signal-relative error):
+
+- Draft residency: 6 layers -> 2.406 GiB BF16 device slab, views byte-match source.
+- fc aux-hidden combine (target->draft interface): 1.9e-7.
+- Context-KV precompute over residency: 3.9e-7 (K) / 1.8e-7 (V).
+- Full query forward (context + self attention, all layers): 3.1e-6.
+- Greedy draft sampling (shared LM head argmax + tie rule): exact.
+- Single drafting entry point (fc->precompute->query->sample): K in-vocab tokens,
+  run-to-run byte-identical.
+- Device greedy verify-accept: matches the P1 host oracle for all j in 0..K.
+- In-engine resident draft lifecycle: loads + validates the real draft against
+  the live target (geometry + vocab matched), gated behind FUCINA_QWEN35_DFLASH,
+  freed on destroy.
+- Target aux-hidden capture seam: gated decode-body hook, no-op when off.
+- DFlash-OFF byte-identity: PASS at every step (qwen35-batch row-independence +
+  graph-on==off + M3-parity + self-chain); P0 GDN rollback byte-identical for all
+  j in 0..K; full `make lib libdg fucina` + Go tests green.
+
+### Remaining for S1A_VALIDATED (the final serving-step orchestration)
+
+- The verify serving step: run the target `(1+K)` forward over [last accepted ++
+  K draft] with all-row logit capture + aux capture, call the device verify-
+  accept, commit via P0 rollback + P4 assembly, advance zero-host-feedback, N+1
+  lookahead, concurrency-gated (this touches the target verify forward for all-row
+  logits and a persistent draft KV cache across steps).
+- End-to-end gates: greedy DFlash token-identical to greedy baseline (losslessness
+  proof); measured acceptance length + tok/s at B=1/2/4 vs the non-spec baseline
+  on the same checkpoint (real numbers only).
 
 ---
 
