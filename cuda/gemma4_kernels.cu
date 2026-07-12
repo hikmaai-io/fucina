@@ -15680,6 +15680,12 @@ extern "C" int gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot) {
     return q35_gdn_commit(eng, slot, nullptr, 0, nullptr);
 }
 
+// S1a P4: score a (1+K) verify block (all-row argmax) with GDN rollback. See qwen35_dflash_verify_block.
+extern "C" int gemma4_engine_q35_dflash_verify_block(gemma4_engine_t *eng, int slot,
+                                                     const int32_t *block, int T, int32_t *out_argmax) {
+    return qwen35_dflash_verify_block(eng, slot, block, T, out_argmax);
+}
+
 // ─── S1a P3/P4 resident draft model lifecycle ──────────────────────────────────────
 #include "qwen35_dflash_forward.cuh"   // residency + drafter + draft entry point (validated modules)
 

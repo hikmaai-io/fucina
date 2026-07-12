@@ -716,6 +716,14 @@ qwen35-dflash-verify-test:
 		-lcudart -lcuda
 	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_verify"
 
+# DFlash target (1+K) verify-block losslessness gate: per-row argmax of a one-shot verify block MUST
+# equal token-by-token greedy decode from the same prefix, and GDN state rolls back. Uses target GGUF.
+qwen35-dflash-verify-block-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_verify_block.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dflash_verify_block \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_dflash_verify_block $(QWEN35_MODEL)"
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:

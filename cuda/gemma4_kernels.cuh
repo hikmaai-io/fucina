@@ -389,6 +389,12 @@ int    gemma4_engine_q35_gdn_commit(gemma4_engine_t *eng, int slot,
                                     const int32_t *accepted, int j, int32_t *out_next);
 int    gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot);
 
+// S1a P4: score a (1+K)-token verify block at the slot's current position, capturing the greedy
+// argmax of every row into out_argmax[0..T), then roll GDN state back to the pre-verify snapshot.
+// Does not commit; the caller applies the accept decision + q35_gdn_commit. Returns 0 on success.
+int    gemma4_engine_q35_dflash_verify_block(gemma4_engine_t *eng, int slot,
+                                             const int32_t *block, int T, int32_t *out_argmax);
+
 // S1a P3/P4: lazily load the resident DFlash draft model from FUCINA_QWEN35_DFLASH_PATH (config +
 // safetensors). Returns 0 on success/already-loaded, non-zero on failure (validated + geometry-
 // checked against the target). ready reports whether the draft substrate is resident.

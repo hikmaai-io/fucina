@@ -1278,7 +1278,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
         q35_jspace_after_layer(eng, x, T, l, st);
     }
 
-    if (want_logits) {
+    if (want_logits == 1) {
         // Final norm over all T rows, but the LM head (VOC=248320, the most expensive GEMV) only on
         // the LAST row — the only one whose logits the caller samples for the first generated token.
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, T, eps);
@@ -1288,6 +1288,23 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             gemv_w(eng, eng->d_logits, Wq(eng->tensors.output_weight),
                    xn + (size_t)(T-1)*H, H, VOC, st, eng->tensors.output_fmt);
         argmax_rows_kernel<<<1,1024,0,st>>>(eng->d_logits, eng->d_ms_outtok, 1, VOC);
+    } else if (want_logits == 2) {
+        // S1a DFlash verify: capture the greedy argmax of EVERY row (the (1+K) verify block). Final
+        // norm over all T rows, batched LM head over all rows into d_sb[11], argmax per row into
+        // d_ms_outtok[0..T). Same kernels/order as multiseq decode, so per-row argmax equals
+        // sequential single-token decode (the losslessness contract the verify path relies on).
+        rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, T, eps);
+        if (eng->format == FORMAT_FP8_BLOCK) {
+            float *xt = workspace_data<float>(eng->q35.decode_workspace[Q35_QG]);
+            for (int r0 = 0; r0 < T; r0 += 32) {
+                int KK = (T - r0 < 32) ? (T - r0) : 32;
+                nvfp4_xT_launch(xt, xn + (size_t)r0 * H, H, KK, st);
+                bf16_head_gemv_batched_launch(eng->d_sb[11] + (size_t)r0 * VOC,
+                                              eng->d_lmhead_bf16, xt, H, VOC, KK, st);
+            }
+        } else
+            gemv_batched_w(eng, eng->d_sb[11], Wq(eng->tensors.output_weight), xn, H, VOC, T, st, eng->tensors.output_fmt);
+        argmax_rows_kernel<<<T,1024,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, T, VOC);
     }
 }
 
@@ -1946,6 +1963,48 @@ static int q35_gdn_commit(gemma4_engine_t *eng, int slot, const int32_t *accepte
         if (out_next) out_next[i] = out;
     }
     eng->q35.gdn_snap_ntokens[slot] = -1;
+    return 0;
+}
+
+// ─── S1a P4: target (1+K) verify forward with all-row argmax capture + GDN rollback ─────
+//
+// Runs the target over a (1+K)-token block appended at the slot's current position, capturing the
+// greedy argmax of EVERY row (each row t predicts the token after block position t), then rolls the
+// GDN/conv recurrent state back to the pre-verify snapshot so the caller can commit only the
+// accepted prefix via q35_gdn_commit. The block is [in_tokens[0..K]] (bonus/last-accepted token +
+// K draft tokens). out_argmax receives T = 1+K per-row argmaxes. Because the chunk body advances
+// state with the SAME kernels as sequential decode and captures per-row argmax with the SAME head,
+// out_argmax[t] equals what a sequential decode would have produced at that position — the greedy
+// verify contract. This does not commit; the caller applies the accept decision + commit.
+static int qwen35_dflash_verify_block(gemma4_engine_t *eng, int slot, const int32_t *block, int T,
+                                      int32_t *out_argmax) {
+    if (!eng || !eng->loaded || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -1;
+    if (slot < 0 || slot >= eng->q35.capacity || !eng->slots[slot].used) return -1;
+    if (T <= 0 || T > GEMMA4_MAX_SEQS) return -1;
+    if (ensure_q35_scratch(eng) != 0) return -1;
+    gemma4_seq *s = &eng->slots[slot];
+    int base = s->n_tokens;
+    if (base + T > eng->q35.maxctx) return -1;
+    if (q35_slot_kv_reserve(eng, slot, base + T) != 0) return -1;
+    // Snapshot GDN state so we can roll back after scoring the speculative block.
+    if (q35_gdn_snapshot(eng, slot) != 0) return -1;
+    cudaStream_t st = eng->stream;
+    // Upload the block tokens/positions into the prefill token/position workspace + slot map.
+    int32_t *d_tok = workspace_data<int32_t>(eng->q35.prefill_token_workspace);
+    int     *d_pos = workspace_data<int>(eng->q35.prefill_position_workspace);
+    int     *d_slot = workspace_data<int>(eng->q35.routing_workspace);
+    int h_pos[GEMMA4_MAX_SEQS], h_slot[GEMMA4_MAX_SEQS];
+    for (int t = 0; t < T; t++) { h_pos[t] = base + t; h_slot[t] = slot; }
+    cudaMemcpyAsync(d_tok, block, (size_t)T*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(d_pos, h_pos, (size_t)T*sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(d_slot, h_slot, (size_t)T*sizeof(int), cudaMemcpyHostToDevice, st);
+    // Score the block (advances state through all T rows), capturing all-row argmax (want_logits=2).
+    qwen35_prefill_chunk_body(eng, slot, base, T, /*want_logits=*/2, st);
+    cudaMemcpyAsync(out_argmax, eng->d_ms_outtok, (size_t)T*sizeof(int32_t), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (cudaGetLastError() != cudaSuccess) { eng->q35.gdn_snap_ntokens[slot] = -1; return -1; }
+    // Roll GDN state back to the snapshot (n_tokens restored to base); caller commits accepted len.
+    if (q35_gdn_restore_snapshot(eng, slot) != 0) return -1;
     return 0;
 }
 
