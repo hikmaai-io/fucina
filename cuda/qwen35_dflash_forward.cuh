@@ -128,6 +128,25 @@ static inline void q35_dflash_backbone_forward(const q35_dflash_residency& R, q3
     q35df_rmsnorm<<<rows,256,0,st>>>(x,R.final_norm,s.out,H,rows,eps);
 }
 
+// ── Aux gather: capture layout -> drafter concat layout ──
+// The target aux capture stores features as [feature_slot][row][H] (slot-major, stride maxrows*H).
+// The drafter's fc expects, per row, the concatenation concat[row][f*H + i] over the F features.
+// This kernel gathers a contiguous [rows] window (row_base..row_base+rows) into concat_out
+// [rows, F*H]. One thread per element. F = num_target_features.
+__global__ void q35df_aux_gather(const float* aux, float* concat_out, int F, int maxrows,
+                                 int H, int row_base, int rows){
+    long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
+    long total = (long)rows * F * H;
+    if (idx >= total) return;
+    int i = idx % H; long t = idx / H; int fslot = t % F; int r = t / F;
+    concat_out[(size_t)r*F*H + (size_t)fslot*H + i] = aux[(size_t)fslot*maxrows*H + (size_t)(row_base+r)*H + i];
+}
+static inline void q35_dflash_aux_gather(const float* aux, float* concat_out, int F, int maxrows,
+                                         int H, int row_base, int rows, cudaStream_t st){
+    long total=(long)rows*F*H; unsigned b=(unsigned)((total+255)/256);
+    q35df_aux_gather<<<b,256,0,st>>>(aux, concat_out, F, maxrows, H, row_base, rows);
+}
+
 // ── Aux-hidden combine (the target->draft input interface) ──
 // When use_aux_hidden, the draft's input hidden for each row is fc(concat of F target-layer hidden
 // states), fc: [H, F*H]. This is the exact interface the target engine feeds: it gathers the F

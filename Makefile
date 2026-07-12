@@ -709,6 +709,13 @@ qwen35-dflash-engine-load-test: lib libdg
 
 DFLASH_PATH ?= /opt/spark/models/models--z-lab--Qwen3.5-9B-DFlash/snapshots/5fc3b3d474760f18c516db87d84c37edbfd3ede6
 
+# DFlash aux gather: capture layout [slot][row][H] -> drafter concat [row][F*H] for a row window.
+# The transpose the real-drafter wiring depends on. Self-contained. Flocks the GPU.
+qwen35-dflash-aux-gather-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_aux_gather.cu -o /tmp/dflash_auxg \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_auxg"
+
 # DFlash device greedy verify-accept: the serving-path accept step (accepted_len + emitted token
 # over a (1+K) target logit block) vs the P1 host oracle, for all j in 0..K. Self-contained. Flocks GPU.
 qwen35-dflash-verify-test:
