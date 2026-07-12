@@ -621,6 +621,13 @@ qwen35-dflash-loader-test:
 qwen35-dflash-real-load-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/test_qwen35_dflash_real_load.cc -o /tmp/dflash_real && /tmp/dflash_real
 
+# P3 context-KV precompute parity on the REAL DFlash weights: device fp32 (RMSNorm + fused KV proj
+# + grouped K-norm) vs a host double reference reading the same bf16 tensors. SKIPs if absent.
+qwen35-dflash-precompute-parity-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_precompute_parity.cu -o /tmp/dflash_pcparity \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_pcparity"
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:
