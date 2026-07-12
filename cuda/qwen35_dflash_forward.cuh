@@ -113,4 +113,39 @@ static inline void q35_dflash_backbone_forward(const q35_dflash_residency& R, q3
     q35df_rmsnorm<<<rows,256,0,st>>>(x,R.final_norm,s.out,H,rows,eps);
 }
 
+// ── Context-KV precompute (the DFlash cross-attention trick) ──
+// The draft never re-runs its layers over the context. The TARGET model's hidden states for the
+// context rows are projected into EACH draft layer's K/V once: hidden RMSNorm -> per-layer K/V
+// projection -> grouped per-head K-norm -> neox RoPE on K. This callable produces, for every draft
+// layer l, the context K [num_ctx, NKV, HD] and V [num_ctx, NKV, HD] in ctxK[l]/ctxV[l] device
+// buffers the caller owns. Matches the validated precompute parity kernels bit-for-bit. Runs eagerly
+// (variable num_ctx), outside any captured graph.
+struct q35_dflash_ctx_scratch {
+    float *normed;   // [num_ctx, H]
+    int    num_ctx;
+};
+static inline bool q35_dflash_ctx_scratch_alloc(q35_dflash_ctx_scratch* c, const qwen35dflash::Geometry& g, int num_ctx){
+    c->num_ctx=num_ctx;
+    return cudaMalloc(&c->normed,(size_t)num_ctx*g.H*4)==cudaSuccess;
+}
+static inline void q35_dflash_ctx_scratch_free(q35_dflash_ctx_scratch* c){ if(c->normed) cudaFree(c->normed); *c=q35_dflash_ctx_scratch{}; }
+
+// Precompute context K/V for all layers. ctxK[l]/ctxV[l] must each be [num_ctx*NKV*HD] device
+// buffers. ctx_hidden [num_ctx,H] is the target hidden state; ctx_pos [num_ctx] absolute positions.
+static inline void q35_dflash_precompute_context_kv(const q35_dflash_residency& R,
+        q35_dflash_ctx_scratch& c, const float* ctx_hidden, const int* ctx_pos,
+        float* const* ctxK, float* const* ctxV, double theta, float eps, cudaStream_t st){
+    const qwen35dflash::Geometry& g=R.geom;
+    const int H=g.H,HD=g.HD,NKV=g.NKV,kvd=g.kv_dim(),num_ctx=c.num_ctx;
+    // Shared hidden RMSNorm (hidden_norm) across layers.
+    q35df_rmsnorm<<<num_ctx,256,0,st>>>(ctx_hidden,R.hidden_norm,c.normed,H,num_ctx,eps);
+    for(int l=0;l<g.L;l++){
+        const q35_dflash_layer_w& w=R.layers[l];
+        q35df_matmul<<<dim3(num_ctx,(kvd+255)/256),256,0,st>>>(c.normed,w.k_proj,ctxK[l],num_ctx,H,kvd);
+        q35df_matmul<<<dim3(num_ctx,(kvd+255)/256),256,0,st>>>(c.normed,w.v_proj,ctxV[l],num_ctx,H,kvd);
+        q35df_headnorm<<<dim3(num_ctx,NKV),128,0,st>>>(ctxK[l],w.k_norm,num_ctx,NKV,HD,eps);
+        q35df_rope<<<dim3(num_ctx,NKV),64,0,st>>>(ctxK[l],ctx_pos,num_ctx,NKV,HD,theta);
+    }
+}
+
 #endif // FUCINA_QWEN35_DFLASH_FORWARD_CUH

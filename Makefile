@@ -664,6 +664,13 @@ qwen35-dflash-forward-test:
 		-lcudart -lcuda
 	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_fwd"
 
+# DFlash callable context-KV precompute over residency (the cross-attention trick's producer):
+# cross-projects target hidden -> per-layer context K/V vs a host double reference. SKIPs if absent.
+qwen35-dflash-ctxkv-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_ctxkv.cu -o /tmp/dflash_ctxkv \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_ctxkv"
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:
