@@ -1,6 +1,51 @@
 # S1a DFlash design and architecture gate
 
-Status: **BLOCKED at Phase 0 architecture gate** (2026-07-12)
+Status: **P0–P2 + planner delivered green; P3/P4 stop at the real-weights boundary** (2026-07-12)
+
+## Delivered (this branch, byte-identical when DFlash disabled)
+
+- **P0 GDN snapshot/rewind/commit** (`ec7f705`): per-slot GDN/conv recurrent-state
+  snapshot + `commit(accepted_len)` that restores the pre-verify snapshot and
+  replays exactly the accepted tokens through the standard decode path. Gate
+  `qwen35-gdn-rollback-test` proves `commit(j)` is byte-identical to `j`
+  sequential single-token decodes for every `j` in `0..K` (rewind `j=0` and
+  full-accept `j=K` included), on the real Qwen3.5-9B GGUF.
+- **P1 deterministic RNG + rejection sampler** (`c068107`): stateless counter PRF
+  keyed `(request_seed, absolute_position, domain)`; greedy + probabilistic
+  (Leviathan) rejection with deterministic residual/bonus sampling. Gates
+  `qwen35-dflash-rng-test` (host oracle + pinned vectors) and
+  `qwen35-dflash-parity-test` (CUDA==CPU bit-identical over 120 RNG triples,
+  greedy, and 8 probabilistic seeds).
+- **P2 config-derived bounds-checked loader** (`4bcb49f`): symbolic `Geometry`
+  from the draft `config.json`; validates every global/per-layer tensor
+  rank/shape/dtype and the optional reduced-vocab `d2t` map before any CUDA
+  allocation; rejects hostile config/tensors with precise reasons. Gate
+  `qwen35-dflash-loader-test`; verified offline against the real public config
+  (`H=4096 L=6 NQ=32 NKV=8 HD=128 V=248320 mask=248077 F=8 fc_in=32768
+  window=4096`, layers `S S S S S F`).
+- **Planner + default-off gate** (`938a72c`): `(1+K)` verify shape, S2 spec graph
+  key `(R*(1+K), R, 1+K)` that never aliases a decode key, `K+1` KV lookahead,
+  and the `FUCINA_QWEN35_DFLASH=0/1/auto` concurrency gate (default OFF, disable
+  at/above a conservative critical batch). OFF schedules no DFlash work; the
+  `qwen35-batch` gate (row-independence + graph-on==off + M3-parity + self-chain)
+  stays PASS, so decode is byte-identical to current main.
+
+## Remaining, gated on the real draft checkpoint (NOT downloaded)
+
+P3 (dense draft context-KV precompute + fixed `(1+K)` query forward) and P4 (the
+target `(1+K)` verify serving path wiring P0 rollback + P1 rejection) require the
+2.58 GB draft weights
+(`z-lab/Qwen3.5-9B-DFlash`, SHA-256
+`0a42274b32554f48de1faa0d42824e9c2ceda649c30ae0a731cddf410dd698c7`). Writing
+those forward/verify kernels without the weights would produce untested code and
+no honest acceptance/performance number, which the mission forbids. Work stops
+here pending an explicit decision to fetch that exact artifact. The primitives
+those phases depend on (rollback, RNG/rejection, loader schema, planner) are all
+implemented and independently gated above.
+
+---
+
+## Original architecture-gate analysis (retained)
 
 ## Scope and sources
 
