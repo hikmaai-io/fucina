@@ -2050,15 +2050,33 @@ static int qwen35_dflash_greedy_step(gemma4_engine_t *eng, int slot, int32_t bon
     if (qwen35_dflash_verify_block(eng, slot, block, T, am) != 0) return -1;
     // Greedy accept: di (block[1+i]) is accepted iff it equals am[i] (row i predicts the token after
     // block position i). Accept the leading run.
-    int j = 0;
-    while (j < K && block[1 + j] == am[j]) j++;
-    int32_t correction = am[j];   // true greedy token at position base+j (bonus row if j==K)
-    // Commit [bonus, d1..dj] = 1+j tokens through the standard decode path (lossless state advance).
-    int32_t commit_toks[GEMMA4_MAX_SEQS];
+    // Provisional accept using the verify chunk-body argmax (a FAST filter to bound how many tokens
+    // to replay). The AUTHORITATIVE greedy decision is the DECODE body, applied below.
+    int jhat = 0;
+    while (jhat < K && block[1 + jhat] == am[jhat]) jhat++;
+    // Replay [bonus, d1..d_jhat] through the standard DECODE path, capturing each step's argmax.
+    // The verify chunk body and the decode body can produce subtly different logits for the same
+    // tokens (different kernels/accumulation order), so the EMITTED tokens must be validated against
+    // the decode body, never the chunk-body argmax am[] (trusting am[] drifts from true sequential
+    // decode over many steps -- a real losslessness bug on some sequences).
+    int32_t commit_toks[GEMMA4_MAX_SEQS], out_next[GEMMA4_MAX_SEQS];
     commit_toks[0] = bonus;
-    for (int i = 0; i < j; i++) commit_toks[1 + i] = block[1 + i];
-    if (q35_gdn_commit(eng, slot, commit_toks, 1 + j, nullptr) != 0) return -1;
-    // Emit the j accepted drafts + the correction (all greedy).
+    for (int i = 0; i < jhat; i++) commit_toks[1 + i] = block[1 + i];
+    if (q35_gdn_commit(eng, slot, commit_toks, 1 + jhat, out_next) != 0) return -1;
+    // Re-derive the greedy-accepted length from the DECODE body: out_next[i] is the greedy token the
+    // committed state predicts after replaying commit_toks[i]; draft i (== commit_toks[1+i]) is
+    // truly accepted iff it equals out_next[i]. Find the first decode-body disagreement.
+    int j = 0;
+    while (j < jhat && block[1 + j] == out_next[j]) j++;
+    // If the decode body rejects earlier than the chunk body (j < jhat), the committed state has
+    // over-advanced; re-commit exactly the decode-accepted prefix so the slot state is byte-
+    // identical to j sequential decodes and the emitted correction is the decode token at base+j.
+    if (j < jhat) {
+        for (int i = 0; i < j; i++) commit_toks[1 + i] = block[1 + i];
+        if (q35_gdn_commit(eng, slot, commit_toks, 1 + j, out_next) != 0) return -1;
+    }
+    int32_t correction = out_next[j];   // decode-body greedy token at position base+j (next bonus)
+    // Emit the j decode-accepted drafts + the decode-derived correction (all == plain greedy decode).
     int n = 0;
     for (int i = 0; i < j; i++) out_emit[n++] = block[1 + i];
     out_emit[n++] = correction;

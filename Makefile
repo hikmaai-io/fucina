@@ -760,9 +760,7 @@ DFLASH_TARGET ?= /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8
 
 # DFlash acceptance + throughput measurement over multiple prompts. Asserts losslessness (byte-
 # identical to greedy) per prompt and reports MEASURED mean accepted length + coarse wall-clock.
-# NOTE: currently EXPOSES a real losslessness bug on the 3rd (numeric-id) prompt under many
-# rejections -- kept as an honest diagnostic (returns nonzero) until that bug is fixed; prompts 0/1
-# are lossless at high acceptance (6.78 / 7.71 tokens/step measured).
+# All prompts now lossless; measured mean emitted/step ~4.56 (accepted ~3.56) single-stream.
 qwen35-dflash-measure-test: lib libdg
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_measure.cu \
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dflash_measure \

@@ -92,13 +92,24 @@ Isolation results (all GPU-verified on the FP8 target):
 - P0 GDN rollback gate: PASS on FP8 (single snapshot->advance->commit byte-
   identical), so ONE commit is perfect.
 
-Conclusion: the bug is in the REPEATED snapshot/commit cycle, prompt-specific,
-not the verify math or the draft. Prime suspect: `q35_gdn_commit` restores the
-bf16 GDN recurrent snapshot but does NOT restore the FULL-attention KV cache the
-speculative verify block wrote; for some sequences a stale speculative KV entry is
-later read. Next: invalidate/rewrite speculative KV on commit, or snapshot+restore
-the affected KV region. This MUST be fixed before S1A_VALIDATED — losslessness is
-absolute. No speedup claimed (reference draft kernels are unoptimized fp64-accum).
+ROOT CAUSE FOUND + FIXED: `greedy_step` trusted the verify CHUNK-body per-row
+argmax (`am[]`) as both the accept decision AND the emitted correction token. But
+the verify chunk body and the standard DECODE body can produce subtly different
+logits for the same tokens (different kernels/accumulation order), so on some
+sequences the chunk-body argmax disagreed with what the committed decode state
+actually predicts — emitting a token that diverges from plain greedy decode. Fix:
+the emitted tokens are now AUTHORITATIVELY derived from the decode body
+(`q35_gdn_commit`'s per-replay-step argmax `out_next[]`): the chunk-body argmax is
+only a fast filter to bound replay length, then acceptance is re-derived by
+comparing each draft to the decode body's `out_next[i]`, and the correction is
+`out_next[j]`. Emitted tokens == plain greedy decode by construction.
+
+Result (measured, real, single-stream, FP8 target + z-lab draft, all lossless):
+prompt 0 6.78/step, prompt 1 7.71/step, prompt 2 2.45/step; AGGREGATE mean
+emitted/step = 4.556 (accepted 3.556/step). qwen35-dflash-measure-test PASSES
+(byte-identical to greedy on every prompt). P0 rollback + verify-block + batch
+gates still green. No speedup claimed yet (reference draft kernels are unoptimized
+fp64-accum; wall-clock is not yet favorable and is reported honestly).
 
 ### (superseded) earlier status: greedy LOSSLESS proven; acceptance = 0
 
