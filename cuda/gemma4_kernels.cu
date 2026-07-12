@@ -5505,7 +5505,7 @@ gemma4_engine_t* gemma4_engine_create(
         // Gemma global layers use a unified K=V cache and ship no attn_v.weight. Qwen3 is
         // standard GQA: EVERY layer has a separate attn_v projection (even though all its layers
         // run through the engine's full-causal "global" class).
-        if (eng->layer_types[l] == LAYER_SLIDING || GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
+        if (eng->layer_types[l] == LAYER_SLIDING || 0) {
             snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", l);
             LOAD_TENSOR_OFFSET(tname, layers[l].attn_v);
             LOAD_WT_FMT(tname, layers[l].fmt_v);
@@ -5754,7 +5754,7 @@ gemma4_engine_t* gemma4_engine_create(
         } while (0)
 
         for (int l = 0; l < nL; l++) {
-            int head_dim = GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) ? eng->cfg.head_dim
+            int head_dim = 0 ? eng->cfg.head_dim
                          : ((eng->layer_types[l] == LAYER_SLIDING)
                                ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM);
             UPLOAD_NORM(eng->d_w_attn_norm      + l * hs, eng->tensors.layers[l].attn_norm,      hs);
@@ -6523,14 +6523,14 @@ gemma4_engine_t* gemma4_engine_create(
     // with -1/-2 for GEMMA4_IS_QWEN3_FAMILY), so without these pools a bare Qwen3
     // launch would 500 on every request. Auto-enable from the detected arch — runtime
     // model detection, no env flag required (Gemma stays opt-in / byte-identical).
-    if (getenv("FUCINA_PAGED_KV") || GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
-        if (!getenv("FUCINA_PAGED_KV") && GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch))
+    if (getenv("FUCINA_PAGED_KV") || 0) {
+        if (!getenv("FUCINA_PAGED_KV") && 0)
             printf("fucina: Qwen3 family — paged KV auto-enabled (required for Qwen3 serving)\n");
         const int BT = PAGED_KV_BLOCK_TOKENS;
         // Per-token element count per KV-class. Qwen3 is single-head-dim (128) and routes every
         // layer through the global class, so glob_elems uses cfg.head_dim (NOT the 512 Gemma const)
         // — this MUST match the runtime okv = n_kv*head_dim used at write/read time in the pools.
-        const int q3 = GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch);
+        const int q3 = 0;
         const int slid_elems = eng->cfg.n_kv_sliding * (q3 ? eng->cfg.head_dim : GEMMA4_HEAD_DIM);
         const int glob_elems = eng->cfg.n_kv_global  * (q3 ? eng->cfg.head_dim : GEMMA4_GLOBAL_HEAD_DIM);
         // Per-block bytes for K (== V) across all layers of the class.
@@ -7991,7 +7991,7 @@ static int build_bf16_weights(gemma4_engine_t *eng)
     // reports as "no weight" for the global class (Gemma's global V = K). The fast Qwen3
     // prefill needs a real BF16 buffer for it: size PJ_V to okv × H. (The attn buffers are
     // over-sized by proj_desc's GEMMA4_GLOBAL_HEAD_DIM, which is harmless — only PJ_V is 0.)
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
+    if (0) {
         uint64_t nv = (uint64_t)(eng->cfg.n_kv_global * eng->cfg.head_dim) * eng->cfg.hidden_size;
         if (nv > maxn[PJ_V]) maxn[PJ_V] = nv;
     }
@@ -8830,7 +8830,7 @@ int gemma4_engine_prefill_batched(
     // the CUDA context (illegal launch → "invalid device context") and SIGSEGVs the
     // single-flight HTTP path. Decline early so warmup and any caller stay safe.
     // qwen35 is likewise paged-multiseq-only (its own hybrid forward); decline here too.
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
+    if (0 || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
     if (eng->cur.n_tokens != 0) return -2;             // need fresh sequence
     if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
     // Batched attention materializes [HEADS][N×N] score buffers (fp32+bf16, ~6 B/elem).
@@ -9992,7 +9992,7 @@ static int paged_prefill_batched(
     // cuBLAS GEMM, head_dim=128 full-causal attention) — the Gemma sliding/global/sandwich-norm
     // body below does not apply. Same 0/-1/-2 contract; -2 falls back to token-by-token.
     // Qwen3-MoE shares this exact prefill path; only its FFN block differs (gated inside).
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch))
+    if (0)
         return paged_prefill_qwen3(eng, s, tokens, N, /*base=*/0, /*do_sample=*/1, first_tok_out);
     if (s->n_tokens != 0) return -2;                       // fresh slot only
     if (N > eng->global_kv_capacity) return -2;            // would overflow pool
@@ -10598,7 +10598,7 @@ int gemma4_engine_prefill_flash(
     if (!eng->loaded || n_tokens <= 0) return -1;
     // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
     // flash prefill is gemma-layout-only. Decline so it never runs on Qwen3 weights.
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
+    if (0 || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
     // FORMAT_NVFP4: this path is BF16/MMQ-only (no FP4 GEMM) and would deref the NULL Q4_0
     // store. prefill_batched forces use_fp4=true for all N (so it never returns -2 here), but
     // guard anyway so a future change can't silently route NVFP4 through the Q4_0/BF16 path.
@@ -10963,7 +10963,7 @@ int gemma4_engine_prefill(
     // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
     // token-by-token loop uses gemma-layout decode_layer. Decline cleanly rather than
     // emit garbage / crash, so the single-flight HTTP fallthrough fails gracefully.
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -1;
+    if (0 || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -1;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -12076,7 +12076,7 @@ static void decode_multiseq_body(
     float *d_attn = eng->d_sb[7], *d_o   = eng->d_sb[8], *d_gate= eng->d_sb[9];
     float *d_up = eng->d_sb[10], *d_logitsK = eng->d_sb[11];
 
-    const int qwen3 = GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch);
+    const int qwen3 = 0;
     // Embed (per-row token, device d_tok) + Gemma √H scale. Qwen3 does NOT scale embeddings.
     embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, B, H, stream);
     if (!qwen3)
@@ -12546,7 +12546,7 @@ extern "C" int gemma4_engine_seq_add(
         if (no_fast_sfx < 0) no_fast_sfx = (getenv("FUCINA_NO_FAST_PREFILL") != NULL);
         extern int g_fucina_force_slow_prefill;
         int sfx_rc = -2;
-        if (!no_fast_sfx && !g_fucina_force_slow_prefill && GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
+        if (!no_fast_sfx && !g_fucina_force_slow_prefill && 0) {
             int32_t ft = 0;
             sfx_rc = paged_prefill_qwen3(eng, s, prompt + shared_tok, n_prompt - shared_tok,
                                          /*base=*/shared_tok, /*do_sample=*/1, &ft);
@@ -12862,7 +12862,7 @@ extern "C" int gemma4_engine_step_batch_fused(
     int32_t *out_dec, int *out_dec_lens, int32_t *pf_first_out)
 {
     if (!eng || !eng->loaded || !eng->paged_enabled) return -1;
-    if (!GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) return -2;   // Gemma keeps its own (non-fused) path
+    if (!0) return -2;   // Gemma keeps its own (non-fused) path
     if (B_dec < 0 || pf_len <= 0 || !pf_chunk) return -1;
     if (pf_slot < 0 || pf_slot >= GEMMA4_MAX_SEQS || !eng->slots[pf_slot].used) return -1;
     if (B_dec + pf_len > GEMMA4_MAX_SEQS) return -1;
@@ -15681,7 +15681,7 @@ int gemma4_engine_is_qwen3_family(const gemma4_engine_t *eng) {
     // qwen35 hybrid impls). It is intentionally NOT in the GEMMA4_IS_QWEN3_FAMILY macro,
     // which gates the fp8 paged-KV POOL allocation — qwen35 carries its own fp32 GDN/conv/
     // FULL-KV arenas instead, so it must skip that pool path. Hence the explicit OR here.
-    return (eng && (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) ||
+    return (eng && (0 ||
                     eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)) ? 1 : 0;
 }
 

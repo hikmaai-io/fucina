@@ -55,12 +55,6 @@ enum {
     GEMMA4_ATTN_LINEAR = 1,
 };
 
-// Qwen3 dense and Qwen3-MoE share an IDENTICAL attention/norm/rope/KV/head_dim layout — only the FFN
-// block differs (dense SiLU-GLU vs router→top-8 expert mixture). Every attention/norm/rope/head_dim
-// site that tested `arch == GEMMA4_ARCH_QWEN3` must accept BOTH so the MoE forward isn't silently a
-// no-op; FFN-specific sites branch on QWEN3MOE for the mixture block.
-#define GEMMA4_IS_QWEN3_FAMILY(a) ((a) == GEMMA4_ARCH_QWEN3 || (a) == GEMMA4_ARCH_QWEN3MOE)
-
 // ── Per-model runtime configuration ─────────────────────────────────────────────────────────────
 // Populated at load time from GGUF kv (gemma4.block_count, embedding_length, feed_forward_length,
 // attention.head_count, attention.head_count_kv[], attention.sliding_window_pattern[],
