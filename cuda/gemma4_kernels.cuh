@@ -431,6 +431,13 @@ void   gemma4_host_free(void *p);
 int  gemma4_engine_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_prompt,
                            int32_t *first_token_out,
                            float temp, int top_k, float top_p, float min_p, uint64_t seed);
+// P1: batched multi-sequence admission-prefill (Qwen3.5). Returns M / 0 (unsupported) / -1.
+int  gemma4_engine_seq_add_multiseq(gemma4_engine_t *eng, const int32_t *tokens_flat,
+                           const int *lens, int M, const float *temps, const int *topks,
+                           const float *topps, const float *minps, const uint64_t *seeds,
+                           int *out_slots, int32_t *out_first);
+// DEBUG (test-only): copy just-computed first-token logits (nrows==1: d_logits; nrows>1: d_sb[11]).
+int  gemma4_engine_debug_logits(gemma4_engine_t *eng, float *out, int nrows);
 int  gemma4_engine_step_batch(gemma4_engine_t *eng, const int *slots,
                               const int32_t *in_tokens, int B, int32_t *out_tokens);
 // MTP speculative batched step: per-slot draft + one batched verify. out_tokens is
