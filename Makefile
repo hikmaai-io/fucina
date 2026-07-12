@@ -632,6 +632,12 @@ qwen35-dflash-commit-test:
 qwen35-dflash-pipeline-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_pipeline_test.cc -o /tmp/dflash_pipe && /tmp/dflash_pipe
 
+# Host-only DFlash context-KV precompute geometry (P3 shape planning): fused KV GEMM / grouped
+# K-norm / batched RoPE / cache-insert element counts + strides, config-derived and overflow-
+# guarded. Weights-free; locks the P3 device buffer sizing before the forward kernels exist.
+qwen35-dflash-pcgeom-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_precompute_geom_test.cc -o /tmp/dflash_pcgeom && /tmp/dflash_pcgeom
+
 # CUDA<->CPU parity for the DFlash RNG + rejection sampler (P1 of S1a). Self-contained, no model;
 # runs the shared __host__ __device__ header on-GPU and asserts bit-identical results vs the host.
 qwen35-dflash-parity-test:
