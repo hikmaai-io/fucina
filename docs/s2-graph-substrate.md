@@ -189,5 +189,41 @@ contract) are fully green.
   `flock /tmp/fucina_gpu.lock -c '/tmp/s2_sweep_dense.sh'` then
   `protection_gate.py check --baseline …/baseline-dense.json --candidate
   /tmp/s2_cand_dense.json` (and the MoE equivalent).
+
+### The S2b dominance-dispatch regression (found + fixed, `0a3bfb0`)
+
+The invalid attempt-1 numbers led to an A/B on the SAME binary
+(`FUCINA_QWEN35_NO_GPU_SPLICE`): splice ON = `engine 74 ms/step`, splice OFF =
+`30 ms/step`, decode throughput HALVED at N=2/4/8. Instrumentation showed the
+regression tracked **graph dispatch**, not the splice kernels: under continuous
+batching only two graphs were ever captured (nt=1, nt=31), and every
+steady-state decode step (B=2/4/8) matched the **nt=31 admission-peak graph** by
+DOMINANCE (`q35_graph_dominates({31,31,1},{4,4,1})==true`). Because fucina runs
+exactly `key.num_tokens` rows of REAL work with NO per-step input padding, a
+31-row graph replaying a 4-row step processes 31 rows — ~8× waste. Determinism
+was never affected (the 4 real rows were always correct; the extra rows were
+discarded), which is why the correctness gates passed while throughput tanked.
+
+**Fix**: decode dispatch is now EXACT-match (`q35_graph_exact_match`).
+`q35_graph_dominates` is retained in the header as the primitive for the FUTURE
+S1/DFlash path, which pads every device buffer to max shapes — only then is
+serving a smaller batch from a larger capture correct AND cheap. A host
+regression lock in `qwen35-graph-key-test` now asserts a 31-row graph never
+matches a 4-row step. This bug was introduced by S2b (the old `graph[B]` array
+was implicitly exact-match) and masked until a clean multi-batch server sweep.
+
+### Protection gate — PASS (quiescent box, post-fix)
+
+Both models, `protection_gate.py check` vs the frozen 2026-07-11 baselines
+(absolute 5% floor + contemporaneous-vLLM competitive edge). ms/step tracked avgB
+cleanly (dense 31→71 ms at B=1→30; MoE 18→57 ms), confirming no contention.
+
+- **dense — GATE PASS**: every cell above floor; claimed-win N=2/4/8 beat vLLM
+  (57.0/112.8/193.8 vs vLLM 42.9/83.9/161.7); N=16/32 improved to 304.8/375.2
+  (base 235.3/260.6).
+- **MoE — GATE PASS**: every cell far above floor (N=1 59.2 vs base 33.9; N=32
+  453.2 vs base 293.4); N=8 claimed-win beats vLLM (224.5 vs 146.5).
+
+S2 is throughput-neutral-to-positive and byte-identical deterministic.
 </content>
 </invoke>
