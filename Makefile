@@ -752,6 +752,14 @@ qwen35-dflash-verify-block-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_dflash_verify_block $(QWEN35_MODEL)"
 
+# DFlash verify-block target-logits self-consistency: the exposed [T,vocab] target logits argmax to
+# the block's per-row argmax (proves they are the real verify distribution). Uses target GGUF/FP8.
+qwen35-dflash-verify-logits-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_verify_logits.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dflash_verify_logits \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_dflash_verify_logits $(DFLASH_TARGET)"
+
 # DFlash END-TO-END greedy losslessness gate: emitted stream MUST be byte-identical to plain greedy
 # decode for arbitrary/adversarial drafts (the S1a losslessness proof); reports measured emitted/step.
 qwen35-dflash-e2e-test: lib libdg

@@ -15687,6 +15687,14 @@ extern "C" int gemma4_engine_q35_dflash_verify_block(gemma4_engine_t *eng, int s
     return qwen35_dflash_verify_block(eng, slot, block, T, out_argmax);
 }
 
+// S1a P4 (probabilistic): score a (1+K) verify block returning BOTH per-row argmax and the per-row
+// target logits [T, vocab] into a caller-provided DEVICE buffer. Used by the probabilistic serving
+// path (rejection needs the full target distribution). See qwen35_dflash_verify_block_ex.
+extern "C" int gemma4_engine_q35_dflash_verify_block_logits(gemma4_engine_t *eng, int slot,
+        const int32_t *block, int T, int32_t *out_argmax, float *d_out_logits) {
+    return qwen35_dflash_verify_block_ex(eng, slot, block, T, out_argmax, d_out_logits);
+}
+
 // S1a P4: one greedy DFlash step (verify + accept + commit). Lossless + draft-content-independent.
 extern "C" int gemma4_engine_q35_dflash_greedy_step(gemma4_engine_t *eng, int slot, int32_t bonus,
         const int32_t *draft, int K, int32_t *out_emit, int *out_n, int32_t *next_bonus) {

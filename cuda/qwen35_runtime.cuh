@@ -1991,8 +1991,8 @@ static int q35_gdn_commit(gemma4_engine_t *eng, int slot, const int32_t *accepte
 // state with the SAME kernels as sequential decode and captures per-row argmax with the SAME head,
 // out_argmax[t] equals what a sequential decode would have produced at that position — the greedy
 // verify contract. This does not commit; the caller applies the accept decision + commit.
-static int qwen35_dflash_verify_block(gemma4_engine_t *eng, int slot, const int32_t *block, int T,
-                                      int32_t *out_argmax) {
+static int qwen35_dflash_verify_block_ex(gemma4_engine_t *eng, int slot, const int32_t *block, int T,
+                                         int32_t *out_argmax, float *out_logits) {
     if (!eng || !eng->loaded || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -1;
     if (slot < 0 || slot >= eng->q35.capacity || !eng->slots[slot].used) return -1;
     if (T <= 0 || T > GEMMA4_MAX_SEQS) return -1;
@@ -2015,7 +2015,13 @@ static int qwen35_dflash_verify_block(gemma4_engine_t *eng, int slot, const int3
     cudaMemcpyAsync(d_slot, h_slot, (size_t)T*sizeof(int), cudaMemcpyHostToDevice, st);
     // Score the block (advances state through all T rows), capturing all-row argmax (want_logits=2).
     qwen35_prefill_chunk_body(eng, slot, base, T, /*want_logits=*/2, st);
-    cudaMemcpyAsync(out_argmax, eng->d_ms_outtok, (size_t)T*sizeof(int32_t), cudaMemcpyDeviceToHost, st);
+    if (out_argmax)
+        cudaMemcpyAsync(out_argmax, eng->d_ms_outtok, (size_t)T*sizeof(int32_t), cudaMemcpyDeviceToHost, st);
+    // Probabilistic path: also copy the per-row target logits [T, vocab] from d_sb[11] (device->
+    // device: the caller passes a device buffer). Greedy callers pass NULL and pay nothing.
+    if (out_logits)
+        cudaMemcpyAsync(out_logits, eng->d_sb[11], (size_t)T*eng->cfg.vocab_size*sizeof(float),
+                        cudaMemcpyDeviceToDevice, st);
     cudaStreamSynchronize(st);
     if (cudaGetLastError() != cudaSuccess) { eng->q35.gdn_snap_ntokens[slot] = -1; return -1; }
     // Roll GDN state back to the snapshot (n_tokens restored to base). The snapshot is LEFT LIVE so
@@ -2023,6 +2029,11 @@ static int qwen35_dflash_verify_block(gemma4_engine_t *eng, int slot, const int3
     // (no commit) should rewind explicitly. keep_snapshot=1 preserves gdn_snap_ntokens.
     if (q35_gdn_restore_snapshot(eng, slot) != 0) return -1;
     return 0;
+}
+// Back-compat greedy wrapper: argmax only, no logit copy.
+static int qwen35_dflash_verify_block(gemma4_engine_t *eng, int slot, const int32_t *block, int T,
+                                      int32_t *out_argmax) {
+    return qwen35_dflash_verify_block_ex(eng, slot, block, T, out_argmax, nullptr);
 }
 
 // ─── S1a P4: one greedy DFlash step (verify + accept + commit) ───────────────────────

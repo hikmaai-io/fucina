@@ -395,6 +395,11 @@ int    gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot);
 int    gemma4_engine_q35_dflash_verify_block(gemma4_engine_t *eng, int slot,
                                              const int32_t *block, int T, int32_t *out_argmax);
 
+// S1a P4 (probabilistic): verify block returning per-row argmax AND per-row target logits
+// [T, vocab] into d_out_logits (a DEVICE buffer). Used by the probabilistic serving path.
+int    gemma4_engine_q35_dflash_verify_block_logits(gemma4_engine_t *eng, int slot,
+        const int32_t *block, int T, int32_t *out_argmax, float *d_out_logits);
+
 // S1a P4: one greedy DFlash step. Given the slot, the bonus token (next to decode) and K draft
 // tokens, verifies the (1+K) block, greedily accepts the leading matching run, commits [bonus ++
 // accepted] losslessly, and emits [accepted drafts ++ correction] into out_emit[0..*out_n). The
