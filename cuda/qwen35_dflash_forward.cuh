@@ -17,7 +17,8 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "qwen35_dflash_residency.cuh"
-#include "qwen35_dflash_rng.cuh"   // shared-key counter RNG (probabilistic draft sampling)
+#include "qwen35_dflash_rng.cuh"      // shared-key counter RNG (probabilistic draft sampling)
+#include "qwen35_dflash_reject.cuh"   // greedy + probabilistic rejection oracle (host/device)
 
 // ── device kernels reading BF16 weights (fp32 compute, double accumulation) ──
 __global__ void q35df_rmsnorm(const float* x,const __nv_bfloat16* w,float* y,int H,int rows,float eps){
@@ -367,6 +368,29 @@ __global__ void q35df_embed(const int32_t* ids, const __nv_bfloat16* embed, floa
 static inline void q35_dflash_embed_query(const int32_t* dids, const __nv_bfloat16* embed, float* out,
                                           int rows, int H, cudaStream_t st){
     q35df_embed<<<rows,256,0,st>>>(dids, embed, out, rows, H);
+}
+
+// ── Probabilistic verify-accept over target+draft logit blocks (single request, one block) ──
+// Device analog of q35_dflash_verify_prob operating on resident logit blocks. target_logits is
+// (1+K) rows [vocab]; draft_logits is K rows [vocab]; draft_tokens the K drafted ids; pos[i] the
+// absolute position of drafted token i; pos_bonus the bonus position. Uses the shared-key uniforms
+// (seed, pos, ACCEPT/RESIDUAL/SAMPLE) so it reproduces the draft's own draws. Single block (the
+// vocab-serial rejection is cheap for one request); out_accept[0]=j, out_emit[0]=emitted token.
+// Matches the P1 host oracle q35_dflash_verify_prob bit-for-bit.
+__global__ void q35df_verify_prob_kernel(const float* target_logits, const float* draft_logits,
+        int vocab, const int32_t* draft_tokens, int K, uint64_t seed,
+        const int64_t* pos, int64_t pos_bonus, int* out_accept, int32_t* out_emit){
+    if(threadIdx.x||blockIdx.x) return;
+    // Reuse the shared host/device reference directly (it is __host__ __device__).
+    q35_dflash_verify_result r = q35_dflash_verify_prob(target_logits, draft_logits, vocab,
+                                                        draft_tokens, K, seed, pos, pos_bonus);
+    *out_accept = r.accepted_len; *out_emit = r.emitted_token;
+}
+static inline void q35_dflash_verify_prob_device(const float* target_logits, const float* draft_logits,
+        int vocab, const int32_t* draft_tokens, int K, uint64_t seed,
+        const int64_t* pos, int64_t pos_bonus, int* out_accept, int32_t* out_emit, cudaStream_t st){
+    q35df_verify_prob_kernel<<<1,1,0,st>>>(target_logits, draft_logits, vocab, draft_tokens, K,
+                                           seed, pos, pos_bonus, out_accept, out_emit);
 }
 
 // ── Single drafting entry point (the verify loop calls this) ──
