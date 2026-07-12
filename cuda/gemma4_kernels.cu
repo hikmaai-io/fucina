@@ -87,6 +87,8 @@ static int moe_alloc_scratch(gemma4_engine_t *eng);          // defined with the
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
 #include "fp8_block.cuh"          // M5: DeepSeek block-fp8 decode GEMV (Qwen3.5-9B FP8)
 #include "qwen35_fp8_loader.h"    // M5: qwen35 FP8 safetensors → engine key mapping
 // =========================================================================
@@ -5092,6 +5094,8 @@ gemma4_engine_t* gemma4_engine_create(
     eng->q35.dflash_capture_active = 0; eng->q35.dflash_capture_nfeat = 0;
     eng->q35.dflash_aux = NULL;
     for (int i = 0; i < GEMMA4_CAP_LAYERS; i++) { eng->q35.dflash_capture_layer[i] = 0; eng->q35.dflash_capture_slot[i] = 0; }
+    eng->q35.dflash_residency = NULL; eng->q35.dflash_drafter = NULL;
+    eng->q35.dflash_loaded = 0; eng->q35.dflash_load_failed = 0;
     eng->q35.d_slot_tok = NULL; eng->q35.d_slot_pos = NULL;
     eng->q35.rowslot = NULL; eng->q35.chunk_scr = NULL;
     eng->q35.pf_pos = NULL; eng->q35.pf_tok = NULL;
@@ -6586,6 +6590,7 @@ gemma4_engine_t* gemma4_engine_create(
     return eng;
 }
 
+static void q35_dflash_unload(gemma4_engine_t *eng);   // S1a: defined after the forward-header include
 void gemma4_engine_destroy(gemma4_engine_t *eng) {
     if (!eng) return;
 
@@ -6709,6 +6714,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     for (int s = 0; s < GEMMA4_MAX_SEQS; s++) {   // P0 GDN rollback snapshots
         CUDA_FREE(eng->q35.gdn_snap_slab[s]); eng->q35.gdn_snap_ntokens[s] = -1;
     }
+    q35_dflash_unload(eng);           // S1a P3/P4 resident draft model (drafter + residency)
     CUDA_FREE(eng->q35.dflash_aux);   // S1a P4 target aux-hidden capture buffer
     for (int i = 0; i < 24; i++) CUDA_FREE(eng->q35.sb[i]);
     CUDA_FREE(eng->q35.rowslot);
@@ -15672,4 +15678,101 @@ extern "C" int gemma4_engine_q35_gdn_commit(gemma4_engine_t *eng, int slot,
 }
 extern "C" int gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot) {
     return q35_gdn_commit(eng, slot, nullptr, 0, nullptr);
+}
+
+// ─── S1a P3/P4 resident draft model lifecycle ──────────────────────────────────────
+#include "qwen35_dflash_forward.cuh"   // residency + drafter + draft entry point (validated modules)
+
+// Lazily load the draft checkpoint (config-derived path FUCINA_QWEN35_DFLASH_PATH) and build the
+// resident draft model + drafter. Returns 0 on success (or already loaded), non-zero on failure
+// (marks load_failed so we never retry per step). Only the dense Qwen3.5-9B target is supported;
+// the draft's target vocab must match. This does NOT run any forward; it only makes the substrate
+// resident. Configures the aux-hidden capture layer map from the draft's target_layer_ids.
+static int q35_dflash_ensure_loaded(gemma4_engine_t *eng) {
+    if (eng->q35.dflash_loaded) return 0;
+    if (eng->q35.dflash_load_failed) return -1;
+    const char *path = getenv("FUCINA_QWEN35_DFLASH_PATH");
+    if (!path || !*path) { eng->q35.dflash_load_failed = 1; return -1; }
+
+    std::string cfgp = std::string(path) + "/config.json";
+    std::string cj; { std::ifstream f(cfgp); if (f) { std::stringstream ss; ss << f.rdbuf(); cj = ss.str(); } }
+    if (cj.empty()) { eng->q35.dflash_load_failed = 1; return -1; }
+
+    auto *R = new q35_dflash_residency{};
+    std::string err;
+    if (!qwen35dflash::parse_config(cj, R->geom, err)) {
+        fprintf(stderr, "fucina: DFlash draft config rejected: %s\n", err.c_str());
+        delete R; eng->q35.dflash_load_failed = 1; return -1;
+    }
+    // The draft's vocab must match the target's (no reduced-vocab d2t path in-engine yet).
+    st::Model M;
+    std::string stp = std::string(path) + "/model.safetensors";
+    if (!M.open(stp.c_str(), err)) {
+        fprintf(stderr, "fucina: DFlash draft open failed: %s\n", err.c_str());
+        delete R; eng->q35.dflash_load_failed = 1; return -1;
+    }
+    if (!qwen35dflash::validate_tensors(M, R->geom, eng->cfg.vocab_size, err)) {
+        fprintf(stderr, "fucina: DFlash draft tensor validation failed: %s\n", err.c_str());
+        delete R; eng->q35.dflash_load_failed = 1; return -1;
+    }
+    if (R->geom.V != eng->cfg.vocab_size || R->geom.H != eng->cfg.hidden_size) {
+        fprintf(stderr, "fucina: DFlash draft geometry mismatch (V %d/%d H %d/%d)\n",
+                R->geom.V, eng->cfg.vocab_size, R->geom.H, eng->cfg.hidden_size);
+        delete R; eng->q35.dflash_load_failed = 1; return -1;
+    }
+    if (q35_dflash_residency_upload(R, M, err) != 0) {
+        fprintf(stderr, "fucina: DFlash draft upload failed: %s\n", err.c_str());
+        delete R; eng->q35.dflash_load_failed = 1; return -1;
+    }
+    // Config-derived K (draft block_size) clamped by the planner; drafter context cap from maxctx.
+    int K = q35_dflash_clamp_k(R->geom.block_size > 0 ? R->geom.block_size : 4);
+    auto *D = new q35_dflash_drafter{};
+    if (!q35_dflash_drafter_init(D, *R, K, eng->q35.maxctx)) {
+        fprintf(stderr, "fucina: DFlash drafter init failed\n");
+        q35_dflash_residency_free(R); delete R; delete D; eng->q35.dflash_load_failed = 1; return -1;
+    }
+    // Aux-hidden capture map from target_layer_ids: parse the ids and mark those target layers.
+    // Feature slot = position in the id list (matches the fc concat order).
+    eng->q35.dflash_capture_nfeat = R->geom.num_target_features;
+    { size_t p = cj.find("\"target_layer_ids\""); if (p != std::string::npos) {
+        size_t b = cj.find('[', p), e = cj.find(']', b); int slot = 0;
+        for (size_t i = b + 1; i < e && slot < GEMMA4_CAP_LAYERS; ) {
+            while (i < e && (cj[i] == ' ' || cj[i] == ',')) i++;
+            if (i >= e || cj[i] < '0' || cj[i] > '9') break;
+            int v = atoi(cj.c_str() + i);
+            while (i < e && cj[i] >= '0' && cj[i] <= '9') i++;
+            if (v >= 0 && v < GEMMA4_CAP_LAYERS) { eng->q35.dflash_capture_layer[v] = 1; eng->q35.dflash_capture_slot[v] = slot++; }
+        }
+    } }
+    if (!eng->q35.dflash_aux)
+        cudaMalloc(&eng->q35.dflash_aux, (size_t)R->geom.num_target_features * eng->cfg.hidden_size * sizeof(float));
+
+    eng->q35.dflash_residency = R; eng->q35.dflash_drafter = D; eng->q35.dflash_loaded = 1;
+    fprintf(stderr, "fucina: DFlash draft model resident (%d layers, K=%d, %d aux features)\n",
+            R->geom.L, K, R->geom.num_target_features);
+    return 0;
+}
+
+static void q35_dflash_unload(gemma4_engine_t *eng) {
+    if (eng->q35.dflash_drafter) {
+        auto *D = (q35_dflash_drafter *)eng->q35.dflash_drafter;
+        if (eng->q35.dflash_residency) q35_dflash_drafter_free(D, *(q35_dflash_residency *)eng->q35.dflash_residency);
+        delete D; eng->q35.dflash_drafter = NULL;
+    }
+    if (eng->q35.dflash_residency) {
+        auto *R = (q35_dflash_residency *)eng->q35.dflash_residency;
+        q35_dflash_residency_free(R); delete R; eng->q35.dflash_residency = NULL;
+    }
+    eng->q35.dflash_loaded = 0;
+}
+
+// Test/serving entry: force-load the draft substrate (returns 0/!=0). Exposed so a gate can prove
+// the engine loads the real checkpoint end to end without running a full server.
+extern "C" int gemma4_engine_q35_dflash_load(gemma4_engine_t *eng) {
+    if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -1;
+    if (ensure_q35_scratch(eng) != 0) return -1;
+    return q35_dflash_ensure_loaded(eng);
+}
+extern "C" int gemma4_engine_q35_dflash_ready(gemma4_engine_t *eng) {
+    return (eng && eng->q35.dflash_loaded) ? 1 : 0;
 }

@@ -389,6 +389,12 @@ int    gemma4_engine_q35_gdn_commit(gemma4_engine_t *eng, int slot,
                                     const int32_t *accepted, int j, int32_t *out_next);
 int    gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot);
 
+// S1a P3/P4: lazily load the resident DFlash draft model from FUCINA_QWEN35_DFLASH_PATH (config +
+// safetensors). Returns 0 on success/already-loaded, non-zero on failure (validated + geometry-
+// checked against the target). ready reports whether the draft substrate is resident.
+int    gemma4_engine_q35_dflash_load(gemma4_engine_t *eng);
+int    gemma4_engine_q35_dflash_ready(gemma4_engine_t *eng);
+
 // Named device-memory accounting. Qwen fields are zero for other architectures.
 typedef struct gemma4_memory_stats {
     uint64_t qwen_workspace_bytes;

@@ -699,6 +699,16 @@ qwen35-dflash-draft-test:
 		-lcudart -lcuda
 	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_draft"
 
+# DFlash engine load gate: the live Qwen3.5-9B target engine lazily loads + validates the resident
+# draft model (geometry+vocab matched) from FUCINA_QWEN35_DFLASH_PATH. SKIPs if target/draft absent.
+qwen35-dflash-engine-load-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_engine_load.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dflash_engine_load \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "FUCINA_QWEN35_DFLASH_PATH=$(DFLASH_PATH) /tmp/fucina_dflash_engine_load $(QWEN35_MODEL)"
+
+DFLASH_PATH ?= /opt/spark/models/models--z-lab--Qwen3.5-9B-DFlash/snapshots/5fc3b3d474760f18c516db87d84c37edbfd3ede6
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:

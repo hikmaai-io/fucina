@@ -85,6 +85,14 @@ struct qwen35_runtime_state {
     int            dflash_capture_slot[GEMMA4_CAP_LAYERS];   // target layer -> feature slot [0,F)
     float         *dflash_aux;                        // [F * H] device concat buffer (last row)
 
+    // S1a P3/P4 resident draft model (opaque handles; real types in qwen35_dflash_forward.cuh).
+    // Loaded lazily on the first enabled verify step from FUCINA_QWEN35_DFLASH_PATH; NULL when the
+    // feature is off or the draft checkpoint is unavailable (verify then falls back to plain decode).
+    void          *dflash_residency;                  // q35_dflash_residency*
+    void          *dflash_drafter;                    // q35_dflash_drafter*
+    int            dflash_loaded;                     // 1 once residency+drafter are ready
+    int            dflash_load_failed;                // 1 if a load attempt failed (don't retry)
+
     // Stable device pointer tables indexed by slot. Individual slot allocations are created on
     // first admission and retained for reuse; graphs dereference these tables at replay time.
     __nv_bfloat16 **S[GEMMA4_CAP_LAYERS];
