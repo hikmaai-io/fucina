@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "qwen35_dflash_residency.cuh"
+#include "qwen35_dflash_rng.cuh"   // shared-key counter RNG (probabilistic draft sampling)
 
 // ── device kernels reading BF16 weights (fp32 compute, double accumulation) ──
 __global__ void q35df_rmsnorm(const float* x,const __nv_bfloat16* w,float* y,int H,int rows,float eps){
@@ -282,6 +283,42 @@ __global__ void q35df_head_argmax(const float* hidden, const __nv_bfloat16* lm_h
 static inline void q35_dflash_sample_greedy(const float* sampled_hidden, const __nv_bfloat16* lm_head,
         int K, int H, int vocab, int32_t* out_tok, cudaStream_t st){
     q35df_head_argmax<<<K,256,0,st>>>(sampled_hidden, lm_head, H, vocab, out_tok);
+}
+
+// Probabilistic draft sampling with the shared-key uniform: row r samples from softmax(logits_r/T)
+// via inverse-CDF using u = CounterRNG(seed, pos_r, SAMPLE). Also materializes the per-row logits
+// into out_logits [K, vocab] (fp32) so the verifier can compute the rejection ratio against the same
+// draft distribution. One block per row: compute logits (LM head), softmax denom, inverse-CDF pick.
+// Matches q35_dflash_uniform_open + softmax inverse-CDF (the P1 draft-sample contract) bit-for-bit.
+__global__ void q35df_head_sample(const float* hidden, const __nv_bfloat16* lm_head, int H, int vocab,
+                                  float* out_logits, int32_t* out_tok, double temp,
+                                  uint64_t seed, const int64_t* pos){
+    int row=blockIdx.x; const float* h=hidden+(size_t)row*H; float* lo=out_logits+(size_t)row*vocab;
+    // Compute logits row (each thread strides the vocab), and track max for stable softmax.
+    __shared__ double smax; __shared__ double ssum;
+    double lmax=-1e300;
+    for(int o=threadIdx.x;o<vocab;o+=blockDim.x){ const __nv_bfloat16* w=lm_head+(size_t)o*H; double acc=0; for(int i=0;i<H;i++) acc+=(double)h[i]*(double)__bfloat162float(w[i]); double l=acc/temp; lo[o]=(float)l; if(l>lmax) lmax=l; }
+    // block max reduce
+    __shared__ double rbuf[256]; rbuf[threadIdx.x]=lmax; __syncthreads();
+    for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s && rbuf[threadIdx.x+s]>rbuf[threadIdx.x]) rbuf[threadIdx.x]=rbuf[threadIdx.x+s]; __syncthreads(); }
+    if(threadIdx.x==0) smax=rbuf[0]; __syncthreads();
+    // block sum of exp
+    double ps=0; for(int o=threadIdx.x;o<vocab;o+=blockDim.x) ps+=exp((double)lo[o]-smax);
+    rbuf[threadIdx.x]=ps; __syncthreads();
+    for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s) rbuf[threadIdx.x]+=rbuf[threadIdx.x+s]; __syncthreads(); }
+    if(threadIdx.x==0) ssum=rbuf[0]; __syncthreads();
+    // inverse-CDF on thread 0 (vocab-serial; K rows in parallel across blocks).
+    if(threadIdx.x==0){
+        double u=q35_dflash_uniform_open(seed, pos[row], Q35_DFLASH_DOMAIN_SAMPLE);
+        double target=u*ssum, acc=0; int32_t pick=vocab-1;
+        for(int o=0;o<vocab;o++){ acc+=exp((double)lo[o]-smax); if(acc>=target){ pick=o; break; } }
+        out_tok[row]=pick;
+    }
+}
+static inline void q35_dflash_sample_prob(const float* sampled_hidden, const __nv_bfloat16* lm_head,
+        int K, int H, int vocab, float* out_logits, int32_t* out_tok, double temp,
+        uint64_t seed, const int64_t* dpos, cudaStream_t st){
+    q35df_head_sample<<<K,256,0,st>>>(sampled_hidden, lm_head, H, vocab, out_logits, out_tok, temp, seed, dpos);
 }
 
 // ── Greedy verify-accept over the target logit block ──

@@ -678,6 +678,13 @@ qwen35-dflash-query-test:
 		-lcudart -lcuda
 	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_query"
 
+# DFlash probabilistic draft sampler: device shared-key inverse-CDF token + materialized per-row
+# logits vs a host softmax reference at temperature. Self-contained. Flocks the GPU.
+qwen35-dflash-sample-prob-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_sample_prob.cu -o /tmp/dflash_sampprob \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_sampprob"
+
 # DFlash greedy draft sampling: device LM-head projection + deterministic argmax over K sampled
 # query rows vs a host reference (incl. lowest-index tie rule). Self-contained. Flocks the GPU.
 qwen35-dflash-sample-test:
