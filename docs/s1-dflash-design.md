@@ -79,14 +79,26 @@ real z-lab draft:
 - prompt 2 (numeric ids): **losslessness FAILS at the tail** under many rejections
   — a real bug (`qwen35-dflash-measure-test` returns nonzero, kept honest).
 
-Ruled out for the prompt-2 bug: verify-block per-row argmax (proven 17/17 == seq
-decode at K=16 on the same numeric prompt); Q8-vs-BF16 head (Q8 head is exact by
-design). The failure is in the MULTI-STEP accumulation path, not the verify math
-— prime suspects: draft-forward corrupting shared FP8 engine scratch (d_sb/cublas
-workspace) or a KV/context growth interaction at high position. This MUST be fixed
-before S1A_VALIDATED: losslessness is absolute. No speedup claimed (the reference
-draft kernels are unoptimized fp64-accum; wall-clock is not yet favorable and is
-reported honestly as such).
+Isolation results (all GPU-verified on the FP8 target):
+- verify-block per-row argmax: **lossless, 17/17 == sequential decode at K=16** on
+  the failing numeric prompt (so the verify math is correct).
+- Q8-vs-BF16 head: Q8 head is exact-by-design.
+- draft-model forward corrupting scratch: **RULED OUT** — the failure reproduces
+  with SYNTHETIC drafts (no draft-model forward) via greedy_step (`iso.cu`).
+- K dependence: **RULED OUT** — fails at the same emit index 45 with K=1 and K=16.
+- prompt dependence: **CONFIRMED** — the France prompt is lossless to N=56 (14
+  steps); the numeric prompt {100,200,..,1000} fails at emit 45. Plain greedy on
+  the numeric prompt is deterministic (56/56 across two runs).
+- P0 GDN rollback gate: PASS on FP8 (single snapshot->advance->commit byte-
+  identical), so ONE commit is perfect.
+
+Conclusion: the bug is in the REPEATED snapshot/commit cycle, prompt-specific,
+not the verify math or the draft. Prime suspect: `q35_gdn_commit` restores the
+bf16 GDN recurrent snapshot but does NOT restore the FULL-attention KV cache the
+speculative verify block wrote; for some sequences a stale speculative KV entry is
+later read. Next: invalidate/rewrite speculative KV on commit, or snapshot+restore
+the affected KV region. This MUST be fixed before S1A_VALIDATED — losslessness is
+absolute. No speedup claimed (reference draft kernels are unoptimized fp64-accum).
 
 ### (superseded) earlier status: greedy LOSSLESS proven; acceptance = 0
 
