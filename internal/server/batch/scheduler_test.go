@@ -50,6 +50,9 @@ type mockEngine struct {
 	// addCalls / removeCalls count admissions and evictions for leak checks.
 	addCalls    int
 	removeCalls int
+
+	// multiseqCalls counts batched-admission (SeqAddMultiseq) calls.
+	multiseqCalls int
 }
 
 func newMockEngine(capacity int) *mockEngine {
@@ -87,6 +90,35 @@ func (m *mockEngine) AddSeq(prompt []int32, _ SeqParams) (int, int32, error) {
 	// keep it deterministic. Use a base of slot*1000 + 1.
 	first := int32(slot*1000 + 1)
 	return slot, m.tokenFor(slot, first), nil
+}
+
+// SeqAddMultiseq mirrors AddSeq for M prompts in one call (P1 batched admission path).
+func (m *mockEngine) SeqAddMultiseq(prompts [][]int32, _ []SeqParams) ([]int, []int32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.addErr != nil {
+		return nil, nil, m.addErr
+	}
+	m.multiseqCalls++
+	M := len(prompts)
+	slots := make([]int, M)
+	firsts := make([]int32, M)
+	for i := 0; i < M; i++ {
+		m.addCalls++
+		var slot int
+		if n := len(m.free); n > 0 {
+			slot = m.free[n-1]
+			m.free = m.free[:n-1]
+		} else {
+			slot = m.nextSlot
+			m.nextSlot++
+		}
+		m.live[slot] = true
+		m.produced[slot] = 0
+		slots[i] = slot
+		firsts[i] = m.tokenFor(slot, int32(slot*1000+1))
+	}
+	return slots, firsts, nil
 }
 
 // tokenFor applies the stop-token policy to a freshly produced token for slot.
@@ -300,6 +332,59 @@ func TestIdleBurstAdmitsInOnePass(t *testing.T) {
 	}
 	if got := len(steps[0]); got != n {
 		t.Errorf("first StepBatch advanced %d slots, want %d (burst was not admitted in one pass)", got, n)
+	}
+}
+
+// TestBatchedAdmissionCancellation (P1, rev-2 correctness matrix — cancellation mid-admit):
+// a burst where one request's ctx is already cancelled must NOT corrupt the batched admission
+// of the others. admitBatched stops the batch at the cancelled request (leaving it to the serial
+// reply-cancel), so the leading run admits via SeqAddMultiseq, the cancelled one finishes
+// FinishCancelled, and the tail admits serially — no slot leak, no wrong reasons.
+func TestBatchedAdmissionCancellation(t *testing.T) {
+	const n = 4
+	const cancelIdx = 2
+	eng := newMockEngine(n)
+	sched := New(eng, 16)
+
+	cols := make([]*collector, n)
+	dones := make([]chan Result, n)
+	for i := 0; i < n; i++ {
+		cols[i] = &collector{}
+		dones[i] = make(chan Result, 1)
+		ctx := context.Background()
+		if i == cancelIdx {
+			c, cancel := context.WithCancel(context.Background())
+			cancel()
+			ctx = c
+		}
+		if err := sched.Submit(Request{
+			Tokens: []int32{int32(i)},
+			MaxNew: 3,
+			Ctx:    ctx,
+			Emit:   cols[i].emit,
+			Done:   dones[i],
+		}); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	sched.Start()
+	defer sched.Shutdown()
+
+	for i := 0; i < n; i++ {
+		res := waitResult(t, dones[i])
+		if i == cancelIdx {
+			if res.Reason != FinishCancelled {
+				t.Errorf("cancelled seq %d: reason = %q, want %q", i, res.Reason, FinishCancelled)
+			}
+		} else if res.Reason != FinishLength {
+			t.Errorf("seq %d: reason = %q, want %q", i, res.Reason, FinishLength)
+		}
+	}
+	if eng.multiseqCalls == 0 {
+		t.Error("batched admission (SeqAddMultiseq) never fired for the burst")
+	}
+	if eng.addCalls != eng.removeCalls {
+		t.Errorf("slot leak: %d admitted (add), %d freed (remove)", eng.addCalls, eng.removeCalls)
 	}
 }
 
