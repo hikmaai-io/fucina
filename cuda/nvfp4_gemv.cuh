@@ -308,6 +308,14 @@ static inline void nvfp4_gemv_batched_launch(
 #ifndef BF16_HEAD_B_ROWS
 #define BF16_HEAD_B_ROWS 12
 #endif
+// Rows/warp for the K>16 single-pass head tile (P2 dense decode). R=3 (the "~96 acc regs"
+// continuation of 12/6) is latency-capped: only R×4=12 in-flight weight loads per lane →
+// 28.6 ms at K=32 (142 GB/s). R=6 doubles the accumulators (255-reg cap, occupancy 17%)
+// but restores the K=16 tile's load parallelism: 16.1 ms at K=32 (~253 GB/s). R=4: 21 ms.
+// Measured on GB10, vocab 248320 × H 4096 BF16 head; see docs/qwen35-p2-dense-decode.md §4.
+#ifndef BF16_HEAD_B_KWIDE_ROWS
+#define BF16_HEAD_B_KWIDE_ROWS 6
+#endif
 // Single-token BF16 head GEMV (register-blocked, weight read once), the K×-loop reference for the
 // batched head bench. Mirrors the engine's bf16_head_gemv_kernel; named distinctly so this header
 // can be included alongside the engine TU without a duplicate symbol.
@@ -440,13 +448,15 @@ __global__ void bf16_head_gemv_batched_kernel(
 }
 // Dispatch the batched BF16 head to its compile-time-K kernel. `xt` = transposed activation
 // [in_dim][K] (nvfp4_xT_launch). Output token-major [K][out_dim]. CUDA-graph-capturable.
-// K<=16 supported: one call reads the head weights ONCE for up to 16 rows (K 9..16 runs a
-// narrower 6-row warp tile to stay inside the register budget).
+// K<=32 supported: one call reads the head weights ONCE for up to 32 rows (K 9..16 runs a
+// 6-row warp tile, K 17..32 a BF16_HEAD_B_KWIDE_ROWS tile, to stay inside the register
+// budget). Per-(token,row) k-order is identical across tiles, so a K=30 single pass is
+// bitwise-identical to the 16+14 two-pass split it replaces.
 static inline void bf16_head_gemv_batched_launch(
     float* y, const __nv_bfloat16* w, const float* xt,
     int in_dim, int out_dim, int K, cudaStream_t stream)
 {
-    const int rows = (K <= 8) ? BF16_HEAD_B_ROWS : 6;
+    const int rows = (K <= 8) ? BF16_HEAD_B_ROWS : (K <= 16 ? 6 : BF16_HEAD_B_KWIDE_ROWS);
     const int per_blk = BF16_HEAD_B_WARPS * rows;
     unsigned blocks = (unsigned)((out_dim + per_blk - 1) / per_blk);
     dim3 b(32 * BF16_HEAD_B_WARPS), g(blocks);
@@ -461,6 +471,14 @@ static inline void bf16_head_gemv_batched_launch(
         BF16_HB_DISPATCH(9, 6)  BF16_HB_DISPATCH(10, 6) BF16_HB_DISPATCH(11, 6)
         BF16_HB_DISPATCH(12, 6) BF16_HB_DISPATCH(13, 6) BF16_HB_DISPATCH(14, 6)
         BF16_HB_DISPATCH(15, 6) BF16_HB_DISPATCH(16, 6)
+        BF16_HB_DISPATCH(17, BF16_HEAD_B_KWIDE_ROWS) BF16_HB_DISPATCH(18, BF16_HEAD_B_KWIDE_ROWS)
+        BF16_HB_DISPATCH(19, BF16_HEAD_B_KWIDE_ROWS) BF16_HB_DISPATCH(20, BF16_HEAD_B_KWIDE_ROWS)
+        BF16_HB_DISPATCH(21, BF16_HEAD_B_KWIDE_ROWS) BF16_HB_DISPATCH(22, BF16_HEAD_B_KWIDE_ROWS)
+        BF16_HB_DISPATCH(23, BF16_HEAD_B_KWIDE_ROWS) BF16_HB_DISPATCH(24, BF16_HEAD_B_KWIDE_ROWS)
+        BF16_HB_DISPATCH(25, BF16_HEAD_B_KWIDE_ROWS) BF16_HB_DISPATCH(26, BF16_HEAD_B_KWIDE_ROWS)
+        BF16_HB_DISPATCH(27, BF16_HEAD_B_KWIDE_ROWS) BF16_HB_DISPATCH(28, BF16_HEAD_B_KWIDE_ROWS)
+        BF16_HB_DISPATCH(29, BF16_HEAD_B_KWIDE_ROWS) BF16_HB_DISPATCH(30, BF16_HEAD_B_KWIDE_ROWS)
+        BF16_HB_DISPATCH(31, BF16_HEAD_B_KWIDE_ROWS) BF16_HB_DISPATCH(32, BF16_HEAD_B_KWIDE_ROWS)
         default: break;
     }
     #undef BF16_HB_DISPATCH
