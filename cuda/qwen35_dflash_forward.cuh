@@ -198,4 +198,33 @@ static inline void q35_dflash_query_forward(const q35_dflash_residency& R, q35_d
     q35df_rmsnorm<<<rows,256,0,st>>>(x,R.final_norm,s.out,H,rows,eps);
 }
 
+// ── Draft sampling ──
+// After the query forward, the K mask-token query rows (offsets 1..K in the (1+K) block) each
+// predict a draft token via the LM head (shared with the target). Greedy drafting takes the argmax
+// of each sampled row's logits. This kernel projects one sampled hidden row through the BF16 LM
+// head [vocab, H] and reduces to an argmax, one block per sampled row. Deterministic (lowest index
+// wins ties), matching q35_dflash_argmax. The probabilistic path uses the P1 shared-key gumbel over
+// the same logits; kept out of this fixed-shape kernel so greedy stays a pure argmax.
+__global__ void q35df_head_argmax(const float* hidden, const __nv_bfloat16* lm_head, int H, int vocab,
+                                  int32_t* out_tok){
+    int row=blockIdx.x; const float* h=hidden+(size_t)row*H;
+    __shared__ double bestv[256]; __shared__ int besti[256];
+    double bv=-1e300; int bi=0;
+    for(int o=threadIdx.x;o<vocab;o+=blockDim.x){
+        const __nv_bfloat16* w=lm_head+(size_t)o*H; double acc=0; for(int i=0;i<H;i++) acc+=(double)h[i]*(double)__bfloat162float(w[i]);
+        if(acc>bv || (acc==bv && o<bi)){ bv=acc; bi=o; }
+    }
+    bestv[threadIdx.x]=bv; besti[threadIdx.x]=bi; __syncthreads();
+    for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s){ if(bestv[threadIdx.x+s]>bestv[threadIdx.x] || (bestv[threadIdx.x+s]==bestv[threadIdx.x] && besti[threadIdx.x+s]<besti[threadIdx.x])){ bestv[threadIdx.x]=bestv[threadIdx.x+s]; besti[threadIdx.x]=besti[threadIdx.x+s]; } } __syncthreads(); }
+    if(threadIdx.x==0) out_tok[row]=besti[0];
+}
+
+// Greedy draft sampling: argmax of the LM head over each of the K sampled query rows. sampled_hidden
+// is [K, H] (the mask-token rows gathered from the query forward's final-normed output); lm_head is
+// the shared BF16 [vocab, H]; out_tok receives K draft token ids.
+static inline void q35_dflash_sample_greedy(const float* sampled_hidden, const __nv_bfloat16* lm_head,
+        int K, int H, int vocab, int32_t* out_tok, cudaStream_t st){
+    q35df_head_argmax<<<K,256,0,st>>>(sampled_hidden, lm_head, H, vocab, out_tok);
+}
+
 #endif // FUCINA_QWEN35_DFLASH_FORWARD_CUH

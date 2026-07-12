@@ -678,6 +678,13 @@ qwen35-dflash-query-test:
 		-lcudart -lcuda
 	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_query"
 
+# DFlash greedy draft sampling: device LM-head projection + deterministic argmax over K sampled
+# query rows vs a host reference (incl. lowest-index tie rule). Self-contained. Flocks the GPU.
+qwen35-dflash-sample-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_sample.cu -o /tmp/dflash_sample \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_sample"
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:
