@@ -15686,6 +15686,12 @@ extern "C" int gemma4_engine_q35_dflash_verify_block(gemma4_engine_t *eng, int s
     return qwen35_dflash_verify_block(eng, slot, block, T, out_argmax);
 }
 
+// S1a P4: one greedy DFlash step (verify + accept + commit). Lossless + draft-content-independent.
+extern "C" int gemma4_engine_q35_dflash_greedy_step(gemma4_engine_t *eng, int slot, int32_t bonus,
+        const int32_t *draft, int K, int32_t *out_emit, int *out_n, int32_t *next_bonus) {
+    return qwen35_dflash_greedy_step(eng, slot, bonus, draft, K, out_emit, out_n, next_bonus);
+}
+
 // ─── S1a P3/P4 resident draft model lifecycle ──────────────────────────────────────
 #include "qwen35_dflash_forward.cuh"   // residency + drafter + draft entry point (validated modules)
 

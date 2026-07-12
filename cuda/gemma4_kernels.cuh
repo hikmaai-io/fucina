@@ -395,6 +395,13 @@ int    gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot);
 int    gemma4_engine_q35_dflash_verify_block(gemma4_engine_t *eng, int slot,
                                              const int32_t *block, int T, int32_t *out_argmax);
 
+// S1a P4: one greedy DFlash step. Given the slot, the bonus token (next to decode) and K draft
+// tokens, verifies the (1+K) block, greedily accepts the leading matching run, commits [bonus ++
+// accepted] losslessly, and emits [accepted drafts ++ correction] into out_emit[0..*out_n). The
+// next step's bonus is returned via *next_bonus. Emitted stream == greedy decode for ANY drafts.
+int    gemma4_engine_q35_dflash_greedy_step(gemma4_engine_t *eng, int slot, int32_t bonus,
+        const int32_t *draft, int K, int32_t *out_emit, int *out_n, int32_t *next_bonus);
+
 // S1a P3/P4: lazily load the resident DFlash draft model from FUCINA_QWEN35_DFLASH_PATH (config +
 // safetensors). Returns 0 on success/already-loaded, non-zero on failure (validated + geometry-
 // checked against the target). ready reports whether the draft substrate is resident.

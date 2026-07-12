@@ -2003,8 +2003,52 @@ static int qwen35_dflash_verify_block(gemma4_engine_t *eng, int slot, const int3
     cudaMemcpyAsync(out_argmax, eng->d_ms_outtok, (size_t)T*sizeof(int32_t), cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
     if (cudaGetLastError() != cudaSuccess) { eng->q35.gdn_snap_ntokens[slot] = -1; return -1; }
-    // Roll GDN state back to the snapshot (n_tokens restored to base); caller commits accepted len.
+    // Roll GDN state back to the snapshot (n_tokens restored to base). The snapshot is LEFT LIVE so
+    // a following q35_gdn_commit can replay the accepted prefix from it; a caller that only scores
+    // (no commit) should rewind explicitly. keep_snapshot=1 preserves gdn_snap_ntokens.
     if (q35_gdn_restore_snapshot(eng, slot) != 0) return -1;
+    return 0;
+}
+
+// ─── S1a P4: one greedy DFlash step (verify + accept + commit) ───────────────────────
+//
+// One DFlash speculative step, greedy, LOSSLESS by construction and independent of draft content.
+// Inputs: the slot at position `base` with `bonus` the token to decode next (last step's emitted
+// token, not yet fed), plus K candidate draft tokens. Steps:
+//   1. verify block [bonus, d1..dK] -> per-row argmax am[0..K] (state rolled back to base).
+//   2. greedy accept: j = number of leading di == am[i-1]; on first mismatch (or all K) the emitted
+//      correction is am[j] (the true greedy token at that position).
+//   3. commit: replay [bonus, d1..dj] (1+j tokens) into state so the slot advances exactly as
+//      sequential greedy decode would have. am[j] becomes the NEXT step's bonus.
+// Emits out_emit[0..nemit) = [d1..dj, am[j]] (the j accepted greedy tokens + the correction), all
+// equal to greedy decode. Returns the next bonus (am[j]) via *next_bonus, nemit via *out_n. Because
+// commit replays through the standard decode path, greedy output is byte-identical to non-spec
+// greedy decode for ANY drafts (wrong drafts only lower j). K<=GEMMA4_MAX_SEQS-1.
+static int qwen35_dflash_greedy_step(gemma4_engine_t *eng, int slot, int32_t bonus,
+                                     const int32_t *draft, int K,
+                                     int32_t *out_emit, int *out_n, int32_t *next_bonus) {
+    if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5 || K < 0 || K + 1 > GEMMA4_MAX_SEQS) return -1;
+    int T = 1 + K;
+    int32_t block[GEMMA4_MAX_SEQS], am[GEMMA4_MAX_SEQS];
+    block[0] = bonus;
+    for (int i = 0; i < K; i++) block[1 + i] = draft[i];
+    if (qwen35_dflash_verify_block(eng, slot, block, T, am) != 0) return -1;
+    // Greedy accept: di (block[1+i]) is accepted iff it equals am[i] (row i predicts the token after
+    // block position i). Accept the leading run.
+    int j = 0;
+    while (j < K && block[1 + j] == am[j]) j++;
+    int32_t correction = am[j];   // true greedy token at position base+j (bonus row if j==K)
+    // Commit [bonus, d1..dj] = 1+j tokens through the standard decode path (lossless state advance).
+    int32_t commit_toks[GEMMA4_MAX_SEQS];
+    commit_toks[0] = bonus;
+    for (int i = 0; i < j; i++) commit_toks[1 + i] = block[1 + i];
+    if (q35_gdn_commit(eng, slot, commit_toks, 1 + j, nullptr) != 0) return -1;
+    // Emit the j accepted drafts + the correction (all greedy).
+    int n = 0;
+    for (int i = 0; i < j; i++) out_emit[n++] = block[1 + i];
+    out_emit[n++] = correction;
+    *out_n = n;
+    *next_bonus = correction;
     return 0;
 }
 
