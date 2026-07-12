@@ -3515,6 +3515,7 @@ typedef struct gemma4_seq {
 // GEMMA4_SPEC_MAX rows — so B independent rows reuse that scratch directly.
 #define GEMMA4_MAX_SEQS GEMMA4_SPEC_MAX
 #include "qwen35_state.cuh"
+#include "qwen35_dflash_plan.cuh"   // S1a DFlash shape/lookahead planner + enable/concurrency gate
 
 // Runtime slot target for memory-heavy batched engines. The compile-time ceiling still sizes
 // graph/scratch arrays, while --parallel (promoted to FUCINA_PAGED_MAXSEQS by the CLI) controls
@@ -5083,6 +5084,11 @@ gemma4_engine_t* gemma4_engine_create(
     eng->q35.maxctx = 0; eng->q35.reserved_context = 0; eng->q35.graph_enabled = 1;
     // S2a GPU input-splicing default-on; FUCINA_QWEN35_NO_GPU_SPLICE=1 forces the host-copy path.
     eng->q35.gpu_splice_enabled = getenv("FUCINA_QWEN35_NO_GPU_SPLICE") ? 0 : 1;
+    // S1a DFlash feature gate (default OFF). Parsed via the shared planner mapping so runtime and
+    // tests agree; OFF keeps every path byte-identical to plain decode. Critical batch stays at the
+    // conservative default (0) until a GB10 sweep measures the real crossover.
+    eng->q35.dflash_mode = q35_dflash_mode_from_env(getenv("FUCINA_QWEN35_DFLASH"));
+    eng->q35.dflash_critical_batch = 0;
     eng->q35.d_slot_tok = NULL; eng->q35.d_slot_pos = NULL;
     eng->q35.rowslot = NULL; eng->q35.chunk_scr = NULL;
     eng->q35.pf_pos = NULL; eng->q35.pf_tok = NULL;
@@ -5125,6 +5131,7 @@ gemma4_engine_t* gemma4_engine_create(
     for (int s = 0; s < GEMMA4_MAX_SEQS; s++) {
         eng->q35.recurrent_slab[s] = NULL;
         eng->q35.slot_allocated[s] = 0; eng->q35.kv_capacity[s] = 0;
+        eng->q35.gdn_snap_slab[s] = NULL; eng->q35.gdn_snap_ntokens[s] = -1;
     }
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
         eng->q35.S[l] = NULL; eng->q35.ring[l] = NULL;
@@ -6696,6 +6703,9 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
         CUDA_FREE(eng->q35.Kc[l]); CUDA_FREE(eng->q35.Vc[l]);
     }
     for (int s = 0; s < GEMMA4_MAX_SEQS; s++) CUDA_FREE(eng->q35.recurrent_slab[s]);
+    for (int s = 0; s < GEMMA4_MAX_SEQS; s++) {   // P0 GDN rollback snapshots
+        CUDA_FREE(eng->q35.gdn_snap_slab[s]); eng->q35.gdn_snap_ntokens[s] = -1;
+    }
     for (int i = 0; i < 24; i++) CUDA_FREE(eng->q35.sb[i]);
     CUDA_FREE(eng->q35.rowslot);
     CUDA_FREE(eng->q35.chunk_scr);
@@ -15644,3 +15654,18 @@ void gemma4_engine_abort_prefill(gemma4_engine_t *eng) {
 #include "qwen35_jspace.cuh"
 #include "qwen35_runtime.cuh"
 #include "qwen35_backend.cuh"
+
+// ─── P0 (S1a) GDN rollback ABI ───────────────────────────────────────────────────────
+// Thin extern "C" wrappers around the q35_gdn_* statics, so the DFlash verify path (and the P0
+// lossless-rollback gate) can snapshot -> speculatively advance -> commit(accepted_len) a slot's
+// GDN recurrent state. Byte-identical continuation is proven by test_qwen35_gdn_rollback.
+extern "C" int gemma4_engine_q35_gdn_snapshot(gemma4_engine_t *eng, int slot) {
+    return q35_gdn_snapshot(eng, slot);
+}
+extern "C" int gemma4_engine_q35_gdn_commit(gemma4_engine_t *eng, int slot,
+                                            const int32_t *accepted, int j, int32_t *out_next) {
+    return q35_gdn_commit(eng, slot, accepted, j, out_next);
+}
+extern "C" int gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot) {
+    return q35_gdn_commit(eng, slot, nullptr, 0, nullptr);
+}

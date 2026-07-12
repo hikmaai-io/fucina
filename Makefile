@@ -239,6 +239,18 @@ qwen35-state-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_state $(QWEN35_MODEL)"
 
+# ─── S1a P0: lossless GDN snapshot/rewind/commit gate (GPU) ───
+# The DFlash (1+K) verification prerequisite. Asserts that for every accepted length j in 0..K,
+# snapshot -> speculatively advance K -> commit(j) leaves the slot's full hybrid state (GDN
+# recurrent slab + FULL-layer K/V) BYTE-IDENTICAL to j sequential single-token decodes, and the
+# committed next token matches the sequential reference. j=0 (pure rewind) and j=K (full accept)
+# are included. Byte-identical, not within-a-bound: commit re-runs the exact sequential path.
+qwen35-gdn-rollback-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_gdn_rollback.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_gdn_rollback \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_gdn_rollback $(QWEN35_MODEL)"
+
 # ─── Qwen3.5 hybrid (qwen35) P1 BATCHED single-pass prefill gate (GPU) ───
 # Drives the continuous-batching ABI (seq_add → qwen35_prefill_batched, then step_batch) and
 # asserts: (1) the integrated batched prefill reproduces the qwen35_forward_greedy oracle's
@@ -593,6 +605,45 @@ model-plan-test:
 # Host-only S2b graph-key helpers (shape triple + dominance dispatch + decode-first ordering).
 qwen35-graph-key-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda -x c++ cuda/qwen35_graph_key_test.cc -o /tmp/q35_graph_key_test && /tmp/q35_graph_key_test
+
+# Host-only DFlash counter-RNG + rejection-sampler oracle (P1 of S1a). Self-contained, no model.
+# Determinism, domain/position independence, uniform range, greedy + probabilistic rejection math.
+qwen35-dflash-rng-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_rng_test.cc -o /tmp/dflash_rng && /tmp/dflash_rng
+
+# Host-only DFlash draft loader schema (P2 of S1a): config geometry + tensor validation and
+# hostile-input rejection (mismatched shapes/dtypes/vocab) BEFORE any CUDA allocation. No model.
+qwen35-dflash-loader-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_loader_test.cc -o /tmp/dflash_ld && /tmp/dflash_ld
+
+# Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
+# S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
+qwen35-dflash-plan-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_plan_test.cc -o /tmp/dflash_plan && /tmp/dflash_plan
+
+# Host-only DFlash verify->commit assembly (P4 orchestration): maps a rejection result to the exact
+# P0 commit token sequence + next-step input token + emitted count. Weights-free, deterministic.
+qwen35-dflash-commit-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_commit_test.cc -o /tmp/dflash_commit && /tmp/dflash_commit
+
+# Host-only DFlash verify-pipeline integration (S1a): composes planner -> shared-key draft sampling
+# -> rejection -> commit assembly end to end on synthetic logits (the seams around the two device
+# forwards). Weights-free; proves the deterministic glue before the draft forward exists.
+qwen35-dflash-pipeline-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_pipeline_test.cc -o /tmp/dflash_pipe && /tmp/dflash_pipe
+
+# Host-only DFlash context-KV precompute geometry (P3 shape planning): fused KV GEMM / grouped
+# K-norm / batched RoPE / cache-insert element counts + strides, config-derived and overflow-
+# guarded. Weights-free; locks the P3 device buffer sizing before the forward kernels exist.
+qwen35-dflash-pcgeom-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_precompute_geom_test.cc -o /tmp/dflash_pcgeom && /tmp/dflash_pcgeom
+
+# CUDA<->CPU parity for the DFlash RNG + rejection sampler (P1 of S1a). Self-contained, no model;
+# runs the shared __host__ __device__ header on-GPU and asserts bit-identical results vs the host.
+qwen35-dflash-parity-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_parity.cu -o /tmp/dflash_parity \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_parity"
 
 allocation-set-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/device_allocation_set_test.cc -o /tmp/allocation_set_test && /tmp/allocation_set_test

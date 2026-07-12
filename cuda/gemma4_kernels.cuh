@@ -379,6 +379,16 @@ int    gemma4_engine_q35_state_save(gemma4_engine_t *eng, int slot, void *buf, i
 int    gemma4_engine_q35_state_restore(gemma4_engine_t *eng, int slot, const void *buf, int n_tokens);
 int    gemma4_engine_seq_ntokens(gemma4_engine_t *eng, int slot);
 
+// P0 (S1a) lossless GDN snapshot / commit / rewind for DFlash (1+K) verification. snapshot copies
+// the slot's GDN/conv recurrent state; commit(accepted,j,out_next) restores the snapshot and
+// replays exactly j accepted tokens so the slot ends byte-identical to j sequential decodes
+// (out_next[i] optionally receives each replay step's argmax); rewind restores with j=0. The
+// FULL-layer K/V cache is absolute-position-indexed and needs no snapshot. Returns 0 on success.
+int    gemma4_engine_q35_gdn_snapshot(gemma4_engine_t *eng, int slot);
+int    gemma4_engine_q35_gdn_commit(gemma4_engine_t *eng, int slot,
+                                    const int32_t *accepted, int j, int32_t *out_next);
+int    gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot);
+
 // Named device-memory accounting. Qwen fields are zero for other architectures.
 typedef struct gemma4_memory_stats {
     uint64_t qwen_workspace_bytes;
