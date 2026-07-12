@@ -1332,117 +1332,6 @@ static void mmq_q4_0_launch(
 // (q4k_scale_min — the ggml get_scale_min_k4 6-bit (scale,min) unpack — is defined with the
 // Q4_K mmvq kernels further below; forward-declared here.)
 __device__ __forceinline__ void q4k_scale_min(const uint8_t *sc, int j, int *s, int *m);
-//
-// Q4_K is ASYMMETRIC: value = d·s_j·q − dmin·m_j (per 32-elem sub-block j). Per block the
-// contribution is dx·[ d·s_j·Σ(q·xq) − dmin·m_j·Σ(xq) ] = Xd·(Wd·sumi − Wm·Σxq), with the
-// raw nibble q (NOT the Q4_0 −8 fold) dp4a'd against the int8 activation. Wd = d·s_j and
-// Wm = dmin·m_j are per-block; Σxq is the activation's per-block sum (sx, same as Q4_0).
-// Math is bit-faithful to mmvq_q4_k_packed; only the K-reduction order differs (float).
-__global__ void mmq_q4_k_tiled_kernel(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
-    int in_dim, int out_dim, int N)
-{
-    __shared__ int   Ws[MMQ_BM][8];   // decoded weight nibbles (raw 0..15), 4 per int
-    __shared__ int   Xs[MMQ_BN][8];   // activation int8, 4 per int
-    __shared__ float Wd[MMQ_BM];      // per-row d·s_j  (block weight scale)
-    __shared__ float Wm[MMQ_BM];      // per-row dmin·m_j (block weight min)
-    __shared__ float Xd[MMQ_BN];      // per-col activation block scale
-    __shared__ int   Xq[MMQ_BN];      // per-col Σ activation int8
-
-    const int nb = in_dim >> 5;           // 32-elem blocks (== Q4_K sub-blocks)
-    const int n_super = in_dim >> 8;      // 256-elem superblocks
-    const int rowbase = blockIdx.x * MMQ_BM;
-    const int colbase = blockIdx.y * MMQ_BN;
-    const int t = threadIdx.x;
-    const int tx = t & 15, ty = t >> 4;
-
-    float acc[4][4];
-    #pragma unroll
-    for (int i = 0; i < 4; i++)
-        #pragma unroll
-        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
-
-    for (int b = 0; b < nb; b++) {
-        const int sb = b >> 3, jsub = b & 7;
-        // Stage W tile: 256 threads = 64 rows × 4 words; each decodes one packed int → 2 ints.
-        {
-            int r = t >> 2, wk = t & 3, row = rowbase + r;
-            if (row < out_dim) {
-                const uint8_t *blk = weight + ((size_t)row*n_super + sb)*144;
-                int w = ((const int *)(blk + 16 + jsub*16))[wk];   // 16-B aligned
-                Ws[r][wk]     =  w        & 0x0F0F0F0F;
-                Ws[r][wk + 4] = (w >> 4)  & 0x0F0F0F0F;
-                if (wk == 0) {
-                    __half_raw hd; hd.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
-                    __half_raw hm; hm.x = (uint16_t)(blk[2] | ((uint16_t)blk[3] << 8));
-                    float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
-                    int s, m; q4k_scale_min(blk + 4, jsub, &s, &m);
-                    Wd[r] = d * (float)s; Wm[r] = dmin * (float)m;
-                }
-            } else { Ws[r][wk] = 0; Ws[r][wk + 4] = 0; if (wk == 0) { Wd[r] = 0.0f; Wm[r] = 0.0f; } }
-        }
-        // Stage X tile: 256 threads = 64 cols × 4; each loads 2 of the 8 ints. (== Q4_0)
-        {
-            int c = t >> 2, xk = t & 3, col = colbase + c;
-            if (col < N) {
-                const int *xqs = (const int *)(qx + (size_t)col*in_dim + (size_t)b*32);
-                Xs[c][xk*2]     = xqs[xk*2];
-                Xs[c][xk*2 + 1] = xqs[xk*2 + 1];
-                if (xk == 0) { Xd[c] = dx[(size_t)col*nb + b]; Xq[c] = sx[(size_t)col*nb + b]; }
-            } else { Xs[c][xk*2] = 0; Xs[c][xk*2 + 1] = 0; if (xk == 0) { Xd[c] = 0.0f; Xq[c] = 0; } }
-        }
-        __syncthreads();
-
-        int sumi[4][4];
-        #pragma unroll
-        for (int i = 0; i < 4; i++)
-            #pragma unroll
-            for (int j = 0; j < 4; j++) sumi[i][j] = 0;
-        #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            int wv[4], xv[4];
-            #pragma unroll
-            for (int i = 0; i < 4; i++) wv[i] = Ws[ty*4 + i][k];
-            #pragma unroll
-            for (int j = 0; j < 4; j++) xv[j] = Xs[tx*4 + j][k];
-            #pragma unroll
-            for (int i = 0; i < 4; i++)
-                #pragma unroll
-                for (int j = 0; j < 4; j++) sumi[i][j] = __dp4a(wv[i], xv[j], sumi[i][j]);
-        }
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            float wd = Wd[ty*4 + i], wm = Wm[ty*4 + i];
-            #pragma unroll
-            for (int j = 0; j < 4; j++)
-                acc[i][j] += Xd[tx*4 + j] * (wd * (float)sumi[i][j] - wm * (float)Xq[tx*4 + j]);
-        }
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        int row = rowbase + ty*4 + i;
-        if (row >= out_dim) continue;
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            int col = colbase + tx*4 + j;
-            if (col < N) out[(size_t)col*out_dim + row] = acc[i][j];
-        }
-    }
-}
-
-// Launch the tiled PACKED-Q4_K MMQ. Same grid/tiling as Q4_0; caller guarantees the weight
-// is repacked (use_packed_q4k) and in_dim is a multiple of 256.
-static void mmq_q4_k_launch(
-    float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
-    int in_dim, int out_dim, int N, cudaStream_t stream)
-{
-    dim3 g((unsigned)((out_dim + MMQ_BM - 1) / MMQ_BM),
-           (unsigned)((N + MMQ_BN - 1) / MMQ_BN));
-    mmq_q4_k_tiled_kernel<<<g, 256, 0, stream>>>(out, weight, qx, dx, sx, in_dim, out_dim, N);
-}
-
 // Single-token warp-per-row MMVQ launch (Step 5). NWARPS output rows per block, no smem.
 static inline void mmvq_launch(
     float *out, const uint8_t *weight, const int8_t *qx, const float *dx, const int *sx,
@@ -4187,7 +4076,7 @@ struct gemma4_engine {
     // give the live counts. See docs/dense-31b-89tok-plan.md (M0).
     gemma4_model_config_t cfg;
 
-    // ─── Sparse-MoE (GEMMA4_ARCH_QWEN3MOE) ──────────────────────────────
+    // ─── Sparse-MoE FFN ──────────────────────────────
     // Per-layer expert/router tensor offsets (into d_weights, read via weight_fp8) + the per-layer
     // ffn_down_exps type. gate/up are uniformly Q4_K (grouped Q4_K GEMM); down is Q4_K on most
     // layers and Q5_K on a few — the Q5_K slabs are requantized to Q8_0 into moe_down_q8[l] at
@@ -5440,20 +5329,6 @@ gemma4_engine_t* gemma4_engine_create(
             fprintf(stderr, "fucina: GGUF arch auto-detect failed: %s "
                             "(falling back to 12B defaults)\n", derr);
             // eng->cfg already holds the 12B defaults seeded at create top.
-        } else if (eng->cfg.arch == GEMMA4_ARCH_QWEN3) {
-            fprintf(stderr, "fucina: detected Qwen3 dense arch: %d layers, hidden %d, FFN %d, "
-                    "%d heads, %d KV heads, head_dim %d, vocab %d, rope_theta %.0f (full-causal)\n",
-                    eng->cfg.n_layers, eng->cfg.hidden_size, eng->cfg.intermediate,
-                    eng->cfg.n_heads, eng->cfg.n_kv_global, eng->cfg.head_dim,
-                    eng->cfg.vocab_size, eng->cfg.rope_theta_global);
-        } else if (eng->cfg.arch == GEMMA4_ARCH_QWEN3MOE) {
-            fprintf(stderr, "fucina: detected Qwen3-MoE arch: %d layers, hidden %d, %d heads, "
-                    "%d KV heads, head_dim %d, %d experts (top-%d, expert_ffn %d), vocab %d, "
-                    "rope_theta %.0f (full-causal)\n",
-                    eng->cfg.n_layers, eng->cfg.hidden_size, eng->cfg.n_heads,
-                    eng->cfg.n_kv_global, eng->cfg.head_dim, eng->cfg.n_experts,
-                    eng->cfg.n_experts_used, eng->cfg.expert_ffn, eng->cfg.vocab_size,
-                    eng->cfg.rope_theta_global);
         } else if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
             fprintf(stderr, "fucina: detected Qwen3.5 hybrid arch: %d layers (%d FULL softmax-GQA / "
                     "%d LINEAR gated-deltanet, full every %d), hidden %d, FFN %d, %d heads, %d KV "
@@ -5588,7 +5463,7 @@ gemma4_engine_t* gemma4_engine_create(
         // Gemma global layers use a unified K=V cache and ship no attn_v.weight. Qwen3 is
         // standard GQA: EVERY layer has a separate attn_v projection (even though all its layers
         // run through the engine's full-causal "global" class).
-        if (eng->layer_types[l] == LAYER_SLIDING || GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
+        if (eng->layer_types[l] == LAYER_SLIDING || 0) {
             snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", l);
             LOAD_TENSOR_OFFSET(tname, layers[l].attn_v);
             LOAD_WT_FMT(tname, layers[l].fmt_v);
@@ -5614,7 +5489,7 @@ gemma4_engine_t* gemma4_engine_create(
 
         // Qwen3-MoE has NO dense FFN tensors (gate/up/down are 3D expert slabs loaded separately
         // below as moe_*); skip the dense names so they don't warn-spam "tensor not found".
-        if (eng->cfg.arch != GEMMA4_ARCH_QWEN3MOE) {
+        if (1) {
             snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
             LOAD_TENSOR_OFFSET(tname, layers[l].ffn_gate);
             LOAD_WT_FMT(tname, layers[l].fmt_gate);
@@ -5837,7 +5712,7 @@ gemma4_engine_t* gemma4_engine_create(
         } while (0)
 
         for (int l = 0; l < nL; l++) {
-            int head_dim = GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) ? eng->cfg.head_dim
+            int head_dim = 0 ? eng->cfg.head_dim
                          : ((eng->layer_types[l] == LAYER_SLIDING)
                                ? GEMMA4_HEAD_DIM : GEMMA4_GLOBAL_HEAD_DIM);
             UPLOAD_NORM(eng->d_w_attn_norm      + l * hs, eng->tensors.layers[l].attn_norm,      hs);
@@ -6183,81 +6058,6 @@ gemma4_engine_t* gemma4_engine_create(
             fprintf(stderr, "fucina: requantized %d Qwen3.5 GDN in_qkv Q5_K tensor(s) -> Q8_0\n", n_q5k_qkv);
     }
 
-    // ── Qwen3-MoE expert/router tensors ──────────────────────────────────
-    // Resolve the three 3D expert slabs (ffn_gate_exps / ffn_up_exps / ffn_down_exps) + the F32
-    // router (ffn_gate_inp) per layer. gate/up are uniformly Q4_K (grouped Q4_K GEMM). down is
-    // Q4_K on most layers and Q5_K on a few; the grouped down GEMM has no Q5_K path, so each Q5_K
-    // down slab is requantized to Q8_0 into its own device buffer (dispatched via the Q8_0 grouped
-    // GEMM). Offsets feed weight_fp8() (→ d_weights); requant reads the mmap'd GGUF bytes.
-    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3MOE) {
-        const int H = eng->cfg.hidden_size, EFFN = eng->cfg.expert_ffn, E = eng->cfg.n_experts;
-        eng->moe_gate_slab     = (int64_t)(H * EFFN / 256) * 144;   // Q4_K bytes/expert (gate/up)
-        eng->moe_up_slab       = eng->moe_gate_slab;
-        eng->moe_down_slab_q4k = (int64_t)(EFFN * H / 256) * 144;   // Q4_K bytes/expert (down)
-        eng->moe_down_slab_q8  = (int64_t)(EFFN * H / 32) * 34;     // Q8_0 bytes/expert (requant)
-        int ok = 1, n_q5k = 0;
-        char tn[128];
-        for (int l = 0; l < eng->cfg.n_layers; l++) {
-            uint64_t off = 0, nel = 0; uint32_t gt = 0;
-            #define MOE_FIND(suffix, dstoff, want_type, label) do { \
-                snprintf(tn, sizeof(tn), "blk.%d." suffix, l); \
-                if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, tn, &off, &nel, &gt) != 0) { \
-                    fprintf(stderr, "fucina: qwen3moe missing %s\n", tn); ok = 0; break; } \
-                if ((want_type) >= 0 && gt != (uint32_t)(want_type)) { \
-                    fprintf(stderr, "fucina: qwen3moe %s unexpected type %u (want %s)\n", tn, gt, label); ok = 0; break; } \
-                (dstoff) = off; \
-            } while (0)
-            MOE_FIND("ffn_gate_exps.weight", eng->moe_gate_exps[l], GGML_TYPE_Q4_K, "Q4_K");
-            MOE_FIND("ffn_up_exps.weight",   eng->moe_up_exps[l],   GGML_TYPE_Q4_K, "Q4_K");
-            MOE_FIND("ffn_gate_inp.weight",  eng->moe_router[l],    GGML_TYPE_F32,  "F32");
-            // ffn_down_exps: Q4_K (read native) or Q5_K (requant → Q8_0 device buffer).
-            snprintf(tn, sizeof(tn), "blk.%d.ffn_down_exps.weight", l);
-            if (gguf_find_tensor(eng->gguf_data, eng->gguf_size, tn, &off, &nel, &gt) != 0) {
-                fprintf(stderr, "fucina: qwen3moe missing %s\n", tn); ok = 0; break;
-            }
-            eng->moe_down_exps[l] = off;
-            eng->moe_down_q8[l] = NULL;
-            if (gt == GGML_TYPE_Q4_K) {
-                // native — read from d_weights via weight_fp8.
-            } else if (gt == GGML_TYPE_Q5_K) {
-                int64_t n_elem = (int64_t)EFFN * H * E;
-                unsigned char *q8 = convert_q5k_to_q8_0((const unsigned char*)(eng->gguf_data + off), n_elem);
-                if (!q8) { fprintf(stderr, "fucina: qwen3moe %s Q5_K->Q8_0 alloc failed\n", tn); ok = 0; break; }
-                size_t q8bytes = (size_t)(n_elem / 32) * 34;
-                unsigned char *d_buf = NULL;
-                if (cudaMalloc(&d_buf, q8bytes) != cudaSuccess) {
-                    cudaGetLastError(); free(q8);
-                    fprintf(stderr, "fucina: qwen3moe %s Q8_0 cudaMalloc(%zu) failed\n", tn, q8bytes); ok = 0; break;
-                }
-                cudaMemcpy(d_buf, q8, q8bytes, cudaMemcpyHostToDevice);
-                free(q8);
-                eng->moe_down_q8[l] = d_buf;
-                n_q5k++;
-            } else {
-                fprintf(stderr, "fucina: qwen3moe %s unsupported down type %u (want Q4_K/Q5_K)\n", tn, gt);
-                ok = 0; break;
-            }
-            #undef MOE_FIND
-        }
-        if (ok) {
-            eng->moe_loaded = 1;
-            // Allocate the MoE forward scratch eagerly so it is ready before the FIRST
-            // decode_multiseq_body — including the warmup CUDA-graph capture, which cannot
-            // cudaMalloc. moe_alloc_scratch is idempotent (prefill's later call is a no-op).
-            if (moe_alloc_scratch(eng) != 0) {
-                fprintf(stderr, "fucina: qwen3moe MoE scratch alloc FAILED — aborting\n");
-                gemma4_engine_destroy(eng);
-                return NULL;
-            }
-            fprintf(stderr, "fucina: qwen3moe experts loaded — %d layers, %d experts, top-%d, "
-                    "expert_ffn %d; %d Q5_K down slab(s) requantized -> Q8_0\n",
-                    eng->cfg.n_layers, E, eng->cfg.n_experts_used, EFFN, n_q5k);
-        } else {
-            fprintf(stderr, "fucina: qwen3moe expert load FAILED — aborting\n");
-            gemma4_engine_destroy(eng);
-            return NULL;
-        }
-    }
 
     // QAT Q4_0 model: convert the Q6_K (or Unsloth UD Q4_K) token_embd (= tied LM head) to a
     // Q8_0 device buffer so the existing Q8_0 embed/LM-head kernels handle it (layers stay Q4_0).
@@ -6606,14 +6406,14 @@ gemma4_engine_t* gemma4_engine_create(
     // with -1/-2 for GEMMA4_IS_QWEN3_FAMILY), so without these pools a bare Qwen3
     // launch would 500 on every request. Auto-enable from the detected arch — runtime
     // model detection, no env flag required (Gemma stays opt-in / byte-identical).
-    if (getenv("FUCINA_PAGED_KV") || GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
-        if (!getenv("FUCINA_PAGED_KV") && GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch))
+    if (getenv("FUCINA_PAGED_KV") || 0) {
+        if (!getenv("FUCINA_PAGED_KV") && 0)
             printf("fucina: Qwen3 family — paged KV auto-enabled (required for Qwen3 serving)\n");
         const int BT = PAGED_KV_BLOCK_TOKENS;
         // Per-token element count per KV-class. Qwen3 is single-head-dim (128) and routes every
         // layer through the global class, so glob_elems uses cfg.head_dim (NOT the 512 Gemma const)
         // — this MUST match the runtime okv = n_kv*head_dim used at write/read time in the pools.
-        const int q3 = GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch);
+        const int q3 = 0;
         const int slid_elems = eng->cfg.n_kv_sliding * (q3 ? eng->cfg.head_dim : GEMMA4_HEAD_DIM);
         const int glob_elems = eng->cfg.n_kv_global  * (q3 ? eng->cfg.head_dim : GEMMA4_GLOBAL_HEAD_DIM);
         // Per-block bytes for K (== V) across all layers of the class.
@@ -8074,7 +7874,7 @@ static int build_bf16_weights(gemma4_engine_t *eng)
     // reports as "no weight" for the global class (Gemma's global V = K). The fast Qwen3
     // prefill needs a real BF16 buffer for it: size PJ_V to okv × H. (The attn buffers are
     // over-sized by proj_desc's GEMMA4_GLOBAL_HEAD_DIM, which is harmless — only PJ_V is 0.)
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
+    if (0) {
         uint64_t nv = (uint64_t)(eng->cfg.n_kv_global * eng->cfg.head_dim) * eng->cfg.hidden_size;
         if (nv > maxn[PJ_V]) maxn[PJ_V] = nv;
     }
@@ -8822,45 +8622,6 @@ static void mmq_proj(
                     in_dim, out_dim, N, stream);
 }
 
-// Tiled-MMQ projection for PACKED Q4_K (Qwen3/MoE prefill): same drop-in contract as mmq_proj
-// but reads native de-interleaved Q4_K weights — no per-projection BF16 dequant. Quantizes the
-// BF16 activation to int8 (+ per-block Σ for the asymmetric min term), then the one-weight-pass
-// Q4_K MMQ kernel. Caller guarantees the weight is repacked (use_packed_q4k) and N ≤ MMQ_MAX_N.
-static void mmq_q4k_proj(
-    gemma4_engine_t *eng, const uint8_t *wq, const __nv_bfloat16 *xb,
-    float *dst, int in_dim, int out_dim, int N, cudaStream_t stream)
-{
-    quantize_q8_1_bf16_kernel<<<(unsigned)((size_t)N*in_dim/32), 32, 0, stream>>>(
-        xb, eng->d_pf_qx, eng->d_pf_dx, eng->d_pf_sx, N*in_dim);
-    mmq_q4_k_launch(dst, wq, eng->d_pf_qx, eng->d_pf_dx, eng->d_pf_sx,
-                    in_dim, out_dim, N, stream);
-}
-
-// Whether a PACKED Q4_K projection should take the native tiled-MMQ prefill path for N tokens.
-//
-// The Qwen3 BF16 prefill dequant is UN-pipelined (per-projection synchronous Q4_K→BF16 — the
-// measured small-N floor), so reading the native weight ONCE via MMQ is a real SMALL-N win:
-// MEASURED (GB10, Qwen3-8B dense) prefill TTFT — N=128: 693 vs 980 ms (1.41×); N=512: 1140 vs
-// 1159 ms (~tied); N=1024: 1306 vs 1321 ms (~tied). The win is entirely the removed dequant
-// floor, which dp4a recovers at small N; at larger N GEMM compute dominates and dp4a ≈ BF16.
-//
-// BUT the dp4a path quantizes the activation to int8 (the weight is the SAME Q4_K), so it is
-// LOWER precision than the BF16 dequant+GEMM. That extra rounding, combined with the pre-existing
-// fresh-vs-suffix attention-path float gap, FLIPS a borderline greedy token on the dense model
-// (qwen3-suffix-test: one-shot 5766 vs suffix 1467 at position 20) — i.e. it is NOT lossless
-// enough to keep the Stage-9 suffix self-consistency gate green. So, exactly like the Q4_0 MMQ
-// (mmq_enabled, also off by default), it ships OFF: opt in with FUCINA_Q4K_MMQ=1 for the small-N
-// TTFT win / A-B. The default prefill stays on the lossless BF16 path (suffix/prefix gates green).
-// A lossless default win needs either the BF16-faithful PIPELINED Q4_K dequant or an int-precise
-// path; tracked as the next step.
-static inline bool q4k_mmq_enabled(gemma4_engine_t *eng, int N)
-{
-    static int opt = -1;
-    if (opt < 0) { const char *e = getenv("FUCINA_Q4K_MMQ"); opt = (e && e[0] == '1') ? 1 : 0; }
-    if (!opt) return false;
-    return (N <= GEMMA4_MMQ_MAX_N) && ensure_mmq_scratch(eng) == 0;
-}
-
 // Whether the prefill should take the native Q4_0 tiled-MMQ path for a batch of N tokens.
 //
 // MEASURED on GB10 (DGX Spark): the dp4a tiled-MMQ kernel is bit-faithful but ~5× SLOWER
@@ -8913,7 +8674,7 @@ int gemma4_engine_prefill_batched(
     // the CUDA context (illegal launch → "invalid device context") and SIGSEGVs the
     // single-flight HTTP path. Decline early so warmup and any caller stay safe.
     // qwen35 is likewise paged-multiseq-only (its own hybrid forward); decline here too.
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
+    if (0 || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
     if (eng->cur.n_tokens != 0) return -2;             // need fresh sequence
     if (n_tokens > eng->global_kv_capacity) return -2;    // would overflow cache
     // Batched attention materializes [HEADS][N×N] score buffers (fp32+bf16, ~6 B/elem).
@@ -10019,10 +9780,6 @@ __global__ void sample_logits_ms_kernel(
 // Fast single-pass Qwen3 prefill (per-tensor Q4_K/Q6_K → BF16 dequant + cuBLAS GEMM,
 // head_dim=128 full-causal attention). Defined after paged_prefill_batched; the Qwen3
 // arch branch in paged_prefill_batched routes here. Returns 0 / -1 / -2 (same contract).
-static int paged_prefill_qwen3(
-    gemma4_engine_t *eng, gemma4_seq *s, const int32_t *tokens, int N,
-    int base, int do_sample, int32_t *first_tok_out);
-// Defined further below; needed by the base>0 suffix mode of paged_prefill_qwen3.
 static int ensure_spec_scratch(gemma4_engine_t *eng);
 static int ensure_ms_scratch(gemma4_engine_t *eng);
 static int paged_slot_sync(gemma4_engine_t *eng, gemma4_seq *s, int pos);
@@ -10075,8 +9832,6 @@ static int paged_prefill_batched(
     // cuBLAS GEMM, head_dim=128 full-causal attention) — the Gemma sliding/global/sandwich-norm
     // body below does not apply. Same 0/-1/-2 contract; -2 falls back to token-by-token.
     // Qwen3-MoE shares this exact prefill path; only its FFN block differs (gated inside).
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch))
-        return paged_prefill_qwen3(eng, s, tokens, N, /*base=*/0, /*do_sample=*/1, first_tok_out);
     if (s->n_tokens != 0) return -2;                       // fresh slot only
     if (N > eng->global_kv_capacity) return -2;            // would overflow pool
     if (N > 4096) return -2;                               // persistent scratch cap
@@ -10386,278 +10141,6 @@ static int paged_prefill_batched(
 // continuation match (the gate-1 dual-path test). Full-causal Qwen3/MoE ONLY (head_dim 128,
 // window 0); Gemma's sliding/global geometry is excluded by the caller. do_sample gates the
 // final LM head / sampler (suffix callers that want the first token pass 1).
-static int paged_prefill_qwen3(
-    gemma4_engine_t *eng, gemma4_seq *s, const int32_t *tokens, int N,
-    int base, int do_sample, int32_t *first_tok_out)
-{
-    if (!eng->loaded || N <= 0 || base < 0) return -1;
-    if (s->n_tokens != base) return -2;                    // fresh (base==0) or exact suffix base
-    if (base + N > eng->global_kv_capacity) return -2;     // would overflow pool
-    if (N > 4096) return -2;                               // persistent scratch cap
-    if (!eng->pf_scratch_ready && alloc_prefill_scratch(eng) != 0) return -2;
-    if (base > 0 && (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0)) return -2;
-    if (build_bf16_weights(eng) != 0) return -1;
-    const int qwen3moe = (eng->cfg.arch == GEMMA4_ARCH_QWEN3MOE);
-    if (qwen3moe && moe_alloc_scratch(eng) != 0) return -1;
-
-    cudaStream_t stream = eng->stream;
-    const int H   = eng->cfg.hidden_size;
-    const int I   = eng->cfg.intermediate;
-    const int HD2 = 32 * sizeof(float);
-    const int HEADS = eng->cfg.n_heads;
-    const int hd  = eng->cfg.head_dim;                     // 128
-    const int nkv = eng->cfg.n_kv_global;                  // 8
-    const int oq  = HEADS * hd;
-    const int okv = nkv * hd;
-    auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
-
-    // Reserve [base, base+N) positions in the slot's paged tables. base==0 is the fresh
-    // setup (both tables grown from empty); base>0 grows the slot that already holds the
-    // adopted prefix via paged_slot_sync (the SAME table-growth prefill_suffix_batched uses
-    // per chunk). Qwen3 is all full-attention; only the global pool is written/read, but we
-    // keep both tables in sync so the subsequent decode (paged_slot_sync) continues cleanly.
-    if (base == 0) {
-        if (paged_table_ensure(&eng->slid_pool, &s->slid_bt, N) != 0) return -2;
-        if (glob_table_ensure(eng, s, N) != 0) return -2;
-        if (paged_upload_blocks(&s->slid_bt, &s->d_slid_blocks, &s->d_slid_cap, stream) != 0) return -1;
-        if (paged_upload_blocks(&s->glob_bt, &s->d_glob_blocks, &s->d_glob_cap, stream) != 0) return -1;
-    } else {
-        if (paged_slot_sync(eng, s, base + N - 1) != 0) return -2;   // grow + upload both tables
-    }
-    // write_pos[r] = base + r. base==0 reuses the engine-lifetime iota; base>0 fills a scratch
-    // int buffer (d_pf_norm is unused by this prefill, sized NC*H floats >> N ints).
-    int *d_wpos = eng->d_pf_wpos;
-    if (base > 0) {
-        d_wpos = (int*)eng->d_pf_norm;
-        int *h_wpos = (int*)malloc((size_t)N*sizeof(int));
-        if (!h_wpos) return -1;
-        for (int r = 0; r < N; r++) h_wpos[r] = base + r;
-        cudaMemcpyAsync(d_wpos, h_wpos, (size_t)N*sizeof(int), cudaMemcpyHostToDevice, stream);
-        cudaStreamSynchronize(stream);
-        free(h_wpos);
-    }
-    {
-        // Two N-row view arrays, built + uploaded ONCE (they do NOT vary by layer):
-        //  - d_pf_views_glob: the WRITE view, n_tokens = base+N (the write ignores n_tokens;
-        //    every row writes its own position base+r via d_wpos).
-        //  - d_pf_views_slid (unused by Qwen3 — no sliding): the per-row ATTENTION view with
-        //    the CAUSAL bound n_tokens = base+r+1, so suffix query r attends [0..base+r].
-        // Hoisting these out of the per-layer chunk loop avoids 36*ceil(N/16) synchronous
-        // pageable view memcpys (the dominant cost of the naive per-chunk upload).
-        PagedSeqView *hvw = (PagedSeqView*)malloc((size_t)N*sizeof(PagedSeqView));
-        PagedSeqView *hva = (PagedSeqView*)malloc((size_t)N*sizeof(PagedSeqView));
-        if (!hvw || !hva) { free(hvw); free(hva); return -1; }
-        for (int r = 0; r < N; r++) {
-            hvw[r].block_table = s->d_glob_blocks; hvw[r].n_blocks = s->glob_bt.n;
-            hvw[r].base = s->glob_bt.base; hvw[r].n_tokens = base + N;
-            hva[r] = hvw[r]; hva[r].n_tokens = base + r + 1;
-        }
-        cudaMemcpyAsync(eng->d_pf_views_glob, hvw, (size_t)N*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(eng->d_pf_views_slid, hva, (size_t)N*sizeof(PagedSeqView), cudaMemcpyHostToDevice, stream);
-        cudaStreamSynchronize(stream);   // hvw/hva consumed by the async copies before free
-        free(hvw); free(hva);
-    }
-    PagedWriteBatch wb_glob; wb_glob.seqs = eng->d_pf_views_glob; wb_glob.write_pos = d_wpos; wb_glob.n_rows = N;
-    PagedSeqView *d_att_views = eng->d_pf_views_slid;   // per-row causal attention views (base>0)
-
-    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
-    cudaEventRecord(t0, stream);
-
-    // Persistent prefill scratch (N<=4096).
-    float *d_x = eng->d_pf_x, *d_q = eng->d_pf_q;
-    float *d_k = eng->d_pf_k, *d_v = eng->d_pf_v, *d_attn = eng->d_pf_attn;
-    float *d_gate = eng->d_pf_gate, *d_up = eng->d_pf_up, *d_scores = eng->d_pf_scores;
-    __nv_bfloat16 *d_inb = eng->d_pf_inb, *d_qb = eng->d_pf_qb, *d_kb = eng->d_pf_kb;
-    __nv_bfloat16 *d_vb = eng->d_pf_vb, *d_kbx = eng->d_pf_kbx, *d_vbx = eng->d_pf_vbx;
-    __nv_bfloat16 *d_pb = eng->d_pf_pb;
-
-    // Per-tensor dequant of one projection into BF16 buffer 0, then cuBLAS GEMM.
-    auto dq_gemm = [&](uint64_t off, int in_dim, int out_dim, int fmt, int p, float *dst){
-        const uint8_t *w = weight_fp8(eng, off);
-        bool packed = (fmt == FORMAT_Q4_K) && use_packed_q4k(eng, fmt, w);
-        // PACKED Q4_K projections take the native tiled-MMQ path (no per-projection BF16
-        // dequant) when enabled; Q6_K/Q8_0 (and unpacked Q4_K) keep the BF16 dequant+GEMM.
-        // The dispatch is per-tensor on `fmt`, so the mixed Q4_K+Q6_K(+Q8_0) model is correct.
-        if (packed && q4k_mmq_enabled(eng, N)) {
-            mmq_q4k_proj(eng, w, d_inb, dst, in_dim, out_dim, N, stream);
-            return;
-        }
-        dequant_proj_to_bf16(eng->d_bf16_layer[0][p], w,
-                             (uint64_t)in_dim * out_dim, fmt, packed, stream);
-        gemm_bf16(eng, eng->d_bf16_layer[0][p], d_inb, dst, in_dim, out_dim, N);
-    };
-
-    // ── Embedding (Qwen3 does NOT scale embeddings by √H). ──
-    {
-        int32_t *d_tok = (int32_t*)d_kbx;   // reuse bf16 scratch as a byte area (>= N ints)
-        cudaMemcpyAsync(d_tok, tokens, (size_t)N*sizeof(int32_t), cudaMemcpyHostToDevice, stream);
-        embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, N, H, stream);
-    }
-
-    for (int l = 0; l < eng->cfg.n_layers; l++) {
-        const __typeof__(eng->tensors.layers[0]) *L = &eng->tensors.layers[l];
-        const float *w_attn = eng->d_w_attn_norm + (size_t)l*H;
-        const float *w_ffn  = eng->d_w_ffn_norm  + (size_t)l*H;
-        const float *w_qn   = eng->d_w_q_norm    + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
-        const float *w_kn   = eng->d_w_k_norm    + (size_t)l*GEMMA4_GLOBAL_HEAD_DIM;
-
-        // pre-attn RMSNorm → bf16 input (feeds Q,K,V)
-        rms_norm_rows_bf16_kernel<<<N,256,HD2,stream>>>(d_inb, d_x, w_attn, H, N, GEMMA4_RMS_EPS);
-
-        dq_gemm(L->attn_q, H, oq, (int)L->fmt_q, PJ_Q, d_q);
-        per_head_rms_norm_rows_kernel<<<dim3(HEADS,N),hd,HD2,stream>>>(d_q, w_qn, HEADS, hd, N, GEMMA4_RMS_EPS);
-        // Qwen3 attention scale: q_norm is learned (no baked scale) → apply 1/sqrt(hd) to Q.
-        scale_kernel<<<grid1d((size_t)N*oq),256,0,stream>>>(d_q, N*oq, 1.0f/sqrtf((float)hd));
-        dq_gemm(L->attn_k, H, okv, (int)L->fmt_k, PJ_K, d_k);
-        dq_gemm(L->attn_v, H, okv, (int)L->fmt_v, PJ_V, d_v);   // separate V, NO V-norm
-        per_head_rms_norm_rows_kernel<<<dim3(nkv,N),hd,HD2,stream>>>(d_k, w_kn, nkv, hd, N, GEMMA4_RMS_EPS);
-
-        rope_rows_kernel<<<dim3(HEADS,N),hd/2,0,stream>>>(
-            d_q, d_k, /*base=*/base, HEADS, nkv, hd, N, 1000000.0f, eng->d_rope_freqs);
-
-        // ── This layer's global pool slice (same stride/slot as decode_multiseq_body). ──
-        int slot = eng->global_slot[l];
-        size_t pls = (size_t)eng->glob_pool.n_blocks * PAGED_KV_BLOCK_TOKENS * okv;
-        pkv_t *pk = eng->d_glob_pool_k + (size_t)slot * pls;
-        pkv_t *pv = eng->d_glob_pool_v + (size_t)slot * pls;
-
-        if (base == 0) {
-            // FRESH: materialized [HEADS][N×N] tensor-core attention (full causal, window=0).
-            // Q is pre-scaled, so softmax scale 1 — same convention as the decode flash path.
-            f32_to_bf16_kernel<<<grid1d((size_t)N*oq),256,0,stream>>>(d_qb, d_q, (size_t)N*oq);
-            f32_to_bf16_kernel<<<grid1d((size_t)N*okv),256,0,stream>>>(d_kb, d_k, (size_t)N*okv);
-            f32_to_bf16_kernel<<<grid1d((size_t)N*okv),256,0,stream>>>(d_vb, d_v, (size_t)N*okv);
-            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),HEADS,N),256,0,stream>>>(d_kbx, d_kb, N, HEADS, nkv, hd);
-            kv_broadcast_bf16_kernel<<<dim3(grid1d(hd),HEADS,N),256,0,stream>>>(d_vbx, d_vb, N, HEADS, nkv, hd);
-            const float a1=1.0f, b0=0.0f;
-            long long sNN = (long long)N * N;
-            cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, N, hd,
-                &a1, d_qb,  CUDA_R_16BF, oq, (long long)hd,
-                     d_kbx, CUDA_R_16BF, oq, (long long)hd,
-                &b0, d_scores, CUDA_R_32F, N, sNN,
-                HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            attn_softmax_batched_kernel<<<dim3(N,HEADS),256,HD2,stream>>>(d_scores, d_pb, N, /*window=*/0);
-            cublasGemmStridedBatchedEx(eng->cublas, CUBLAS_OP_N, CUBLAS_OP_T, hd, N, N,
-                &a1, d_vbx, CUDA_R_16BF, oq, (long long)hd,
-                     d_pb,  CUDA_R_16BF, N,  sNN,
-                &b0, d_attn, CUDA_R_32F, oq, (long long)hd,
-                HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            // Scatter ALL N tokens' K (post-norm/RoPE) and V (raw) into the pool slice.
-            paged_kv_write<<<dim3(grid1d(okv),N),256,0,stream>>>(
-                pk, pv, d_k, d_v, wb_glob, PAGED_KV_BLOCK_TOKENS, okv);
-        } else {
-            // SUFFIX (base>0): write the N suffix tokens' K/V into the pool FIRST (at
-            // positions base..base+N-1), then attend through the block table — each suffix
-            // query reads history [0..base) UNION causal suffix [base..base+i] from the
-            // SAME fp8 pool with the SAME split-K kernels decode_multiseq_body uses, in
-            // ≤GEMMA4_MAX_SEQS-row chunks (reusing the 16-row d_fa_*/d_ms_views_glob
-            // scratch). Bit-identical to prefill_suffix_batched's attention.
-            paged_kv_write<<<dim3(grid1d(okv),N),256,0,stream>>>(
-                pk, pv, d_k, d_v, wb_glob, PAGED_KV_BLOCK_TOKENS, okv);
-            for (int c0 = 0; c0 < N; c0 += GEMMA4_MAX_SEQS) {
-                int cn = (N - c0 < GEMMA4_MAX_SEQS) ? (N - c0) : GEMMA4_MAX_SEQS;
-                PagedSeqView *views_c = d_att_views + c0;   // prebuilt causal views for this chunk
-                int longest = base + c0 + cn;     // longest row's context (exclusive bound)
-                int g_splits = (longest + GEMMA4_GLOBAL_SPLIT_CHUNK - 1) / GEMMA4_GLOBAL_SPLIT_CHUNK;
-                if (g_splits < 1) g_splits = 1;
-                if (g_splits > GEMMA4_GLOBAL_MAX_SPLITS) g_splits = GEMMA4_GLOBAL_MAX_SPLITS;
-                float *q_c   = d_q    + (size_t)c0*oq;   // [cn][oq] slice
-                float *att_c = d_attn + (size_t)c0*oq;
-                if (nkv == 8) {
-                    paged_global_attn_splitk_batched<32, 8, 128, GEMMA4_GLOBAL_MAX_SPLITS>
-                        <<<dim3(g_splits, cn), 32*32, 0, stream>>>(
-                            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q_c, pk, pv, views_c,
-                            GEMMA4_GLOBAL_SPLIT_CHUNK, PAGED_KV_BLOCK_TOKENS, okv);
-                } else {   // nkv == 4 (Qwen3-MoE)
-                    paged_global_attn_splitk_batched<32, 4, 128, GEMMA4_GLOBAL_MAX_SPLITS>
-                        <<<dim3(g_splits, cn), 32*32, 0, stream>>>(
-                            eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, q_c, pk, pv, views_c,
-                            GEMMA4_GLOBAL_SPLIT_CHUNK, PAGED_KV_BLOCK_TOKENS, okv);
-                }
-                paged_flash_decode_combine_batched<32, GEMMA4_GLOBAL_MAX_SPLITS>
-                    <<<dim3(HEADS, cn), hd, 0, stream>>>(
-                        att_c, eng->d_fa_acc, eng->d_fa_m, eng->d_fa_l, views_c,
-                        hd, /*window=*/0, GEMMA4_GLOBAL_SPLIT_CHUNK);
-            }
-        }
-
-        // O projection → d_q ; plain residual add (Qwen3 has no post-attn sandwich norm).
-        f32_to_bf16_kernel<<<grid1d((size_t)N*oq),256,0,stream>>>(d_inb, d_attn, (size_t)N*oq);
-        dq_gemm(L->attn_output, oq, H, (int)L->fmt_o, PJ_O, d_q);
-        residual_add_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, d_q, N*H);
-
-        // FFN: pre-norm → SiLU-GLU → down → residual add. Qwen3-MoE replaces the single dense
-        // SiLU-GLU with the 128-expert top-8 mixture (gated on arch; FP32 ffn-norm feeds moe_ffn).
-        if (qwen3moe) {
-            rms_norm_rows_kernel<<<N,256,HD2,stream>>>(d_gate, d_x, w_ffn, H, N, GEMMA4_RMS_EPS);
-            moe_ffn(eng, l, d_gate, d_up, N, stream);   // h_f32=d_gate, out=d_up (both FP32 [N×H])
-            residual_add_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, d_up, N*H);
-        } else {
-            rms_norm_rows_bf16_kernel<<<N,256,HD2,stream>>>(d_inb, d_x, w_ffn, H, N, GEMMA4_RMS_EPS);
-            dq_gemm(L->ffn_gate, H, I, (int)L->fmt_gate, PJ_GATE, d_gate);
-            dq_gemm(L->ffn_up,   H, I, (int)L->fmt_up,   PJ_UP,   d_up);
-            silu_glu_bf16_kernel<<<grid1d((size_t)N*I),256,0,stream>>>(d_inb, d_gate, d_up, N*I);
-            dq_gemm(L->ffn_down, I, H, (int)L->fmt_down, PJ_DOWN, d_q);
-            residual_add_kernel<<<grid1d((size_t)N*H),256,0,stream>>>(d_x, d_q, N*H);
-        }
-    }
-
-    // ── Output norm + LM head on the LAST token only (only when a token is wanted). ──
-    int32_t last_tok = 0;
-    if (do_sample) {
-        int vocab = eng->cfg.vocab_size;
-        float *x_last = d_x + (size_t)(N-1)*H;
-        rms_norm_kernel<<<1,256,HD2,stream>>>(eng->d_norm, x_last, eng->d_w_out_norm, H, GEMMA4_RMS_EPS);
-        logits_head(eng, eng->d_logits, eng->d_norm, H, vocab, stream);
-        if (eng->cfg.softcap > 0.0f)
-            logit_softcap_kernel<<<grid1d((size_t)vocab),256,0,stream>>>(eng->d_logits, eng->cfg.softcap, vocab);
-        if (eng->n_suppress > 0)
-            suppress_tokens_kernel<<<grid1d(eng->n_suppress),256,0,stream>>>(
-                eng->d_logits, eng->d_suppress, eng->n_suppress, vocab);
-
-        // First token EXACTLY as seq_add: greedy argmax, or the per-row splitmix64 sampler at
-        // RNG index n_sampled. Routes through eng->d_ms_outtok.
-        if (s->samp_temp <= 0.0f) {
-            argmax_rows_kernel<<<1,1024,0,stream>>>(eng->d_logits, eng->d_ms_outtok, 1, vocab);
-        } else {
-            float h_temp[1] = { s->samp_temp }, h_topp[1] = { s->samp_top_p };
-            float h_minp[1] = { s->samp_min_p }, h_rnd[1];
-            int   h_topk[1] = { s->samp_top_k };
-            uint64_t z = (s->samp_seed ? s->samp_seed : 0x9e3779b97f4a7c15ULL) + 0x9e3779b97f4a7c15ULL * (s->n_sampled + 1);
-            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-            z =  z ^ (z >> 31);
-            h_rnd[0] = (float)((z >> 11) * (1.0 / 9007199254740992.0));
-            cudaMemcpyAsync(eng->d_ms_temp, h_temp, sizeof(float), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(eng->d_ms_topk, h_topk, sizeof(int),   cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(eng->d_ms_topp, h_topp, sizeof(float), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(eng->d_ms_minp, h_minp, sizeof(float), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(eng->d_ms_rnd,  h_rnd,  sizeof(float), cudaMemcpyHostToDevice, stream);
-            sample_logits_ms_kernel<<<1,1024,0,stream>>>(
-                eng->d_logits, vocab, eng->d_ms_temp, eng->d_ms_topk,
-                eng->d_ms_topp, eng->d_ms_minp, eng->d_ms_rnd, eng->d_ms_outtok);
-        }
-        cudaMemcpyAsync(&last_tok, eng->d_ms_outtok, sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
-    }
-
-    cudaEventRecord(t1, stream);
-    cudaEventSynchronize(t1);
-    float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
-    eng->prefill_time_ms += ms;
-    eng->n_prefill_tokens += N;
-    cudaEventDestroy(t0); cudaEventDestroy(t1);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "fucina: qwen3-prefill CUDA error: %s\n", cudaGetErrorString(err));
-        return -1;
-    }
-    s->n_tokens = base + N;
-    if (do_sample) s->n_sampled++;   // fresh: 0→1; suffix: advances the slot's RNG index once
-    s->mtp_h_valid = 0;
-    if (do_sample && first_tok_out) *first_tok_out = last_tok;
-    return 0;
-}
 
 // Chunked FLASH prefill: process the prompt in bounded chunks, each attending the
 // frozen KV cache (history) + its own keys via the online-softmax flash kernels — no
@@ -10681,7 +10164,7 @@ int gemma4_engine_prefill_flash(
     if (!eng->loaded || n_tokens <= 0) return -1;
     // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
     // flash prefill is gemma-layout-only. Decline so it never runs on Qwen3 weights.
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
+    if (0 || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -2;
     // FORMAT_NVFP4: this path is BF16/MMQ-only (no FP4 GEMM) and would deref the NULL Q4_0
     // store. prefill_batched forces use_fp4=true for all N (so it never returns -2 here), but
     // guard anyway so a future change can't silently route NVFP4 through the Q4_0/BF16 path.
@@ -11046,7 +10529,7 @@ int gemma4_engine_prefill(
     // Qwen3 is paged-path only (see gemma4_engine_prefill_batched) — this non-paged
     // token-by-token loop uses gemma-layout decode_layer. Decline cleanly rather than
     // emit garbage / crash, so the single-flight HTTP fallthrough fails gracefully.
-    if (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -1;
+    if (0 || eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) return -1;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -12159,7 +11642,7 @@ static void decode_multiseq_body(
     float *d_attn = eng->d_sb[7], *d_o   = eng->d_sb[8], *d_gate= eng->d_sb[9];
     float *d_up = eng->d_sb[10], *d_logitsK = eng->d_sb[11];
 
-    const int qwen3 = GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch);
+    const int qwen3 = 0;
     // Embed (per-row token, device d_tok) + Gemma √H scale. Qwen3 does NOT scale embeddings.
     embed_w(eng, d_x, weight_fp8(eng, eng->tensors.token_embd), d_tok, B, H, stream);
     if (!qwen3)
@@ -12316,7 +11799,7 @@ static void decode_multiseq_body(
         }
 
         rms_norm_rows_kernel<<<B,256,HD2,stream>>>(d_inf, d_x, w_ffn, H, B, GEMMA4_RMS_EPS);
-        if (eng->cfg.arch == GEMMA4_ARCH_QWEN3MOE) {
+        if (0) {
             // Sparse MoE FFN: h_f32 = d_inf (ffn-normed), expert mixture → d_gate, add to residual.
             moe_ffn(eng, l, d_inf, d_gate, B, stream);
             residual_add_kernel<<<grid1d((size_t)B*H),256,0,stream>>>(d_x, d_gate, B*H);
@@ -12629,19 +12112,6 @@ extern "C" int gemma4_engine_seq_add(
         if (no_fast_sfx < 0) no_fast_sfx = (getenv("FUCINA_NO_FAST_PREFILL") != NULL);
         extern int g_fucina_force_slow_prefill;
         int sfx_rc = -2;
-        if (!no_fast_sfx && !g_fucina_force_slow_prefill && GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) {
-            int32_t ft = 0;
-            sfx_rc = paged_prefill_qwen3(eng, s, prompt + shared_tok, n_prompt - shared_tok,
-                                         /*base=*/shared_tok, /*do_sample=*/1, &ft);
-            if (sfx_rc == 0) {
-                cudaStreamSynchronize(eng->stream);
-                if (cudaGetLastError() != cudaSuccess) { gemma4_engine_seq_remove(eng, slot); return -1; }
-                if (first_token_out) *first_token_out = ft;
-            } else if (sfx_rc == -1) {
-                gemma4_engine_seq_remove(eng, slot); return -1;
-            }
-            // sfx_rc == -2: unsupported → fall through to the chunk path (state untouched).
-        }
         if (sfx_rc != 0 &&
             prefill_suffix_batched(eng, s, prompt + shared_tok,
                                    n_prompt - shared_tok, /*do_sample=*/1, first_token_out) != 0) {
@@ -12944,74 +12414,12 @@ extern "C" int gemma4_engine_step_batch_fused(
     int pf_slot, const int32_t *pf_chunk, int pf_len, int pf_is_final,
     int32_t *out_dec, int *out_dec_lens, int32_t *pf_first_out)
 {
-    if (!eng || !eng->loaded || !eng->paged_enabled) return -1;
-    if (!GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch)) return -2;   // Gemma keeps its own (non-fused) path
-    if (B_dec < 0 || pf_len <= 0 || !pf_chunk) return -1;
-    if (pf_slot < 0 || pf_slot >= GEMMA4_MAX_SEQS || !eng->slots[pf_slot].used) return -1;
-    if (B_dec + pf_len > GEMMA4_MAX_SEQS) return -1;
-    if (ensure_spec_scratch(eng) != 0 || ensure_ms_scratch(eng) != 0) return -1;
-
-    gemma4_seq *pf = &eng->slots[pf_slot];
-    int pf_base = pf->n_tokens;
-
-    // Ensure the prefilling seq's paged blocks cover [pf_base, pf_base+pf_len) BEFORE the pass
-    // (mirror prefill_suffix_batched / seq_prefill_chunk). Done FIRST so a KV exhaustion here
-    // leaves the decode rows entirely untouched (no n_tokens advanced) — the caller evicts pf and
-    // retries the decode rows next pass.
-    if (paged_slot_sync(eng, pf, pf_base + pf_len - 1) != 0) return -1;
-
-    gemma4_seq *slv[GEMMA4_MAX_SEQS];
-    int32_t    in2[GEMMA4_MAX_SEQS];
-    int        positions[GEMMA4_MAX_SEQS];
-    int        rowmap[GEMMA4_MAX_SEQS];
-    int M = 0;
-
-    // Decode rows — per-row admission with the same -1 sentinel as gemma4_engine_step_batch.
-    for (int r = 0; r < B_dec; r++) {
-        if (out_dec)      out_dec[r] = 0;
-        if (out_dec_lens) out_dec_lens[r] = 1;
-        int id = dec_slots[r];
-        if (id < 0 || id >= GEMMA4_MAX_SEQS || !eng->slots[id].used) return -1;
-        gemma4_seq *s = &eng->slots[id];
-        if (paged_slot_sync(eng, s, s->n_tokens) != 0) {   // out of KV blocks → stop this row
-            if (out_dec)      out_dec[r] = -1;
-            if (out_dec_lens) out_dec_lens[r] = -1;
-            continue;
-        }
-        slv[M] = s; in2[M] = dec_toks[r]; positions[M] = s->n_tokens; rowmap[M] = r; M++;
-    }
-    int dec_rows = M;   // [0, dec_rows) are decode rows; [dec_rows, M) the prefill rows
-
-    // Prefill chunk rows: all = pf at consecutive positions pf_base+j (rng_off implicitly 0).
-    for (int j = 0; j < pf_len; j++) {
-        slv[M] = pf; in2[M] = pf_chunk[j]; positions[M] = pf_base + j; rowmap[M] = -1; M++;
-    }
-    if (M == 0) return 0;   // pf_len >= 1 guarantees M > 0; defensive.
-
-    // ONE batched forward over all M rows. rng_off = NULL → every row's splitmix64 index is
-    // (its seq's n_sampled + 1), identical to plain step_batch (decode) and prefill_suffix_batched
-    // (prefill), so decode is byte-identical with or without the co-batched prefill.
-    if (decode_multiseq_forward(eng, slv, in2, positions, M, /*want_sample=*/1, NULL) != 0) return -1;
-
-    int32_t outs[GEMMA4_MAX_SEQS];
-    cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)M*sizeof(int32_t), cudaMemcpyDeviceToHost, eng->stream);
-    cudaStreamSynchronize(eng->stream);
-    if (cudaGetLastError() != cudaSuccess) return -1;
-
-    // Commit decode rows — byte-identical to gemma4_engine_step_batch.
-    for (int v = 0; v < dec_rows; v++) {
-        slv[v]->n_tokens = positions[v] + 1;
-        slv[v]->n_sampled++;
-        if (out_dec) out_dec[rowmap[v]] = outs[v];
-    }
-    // Commit prefill: advance pf by the whole chunk; the final chunk's LAST prefill row's sample
-    // is the prompt's first generated token (matching prefill_suffix_batched / seq_prefill_chunk).
-    pf->n_tokens = pf_base + pf_len;
-    if (pf_is_final) {
-        pf->n_sampled++;
-        if (pf_first_out) *pf_first_out = outs[M - 1];
-    }
-    return 0;
+    // Legacy Stage-18 fused prefill+decode removed with legacy Qwen3. Qwen3.5 fuses via the
+    // qwen35 batched engine; this returns -2 so the Go FusedPrefillEngine falls back cleanly.
+    (void)dec_slots; (void)dec_toks; (void)B_dec; (void)pf_slot; (void)pf_chunk;
+    (void)pf_len; (void)pf_is_final; (void)out_dec; (void)out_dec_lens; (void)pf_first_out;
+    if (!eng || !eng->loaded) return -1;
+    return -2;
 }
 
 static int mtp_draft_paged(gemma4_engine_t *eng, gemma4_seq *s, int32_t g,
@@ -15764,7 +15172,7 @@ int gemma4_engine_is_qwen3_family(const gemma4_engine_t *eng) {
     // qwen35 hybrid impls). It is intentionally NOT in the GEMMA4_IS_QWEN3_FAMILY macro,
     // which gates the fp8 paged-KV POOL allocation — qwen35 carries its own fp32 GDN/conv/
     // FULL-KV arenas instead, so it must skip that pool path. Hence the explicit OR here.
-    return (eng && (GEMMA4_IS_QWEN3_FAMILY(eng->cfg.arch) ||
+    return (eng && (0 ||
                     eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)) ? 1 : 0;
 }
 

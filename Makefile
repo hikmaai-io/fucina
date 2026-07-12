@@ -29,8 +29,8 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 .PHONY: all clean test cuda lib libdg fucina fucina-calibrate smoke profile model-plan-test allocation-set-test nvfp4-test e4b-test \
         e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
         e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
-        go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test qwen3-prefix-test \
-        qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-suffix-test qwen3-fused-test gpu-gates \
+        go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test \
+        gpu-gates qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-moe-fp8-engine-test \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
         qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen36-ssd-stream-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench phase-b-test \
@@ -120,10 +120,9 @@ test: fucina go-test go-test-cgo paged-kv-test
 # correctness gates introduced this session. Each is a standalone target, but
 # none was a prerequisite of `test`, so all could be silently forgotten. This
 # umbrella chains them so a regression in any cannot pass unnoticed. Requires
-# the Qwen3 dense + MoE GGUFs (override with MODEL= / QWEN3MOE_MODEL=) and a
-# GPU; run each invocation under the shared GPU flock.
-gpu-gates: qwen3-parity-test qwen3moe-parity-test qwen3moe-spec-test qwen3moe-one-test qwen3-prefix-test qwen3-suffix-test qwen3-fused-test
-	@echo "gpu-gates: all Qwen3-dense/MoE/spec/prefix/suffix/B=2/fused regression gates passed"
+# the Qwen3.5 FP8/NVFP4 checkpoints and a GPU; run each under the shared GPU flock.
+gpu-gates: qwen35-parity-test qwen35-batch-test qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-moe-fp8-engine-test
+	@echo "gpu-gates: all Qwen3.5 dense+MoE parity/batch/state/chunk/multiseq-prefill/MoE-engine gates passed"
 
 
 # ─── Paged-KV allocator unit test (host-only, no GPU) ───────────────────
@@ -144,12 +143,6 @@ mmvq-q4k-test:
 # ─── Qwen3 ragged spec-in-batch verify (DSpark step) (GPU) ──────────────
 # Asserts gemma4_engine_step_batch_spec: anchor-only (d=0) == step_batch greedy;
 # correct draft accepted (run grows), wrong draft rejected with target correction.
-qwen3-spec-test: lib
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_spec.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_spec \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3_spec
-
 # ─── Paged-KV device-kernel test (GPU) ──────────────────────────────────
 # Proves block-table indirection (paged_kv_device.cuh) is bit-identical to the
 # contiguous KV layout on the read path, and numerically correct for attention.
@@ -410,85 +403,35 @@ qwen35-fp8-bench: lib libdg
 # Feeds llama.cpp's input ids for "The capital of France is" through fucina's
 # arch-driven multiseq path and asserts the greedy continuation matches
 # llama.cpp's [12095,13,576,6722,315,15344,374,21718] (Qwen3-8B Q4_K_M).
-qwen3-parity-test: lib libdg
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_parity.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_parity \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3_parity
-
 # ─── Qwen3-MoE (qwen3moe) numeric parity vs llama.cpp (GPU) ─────────────
 # Loads Qwen3-30B-A3B (sparse MoE: 128 experts, top-8) and asserts fucina's greedy
 # continuation of "The capital of France is" matches llama.cpp's raw-completion reference
 # [12095,13,576,6722,315,279,3639,4180] token-for-token (8/8). Override the model with MODEL=.
-QWEN3MOE_MODEL ?= /opt/spark/models/Qwen3-30B-A3B-Instruct-2507-UD-Q4_K_XL.gguf
-qwen3moe-parity-test: lib libdg
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3moe_parity.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3moe_parity \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3moe_parity $(QWEN3MOE_MODEL)
-
 # ─── Qwen3-MoE DSpark spec losslessness on the MoE FFN (GPU) ────────────
 # Drives Qwen3-30B-A3B through the spec-decode verify path and asserts: (A) depth-0 spec is
 # byte-identical to plain step_batch (lossless), (B) a correct draft is accepted and grows the
 # run, (C) a wrong draft is rejected and corrected. Guards the deterministic per-token MoE
 # expert reduce (no atomicAdd scatter) that makes the batched MoE FFN bit-reproducible.
-qwen3moe-spec-test: lib libdg
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3moe_spec.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3moe_spec \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3moe_spec $(QWEN3MOE_MODEL)
-
 # ─── Qwen3-MoE B=2 cross-sequence row-independence (GPU) ────────────────
 # The atomicAdd-scatter nondeterminism bug only surfaced at B>=2 with DIVERGENT rows;
 # single-seq parity missed it entirely. This batches two sequences at different
 # trajectory positions in ONE step_batch(B=2) and asserts each row continues
 # independently (row0==single-seq next, row1==trajectory[3], rows differ) — the
 # direct gate for the deterministic dg_moe_route_inv/dg_moe_reduce combine.
-qwen3moe-one-test: lib libdg
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3moe_one.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3moe_one \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3moe_one $(QWEN3MOE_MODEL)
-
 # ─── Qwen3 cross-request prefix cache losslessness (GPU) ────────────────
 # Proves cache-served requests (shared-prefix reuse) produce a greedy token stream
 # bit-identical to a cold request, sequentially and concurrently. See paged_prefix.h.
-qwen3-prefix-test: lib libdg
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_prefix.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_prefix \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3_prefix $(MODEL)
-
 # ─── Stage 9: base-offset compute-bound suffix prefill losslessness (GPU) ─
 # Proves the GEMM suffix prefill (paged_prefill_qwen3 base>0) is lossless: a sequence built
 # prefix-then-suffix (cross-request prefix-cache adoption) yields a greedy stream bit-identical
 # to a one-shot prefill, on BOTH Qwen3-8B dense and Qwen3-30B-A3B MoE. Args: <dense> [<moe>].
-QWEN3_DENSE_MODEL ?= /opt/spark/models/Qwen3-8B-abliterated.Q4_K_M.gguf
-qwen3-suffix-test: lib libdg
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_suffix_prefill.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_suffix \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3_suffix $(if $(MODEL),$(MODEL),$(QWEN3_DENSE_MODEL)) $(QWEN3MOE_MODEL)
-
 # ─── Stage 18: FUSED prefill+decode losslessness (GPU) ──────────────────
 # Proves gemma4_engine_step_batch_fused is lossless on BOTH halves: a sequence prefilled via the
 # FUSED path while co-batched with N>=2 unrelated DECODE rows yields a first token + >=16-token
 # greedy continuation byte-identical to a STANDALONE seq_open+seq_prefill_chunk (LOSSLESS-PREFILL),
 # AND the co-batched decode rows are byte-identical to a plain step_batch of the same rows without
 # the prefill (LOSSLESS-DECODE). Runs on Qwen3-8B dense and Qwen3-30B-A3B MoE. Args: <dense> [<moe>].
-qwen3-fused-test: lib libdg
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_fused.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_fused \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3_fused $(if $(MODEL),$(MODEL),$(QWEN3_DENSE_MODEL)) $(QWEN3MOE_MODEL)
-
 # ─── Qwen3 decode throughput (GPU) ──────────────────────────────────────
-qwen3-bench: lib libdg
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen3_bench.cu \
-		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen3_bench \
-		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
-	/tmp/fucina_qwen3_bench $(MODEL)
-
 # ─── KV-quant exploration (host, Phase 6) ───────────────────────────────
 # Offline comparison of KV-cache quant codecs (FP8 / per-token FP8 / NVFP4 /
 # TurboQuant-MSE). Decides whether to move KV off flat FP8. Host-only, no engine
