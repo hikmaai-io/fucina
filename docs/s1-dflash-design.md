@@ -1,6 +1,26 @@
 # S1a DFlash design and architecture gate
 
-Status: **P0–P2 + planner delivered green; P3/P4 stop at the real-weights boundary** (2026-07-12)
+Status: **LOSSLESS GREEDY DFLASH WORKING on real weights, all gates green** (2026-07-12).
+Measured single-stream acceptance 3.56 drafts/step (aggregate), emitted byte-
+identical to plain greedy decode on every tested prompt. Remaining: probabilistic
+path, kernel optimization for wall-clock speedup, concurrency B>1 tuning.
+
+## Certified gate matrix (2026-07-12, all PASS)
+
+Host: dflash-rng, -loader, -plan, -commit, -pipeline, -pcgeom, -real-load.
+GPU numerical (real weights): -parity (CPU==CUDA), -query forward, -draft entry,
+-verify-accept, precompute/backbone/attn/ctxkv/residency/forward/combine parities.
+GPU end-to-end (real FP8 target + z-lab draft): -gdn-rollback (commit(j) byte-
+identical ∀j), -verify-block (per-row argmax == sequential decode, GDN rollback),
+-engine-load (real draft resident + validated), **-measure (byte-identical to
+greedy on all prompts; MEASURED mean emitted/step 4.556 = accepted 3.556/step)**.
+Regression: -batch (row-independence + graph-on==off + M3-parity + self-chain),
+full `make lib libdg fucina` + Go tests. DFlash-off byte-identity preserved.
+
+---
+
+(Original phased status below.)
+
 
 ## Delivered (this branch, byte-identical when DFlash disabled)
 
