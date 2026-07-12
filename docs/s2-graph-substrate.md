@@ -168,5 +168,26 @@ throughput is expected neutral. The `scripts/protection_gate.py` sweep requires 
 quiescent box (a contended GPU makes throughput numbers invalid). Status recorded
 in the completion note below; determinism + parity gates (the correctness
 contract) are fully green.
+
+### Protection-gate run log (2026-07-12)
+
+- Attempt 1 (dense 9B, `s2-a134cbf`): **INVALID — multi-agent GPU contention.**
+  During the ordered 1→32 sweep a sibling agent's 12–22 GB job was resident on the
+  shared 273 GB/s GPU; server telemetry showed `engine 74.7 ms/step` at avgB=2
+  (vs the ~30 ms floor). Result: N=2/4/8 throughput ~halved then *recovered* to
+  ABOVE baseline by N=32 as contention eased (N=32 336 vs base 261; TTFT better in
+  every cell). A byte-identical-math change (determinism-proven) cannot halve N=2
+  decode — the shape is a textbook contention artifact, not a regression.
+- **Decision**: do NOT weaken the gate and do NOT accept a contention-poisoned
+  result. The protection sweep must be re-run in a quiescent window (no other
+  inference server active, per `benchmark-evidence/PROTOCOL.md`). The
+  correctness-critical gates (byte-identical determinism, unchanged logit bounds,
+  24× zero-sync self-chain, parity) are all green and are what guard the change's
+  *correctness*; the protection gate guards *throughput*, which S2 does not touch
+  (no kernel math changed; +2 int-only kernels over B≤32 rows inside the graph).
+- Re-run command (quiescent box):
+  `flock /tmp/fucina_gpu.lock -c '/tmp/s2_sweep_dense.sh'` then
+  `protection_gate.py check --baseline …/baseline-dense.json --candidate
+  /tmp/s2_cand_dense.json` (and the MoE equivalent).
 </content>
 </invoke>
