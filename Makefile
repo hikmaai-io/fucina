@@ -643,6 +643,13 @@ qwen35-dflash-layer-parity-test:
 		-lcudart -lcuda
 	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_layer"
 
+# P3 full 6-layer DFlash backbone forward parity on the REAL weights: all 6 real layers + final
+# norm, exercising cross-layer residual propagation + per-layer weight binding. SKIPs if absent.
+qwen35-dflash-backbone-parity-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_backbone_parity.cu -o /tmp/dflash_backbone \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_backbone"
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:
