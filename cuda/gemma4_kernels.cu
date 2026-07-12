@@ -1987,6 +1987,93 @@ __global__ void mmvq_q4_k_packedT_batched_kernel(
     for (int n = 0; n < NK; n++) { float v = warp_reduce_sum_all(acc[n]); if (lane==0) out[(size_t)n*out_dim+idx] = v; }
 }
 
+// K>8 MULTI-CHUNK variant (P2 dense decode): ONE launch covers all ceil(K/8) 8-token chunks
+// with grid = (chunk, row-group) — blockIdx.x (fastest-dispatched) is the CHUNK, so all chunks
+// of a row group are scheduled adjacently and the row's weight bytes stream from DRAM once and
+// hit L2 (24 MB on GB10, ~90% hit measured) for the other chunks. This replaces the serial
+// NK=16/8/rem ladder that re-read the whole weight slab per pass (3× at B=30 — 59 ms of a
+// 91.6 ms dense decode step) while KEEPING the NK≤8 register footprint (68 regs vs 144 for
+// the NK=16 tile at 16.6% occupancy). Per-token accumulation acc[n] walks the b-loop in the
+// SAME lane order regardless of chunking ⇒ outputs BITWISE-identical to the single-chunk
+// kernel and to the ladder it replaces. `ntok` guards the ≤8-token tail chunk.
+// (Tried and rejected: PIPE=4 — 323 vs 366 agg @ B=16; 2-row register blocking — spills.)
+template<int NK>
+__global__ void __launch_bounds__(256, 4) mmvq_q4_k_packedT_multi_kernel(
+    float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K)
+{
+    constexpr int PIPE = 2;                      // superblock epochs staged per chunk
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.y * nwarps + warp;        // output row (grid.y = row groups)
+    if (idx >= out_dim) return;
+    const int t0 = (int)blockIdx.x * NK;         // this chunk's first token
+    const int ntok = (K - t0 < NK) ? (K - t0) : NK;
+    const int8_t *qxTc = qxT + (size_t)t0 * in_dim;
+    const float  *dxc  = dx + (size_t)t0 * (in_dim >> 5);
+    const int    *sxc  = sx + (size_t)t0 * (in_dim >> 5);
+    float        *outc = out + (size_t)t0 * out_dim;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * 144;
+    float acc[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
+    for (int b0 = lane; b0 < nb32; b0 += 32*PIPE) {
+        uint4 hh[PIPE], hq[PIPE];
+        #pragma unroll
+        for (int p = 0; p < PIPE; p++) {
+            int b = b0 + 32*p;
+            if (b < nb32) {
+                const uint8_t *blk = wrow + (size_t)(b >> 3) * 144;
+                hh[p] = __ldg((const uint4 *)blk);
+                hq[p] = __ldg((const uint4 *)(blk + 16 + (size_t)(b & 7) * 16));
+            }
+        }
+        #pragma unroll
+        for (int p = 0; p < PIPE; p++) {
+            int b = b0 + 32*p;
+            if (b >= nb32) break;
+            int j = b & 7;
+            uint4 h = hh[p];
+            __half_raw hd; hd.x = (uint16_t)(h.x & 0xFFFF);
+            __half_raw hm; hm.x = (uint16_t)(h.x >> 16);
+            float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+            int s, m; q4k_scale_min_reg(h.y, h.z, h.w, j, &s, &m);
+            float ds = d*(float)s, dm = dmin*(float)m;   // original (d·s), (dmin·m) grouping
+            uint4 q = hq[p];
+            int wv[8];
+            int w0=(int)q.x, w1=(int)q.y, w2=(int)q.z, w3=(int)q.w;
+            wv[0]=w0&0x0F0F0F0F; wv[1]=(w0>>4)&0x0F0F0F0F;
+            wv[2]=w1&0x0F0F0F0F; wv[3]=(w1>>4)&0x0F0F0F0F;
+            wv[4]=w2&0x0F0F0F0F; wv[5]=(w2>>4)&0x0F0F0F0F;
+            wv[6]=w3&0x0F0F0F0F; wv[7]=(w3>>4)&0x0F0F0F0F;
+            const int8_t *xbase = qxTc + (size_t)(b >> 5)*1024 + (size_t)(b & 31)*16;
+            #pragma unroll
+            for (int n = 0; n < NK; n++) {
+                if (n >= ntok) break;
+                uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);        // xqs[0..3]
+                uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);  // xqs[4..7]
+                int sumi = 0;
+                sumi = __dp4a(wv[0], (int)A.x, sumi);
+                sumi = __dp4a(wv[1], (int)B.x, sumi);
+                sumi = __dp4a(wv[2], (int)A.y, sumi);
+                sumi = __dp4a(wv[3], (int)B.y, sumi);
+                sumi = __dp4a(wv[4], (int)A.z, sumi);
+                sumi = __dp4a(wv[5], (int)B.z, sumi);
+                sumi = __dp4a(wv[6], (int)A.w, sumi);
+                sumi = __dp4a(wv[7], (int)B.w, sumi);
+                acc[n] += dxc[(size_t)n*nb32 + b] *
+                          (ds*(float)sumi - dm*(float)sxc[(size_t)n*nb32 + b]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) {
+        if (n >= ntok) break;
+        float v = warp_reduce_sum_all(acc[n]);
+        if (lane==0) outc[(size_t)n*out_dim+idx] = v;
+    }
+}
+
 static void mmvq_q4_k_packedT_batched_launch(
     float *out, const uint8_t *w, const int8_t *qxT, const float *dx, const int *sx,
     int in_dim, int out_dim, int K, cudaStream_t stream)
@@ -2001,18 +2088,14 @@ static void mmvq_q4_k_packedT_batched_launch(
         case 7: LPT_Q4K(7,0); return; case 8: LPT_Q4K(8,0); return;
         default: break;
     }
-    // K>8: same NK grouping as the row-major launch (32 prefill / 16 B=16-decode / 8 / rem).
-    int o = 0;
-    for (; o + 32 <= K; o += 32) LPT_Q4K(32, o);
-    for (; o + 16 <= K; o += 16) LPT_Q4K(16, o);
-    for (; o + 8  <= K; o += 8)  LPT_Q4K(8,  o);
-    int rem = K - o;
-    switch (rem) {
-        case 1: LPT_Q4K(1,o); break; case 2: LPT_Q4K(2,o); break; case 3: LPT_Q4K(3,o); break;
-        case 4: LPT_Q4K(4,o); break; case 5: LPT_Q4K(5,o); break; case 6: LPT_Q4K(6,o); break;
-        case 7: LPT_Q4K(7,o); break; default: break;
-    }
     #undef LPT_Q4K
+    // K>8: one multi-chunk launch, weight read once (chunk-major dispatch → L2 reuse across
+    // the ≤8-token chunks of each row group). Bitwise-identical to the old NK=16/8/rem ladder
+    // (same per-(row,token) ascending-b accumulation; chunking only changes WHICH block computes
+    // a (row, token) pair, not its arithmetic).
+    dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
+    mmvq_q4_k_packedT_multi_kernel<8><<<gm, b, 0, stream>>>(
+        out, w, qxT, dx, sx, in_dim, out_dim, K);
 }
 
 // ─── Native Q4_K / Q6_K → BF16 dequant (fast Qwen3 prefill) ─────────────────────────

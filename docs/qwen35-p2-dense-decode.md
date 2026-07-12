@@ -88,6 +88,22 @@ Expected: 59 → ~16–20 ms/step at B=30.
 
 ## 4. Measured deltas (updated as fixes land)
 
-| change | B=16 agg | B=30 step | B=32 agg | gates |
+| change | B=16 agg | B=30 agg | B=32 agg | gates |
 |---|---|---|---|---|
-| baseline (028c8b2) | 345 tok/s | 91.6 ms | 380 tok/s | green |
+| baseline (1cc35ed, pre-fix) | 345.3 | 330.6 | 382.6 | green |
+| F1 (single-pass BF16 head, f6c5634) + F2 (mixer weight-read-once) | 352.3 | **425.0** | 399.4 | all green |
+| **delta** | +2.0% | **+28.6%** | +4.4% | — |
+
+**Result:** F1+F2 land the predicted win at B=30 (the non-power-of-2 case where the old
+chunked ladder read the 3.89 GB mixer 3× as 16+8+6): **330.6 → 425.0 tok/s (+28.6%)**,
+step 91.6 → ~70.6 ms. B=32 (single NK=32 pass) and B=16 (already single-pass) gain less,
+as predicted — the fix targets the multi-chunk ladder regime. Losslessness gate PASS
+(byte-identical determinism, dense logit rel ≤0.0029 unchanged from pre-fix, MoE
+expert-flips only in the documented cells). Both fixes bitwise-identical by construction.
+
+### Verification
+- `qwen35-multiseq-prefill-test`: PASS both models, logit bounds identical to pre-fix.
+- Apples-to-apples bench: baseline binary built at 1cc35ed vs F1+F2 at HEAD, same
+  checkpoint (Qwen3.5-9B-FP8), same 96-step harness, B∈{16,30,32}.
+- Serving impact: the served dense path admits at avgB≈30 → this is the B that matters
+  for the L-dense N≥16 loss; +28.6% at B=30 closes most of the vLLM aggregate gap there.
