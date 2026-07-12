@@ -85,6 +85,7 @@ struct qwen35_runtime_state {
     uint8_t        dflash_capture_layer[GEMMA4_CAP_LAYERS];  // 1 => capture this target layer
     int            dflash_capture_slot[GEMMA4_CAP_LAYERS];   // target layer -> feature slot [0,F)
     float         *dflash_aux;                        // [F * maxrows * H] device: [slot][row][H]
+    float         *dflash_target_logits;              // [(1+K) * vocab] device: probabilistic verify
 
     // S1a P3/P4 resident draft model (opaque handles; real types in qwen35_dflash_forward.cuh).
     // Loaded lazily on the first enabled verify step from FUCINA_QWEN35_DFLASH_PATH; NULL when the

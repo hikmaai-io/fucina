@@ -768,6 +768,14 @@ qwen35-dflash-e2e-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_dflash_e2e $(QWEN35_MODEL)"
 
+# DFlash probabilistic real step (assembly correctness): in-vocab tokens + run-to-run byte-identical
+# for a fixed seed on the real FP8 target (distribution preservation proven separately).
+qwen35-dflash-prob-step-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_prob_step.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dflash_prob_step \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "FUCINA_QWEN35_DFLASH_PATH=$(DFLASH_PATH) /tmp/fucina_dflash_prob_step $(DFLASH_TARGET)"
+
 # DFlash REAL end-to-end: drive the resident draft model through gemma4_engine_q35_dflash_real_step;
 # emitted stream MUST be byte-identical to plain greedy decode; reports MEASURED accept rate.
 qwen35-dflash-real-e2e-test: lib libdg

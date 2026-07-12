@@ -420,6 +420,12 @@ int    gemma4_engine_q35_dflash_real_step(gemma4_engine_t *eng, int slot, int32_
                                           int32_t *out_emit, int *out_n, int32_t *next_bonus);
 void   gemma4_engine_q35_dflash_reset_context(gemma4_engine_t *eng);
 
+// S1a P4 probabilistic (temperature>0): one REAL DFlash step drafting + verifying with the P1
+// rejection sampler over full target/draft distributions (shared-key uniforms). Distribution-
+// preserving: emitted tokens ~ direct temperature sampling from the target, regardless of draft.
+int    gemma4_engine_q35_dflash_real_step_prob(gemma4_engine_t *eng, int slot, int32_t bonus,
+        double temp, uint64_t seed, int32_t *out_emit, int *out_n, int32_t *next_bonus);
+
 // Named device-memory accounting. Qwen fields are zero for other architectures.
 typedef struct gemma4_memory_stats {
     uint64_t qwen_workspace_bytes;

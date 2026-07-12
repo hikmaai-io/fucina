@@ -5093,7 +5093,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->q35.dflash_critical_batch = 0;
     eng->q35.dflash_capture_active = 0; eng->q35.dflash_capture_nfeat = 0;
     eng->q35.dflash_capture_maxrows = 0;
-    eng->q35.dflash_aux = NULL;
+    eng->q35.dflash_aux = NULL; eng->q35.dflash_target_logits = NULL;
     for (int i = 0; i < GEMMA4_CAP_LAYERS; i++) { eng->q35.dflash_capture_layer[i] = 0; eng->q35.dflash_capture_slot[i] = 0; }
     eng->q35.dflash_residency = NULL; eng->q35.dflash_drafter = NULL;
     eng->q35.dflash_loaded = 0; eng->q35.dflash_load_failed = 0;
@@ -6717,6 +6717,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     }
     q35_dflash_unload(eng);           // S1a P3/P4 resident draft model (drafter + residency)
     CUDA_FREE(eng->q35.dflash_aux);   // S1a P4 target aux-hidden capture buffer
+    CUDA_FREE(eng->q35.dflash_target_logits);   // S1a P4 probabilistic verify target logits
     for (int i = 0; i < 24; i++) CUDA_FREE(eng->q35.sb[i]);
     CUDA_FREE(eng->q35.rowslot);
     CUDA_FREE(eng->q35.chunk_scr);
@@ -15895,6 +15896,100 @@ extern "C" int gemma4_engine_q35_dflash_real_step(gemma4_engine_t *eng, int slot
         D->ctxlen++;
     }
     cudaStreamSynchronize(st);
+    return 0;
+}
+
+// One REAL DFlash step, PROBABILISTIC (temperature>0). Mirrors the greedy real_step but drafts +
+// verifies with the P1 rejection sampler over full target/draft distributions using the shared-key
+// uniforms. Distribution-preserving (not byte-identical): emitted tokens are distributed exactly as
+// direct temperature sampling from the target, regardless of the draft (proven: prob-dist gate).
+// Steps: draft_prob -> verify_block_logits (target logits [T,vocab] + argmax) -> device rejection
+// accept (j, emitted) -> commit [bonus, d1..dj] -> emit [d1..dj, emitted], next bonus = emitted.
+extern "C" int gemma4_engine_q35_dflash_real_step_prob(gemma4_engine_t *eng, int slot, int32_t bonus,
+        double temp, uint64_t seed, int32_t *out_emit, int *out_n, int32_t *next_bonus) {
+    if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -1;
+    if (q35_dflash_ensure_loaded(eng) != 0) return -1;
+    if (slot < 0 || slot >= eng->q35.capacity || !eng->slots[slot].used) return -1;
+    if (!eng->d_embed_bf16 || !eng->d_lmhead_bf16) return -3;   // needs FP8 target BF16 tables
+    auto *R = (q35_dflash_residency *)eng->q35.dflash_residency;
+    auto *D = (q35_dflash_drafter *)eng->q35.dflash_drafter;
+    const int H = eng->cfg.hidden_size, VOC = eng->cfg.vocab_size, K = D->K, F = R->geom.num_target_features;
+    const int maxr = eng->q35.dflash_capture_maxrows, T = 1 + K;
+    cudaStream_t st = eng->stream;
+    const double theta = 10000000.0; const float eps = 1e-6f;
+
+    // Target logits buffer [(1+K) * vocab] (lazy).
+    if (!eng->q35.dflash_target_logits &&
+        cudaMalloc(&eng->q35.dflash_target_logits, (size_t)T * VOC * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError(); return -1;
+    }
+
+    int base = eng->slots[slot].n_tokens;
+    int32_t qids[GEMMA4_MAX_SEQS]; int qpos[GEMMA4_MAX_SEQS]; int64_t spos[GEMMA4_MAX_SEQS];
+    qids[0] = bonus; for (int i = 1; i <= K; i++) qids[i] = R->geom.mask_token_id;
+    for (int i = 0; i <= K; i++) qpos[i] = base + i;
+    // Drafted token i occupies absolute position base+1+i; its shared-key sample uses that position.
+    for (int i = 0; i < K; i++) spos[i] = base + 1 + i;
+
+    // 1) Probabilistic draft over the accumulated context.
+    int32_t draft[GEMMA4_MAX_SEQS];
+    {
+        int num_ctx = D->ctxlen;
+        if (num_ctx <= 0) {
+            static float *zero_aux = nullptr; static int zeros_for = 0;
+            if (!zero_aux || zeros_for < F*H) { if (zero_aux) cudaFree(zero_aux); cudaMalloc(&zero_aux,(size_t)F*H*4); cudaMemset(zero_aux,0,(size_t)F*H*4); zeros_for=F*H; }
+            int one_pos[1] = {0};
+            q35_dflash_draft_prob(*R, *D, zero_aux, one_pos, 1, qids, qpos, spos,
+                                  eng->d_embed_bf16, eng->d_lmhead_bf16, VOC, draft, temp, seed, theta, eps, st);
+        } else {
+            q35_dflash_draft_prob(*R, *D, D->ctx_aux_concat, D->ctx_abs_pos, num_ctx, qids, qpos, spos,
+                                  eng->d_embed_bf16, eng->d_lmhead_bf16, VOC, draft, temp, seed, theta, eps, st);
+        }
+        cudaStreamSynchronize(st);
+        if (cudaGetLastError() != cudaSuccess) { fprintf(stderr, "fucina: DFlash prob draft CUDA error\n"); return -2; }
+    }
+
+    // 2) Verify block with capture ON, retaining per-row target logits into the device buffer.
+    int32_t block[GEMMA4_MAX_SEQS], am[GEMMA4_MAX_SEQS];
+    block[0] = bonus; for (int i = 0; i < K; i++) block[1 + i] = draft[i];
+    eng->q35.dflash_capture_active = 1;
+    int vrc = qwen35_dflash_verify_block_ex(eng, slot, block, T, am, eng->q35.dflash_target_logits);
+    eng->q35.dflash_capture_active = 0;
+    if (vrc != 0) return -1;
+
+    // 3) Device probabilistic rejection over target/draft logits with the shared-key uniforms.
+    //    The target rows used by the rejection are rows 0..K-1 (row i predicts drafted token i);
+    //    draft rows are D->draft_logits [K, vocab]; positions are spos; bonus position = base+1+K.
+    static int *d_acc = nullptr; static int32_t *d_emit = nullptr; static int64_t *d_spos = nullptr; static int32_t *d_draft = nullptr;
+    if (!d_acc) { cudaMalloc(&d_acc, sizeof(int)); cudaMalloc(&d_emit, sizeof(int32_t)); cudaMalloc(&d_spos, (size_t)GEMMA4_MAX_SEQS*sizeof(int64_t)); cudaMalloc(&d_draft, (size_t)GEMMA4_MAX_SEQS*sizeof(int32_t)); }
+    cudaMemcpyAsync(d_spos, spos, (size_t)K*sizeof(int64_t), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(d_draft, draft, (size_t)K*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    q35_dflash_verify_prob_device(eng->q35.dflash_target_logits, D->draft_logits, VOC, d_draft,
+                                  K, seed, d_spos, (int64_t)(base + 1 + K), d_acc, d_emit, st);
+    int j = 0; int32_t emitted = 0;
+    cudaMemcpyAsync(&j, d_acc, sizeof(int), cudaMemcpyDeviceToHost, st);
+    cudaMemcpyAsync(&emitted, d_emit, sizeof(int32_t), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (j < 0) j = 0; if (j > K) j = K;
+
+    // 4) Commit [bonus, d1..dj] through the decode path (state advances through the accepted
+    //    sampled tokens). Losslessness here is DISTRIBUTION preservation, not byte-identity.
+    int32_t commit_toks[GEMMA4_MAX_SEQS];
+    commit_toks[0] = bonus; for (int i = 0; i < j; i++) commit_toks[1 + i] = block[1 + i];
+    if (q35_gdn_commit(eng, slot, commit_toks, 1 + j, nullptr) != 0) return -1;
+
+    // 5) Append committed rows' aux to the draft context (like the greedy path).
+    int commit_rows = 1 + j;
+    for (int r = 0; r < commit_rows; r++) {
+        if (D->ctxlen >= D->ctx_aux_cap) break;
+        q35_dflash_aux_gather(eng->q35.dflash_aux, D->ctx_aux_concat + (size_t)D->ctxlen*F*H, F, maxr, H, r, 1, st);
+        D->ctx_abs_pos[D->ctxlen] = base + r; D->ctxlen++;
+    }
+    cudaStreamSynchronize(st);
+
+    // Emit the j accepted sampled drafts + the rejection-resampled/bonus token.
+    int n = 0; for (int i = 0; i < j; i++) out_emit[n++] = block[1 + i]; out_emit[n++] = emitted;
+    *out_n = n; *next_bonus = emitted;
     return 0;
 }
 
