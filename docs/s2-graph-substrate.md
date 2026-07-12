@@ -85,6 +85,38 @@ Both must land green + gated before push.
 
 ## Decisions log
 
-(appended as work lands)
+### S2b — keyed CUDA-graph cache (LANDED, `e503175`)
+
+- New `cuda/qwen35_graph_key.cuh` (ABOUTME): pure, host-testable `q35_graph_key
+  {num_tokens, num_reqs, uniform_token_count}`, `q35_make_decode_key`,
+  `q35_make_spec_key`, `q35_graph_dominates` (dominance dispatch), and
+  `q35_sort_batch_decode_first` (stable decode-first ordering, C-style, no STL).
+- `qwen35_state.cuh`: replaced `cudaGraphExec_t graph[GEMMA4_MAX_SEQS+1]` with a
+  linear-probed `q35_graph_entry graph_cache[Q35_GRAPH_CACHE_CAP=64]` +
+  `graph_count`.
+- `qwen35_runtime.cuh`: `qwen35_ms_graph_ensure` now takes a key, looks up by
+  dominance, captures on miss, and `q35_graph_evict` compacts on replay failure.
+  `qwen35_ms_run` builds `q35_make_decode_key(B)` for the plain-decode path.
+- **Determinism**: plain decode maps `B → (B, B, 1)`, one distinct key per row
+  count, so the captured body and dispatch are bitwise-identical to the old
+  `graph[B]` scheme. `uniform_token_count` must match EXACTLY in dominance (it
+  changes the per-request query layout), so a decode key never aliases a
+  `(1+K)` spec key.
+- **Gates**: host unit test `qwen35-graph-key-test` PASS; batch selftest
+  `graph-on==off PASS`, `row-independence PASS`, `M3-parity 8/8` (captured log:
+  `qwen35 M4 batch graph captured (nt=3 nr=3 utc=1)`); multiseq-prefill PASS with
+  **unchanged** bounds (MoE ≤0.0946, dense ≤0.0029). `make lib libdg fucina`
+  green.
+- **Multi-agent note**: recovered from a cross-worktree stash collision (a
+  sibling agent parked this WIP in a shared-object-store stash and a foreign
+  `__launch_bounds__` edit leaked into the index). Reset to pristine HEAD,
+  re-applied the S2b patch cleanly, verified the `launch_bounds` baseline intact,
+  committed immediately.
+
+### Why performance-neutral
+
+The graph body captured is unchanged; only the host-side cache index changed
+(array subscript → small linear probe over ≤64 entries, once per distinct shape,
+then a pointer replay). No per-token host work added inside the hot loop.
 </content>
 </invoke>
