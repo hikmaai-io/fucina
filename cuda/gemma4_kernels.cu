@@ -15754,7 +15754,10 @@ static int q35_dflash_ensure_loaded(gemma4_engine_t *eng) {
             if (i >= e || cj[i] < '0' || cj[i] > '9') break;
             int v = atoi(cj.c_str() + i);
             while (i < e && cj[i] >= '0' && cj[i] <= '9') i++;
-            if (v >= 0 && v < GEMMA4_CAP_LAYERS) { eng->q35.dflash_capture_layer[v] = 1; eng->q35.dflash_capture_slot[v] = slot++; }
+            // vLLM captures the residual stream when (layer_idx+1) == target_layer_id, i.e. AFTER
+            // completing layer (id-1). fucina's hook fires after layer l, so map id -> l = id-1.
+            int l = v - 1;
+            if (l >= 0 && l < GEMMA4_CAP_LAYERS) { eng->q35.dflash_capture_layer[l] = 1; eng->q35.dflash_capture_slot[l] = slot++; }
         }
     } }
     // Aux buffer sized F * maxrows * H, where maxrows covers the largest context+query span we
