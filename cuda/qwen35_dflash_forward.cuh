@@ -414,6 +414,9 @@ struct q35_dflash_drafter {
     int     ctx_aux_cap;          // rows of context aux held (== ctx_cap)
     float  *ctx_aux_concat;       // [ctx_aux_cap, F*H]: accumulated per-token target aux (context)
     int    *ctx_abs_pos;          // [ctx_aux_cap] host: absolute position of each context row
+    float  *draft_logits;         // [K, vocab] probabilistic draft logits (NULL until prob path used)
+    int64_t *sample_pos64;        // [K] device: absolute positions of the K sampled draft rows
+    int     vocab;
 };
 
 static inline bool q35_dflash_drafter_init(q35_dflash_drafter* D, const q35_dflash_residency& R,
@@ -434,6 +437,11 @@ static inline bool q35_dflash_drafter_init(q35_dflash_drafter* D, const q35_dfla
     ok = ok && cudaMalloc(&D->ctx_aux_concat,(size_t)ctx_cap*g.fc_in()*4)==cudaSuccess;
     D->ctx_abs_pos = (int*)malloc(sizeof(int)*ctx_cap);
     ok = ok && (D->ctx_abs_pos != nullptr);
+    // Probabilistic buffers (draft logits [K,vocab] + int64 sample positions). Allocated here so the
+    // prob path pays no per-step alloc; ~K*vocab*4 = 16 * 248320 * 4 = 15.9 MiB.
+    D->vocab = g.V;
+    ok = ok && cudaMalloc(&D->draft_logits,(size_t)K*(size_t)g.V*4)==cudaSuccess;
+    ok = ok && cudaMalloc(&D->sample_pos64,(size_t)K*sizeof(int64_t))==cudaSuccess;
     D->ctxlen=0;
     if(!ok) cudaGetLastError();
     D->ready=ok?1:0; return ok;
@@ -446,6 +454,8 @@ static inline void q35_dflash_drafter_free(q35_dflash_drafter* D, const q35_dfla
     if(D->query_ids) cudaFree(D->query_ids);
     if(D->ctx_aux_concat) cudaFree(D->ctx_aux_concat);
     if(D->ctx_abs_pos) free(D->ctx_abs_pos);
+    if(D->draft_logits) cudaFree(D->draft_logits);
+    if(D->sample_pos64) cudaFree(D->sample_pos64);
     *D=q35_dflash_drafter{};
 }
 
@@ -475,6 +485,32 @@ static inline int q35_dflash_draft_greedy(const q35_dflash_residency& R, q35_dfl
     q35_dflash_query_forward(R, D.fwd, D.query_hidden, D.query_pos, num_ctx, D.ctxK, D.ctxV, theta, eps, st, D.ctx_pos);
     // sample the K mask rows (query offsets 1..K) from the final-normed query output.
     q35_dflash_sample_greedy(D.fwd.out + (size_t)1*H, lm_head, D.K, H, vocab, out_draft, st);
+    return 0;
+}
+
+// Probabilistic draft step: identical to q35_dflash_draft_greedy through the query forward, but the
+// K mask rows are sampled from softmax(logits/temp) via the shared-key uniform (seed, sample_pos64,
+// SAMPLE), and the per-row draft logits are retained in D.draft_logits for the rejection sampler.
+// sample_pos64 [K] are the absolute positions of the drafted tokens (query offsets 1..K).
+static inline int q35_dflash_draft_prob(const q35_dflash_residency& R, q35_dflash_drafter& D,
+        const float* ctx_concat_aux, const int* ctx_positions, int num_ctx,
+        const int32_t* query_ids, const int* query_positions, const int64_t* sample_pos64,
+        const __nv_bfloat16* embed, const __nv_bfloat16* lm_head, int vocab, int32_t* out_draft,
+        double temp, uint64_t seed, double theta, float eps, cudaStream_t st){
+    if(!D.ready || num_ctx>D.ctx_cap || !D.draft_logits) return -1;
+    const qwen35dflash::Geometry& g=R.geom; const int H=g.H, rows=1+D.K;
+    D.ctx.num_ctx=num_ctx;
+    cudaMemcpyAsync(D.ctx_pos, ctx_positions, (size_t)num_ctx*sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(D.query_pos, query_positions, (size_t)rows*sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(D.query_ids, query_ids, (size_t)rows*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(D.sample_pos64, sample_pos64, (size_t)D.K*sizeof(int64_t), cudaMemcpyHostToDevice, st);
+    q35_dflash_combine_aux(R, ctx_concat_aux, D.ctx_hidden, num_ctx, st);
+    q35_dflash_embed_query(D.query_ids, embed, D.query_hidden, rows, H, st);
+    q35_dflash_precompute_context_kv(R, D.ctx, D.ctx_hidden, D.ctx_pos, D.ctxK, D.ctxV, theta, eps, st);
+    q35_dflash_query_forward(R, D.fwd, D.query_hidden, D.query_pos, num_ctx, D.ctxK, D.ctxV, theta, eps, st, D.ctx_pos);
+    // Probabilistic sample of the K mask rows (query offsets 1..K), retaining per-row draft logits.
+    q35_dflash_sample_prob(D.fwd.out + (size_t)1*H, lm_head, D.K, H, vocab, D.draft_logits,
+                           out_draft, temp, seed, D.sample_pos64, st);
     return 0;
 }
 
