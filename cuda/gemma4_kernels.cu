@@ -15859,6 +15859,13 @@ extern "C" int gemma4_engine_q35_dflash_real_step(gemma4_engine_t *eng, int slot
     int rc = qwen35_dflash_greedy_step(eng, slot, bonus, draft, K, out_emit, out_n, next_bonus);
     eng->q35.dflash_capture_active = 0;
     if (rc != 0) { fprintf(stderr, "fucina: DFlash greedy_step rc=%d (base=%d K=%d)\n", rc, base, K); return rc; }
+    if (getenv("FUCINA_DFLASH_DIAG")) {
+        // The true greedy next token is out_emit[0] when 0 accepted (correction), else the first
+        // accepted draft. draft[0] is the draft's guess for that same position. Print both + ctxlen.
+        int32_t true_next = out_emit[0];
+        fprintf(stderr, "DFLASHDIAG base=%d ctxlen=%d draft0=%d true_next=%d accepted=%d\n",
+                base, D->ctxlen, draft[0], true_next, *out_n - 1);
+    }
 
     // 4) Append the committed rows' aux to the draft context cache. The verify block was
     //    [bonus, d1..dK]; we committed 1+j rows (j = *out_n - 1). Gather those rows' aux from

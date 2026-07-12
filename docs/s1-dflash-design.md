@@ -78,13 +78,18 @@ yet match what the checkpoint was trained on.
 
 Ruled out so far (each fixed, still 0): draft context size (now full accumulated
 context, not a 17-row window); context RoPE positions (now absolute per-token, not
-[0..n)). The remaining open question is the exact aux SEMANTICS the draft's `fc`
-expects: which residual tensor at each `target_layer_id` (pre- vs post-norm, which
-of the FP8 target's 32 hybrid layers maps to the id), and whether the draft
-requires the target's aux at the QUERY positions too (not just context). Resolving
-this needs a per-tensor cross-check of one target-layer aux against a reference,
-not more loop iterations. **No speedup is claimed; acceptance is not yet
-demonstrated.**
+[0..n)); plumbing/structure (a `FUCINA_DFLASH_DIAG` trace shows `draft0` is
+deterministic and RESPONDS to the repeating context with a repeating output — the
+pipeline runs and is context-sensitive — but the prediction never equals the
+target greedy token). The output being context-responsive yet systematically
+wrong localizes the bug to **aux CONTENT semantics**: the exact target hidden-
+state tensor the draft's `fc` was trained on at each `target_layer_id` (pre- vs
+post-layernorm residual; which of the FP8 target's 32 hybrid layers maps to each
+id; possibly the aux at query positions too). This is a checkpoint-matching
+research problem that requires a Python/transformers reference cross-check of one
+target-layer aux tensor against fucina's capture — a distinct investigation, not
+more serving-loop iterations. **No speedup is claimed; acceptance is not yet
+demonstrated (measured 0).** Greedy losslessness remains fully proven and gated.
 
 ### Remaining for S1A_VALIDATED (the final serving-step orchestration)
 
