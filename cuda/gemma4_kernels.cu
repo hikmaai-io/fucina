@@ -5113,7 +5113,11 @@ gemma4_engine_t* gemma4_engine_create(
             eng->q35.fp4_w[l][p] = NULL; eng->q35.fp4_wsc[l][p] = NULL;
         }
     eng->q35.graph_failed = 0; eng->q35.graph_logged = 0;
-    for (int b = 0; b <= GEMMA4_MAX_SEQS; b++) eng->q35.graph[b] = NULL;
+    eng->q35.graph_count = 0;
+    for (int i = 0; i < Q35_GRAPH_CACHE_CAP; i++) {
+        eng->q35.graph_cache[i].exec = NULL;
+        eng->q35.graph_cache[i].key = q35_graph_key{0, 0, 0};
+    }
     eng->q35.allocated_slots = 0;
     for (int s = 0; s < GEMMA4_MAX_SEQS; s++) {
         eng->q35.recurrent_slab[s] = NULL;
@@ -6673,8 +6677,12 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     CUDA_FREE(eng->d_ms_minp);
     CUDA_FREE(eng->d_ms_rnd);
     // qwen35 M4 batched-decode arenas + captured graphs (no-ops when never allocated).
-    for (int b = 0; b <= GEMMA4_MAX_SEQS; b++)
-        if (eng->q35.graph[b]) { cudaGraphExecDestroy(eng->q35.graph[b]); eng->q35.graph[b] = NULL; }
+    for (int i = 0; i < Q35_GRAPH_CACHE_CAP; i++)
+        if (eng->q35.graph_cache[i].exec) {
+            cudaGraphExecDestroy(eng->q35.graph_cache[i].exec);
+            eng->q35.graph_cache[i].exec = NULL;
+        }
+    eng->q35.graph_count = 0;
     for (int l = 0; l < GEMMA4_CAP_LAYERS; l++) {
         // S_slot/ring_slot are non-owning views into recurrent_slab[slot].
         for (int s = 0; s < GEMMA4_MAX_SEQS; s++) {

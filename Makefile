@@ -590,6 +590,10 @@ fp4: fp4-probe fp4-gemm-test
 model-plan-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/model_plan_test.cc -o /tmp/model_plan_test && /tmp/model_plan_test
 
+# Host-only S2b graph-key helpers (shape triple + dominance dispatch + decode-first ordering).
+qwen35-graph-key-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda -x c++ cuda/qwen35_graph_key_test.cc -o /tmp/q35_graph_key_test && /tmp/q35_graph_key_test
+
 allocation-set-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/device_allocation_set_test.cc -o /tmp/allocation_set_test && /tmp/allocation_set_test
 

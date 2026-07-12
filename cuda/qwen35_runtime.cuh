@@ -469,32 +469,66 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
         argmax_rows_kernel<<<B,1024,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, B, VOC);
 }
 
-// Capture the B-row decode (want_argmax) once and instantiate it; replayed per step with the
-// per-step varying device inputs refreshed outside the capture (tokens/positions/row→slot).
-static int qwen35_ms_graph_ensure(gemma4_engine_t *eng, int B) {
-    if (eng->fp4m_ssd_stream) return -1; // SSD reads and staging copies are not graph-capturable
-    if (B < 1 || B > eng->q35.capacity) return -1;
-    if (eng->q35.graph[B]) return 0;
-    if (eng->q35.graph_failed) return -1;
-    cudaStream_t cs = NULL; cudaGraph_t g = NULL;
+// ── S2b: keyed CUDA-graph cache ────────────────────────────────────────────────────────
+// Key semantics (q35_make_decode_key / q35_graph_dominates) live in qwen35_graph_key.cuh.
+// Look up a replayable graph whose captured shape dominates `want`. Returns NULL on miss.
+static cudaGraphExec_t q35_graph_lookup(gemma4_engine_t *eng, const q35_graph_key &want) {
+    for (int i = 0; i < eng->q35.graph_count; i++) {
+        const q35_graph_entry &e = eng->q35.graph_cache[i];
+        if (e.exec && q35_graph_dominates(e.key, want)) return e.exec;
+    }
+    return NULL;
+}
+
+// Capture the decode body for `key` once and instantiate it; replayed per step with the per-step
+// varying device inputs refreshed outside the capture (tokens/positions/row→slot). num_tokens is
+// the row count driven through qwen35_decode_multiseq_body (== num_reqs for plain decode).
+static cudaGraphExec_t qwen35_ms_graph_ensure(gemma4_engine_t *eng, const q35_graph_key &key) {
+    if (eng->fp4m_ssd_stream) return NULL; // SSD reads and staging copies are not graph-capturable
+    if (key.num_tokens < 1 || key.num_reqs < 1 || key.num_reqs > eng->q35.capacity) return NULL;
+    if (eng->q35.graph_failed) return NULL;
+    if (cudaGraphExec_t hit = q35_graph_lookup(eng, key)) return hit;
+    if (eng->q35.graph_count >= Q35_GRAPH_CACHE_CAP) return NULL; // cache full — per-kernel launches
+    cudaStream_t cs = NULL; cudaGraph_t g = NULL; cudaGraphExec_t exec = NULL;
     int ok = cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) == cudaSuccess;
     if (ok && cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
-        qwen35_decode_multiseq_body(eng, B, /*want_argmax=*/1, cs);
+        qwen35_decode_multiseq_body(eng, key.num_tokens, /*want_argmax=*/1, cs);
         ok = cudaStreamEndCapture(cs, &g) == cudaSuccess && g != NULL;
     } else ok = 0;
-    if (ok) ok = cudaGraphInstantiate(&eng->q35.graph[B], g, 0) == cudaSuccess;
+    if (ok) ok = cudaGraphInstantiate(&exec, g, 0) == cudaSuccess;
     if (g)  cudaGraphDestroy(g);
     if (cs) cudaStreamDestroy(cs);
-    if (!ok || !eng->q35.graph[B]) {
-        eng->q35.graph[B] = NULL; eng->q35.graph_failed = 1; cudaGetLastError();
-        fprintf(stderr, "fucina: qwen35 M4 batch graph capture failed (B=%d) — per-kernel launches\n", B);
-        return -1;
+    if (!ok || !exec) {
+        eng->q35.graph_failed = 1; cudaGetLastError();
+        fprintf(stderr, "fucina: qwen35 M4 batch graph capture failed "
+                        "(nt=%d nr=%d utc=%d) — per-kernel launches\n",
+                key.num_tokens, key.num_reqs, key.uniform_token_count);
+        return NULL;
     }
-    if (!(eng->q35.graph_logged & (1ULL << B))) {
-        fprintf(stderr, "fucina: qwen35 M4 batch graph captured (B=%d)\n", B);
-        eng->q35.graph_logged |= (1ULL << B);
+    q35_graph_entry &slot = eng->q35.graph_cache[eng->q35.graph_count++];
+    slot.key = key; slot.exec = exec;
+    // graph_logged is a per-num_tokens dedupe bitmask (num_tokens<=64 fits Q35_GRAPH_CACHE_CAP).
+    if (key.num_tokens < 64 && !(eng->q35.graph_logged & (1ULL << key.num_tokens))) {
+        fprintf(stderr, "fucina: qwen35 M4 batch graph captured "
+                        "(nt=%d nr=%d utc=%d)\n",
+                key.num_tokens, key.num_reqs, key.uniform_token_count);
+        eng->q35.graph_logged |= (1ULL << key.num_tokens);
     }
-    return 0;
+    return exec;
+}
+
+// Drop a graph from the cache (compacting swap-with-last) after a failed replay, so a later step
+// can recapture it. Matches the OLD single-slot invalidate-on-replay-failure semantics.
+static void q35_graph_evict(gemma4_engine_t *eng, cudaGraphExec_t exec) {
+    for (int i = 0; i < eng->q35.graph_count; i++) {
+        if (eng->q35.graph_cache[i].exec == exec) {
+            cudaGraphExecDestroy(exec);
+            eng->q35.graph_cache[i] = eng->q35.graph_cache[--eng->q35.graph_count];
+            eng->q35.graph_cache[eng->q35.graph_count].exec = NULL;
+            eng->q35.graph_cache[eng->q35.graph_count].key = q35_graph_key{0, 0, 0};
+            return;
+        }
+    }
 }
 
 // Sample B Qwen rows with sequence-stable RNG. The generic sampler handles temp<=0 as argmax,
@@ -539,12 +573,15 @@ static int qwen35_ms_run(gemma4_engine_t *eng, gemma4_seq **slv, const int32_t *
     cudaMemcpyAsync(eng->d_ms_pos, positions, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(workspace_data<int>(eng->q35.routing_workspace),h_slot,
                     (size_t)B*sizeof(int),cudaMemcpyHostToDevice,st);
-    if (use_graph && want_sample && !any_sample && eng->q35.graph_enabled &&
-        qwen35_ms_graph_ensure(eng, B) == 0) {
-        if (cudaGraphLaunch(eng->q35.graph[B], st) == cudaSuccess) return 0;
-        cudaGetLastError();
-        cudaGraphExecDestroy(eng->q35.graph[B]); eng->q35.graph[B] = NULL; eng->q35.graph_failed = 1;
-        fprintf(stderr, "fucina: qwen35 M4 graph replay failed — per-kernel launches\n");
+    if (use_graph && want_sample && !any_sample && eng->q35.graph_enabled) {
+        q35_graph_key key = q35_make_decode_key(B);
+        cudaGraphExec_t exec = qwen35_ms_graph_ensure(eng, key);
+        if (exec) {
+            if (cudaGraphLaunch(exec, st) == cudaSuccess) return 0;
+            cudaGetLastError();
+            q35_graph_evict(eng, exec); eng->q35.graph_failed = 1;
+            fprintf(stderr, "fucina: qwen35 M4 graph replay failed — per-kernel launches\n");
+        }
     }
     qwen35_decode_multiseq_body(eng, B, want_sample && !any_sample, st);
     if (want_sample && any_sample) qwen35_sample_rows(eng, slv, eng->d_sb[11], B, st);
@@ -1722,6 +1759,7 @@ extern "C" void gemma4_engine_memory_stats(const gemma4_engine_t *eng,
     out->qwen_reserved_context = eng->q35.reserved_context;
 }
 
+// S2b decode-first batch ordering (q35_sort_batch_decode_first) lives in qwen35_graph_key.cuh.
 static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
                              const int32_t *in_tokens, int B, int32_t *out_tokens) {
     if (!eng || !eng->loaded || B <= 0 || B > eng->q35.capacity) return -1;

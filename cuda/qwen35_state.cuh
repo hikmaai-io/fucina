@@ -26,6 +26,14 @@ static size_t q35_physical_available(size_t cuda_free) {
     return m.mem_available > cuda_free ? m.mem_available : cuda_free;
 }
 
+// S2b — CUDA-graph cache key (shape triple + dominance dispatch); see the header for semantics.
+#include "qwen35_graph_key.cuh"
+struct q35_graph_entry {
+    q35_graph_key   key;
+    cudaGraphExec_t exec;
+};
+#define Q35_GRAPH_CACHE_CAP 64   // decode buckets (<=32) + headroom for (1+K) spec-decode keys
+
 // Qwen3.5 engine-owned runtime state. This is deliberately separate from gemma4_engine:
 // generic model weights/configuration stay in the parent engine, while hybrid recurrent state,
 // attention KV, prefill workspace, graph cache and Qwen-specific quantization caches live here.
@@ -109,8 +117,11 @@ struct qwen35_runtime_state {
     fp8_scent     *fp8_scale_tab;
     int            fp8_scale_n;
 
-    // Captured decode graphs.
-    cudaGraphExec_t graph[GEMMA4_MAX_SEQS + 1];
+    // Captured decode graphs, keyed by shape triple (S2b). Linear-probed small cache; entries
+    // are exact-shape captures dispatched by q35_graph_dominates (exact match today, strict
+    // dominance once S2a padding lands).
+    q35_graph_entry graph_cache[Q35_GRAPH_CACHE_CAP];
+    int             graph_count;
     int             graph_failed;
     uint64_t        graph_logged;
 
