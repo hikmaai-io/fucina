@@ -616,6 +616,11 @@ qwen35-dflash-rng-test:
 qwen35-dflash-loader-test:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/qwen35_dflash_loader_test.cc -o /tmp/dflash_ld && /tmp/dflash_ld
 
+# Real-checkpoint DFlash loader gate (P2 against real weights): opens z-lab/Qwen3.5-9B-DFlash and
+# validates its 69-tensor schema + exact geometry. SKIPs cleanly when the checkpoint is absent.
+qwen35-dflash-real-load-test:
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Icuda cuda/test_qwen35_dflash_real_load.cc -o /tmp/dflash_real && /tmp/dflash_real
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:
