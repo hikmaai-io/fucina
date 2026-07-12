@@ -55,7 +55,7 @@ int main(int argc,char**argv){
     q35_dflash_ctx_scratch c{}; if(!q35_dflash_ctx_scratch_alloc(&c,g,num_ctx)){ printf("FAIL ctx scratch\n"); return 1; }
     q35_dflash_fwd_scratch s{}; if(!q35_dflash_fwd_scratch_alloc(&s,g,rows)){ printf("FAIL fwd scratch\n"); return 1; }
     q35_dflash_precompute_context_kv(R,c,dXc,dCpos,dK.data(),dV.data(),theta,eps,0);
-    q35_dflash_query_forward(R,s,dXq,dQpos,num_ctx,dK.data(),dV.data(),theta,eps,0);
+    q35_dflash_query_forward(R,s,dXq,dQpos,num_ctx,dK.data(),dV.data(),theta,eps,0,dCpos);
     CUDA_OK(cudaDeviceSynchronize());
     std::vector<float> out((size_t)rows*H); CUDA_OK(cudaMemcpy(out.data(),s.out,(size_t)rows*H*4,cudaMemcpyDeviceToHost));
 
@@ -93,13 +93,15 @@ int main(int argc,char**argv){
             for(int h=0;h<NQ;h++){ double sq=0; for(int i=0;i<HD;i++){ double x=Qh[(size_t)r*qd+h*HD+i]; sq+=x*x; } double inv=1.0/std::sqrt(sq/HD+eps); std::vector<double> t(HD); for(int i=0;i<HD;i++) t[i]=Qh[(size_t)r*qd+h*HD+i]*inv*(double)qn[i]; ropev(t,qpos[r]); for(int i=0;i<HD;i++) Qh[(size_t)r*qd+h*HD+i]=t[i]; }
             for(int h=0;h<NKV;h++){ double sq=0; for(int i=0;i<HD;i++){ double x=Kq[(size_t)r*kvd+h*HD+i]; sq+=x*x; } double inv=1.0/std::sqrt(sq/HD+eps); std::vector<double> t(HD); for(int i=0;i<HD;i++) t[i]=Kq[(size_t)r*kvd+h*HD+i]*inv*(double)kn[i]; ropev(t,qpos[r]); for(int i=0;i<HD;i++) Kq[(size_t)r*kvd+h*HD+i]=t[i]; }
         }
+        // SWA draft layers are causal; the full_attention layer is non-causal (match the device).
+        bool causal = (g.layer_attn[l]==qwen35dflash::ATTN_SLIDING);
         for(int r=0;r<rows;r++){
-            std::vector<double> attn(qd,0);
-            for(int h=0;h<NQ;h++){ int gg=h/(NQ/NKV); int tot=num_ctx+rows; std::vector<double> sc(tot);
-                for(int t=0;t<num_ctx;t++){ double d=0; for(int i=0;i<HD;i++) d+=Qh[(size_t)r*qd+h*HD+i]*Kc[l][(size_t)t*kvd+gg*HD+i]; sc[t]=d*scale; }
-                for(int t=0;t<rows;t++){ double d=0; for(int i=0;i<HD;i++) d+=Qh[(size_t)r*qd+h*HD+i]*Kq[(size_t)t*kvd+gg*HD+i]; sc[num_ctx+t]=d*scale; }
+            std::vector<double> attn(qd,0); int qp=qpos[r];
+            for(int h=0;h<NQ;h++){ int gg=h/(NQ/NKV); int tot=num_ctx+rows; std::vector<double> sc(tot,-1e300);
+                for(int t=0;t<num_ctx;t++){ if(causal && cpos[t]>qp) continue; double d=0; for(int i=0;i<HD;i++) d+=Qh[(size_t)r*qd+h*HD+i]*Kc[l][(size_t)t*kvd+gg*HD+i]; sc[t]=d*scale; }
+                for(int t=0;t<rows;t++){ if(causal && qpos[t]>qp) continue; double d=0; for(int i=0;i<HD;i++) d+=Qh[(size_t)r*qd+h*HD+i]*Kq[(size_t)t*kvd+gg*HD+i]; sc[num_ctx+t]=d*scale; }
                 double mmax=-1e300; for(double x:sc) if(x>mmax) mmax=x; double sm=0; for(double&x:sc){ x=std::exp(x-mmax); sm+=x; }
-                for(int i=0;i<HD;i++){ double a=0; for(int t=0;t<num_ctx;t++) a+=sc[t]*Vc[l][(size_t)t*kvd+gg*HD+i]; for(int t=0;t<rows;t++) a+=sc[num_ctx+t]*Vq[(size_t)t*kvd+gg*HD+i]; attn[h*HD+i]=a/sm; } }
+                for(int i=0;i<HD;i++){ double a=0; for(int t=0;t<num_ctx;t++){ if(causal && cpos[t]>qp) continue; a+=sc[t]*Vc[l][(size_t)t*kvd+gg*HD+i]; } for(int t=0;t<rows;t++){ if(causal && qpos[t]>qp) continue; a+=sc[num_ctx+t]*Vq[(size_t)t*kvd+gg*HD+i]; } attn[h*HD+i]=a/sm; } }
             for(int o=0;o<H;o++){ double a=0; for(int i=0;i<qd;i++) a+=attn[i]*(double)Wo[(size_t)o*qd+i]; xq[(size_t)r*H+o]+=a; }
             std::vector<double> xr(H); for(int i=0;i<H;i++) xr[i]=xq[(size_t)r*H+i]; auto h2=rmsn(xr,poln,H);
             std::vector<double> ff(I); for(int o=0;o<I;o++){ double gg2=0,uu=0; for(int i=0;i<H;i++){ gg2+=h2[i]*(double)Wg[(size_t)o*H+i]; uu+=h2[i]*(double)Wu[(size_t)o*H+i]; } ff[o]=(gg2/(1.0+std::exp(-gg2)))*uu; }

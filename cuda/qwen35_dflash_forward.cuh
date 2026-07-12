@@ -58,13 +58,22 @@ __global__ void q35df_attn(const float* Q,const float* K,const float* V,float* O
 }
 // Combined non-causal GQA: each query row attends the concatenation of context K/V [ctx,NKV,HD]
 // and the query block's own K/V [rows,NKV,HD]. Softmax over (ctx+rows) positions; O[rows,NQ,HD].
+// causal: when 1, a query row r only attends key positions with absolute position <= its own.
+// Context rows carry absolute positions cpos_abs[t]; query rows carry qpos_abs. Non-causal (0)
+// attends everything (the DFlash full_attention layer). All context is <= the query positions
+// anyway, so causality only masks among the query block for causal (SWA) layers.
 __global__ void q35df_attn_ctx(const float* Q,const float* Kc,const float* Vc,const float* Kq,const float* Vq,
-                               float* O,int rows,int ctx,int NQ,int NKV,int HD){
+                               float* O,int rows,int ctx,int NQ,int NKV,int HD,int causal,
+                               const int* cpos_abs,const int* qpos_abs){
     int r=blockIdx.x; int h=blockIdx.y; if(r>=rows||h>=NQ) return; int g=h/(NQ/NKV);
     const float* q=Q+((size_t)r*NQ+h)*HD; extern __shared__ double sh[]; int tot=ctx+rows; double scale=1.0/sqrt((double)HD);
+    int qp = causal ? qpos_abs[r] : 0;
     for(int t=threadIdx.x;t<tot;t+=blockDim.x){
         const float* k = (t<ctx) ? Kc+((size_t)t*NKV+g)*HD : Kq+((size_t)(t-ctx)*NKV+g)*HD;
-        double d=0; for(int i=0;i<HD;i++) d+=(double)q[i]*(double)k[i]; sh[t]=d*scale;
+        int allow = 1;
+        if(causal){ int kp = (t<ctx) ? cpos_abs[t] : qpos_abs[t-ctx]; allow = (kp <= qp); }
+        if(allow){ double d=0; for(int i=0;i<HD;i++) d+=(double)q[i]*(double)k[i]; sh[t]=d*scale; }
+        else sh[t]=-1e300;
     }
     __syncthreads(); __shared__ double sm;
     if(threadIdx.x==0){ double m=-1e300; for(int t=0;t<tot;t++) if(sh[t]>m) m=sh[t]; double s=0; for(int t=0;t<tot;t++){ sh[t]=exp(sh[t]-m); s+=sh[t]; } sm=s; }
@@ -215,13 +224,16 @@ static inline void q35_dflash_precompute_context_kv(const q35_dflash_residency& 
 // rows. out receives the final-normed hidden. Reads resident BF16 weights.
 static inline void q35_dflash_query_forward(const q35_dflash_residency& R, q35_dflash_fwd_scratch& s,
         float* x, const int* dpos, int num_ctx, float* const* ctxK, float* const* ctxV,
-        double theta, float eps, cudaStream_t st){
+        double theta, float eps, cudaStream_t st, const int* dctx_pos=nullptr){
     const qwen35dflash::Geometry& g=R.geom;
     const int H=g.H,I=g.I,HD=g.HD,NQ=g.NQ,NKV=g.NKV,qd=g.q_dim(),kvd=g.kv_dim(),rows=s.rows;
     auto gr=[&](int n){ return (unsigned)((n+255)/256); };
     size_t smem=(size_t)(num_ctx+rows)*sizeof(double);
     for(int l=0;l<g.L;l++){
         const q35_dflash_layer_w& w=R.layers[l];
+        // Sliding-window (SWA) draft layers are CAUSAL; the full_attention layer is non-causal
+        // (per vLLM _resolve_layer_attention). Causal masking needs device absolute positions.
+        int causal = (l < (int)g.layer_attn.size() && g.layer_attn[l]==qwen35dflash::ATTN_SLIDING) ? 1 : 0;
         q35df_rmsnorm<<<rows,256,0,st>>>(x,w.input_norm,s.h1,H,rows,eps);
         q35df_matmul<<<dim3(rows,(qd+255)/256),256,0,st>>>(s.h1,w.q_proj,s.q,rows,H,qd);
         q35df_matmul<<<dim3(rows,(kvd+255)/256),256,0,st>>>(s.h1,w.k_proj,s.k,rows,H,kvd);
@@ -230,7 +242,7 @@ static inline void q35_dflash_query_forward(const q35_dflash_residency& R, q35_d
         q35df_headnorm<<<dim3(rows,NKV),128,0,st>>>(s.k,w.k_norm,rows,NKV,HD,eps);
         q35df_rope<<<dim3(rows,NQ),64,0,st>>>(s.q,dpos,rows,NQ,HD,theta);
         q35df_rope<<<dim3(rows,NKV),64,0,st>>>(s.k,dpos,rows,NKV,HD,theta);
-        q35df_attn_ctx<<<dim3(rows,NQ),128,smem,st>>>(s.q,ctxK[l],ctxV[l],s.k,s.v,s.attn,rows,num_ctx,NQ,NKV,HD);
+        q35df_attn_ctx<<<dim3(rows,NQ),128,smem,st>>>(s.q,ctxK[l],ctxV[l],s.k,s.v,s.attn,rows,num_ctx,NQ,NKV,HD,causal,dctx_pos,dpos);
         q35df_matmul<<<dim3(rows,(H+255)/256),256,0,st>>>(s.attn,w.o_proj,s.mix,rows,qd,H);
         q35df_residual<<<gr(rows*H),256,0,st>>>(x,s.mix,rows*H);
         q35df_rmsnorm<<<rows,256,0,st>>>(x,w.post_norm,s.h2,H,rows,eps);
@@ -399,7 +411,7 @@ static inline int q35_dflash_draft_greedy(const q35_dflash_residency& R, q35_dfl
     q35_dflash_embed_query(D.query_ids, embed, D.query_hidden, rows, H, st);
     // precompute context K/V, then query forward.
     q35_dflash_precompute_context_kv(R, D.ctx, D.ctx_hidden, D.ctx_pos, D.ctxK, D.ctxV, theta, eps, st);
-    q35_dflash_query_forward(R, D.fwd, D.query_hidden, D.query_pos, num_ctx, D.ctxK, D.ctxV, theta, eps, st);
+    q35_dflash_query_forward(R, D.fwd, D.query_hidden, D.query_pos, num_ctx, D.ctxK, D.ctxV, theta, eps, st, D.ctx_pos);
     // sample the K mask rows (query offsets 1..K) from the final-normed query output.
     q35_dflash_sample_greedy(D.fwd.out + (size_t)1*H, lm_head, D.K, H, vocab, out_draft, st);
     return 0;
