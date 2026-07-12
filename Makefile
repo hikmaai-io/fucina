@@ -635,6 +635,14 @@ qwen35-dflash-attn-parity-test:
 		-lcudart -lcuda
 	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_attn"
 
+# P3 full DFlash draft-LAYER forward parity on the REAL weights: composes input_norm -> QKV ->
+# q/k-norm -> RoPE -> non-causal GQA -> o_proj -> residual -> post-norm -> silu-GLU MLP -> residual,
+# device fp32 vs host double on real layer-0 weights. De-risks full-stack composition. SKIPs if absent.
+qwen35-dflash-layer-parity-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_layer_parity.cu -o /tmp/dflash_layer \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_layer"
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:
