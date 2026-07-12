@@ -650,6 +650,13 @@ qwen35-dflash-backbone-parity-test:
 		-lcudart -lcuda
 	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_backbone"
 
+# DFlash draft-model device residency: uploads the real BF16 draft weights into one device slab and
+# binds per-layer views; the gate spot-checks device bytes vs the safetensors source. SKIPs if absent.
+qwen35-dflash-residency-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_residency.cu -o /tmp/dflash_resid \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_resid"
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:
