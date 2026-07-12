@@ -100,3 +100,34 @@ Batched multi-seq prefill == per-sequence standalone prefill:
 - ALL of N=1–32 pass the P3 dual-sided gate on both models (no >5% floor regression; no
   loss of the claimed-win cells: MoE N=8, dense N=2/4/8).
 - Behind a rollback env toggle; full gate suite green before merge.
+
+---
+
+## P1 IMPLEMENTED — results (2026-07-12)
+
+Landed: batched multi-sequence prefill (`gemma4_engine_seq_add_multiseq`) wired into the
+scheduler's idle-burst admission, + FP8-native determinism unification (default-on,
+opt-out `FUCINA_NO_UNIFY`). Commits: `1de3ddb` (CUDA core + gate), `9ea8d8a` (scheduler
+wiring), `f04e062` (cancellation test).
+
+**Correctness (gate = rev-2 option (i); token-equality-vs-standalone abandoned as proven
+mutually exclusive with amortization — vLLM has the same batch-dependence):**
+- DETERMINISM: byte-identical run-to-run, 30/30 cells, both models (grouped-gemm-broken-gb10 guard).
+- Dense: logit ≤0.29% rel, first-token exact (0/37). MoE: ≤9.5% rel, first-token flips ≤2/8
+  (top-k expert-flip on router-reorder near-ties, documented). Coherent continuation.
+- `make qwen35-multiseq-prefill-test` PASS. Cancellation gate `TestBatchedAdmissionCancellation` PASS.
+
+**Perf — Qwen3.5-35B-A3B MoE, median TTFT ms / agg tok/s (N=1..32):**
+
+| N | TTFT pre-P1 | TTFT P1 | vLLM TTFT | agg pre-P1 | agg P1 | vLLM agg |
+|---|---|---|---|---|---|---|
+| 4 | 263 | **163** | 417 | 101.8 | 166.0 | 105.0 |
+| 8 | 500 | **291** | 669 | 154.7 | 224.0 | 146.5 |
+| 16 | 951 | **466** | 549 | 208.4 | 287.7 | 204.8 |
+| 32 | 1892 | **866** | 664 | 291.7 | **405.1** | 302.8 |
+
+**N=32 MoE TTFT 1892 → 866 ms (2.2×), now 1.3× vs vLLM (was 2.9×).** The batched lockstep
+admission also lifted aggregate throughput — **N=32 agg 291.7 → 405.1, now BEATS vLLM (302.8)**;
+fucina beats vLLM TTFT at N≤16 and aggregate at N=32. Dense N=32 TTFT 2898 → 866 ms (3.3×).
+866 ms is not fully inside vLLM's 664 ms band but the surrounding cells win outright.
+P3 protection gate PASS both models (no N=1/2/4 regression from the unification; short_single identical).
