@@ -657,6 +657,13 @@ qwen35-dflash-residency-test:
 		-lcudart -lcuda
 	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_resid"
 
+# DFlash callable draft backbone forward over residency: runs q35_dflash_backbone_forward reading
+# resident BF16 views vs a host double reference on the real weights (the verify-path form). SKIPs if absent.
+qwen35-dflash-forward-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_forward.cu -o /tmp/dflash_fwd \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_fwd"
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:
