@@ -746,6 +746,18 @@ qwen35-dflash-e2e-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_dflash_e2e $(QWEN35_MODEL)"
 
+# DFlash REAL end-to-end: drive the resident draft model through gemma4_engine_q35_dflash_real_step;
+# emitted stream MUST be byte-identical to plain greedy decode; reports MEASURED accept rate.
+qwen35-dflash-real-e2e-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_real_e2e.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dflash_real_e2e \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "FUCINA_QWEN35_DFLASH_PATH=$(DFLASH_PATH) /tmp/fucina_dflash_real_e2e $(DFLASH_TARGET)"
+
+# The DFlash real path needs the FP8 target (BF16 embed/LM head shared with the draft); the Q4_0
+# GGUF has no BF16 tables. Override DFLASH_TARGET to point at the FP8 checkpoint.
+DFLASH_TARGET ?= /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8
+
 # Host-only DFlash shape/lookahead planner + enable/concurrency gate (S1a): (1+K) verify shapes,
 # S2 spec graph key, N+1 KV lookahead, default-off + conservative concurrency gating. No model.
 qwen35-dflash-plan-test:

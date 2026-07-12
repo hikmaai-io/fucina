@@ -15793,3 +15793,100 @@ extern "C" int gemma4_engine_q35_dflash_load(gemma4_engine_t *eng) {
 extern "C" int gemma4_engine_q35_dflash_ready(gemma4_engine_t *eng) {
     return (eng && eng->q35.dflash_loaded) ? 1 : 0;
 }
+
+// One REAL DFlash step (B=1, greedy): draft K tokens with the resident draft model over the
+// accumulated context, then verify+accept+commit via the lossless greedy step. On the first step
+// the drafter context is empty (num_ctx=0) so the draft is weak; each step appends the committed
+// tokens' captured target aux to the draft context, growing the cross-attention context. Because
+// the greedy step is lossless regardless of draft content, emitted tokens ALWAYS equal greedy
+// decode; the drafts only affect how many are accepted per verify. Returns emitted run in out_emit
+// [<=1+K], count in *out_n, and next bonus in *next_bonus. Requires the draft substrate loaded.
+//
+// Aux flow: q35_dflash_greedy_step runs the verify forward with capture active, so after it returns
+// eng->q35.dflash_aux holds the (1+K) verify rows' aux (rows 0..T-1 = the committed block positions).
+// We append the aux of the committed rows [0, 1+j) to the drafter's context cache for next step.
+extern "C" int gemma4_engine_q35_dflash_real_step(gemma4_engine_t *eng, int slot, int32_t bonus,
+                                                  int32_t *out_emit, int *out_n, int32_t *next_bonus) {
+    if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -1;
+    if (q35_dflash_ensure_loaded(eng) != 0) return -1;
+    if (slot < 0 || slot >= eng->q35.capacity || !eng->slots[slot].used) return -1;
+    // The draft shares the target's BF16 embedding + LM head; these are resident only for the FP8/
+    // safetensors target (d_embed_bf16 / d_lmhead_bf16). The Q4_0 GGUF target keeps embeddings as
+    // Q8_0 (d_token_embd) and has no BF16 tables, so the DFlash draft path requires the FP8 target.
+    if (!eng->d_embed_bf16 || !eng->d_lmhead_bf16) {
+        fprintf(stderr, "fucina: DFlash real step needs the FP8 target (BF16 embed/LM head); the "
+                        "Q4_0 GGUF target has no BF16 tables. Use the Qwen3.5-9B-FP8 checkpoint.\n");
+        return -3;
+    }
+    auto *R = (q35_dflash_residency *)eng->q35.dflash_residency;
+    auto *D = (q35_dflash_drafter *)eng->q35.dflash_drafter;
+    const int H = eng->cfg.hidden_size, VOC = eng->cfg.vocab_size, K = D->K, F = R->geom.num_target_features;
+    const int maxr = eng->q35.dflash_capture_maxrows;
+    cudaStream_t st = eng->stream;
+    const double theta = 10000000.0; const float eps = 1e-6f;
+
+    // 1) Build query ids [bonus, mask x K] and their absolute positions [base .. base+K].
+    int base = eng->slots[slot].n_tokens;
+    int32_t qids[GEMMA4_MAX_SEQS]; int qpos[GEMMA4_MAX_SEQS];
+    qids[0] = bonus; for (int i = 1; i <= K; i++) qids[i] = R->geom.mask_token_id;
+    for (int i = 0; i <= K; i++) qpos[i] = base + i;
+
+    // 2) Draft K tokens with the real draft model over the accumulated context (D->ctxlen rows).
+    //    Context positions are [0 .. ctxlen). num_ctx may be 0 (cold start) -> weak draft, still lossless.
+    int32_t draft[GEMMA4_MAX_SEQS];
+    {
+        int num_ctx = D->ctxlen;
+        // Gather context aux (already stored per-row in D->ctx_aux_concat by prior steps) — for the
+        // cold path num_ctx==0 we still must call the drafter with a valid (empty) context. The
+        // drafter reads ctx_concat_aux [num_ctx, F*H]; we keep it in D->ctx_aux_concat sized (1+K),
+        // so for num_ctx>1+K we cap the visible context to the most recent (1+K) rows (sliding).
+        int vis = num_ctx; if (vis > 1 + K) vis = 1 + K;
+        int cstart = num_ctx - vis;
+        int cpos[GEMMA4_MAX_SEQS]; for (int i = 0; i < vis; i++) cpos[i] = cstart + i;
+        int *dqpos = qpos; // host arrays; drafter copies H2D internally
+        int32_t *dqids = qids;
+        if (vis <= 0) {
+            // Cold start: no context. Draft from a single zero context row so attention is defined.
+            static float *zero_aux = nullptr; static int zeros_for = 0;
+            if (!zero_aux || zeros_for < F*H) { if (zero_aux) cudaFree(zero_aux); cudaMalloc(&zero_aux,(size_t)F*H*4); cudaMemset(zero_aux,0,(size_t)F*H*4); zeros_for=F*H; }
+            int one_pos[1] = {0};
+            q35_dflash_draft_greedy(*R, *D, zero_aux, one_pos, 1, dqids, dqpos,
+                                    eng->d_embed_bf16, eng->d_lmhead_bf16, VOC, draft, theta, eps, st);
+        } else {
+            q35_dflash_draft_greedy(*R, *D, D->ctx_aux_concat + (size_t)cstart*F*H, cpos, vis,
+                                    dqids, dqpos, eng->d_embed_bf16, eng->d_lmhead_bf16, VOC, draft, theta, eps, st);
+        }
+        cudaStreamSynchronize(st);
+    }
+
+    // 3) Verify + accept + commit (lossless) with capture ON so we get the committed rows' aux.
+    { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { fprintf(stderr, "fucina: DFlash draft CUDA error: %s\n", cudaGetErrorString(e)); return -2; } }
+    eng->q35.dflash_capture_active = 1;
+    int rc = qwen35_dflash_greedy_step(eng, slot, bonus, draft, K, out_emit, out_n, next_bonus);
+    eng->q35.dflash_capture_active = 0;
+    if (rc != 0) { fprintf(stderr, "fucina: DFlash greedy_step rc=%d (base=%d K=%d)\n", rc, base, K); return rc; }
+
+    // 4) Append the committed rows' aux to the draft context cache. The verify block was
+    //    [bonus, d1..dK]; we committed 1+j rows (j = *out_n - 1). Gather those rows' aux from
+    //    dflash_aux [F][row][H] into D->ctx_aux_concat at the current ctxlen (sliding window cap).
+    int commit_rows = *out_n;   // 1 + accepted
+    for (int r = 0; r < commit_rows; r++) {
+        int dst = D->ctxlen + r; if (dst >= 1 + K) { // slide: keep the most recent (1+K) rows
+            // shift-down by one row
+            for (int s2 = 1; s2 < 1 + K; s2++)
+                cudaMemcpyAsync(D->ctx_aux_concat + (size_t)(s2-1)*F*H, D->ctx_aux_concat + (size_t)s2*F*H, (size_t)F*H*4, cudaMemcpyDeviceToDevice, st);
+            dst = K;
+            D->ctxlen = K; // capped
+        }
+        // gather row r of dflash_aux [F][r][H] -> ctx_aux_concat[dst][F*H]
+        q35_dflash_aux_gather(eng->q35.dflash_aux, D->ctx_aux_concat + (size_t)dst*F*H, F, maxr, H, r, 1, st);
+        if (D->ctxlen < 1 + K) D->ctxlen++;
+    }
+    cudaStreamSynchronize(st);
+    return 0;
+}
+
+// Reset the drafter's accumulated context (call when a sequence starts/resets).
+extern "C" void gemma4_engine_q35_dflash_reset_context(gemma4_engine_t *eng) {
+    if (eng && eng->q35.dflash_drafter) ((q35_dflash_drafter *)eng->q35.dflash_drafter)->ctxlen = 0;
+}

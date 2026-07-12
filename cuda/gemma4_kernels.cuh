@@ -408,6 +408,13 @@ int    gemma4_engine_q35_dflash_greedy_step(gemma4_engine_t *eng, int slot, int3
 int    gemma4_engine_q35_dflash_load(gemma4_engine_t *eng);
 int    gemma4_engine_q35_dflash_ready(gemma4_engine_t *eng);
 
+// S1a P4: one REAL DFlash step (B=1, greedy) — draft K tokens with the resident draft model over
+// the accumulated context, then verify+accept+commit losslessly. Emitted tokens == greedy decode
+// regardless of draft quality; drafts only affect accept rate. out_emit[<=1+K], *out_n, *next_bonus.
+int    gemma4_engine_q35_dflash_real_step(gemma4_engine_t *eng, int slot, int32_t bonus,
+                                          int32_t *out_emit, int *out_n, int32_t *next_bonus);
+void   gemma4_engine_q35_dflash_reset_context(gemma4_engine_t *eng);
+
 // Named device-memory accounting. Qwen fields are zero for other architectures.
 typedef struct gemma4_memory_stats {
     uint64_t qwen_workspace_bytes;
