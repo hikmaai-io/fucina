@@ -41,24 +41,27 @@ int main(int argc,char**argv){
     const double theta=1e7; const float eps=1e-6f;
 
     // Synthetic aux features (target hidden concat) + a synthetic shared LM head.
-    std::vector<float> caux((size_t)num_ctx*fin), qaux((size_t)rows*fin);
+    std::vector<float> caux((size_t)num_ctx*fin);
     for(int r=0;r<num_ctx;r++) for(int i=0;i<fin;i++) caux[(size_t)r*fin+i]=0.02f*std::sin(0.0007f*i+0.3f*r)+0.004f*(r+1);
-    for(int r=0;r<rows;r++) for(int i=0;i<fin;i++) qaux[(size_t)r*fin+i]=0.02f*std::cos(0.0009f*i+0.35f*r)+0.003f*(r+1);
+    // Query rows embed token ids: bonus token at offset 0, mask_token_id at offsets 1..K.
+    std::vector<int32_t> qids(rows); qids[0]=123; for(int i=1;i<rows;i++) qids[i]=R.geom.mask_token_id % vocab;
     std::vector<uint16_t> lm((size_t)vocab*H); for(int o=0;o<vocab;o++) for(int i=0;i<H;i++) lm[(size_t)o*H+i]=f_bf16(0.02f*std::sin(0.001f*i+0.05f*o));
+    std::vector<uint16_t> emb((size_t)vocab*H); for(int o=0;o<vocab;o++) for(int i=0;i<H;i++) emb[(size_t)o*H+i]=f_bf16(0.015f*std::cos(0.0013f*i+0.03f*o));
     std::vector<int> cpos(num_ctx); for(int r=0;r<num_ctx;r++) cpos[r]=r;
     std::vector<int> qpos(rows); for(int r=0;r<rows;r++) qpos[r]=num_ctx-1+r;   // query follows context
 
-    float *dCaux,*dQaux; __nv_bfloat16* dLM; int32_t *dT1,*dT2;
+    float *dCaux; __nv_bfloat16 *dLM,*dEmb; int32_t *dQids,*dT1,*dT2;
     CUDA_OK(cudaMalloc(&dCaux,(size_t)num_ctx*fin*4)); CUDA_OK(cudaMemcpy(dCaux,caux.data(),(size_t)num_ctx*fin*4,cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMalloc(&dQaux,(size_t)rows*fin*4)); CUDA_OK(cudaMemcpy(dQaux,qaux.data(),(size_t)rows*fin*4,cudaMemcpyHostToDevice));
     CUDA_OK(cudaMalloc(&dLM,lm.size()*2)); CUDA_OK(cudaMemcpy(dLM,lm.data(),lm.size()*2,cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMalloc(&dEmb,emb.size()*2)); CUDA_OK(cudaMemcpy(dEmb,emb.data(),emb.size()*2,cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMalloc(&dQids,rows*sizeof(int32_t))); CUDA_OK(cudaMemcpy(dQids,qids.data(),rows*sizeof(int32_t),cudaMemcpyHostToDevice));
     CUDA_OK(cudaMalloc(&dT1,K*sizeof(int32_t))); CUDA_OK(cudaMalloc(&dT2,K*sizeof(int32_t)));
 
     q35_dflash_drafter D{}; if(!q35_dflash_drafter_init(&D,R,K,ctx_cap)){ printf("FAIL drafter init\n"); return 1; }
 
-    if(q35_dflash_draft_greedy(R,D,dCaux,cpos.data(),num_ctx,dQaux,qpos.data(),dLM,vocab,dT1,theta,eps,0)!=0){ printf("FAIL draft 1\n"); return 1; }
+    if(q35_dflash_draft_greedy(R,D,dCaux,cpos.data(),num_ctx,qids.data(),qpos.data(),dEmb,dLM,vocab,dT1,theta,eps,0)!=0){ printf("FAIL draft 1\n"); return 1; }
     CUDA_OK(cudaDeviceSynchronize());
-    if(q35_dflash_draft_greedy(R,D,dCaux,cpos.data(),num_ctx,dQaux,qpos.data(),dLM,vocab,dT2,theta,eps,0)!=0){ printf("FAIL draft 2\n"); return 1; }
+    if(q35_dflash_draft_greedy(R,D,dCaux,cpos.data(),num_ctx,qids.data(),qpos.data(),dEmb,dLM,vocab,dT2,theta,eps,0)!=0){ printf("FAIL draft 2\n"); return 1; }
     CUDA_OK(cudaDeviceSynchronize());
     std::vector<int32_t> t1(K),t2(K);
     CUDA_OK(cudaMemcpy(t1.data(),dT1,K*sizeof(int32_t),cudaMemcpyDeviceToHost));
@@ -69,7 +72,7 @@ int main(int argc,char**argv){
     printf("draft tokens:"); for(int i=0;i<K;i++) printf(" %d",t1[i]); printf("\n");
 
     q35_dflash_drafter_free(&D,R); q35_dflash_residency_free(&R);
-    cudaFree(dCaux);cudaFree(dQaux);cudaFree(dLM);cudaFree(dT1);cudaFree(dT2);
+    cudaFree(dCaux);cudaFree(dLM);cudaFree(dEmb);cudaFree(dQids);cudaFree(dT1);cudaFree(dT2);
     if(fails){ printf("FAIL — DFlash drafting entry point (%d)\n",fails); return 1; }
     printf("PASS — DFlash drafting entry point: %d in-vocab draft tokens, run-to-run byte-identical "
            "(fc -> precompute -> query forward -> greedy sample composed over real weights)\n",K);

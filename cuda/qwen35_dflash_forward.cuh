@@ -294,6 +294,19 @@ static inline void q35_dflash_verify_greedy_device(const float* logits, int rows
     q35df_verify_reduce<<<1,1,0,st>>>(row_argmax, draft, K, out_accept, out_emit);
 }
 
+// ── Query token embedding (bonus + mask rows) ──
+// The DFlash QUERY rows embed token ids (the bonus/last-accepted token at offset 0 and the mask
+// token at offsets 1..K), NOT fc(aux). Only the CONTEXT K/V comes from fc(aux). This kernel gathers
+// the BF16 shared embedding rows for the (1+K) query token ids into a [rows, H] fp32 buffer.
+__global__ void q35df_embed(const int32_t* ids, const __nv_bfloat16* embed, float* out, int rows, int H){
+    int r=blockIdx.x; if(r>=rows) return; int id=ids[r]; const __nv_bfloat16* e=embed+(size_t)id*H; float* o=out+(size_t)r*H;
+    for(int i=threadIdx.x;i<H;i+=blockDim.x) o[i]=__bfloat162float(e[i]);
+}
+static inline void q35_dflash_embed_query(const int32_t* dids, const __nv_bfloat16* embed, float* out,
+                                          int rows, int H, cudaStream_t st){
+    q35df_embed<<<rows,256,0,st>>>(dids, embed, out, rows, H);
+}
+
 // ── Single drafting entry point (the verify loop calls this) ──
 // Owns all drafting scratch + per-layer context K/V buffers for one request's draft step. Produced
 // once per residency; reused across steps (fixed (1+K) query shape, variable context length up to a
@@ -304,9 +317,10 @@ struct q35_dflash_drafter {
     float **ctxK;                 // [L] each [ctx_cap*NKV*HD]
     float **ctxV;
     float  *ctx_hidden;           // [ctx_cap, H] fc-combined context input
-    float  *query_hidden;         // [1+K, H]  fc-combined query input (mutated by forward)
+    float  *query_hidden;         // [1+K, H]  query input = embed(query_ids) (mutated by forward)
     int    *ctx_pos;              // [ctx_cap]
     int    *query_pos;            // [1+K]
+    int32_t *query_ids;           // [1+K]  bonus token + K mask tokens
     int     ctx_cap;
     int     K;
     int     ready;
@@ -324,6 +338,7 @@ static inline bool q35_dflash_drafter_init(q35_dflash_drafter* D, const q35_dfla
     ok = ok && cudaMalloc(&D->query_hidden,(size_t)rows*H*4)==cudaSuccess;
     ok = ok && cudaMalloc(&D->ctx_pos,(size_t)ctx_cap*sizeof(int))==cudaSuccess;
     ok = ok && cudaMalloc(&D->query_pos,(size_t)rows*sizeof(int))==cudaSuccess;
+    ok = ok && cudaMalloc(&D->query_ids,(size_t)rows*sizeof(int32_t))==cudaSuccess;
     if(!ok) cudaGetLastError();
     D->ready=ok?1:0; return ok;
 }
@@ -332,28 +347,31 @@ static inline void q35_dflash_drafter_free(q35_dflash_drafter* D, const q35_dfla
     q35_dflash_ctx_scratch_free(&D->ctx); q35_dflash_fwd_scratch_free(&D->fwd);
     if(D->ctx_hidden) cudaFree(D->ctx_hidden); if(D->query_hidden) cudaFree(D->query_hidden);
     if(D->ctx_pos) cudaFree(D->ctx_pos); if(D->query_pos) cudaFree(D->query_pos);
+    if(D->query_ids) cudaFree(D->query_ids);
     *D=q35_dflash_drafter{};
 }
 
-// One draft step. ctx_concat_aux [num_ctx, F*H] and query_concat_aux [1+K, F*H] are the target's
-// aux-hidden features (already gathered + concatenated by the caller). ctx_positions [num_ctx] and
-// query_positions [1+K] are absolute positions. Produces K greedy draft tokens into out_draft (K).
-// Steps: fc combine (both) -> precompute context K/V -> query forward -> LM-head argmax on the K
-// mask rows (query offsets 1..K). All validated stages; deterministic. lm_head is the shared target
-// BF16 [vocab,H]. num_ctx must be <= ctx_cap.
+// One draft step. Per qwen3_dflash.py: the CONTEXT K/V is projected from fc(aux) but the QUERY rows
+// EMBED token ids (bonus + mask tokens), not fc(aux). ctx_concat_aux [num_ctx, F*H] is the target's
+// gathered aux features for the context rows; query_ids [1+K] are the query token ids (bonus token
+// at offset 0, mask_token_id at offsets 1..K); embed is the shared BF16 embedding [vocab,H].
+// ctx_positions/query_positions are absolute positions. Produces K greedy draft tokens into
+// out_draft. Steps: fc combine (context) -> precompute context K/V -> embed query ids -> query
+// forward -> LM-head argmax on the K mask rows. All validated stages; deterministic. num_ctx<=cap.
 static inline int q35_dflash_draft_greedy(const q35_dflash_residency& R, q35_dflash_drafter& D,
         const float* ctx_concat_aux, const int* ctx_positions, int num_ctx,
-        const float* query_concat_aux, const int* query_positions,
-        const __nv_bfloat16* lm_head, int vocab, int32_t* out_draft,
+        const int32_t* query_ids, const int* query_positions,
+        const __nv_bfloat16* embed, const __nv_bfloat16* lm_head, int vocab, int32_t* out_draft,
         double theta, float eps, cudaStream_t st){
     if(!D.ready || num_ctx>D.ctx_cap) return -1;
     const qwen35dflash::Geometry& g=R.geom; const int H=g.H, rows=1+D.K;
     D.ctx.num_ctx=num_ctx;
     cudaMemcpyAsync(D.ctx_pos, ctx_positions, (size_t)num_ctx*sizeof(int), cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(D.query_pos, query_positions, (size_t)rows*sizeof(int), cudaMemcpyHostToDevice, st);
-    // fc combine both context and query aux features -> input hidden.
+    cudaMemcpyAsync(D.query_ids, query_ids, (size_t)rows*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    // Context input = fc(aux); query input = embed(query token ids).
     q35_dflash_combine_aux(R, ctx_concat_aux, D.ctx_hidden, num_ctx, st);
-    q35_dflash_combine_aux(R, query_concat_aux, D.query_hidden, rows, st);
+    q35_dflash_embed_query(D.query_ids, embed, D.query_hidden, rows, H, st);
     // precompute context K/V, then query forward.
     q35_dflash_precompute_context_kv(R, D.ctx, D.ctx_hidden, D.ctx_pos, D.ctxK, D.ctxV, theta, eps, st);
     q35_dflash_query_forward(R, D.fwd, D.query_hidden, D.query_pos, num_ctx, D.ctxK, D.ctxV, theta, eps, st);
