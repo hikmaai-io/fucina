@@ -177,22 +177,35 @@ static inline bool q35_dflash_ctx_scratch_alloc(q35_dflash_ctx_scratch* c, const
 }
 static inline void q35_dflash_ctx_scratch_free(q35_dflash_ctx_scratch* c){ if(c->normed) cudaFree(c->normed); *c=q35_dflash_ctx_scratch{}; }
 
-// Precompute context K/V for all layers. ctxK[l]/ctxV[l] must each be [num_ctx*NKV*HD] device
-// buffers. ctx_hidden [num_ctx,H] is the target hidden state; ctx_pos [num_ctx] absolute positions.
-static inline void q35_dflash_precompute_context_kv(const q35_dflash_residency& R,
-        q35_dflash_ctx_scratch& c, const float* ctx_hidden, const int* ctx_pos,
-        float* const* ctxK, float* const* ctxV, double theta, float eps, cudaStream_t st){
+// Precompute context K/V for all layers into caller buffers at a WRITE OFFSET (in rows). ctxK[l]/
+// ctxV[l] point at persistent per-layer caches [cap*NKV*HD]; this writes num_ctx rows starting at
+// dst_row. ctx_hidden [num_ctx,H] is the target hidden; ctx_pos [num_ctx] absolute positions. When
+// dst_row==0 this is a full (re)compute; dst_row>0 APPENDS new context to an accumulating cache
+// (each decode step inserts only the newly-committed target tokens, matching vLLM's per-step
+// precompute_and_store_context_kv into a persistent cache). Deterministic: appended rows are a pure
+// function of their own hidden+position, so append == full recompute over the same rows.
+static inline void q35_dflash_precompute_context_kv_at(const q35_dflash_residency& R,
+        q35_dflash_ctx_scratch& c, const float* ctx_hidden, const int* ctx_pos, int num_ctx,
+        float* const* ctxK, float* const* ctxV, int dst_row, int cap, double theta, float eps,
+        cudaStream_t st){
     const qwen35dflash::Geometry& g=R.geom;
-    const int H=g.H,HD=g.HD,NKV=g.NKV,kvd=g.kv_dim(),num_ctx=c.num_ctx;
-    // Shared hidden RMSNorm (hidden_norm) across layers.
+    const int H=g.H,HD=g.HD,NKV=g.NKV,kvd=g.kv_dim();
+    if(num_ctx<=0 || dst_row+num_ctx>cap) return;
     q35df_rmsnorm<<<num_ctx,256,0,st>>>(ctx_hidden,R.hidden_norm,c.normed,H,num_ctx,eps);
     for(int l=0;l<g.L;l++){
         const q35_dflash_layer_w& w=R.layers[l];
-        q35df_matmul<<<dim3(num_ctx,(kvd+255)/256),256,0,st>>>(c.normed,w.k_proj,ctxK[l],num_ctx,H,kvd);
-        q35df_matmul<<<dim3(num_ctx,(kvd+255)/256),256,0,st>>>(c.normed,w.v_proj,ctxV[l],num_ctx,H,kvd);
-        q35df_headnorm<<<dim3(num_ctx,NKV),128,0,st>>>(ctxK[l],w.k_norm,num_ctx,NKV,HD,eps);
-        q35df_rope<<<dim3(num_ctx,NKV),64,0,st>>>(ctxK[l],ctx_pos,num_ctx,NKV,HD,theta);
+        float* kdst=ctxK[l]+(size_t)dst_row*kvd; float* vdst=ctxV[l]+(size_t)dst_row*kvd;
+        q35df_matmul<<<dim3(num_ctx,(kvd+255)/256),256,0,st>>>(c.normed,w.k_proj,kdst,num_ctx,H,kvd);
+        q35df_matmul<<<dim3(num_ctx,(kvd+255)/256),256,0,st>>>(c.normed,w.v_proj,vdst,num_ctx,H,kvd);
+        q35df_headnorm<<<dim3(num_ctx,NKV),128,0,st>>>(kdst,w.k_norm,num_ctx,NKV,HD,eps);
+        q35df_rope<<<dim3(num_ctx,NKV),64,0,st>>>(kdst,ctx_pos,num_ctx,NKV,HD,theta);
     }
+}
+// Full (re)compute at offset 0 (back-compat wrapper).
+static inline void q35_dflash_precompute_context_kv(const q35_dflash_residency& R,
+        q35_dflash_ctx_scratch& c, const float* ctx_hidden, const int* ctx_pos,
+        float* const* ctxK, float* const* ctxV, double theta, float eps, cudaStream_t st){
+    q35_dflash_precompute_context_kv_at(R,c,ctx_hidden,ctx_pos,c.num_ctx,ctxK,ctxV,0,c.num_ctx,theta,eps,st);
 }
 
 // Full DFlash query forward: the (1+K) query rows attend the precomputed context K/V (ctxK/ctxV

@@ -709,6 +709,13 @@ qwen35-dflash-engine-load-test: lib libdg
 
 DFLASH_PATH ?= /opt/spark/models/models--z-lab--Qwen3.5-9B-DFlash/snapshots/5fc3b3d474760f18c516db87d84c37edbfd3ede6
 
+# DFlash incremental context-KV append == full recompute (the accumulating draft KV cache): append
+# context in chunks vs one-shot precompute, byte-identical, on real weights. SKIPs if absent.
+qwen35-dflash-ctx-append-test:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_ctx_append.cu -o /tmp/dflash_ctxapp \
+		-lcudart -lcuda
+	flock -w 600 /tmp/fucina_gpu.lock -c "/tmp/dflash_ctxapp"
+
 # DFlash aux gather: capture layout [slot][row][H] -> drafter concat [row][F*H] for a row window.
 # The transpose the real-drafter wiring depends on. Self-contained. Flocks the GPU.
 qwen35-dflash-aux-gather-test:
