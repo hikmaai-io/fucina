@@ -5090,7 +5090,7 @@ gemma4_engine_t* gemma4_engine_create(
     eng->q35.dflash_mode = q35_dflash_mode_from_env(getenv("FUCINA_QWEN35_DFLASH"));
     eng->q35.dflash_critical_batch = 0;
     eng->q35.d_slot_tok = NULL; eng->q35.d_slot_pos = NULL;
-    eng->q35.rowslot = NULL; eng->q35.chunk_scr = NULL;
+    eng->q35.rowslot = NULL; eng->q35.chunk_scr = NULL; eng->q35.d_pf_seqmeta = NULL;
     eng->q35.pf_pos = NULL; eng->q35.pf_tok = NULL;
     eng->q35.attn_splits = 0; eng->q35.attn_tile = 0;
     eng->q35.part_m = NULL; eng->q35.part_l = NULL; eng->q35.part_o = NULL;
@@ -6709,6 +6709,7 @@ void gemma4_engine_destroy(gemma4_engine_t *eng) {
     for (int i = 0; i < 24; i++) CUDA_FREE(eng->q35.sb[i]);
     CUDA_FREE(eng->q35.rowslot);
     CUDA_FREE(eng->q35.chunk_scr);
+    CUDA_FREE(eng->q35.d_pf_seqmeta);
     CUDA_FREE(eng->q35.part_m); CUDA_FREE(eng->q35.part_l); CUDA_FREE(eng->q35.part_o);
     CUDA_FREE(eng->q35.pf_pos);
     CUDA_FREE(eng->q35.pf_tok);

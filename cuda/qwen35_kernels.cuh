@@ -1366,11 +1366,15 @@ __device__ inline void wmma_gemm_tf32(float *C, const float *A, const float *B,
 // token-by-token (and to the M2 chunk==recur self-test). One block per v-head, CHUNK=64.
 // q/k indexed [row,NKH,SD]; v/g/beta indexed [row,NVH]; reads inputs only at rows < T (guarded),
 // so the T-row scratch needs no NPAD zero-padding. NPAD = roundup(T,CHUNK) drives the chunk count.
-__global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const float *k,
-                                          const float *v, const float *g, const float *beta,
-                                          __nv_bfloat16 *const *S_slots, float *scratch,
-                                          int slot, int N, int NPAD, int interleave, int nvh) {
-    int vh  = blockIdx.x;
+// Shared GDN chunk-scan body — one v-head's contiguous 64-token chunked run carrying slot state
+// S_slots[slot]. Extracted so the per-seq kernel (blockIdx.x=vh) and the multiseq kernel
+// (blockIdx.x=seq*nvh+vh) run the SAME math per (seq,vh) => byte-identical. `vh` is this block's
+// v-head; `scr_blk` is the global block id used to index the per-block scratch slab; q/k/v/g/beta
+// are already row-offset to this sequence's rows.
+__device__ __forceinline__ void qwen35_gdn_chunk_body(
+        float *core, const float *q, const float *k, const float *v, const float *g,
+        const float *beta, __nv_bfloat16 *const *S_slots, float *scratch,
+        int slot, int N, int NPAD, int interleave, int nvh, int vh, int scr_blk) {
     // TILE (GGUF) vs repeat-INTERLEAVE (FP8/safetensors). See [[qwen35-fp8-engine-serving]].
     int kh  = interleave ? (vh / (nvh / M2_NKH)) : (vh % M2_NKH);
     int tid = threadIdx.x;
@@ -1381,7 +1385,7 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
     float *gc   = kch + CS * SD;      // [CS] cumulative decay
     float *bet  = gc + CS;            // [CS] beta per chunk row
     float *rowb = bet + CS;           // [CS] fwd-subst scratch row
-    float *Tm    = scratch + (size_t)vh * Q35_GDN_SCR;
+    float *Tm    = scratch + (size_t)scr_blk * Q35_GDN_SCR;
     float *u     = Tm + CS * CS;
     float *kcd   = u + CS * SD;
     float *vnew  = kcd + CS * SD;
@@ -1499,5 +1503,42 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
         __syncthreads();
     }
     for (int idx = tid; idx < SD * SD; idx += blockDim.x) Sg[idx] = __float2bfloat16(S[idx]);   // carry-out
+}
+
+// Per-sequence GDN chunk scan: one block per v-head (blockIdx.x=vh), scratch indexed by vh.
+__global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const float *k,
+                                          const float *v, const float *g, const float *beta,
+                                          __nv_bfloat16 *const *S_slots, float *scratch,
+                                          int slot, int N, int NPAD, int interleave, int nvh) {
+    int vh = blockIdx.x;
+    qwen35_gdn_chunk_body(core, q, k, v, g, beta, S_slots, scratch, slot, N, NPAD,
+                          interleave, nvh, vh, /*scr_blk=*/vh);
+}
+
+// Multiseq GDN chunk scan: ONE launch of nvh*M blocks (F2, kills the per-seq serial loop in the
+// N=32 admission prefill). blockIdx.x = seq*nvh + vh decodes the sequence and its v-head; each
+// block reads its own slot state slots[seq] and its own row-offset q/k/v/g/beta. Per-sequence
+// recurrence order is UNCHANGED (each block scans one sequence's contiguous chunks) => the produced
+// core rows and carried state are byte-identical to the per-seq launch; only the launch coalesces,
+// filling nvh*M blocks across the SMs (was nvh) and removing the M-1 serial kernel-launch tail.
+// slots/offs/lens are device arrays of length M; nlens uses row-offset q/k/v/g/beta base pointers.
+__global__ void qwen35_b_gdn_chunk_multiseq_kernel(
+        float *core, const float *q, const float *k, const float *v, const float *g,
+        const float *beta, __nv_bfloat16 *const *S_slots, float *scratch,
+        const int *slots, const int *offs, const int *lens, int interleave, int nvh) {
+    int seq = blockIdx.x / nvh;
+    int vh  = blockIdx.x % nvh;
+    int off = offs[seq], N = lens[seq], slot = slots[seq];
+    int NPAD = ((N + M2_CHUNK - 1) / M2_CHUNK) * M2_CHUNK;
+    // Row-offset the flattened Ttot-row buffers to this sequence's rows (same offsets the per-seq
+    // launch passes as base pointers). q/k indexed [row,NKH,SD]; core/v/g/beta [row,NVH*...].
+    qwen35_gdn_chunk_body(core + (size_t)off * nvh * M2_SD,
+                          q + (size_t)off * M2_NKH * M2_SD,
+                          k + (size_t)off * M2_NKH * M2_SD,
+                          v + (size_t)off * nvh * M2_SD,
+                          g + (size_t)off * nvh,
+                          beta + (size_t)off * nvh,
+                          S_slots, scratch, slot, N, NPAD, interleave, nvh, vh,
+                          /*scr_blk=*/blockIdx.x);
 }
 
