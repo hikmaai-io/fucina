@@ -776,6 +776,14 @@ qwen35-dflash-e2e-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_dflash_e2e $(QWEN35_MODEL)"
 
+# DFlash GREEDY repeated-run determinism (P5): two independent runs over the same prompt emit a
+# byte-identical token stream + identical per-step accept counts on the real FP8 target.
+qwen35-dflash-determinism-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_determinism.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dflash_determinism \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "FUCINA_QWEN35_DFLASH_PATH=$(DFLASH_PATH) /tmp/fucina_dflash_determinism $(DFLASH_TARGET)"
+
 # DFlash probabilistic real step (assembly correctness): in-vocab tokens + run-to-run byte-identical
 # for a fixed seed on the real FP8 target (distribution preservation proven separately).
 qwen35-dflash-prob-step-test: lib libdg
