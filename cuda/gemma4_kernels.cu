@@ -15858,19 +15858,30 @@ extern "C" int gemma4_engine_q35_dflash_real_step(gemma4_engine_t *eng, int slot
     int32_t draft[GEMMA4_MAX_SEQS];
     {
         int num_ctx = D->ctxlen;
+        const float *dhid = nullptr;   // [K, H] final-normed draft mask rows
         if (num_ctx <= 0) {
             // Cold start: no context. Draft from a single zero context row so attention is defined.
             static float *zero_aux = nullptr; static int zeros_for = 0;
             if (!zero_aux || zeros_for < F*H) { if (zero_aux) cudaFree(zero_aux); cudaMalloc(&zero_aux,(size_t)F*H*4); cudaMemset(zero_aux,0,(size_t)F*H*4); zeros_for=F*H; }
             int one_pos[1] = {0};
-            q35_dflash_draft_greedy(*R, *D, zero_aux, one_pos, 1, qids, qpos,
-                                    eng->d_embed_bf16, eng->d_lmhead_bf16, VOC, draft, theta, eps, st);
+            q35_dflash_draft_hidden(*R, *D, zero_aux, one_pos, 1, qids, qpos,
+                                    eng->d_embed_bf16, theta, eps, st, &dhid);
         } else {
             // Context rows carry their ABSOLUTE positions (ctx_abs_pos), so context-K RoPE matches
             // the query positions [base..base+K]. Using [0..num_ctx) would misalign RoPE and destroy
             // acceptance.
-            q35_dflash_draft_greedy(*R, *D, D->ctx_aux_concat, D->ctx_abs_pos, num_ctx,
-                                    qids, qpos, eng->d_embed_bf16, eng->d_lmhead_bf16, VOC, draft, theta, eps, st);
+            q35_dflash_draft_hidden(*R, *D, D->ctx_aux_concat, D->ctx_abs_pos, num_ctx,
+                                    qids, qpos, eng->d_embed_bf16, theta, eps, st, &dhid);
+        }
+        // S1a-PERF L1: run the DRAFT LM head with the engine's tuned tensor-core batched head
+        // (transpose [K,H]->[H,K] then weight-read-once GEMV) + argmax_rows, instead of the hand-
+        // rolled q35df_head_argmax_batched (nsys: 38.5 -> ~10 ms/step). Same argmax result; draft is
+        // not bit-constrained. Uses d_specxt (transposed) + d_sb[11] (K*vocab logits) + d_ms_outtok.
+        if (ensure_spec_scratch(eng) == 0 && dhid) {
+            nvfp4_xT_launch(eng->d_specxt, dhid, H, K, st);
+            bf16_head_gemv_batched_launch(eng->d_sb[11], eng->d_lmhead_bf16, eng->d_specxt, H, VOC, K, st);
+            argmax_rows_kernel<<<K, 1024, 0, st>>>(eng->d_sb[11], eng->d_ms_outtok, K, VOC);
+            cudaMemcpyAsync(draft, eng->d_ms_outtok, (size_t)K*sizeof(int32_t), cudaMemcpyDeviceToHost, st);
         }
         cudaStreamSynchronize(st);
     }

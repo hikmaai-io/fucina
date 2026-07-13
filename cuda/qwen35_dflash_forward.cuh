@@ -542,6 +542,30 @@ static inline int q35_dflash_draft_greedy(const q35_dflash_residency& R, q35_dfl
     return 0;
 }
 
+// S1a-PERF: draft forward WITHOUT the LM head. Runs fc-combine -> precompute -> embed -> query
+// forward and leaves the final-normed query output in D.fwd.out; *out_hidden points at the K mask
+// rows (D.fwd.out + H). The caller runs the head with the engine's tuned tensor-core batched head
+// (bf16_head_gemv_batched) instead of the hand-rolled q35df_head_argmax_batched (profile: 38.5 ->
+// ~10 ms/step). Draft correctness is NOT bit-constrained (losslessness is target-side), so a faster
+// head that returns the same argmax is a pure win.
+static inline int q35_dflash_draft_hidden(const q35_dflash_residency& R, q35_dflash_drafter& D,
+        const float* ctx_concat_aux, const int* ctx_positions, int num_ctx,
+        const int32_t* query_ids, const int* query_positions,
+        const __nv_bfloat16* embed, double theta, float eps, cudaStream_t st, const float** out_hidden){
+    if(!D.ready || num_ctx>D.ctx_cap) return -1;
+    const qwen35dflash::Geometry& g=R.geom; const int H=g.H, rows=1+D.K;
+    D.ctx.num_ctx=num_ctx;
+    cudaMemcpyAsync(D.ctx_pos, ctx_positions, (size_t)num_ctx*sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(D.query_pos, query_positions, (size_t)rows*sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(D.query_ids, query_ids, (size_t)rows*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    q35_dflash_combine_aux(R, ctx_concat_aux, D.ctx_hidden, num_ctx, st);
+    q35_dflash_embed_query(D.query_ids, embed, D.query_hidden, rows, H, st);
+    q35_dflash_precompute_context_kv(R, D.ctx, D.ctx_hidden, D.ctx_pos, D.ctxK, D.ctxV, theta, eps, st);
+    q35_dflash_query_forward(R, D.fwd, D.query_hidden, D.query_pos, num_ctx, D.ctxK, D.ctxV, theta, eps, st, D.ctx_pos);
+    *out_hidden = D.fwd.out + (size_t)1*H;   // the K mask rows [K, H]
+    return 0;
+}
+
 // Probabilistic draft step: identical to q35_dflash_draft_greedy through the query forward, but the
 // K mask rows are sampled from softmax(logits/temp) via the shared-key uniform (seed, sample_pos64,
 // SAMPLE), and the per-row draft logits are retained in D.draft_logits for the rejection sampler.
