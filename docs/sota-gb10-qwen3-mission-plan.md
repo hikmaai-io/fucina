@@ -4,6 +4,39 @@ Status: ACTIVE (2026-07-12). Supersedes the tactical parts of
 `qwen35-only-beat-vllm-plan.md` (rev 2) and folds in the vLLM subsystem analysis
 (`/tmp/vllm-analysis-report.md`, vLLM @ 5f8e73cb).
 
+## UPDATE 2026-07-13: S1 DFlash verdict + pivot
+
+**S1 spec decode (DFlash) is CORRECT but NOT a net perf win on GB10 — shelved as a
+SOTA lever.** Branch `feat/qwen35-dflash` @ `1413cea` (58 commits, pushed, NOT
+merged): lossless GDN rollback + deterministic RNG + loader all certified;
+greedy byte-identical to greedy decode (3.556 accept/step), probabilistic
+TV=0.0015; L1 draft-head tensor-core opt kept (435→408 ms/step, lossless).
+
+**The measured ceiling (why we pivot):** B=1 greedy DFlash is *structurally* ≥
+plain decode because the lossless commit re-decodes the accepted prefix as j
+sequential single-token decodes (293 of 408 ms/step); at accept 9.2 that is
+≥31.8 ms/emitted-token even with a free draft+verify, vs 29 ms plain. The
+batched (T=17) verify argmax diverges from single-token decode on 2.0% of rows,
+forcing the re-decode. And at B>1, **plain batched decode already amortizes
+weights** (B=8: 4.35 ms/token), so batched DFlash only ~matches it. This confirms
+the vLLM-analysis prediction: on a 273 GB/s bandwidth-bound engine, batching
+already captures spec-decode's weight-amortization win; spec decode has a low
+ceiling here.
+
+**Decision: pivot the SOTA effort to the remaining MEASURED vLLM gaps** rather
+than chase spec decode. Only surviving DFlash lever (deferred, not scheduled): a
+bit-identical `(1+K)` batched verify enabling re-decode-free fast-commit (~1.2×
+at B=1 interactive) — a large separate workstream, low priority.
+
+### New priority order (evidence-ranked)
+1. **M-TTFT (ACTIVE)**: MoE N=32 TTFT 866/874 ms (med/p95) vs vLLM 664 ms — the
+   last cell where vLLM wins (fucina already wins MoE N=32 aggregate 405 vs 303).
+   Branch `perf/qwen35-moe-ttft`.
+2. MoE N=2/4 low-concurrency cells.
+3. Re-freeze protection baselines with a fresh contemporaneous vLLM sweep after
+   S2 + P2 landed on main.
+4. Phase E distributed (parked).
+
 ## Mission
 
 Be the state-of-the-art inference engine for Qwen3.5 on a single NVIDIA GB10
