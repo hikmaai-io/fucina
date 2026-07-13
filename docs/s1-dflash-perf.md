@@ -75,3 +75,34 @@ losslessness contract.
   through the engine's tensor-core `gemm_bf16` (cutlass) with a bf16 activation
   transpose, exactly as the target verify does -- needs the draft head done in the
   engine like L1, or a draft-forward variant that takes an engine cuBLAS/gemm hook.
+
+## DECISIVE CEILING (MEASURED /tmp/breakdown, B=1)
+
+DFlash step (408 ms) decomposes as:
+- draft forward ~76 ms
+- verify_block(T=17) **89.3 ms**
+- commit replay of the accepted prefix **292.8 ms** (== ~10 x single_decode 29.3 ms)
+
+The commit replays the j accepted tokens as **j SEQUENTIAL single-token target
+decodes** (q35_gdn_commit -> qwen35_step_batch per token), because exact-lossless
+accept requires the decode-body argmax (the batched verify argmax diverges from
+single-token decode at ~10/40 interior positions -- see f348ec7; the fast-commit
+primitive q35_gdn_commit_fast gives byte-identical STATE in ~1 pass but its argmax
+is chunk-body, not decode-identical).
+
+**Ceiling math**: at accept j=9.2, the commit alone is ~10 x 29.3 = 293 ms => the
+DFlash step emits 9.2 tokens for >=293 ms = **>= 31.8 ms/emitted-token EVEN IF
+draft and verify were free** (both are not). Plain decode is 29.3 ms/token. So
+**greedy DFlash at B=1 is STRUCTURALLY >= plain decode with this commit**: the
+commit re-runs the target once per accepted token (exactly plain decode's work)
+PLUS draft+verify overhead. This is not a kernel-tuning gap; it is the exact-
+lossless commit design on a per-token-decode engine.
+
+The ONLY B=1 win requires the commit to advance state over the accepted prefix
+WITHOUT j sequential target decodes -- i.e. a BATCHED (T-row) target forward that
+is BIT-IDENTICAL to single-token decode so its argmax can be trusted for accept +
+emit. That is a deep engine change (make batched GEMM/attention numerics equal to
+the gemv single-token path) OUT OF S1a-PERF scope and risking the proven
+losslessness. Pivot: the smallest B>1 concurrency-batched path, where the verify +
+commit amortize the target weight read across B requests so the per-request commit
+cost is shared -- the regime where spec decode wins on this engine.
