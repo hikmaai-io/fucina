@@ -101,8 +101,30 @@ lossless commit design on a per-token-decode engine.
 The ONLY B=1 win requires the commit to advance state over the accepted prefix
 WITHOUT j sequential target decodes -- i.e. a BATCHED (T-row) target forward that
 is BIT-IDENTICAL to single-token decode so its argmax can be trusted for accept +
-emit. That is a deep engine change (make batched GEMM/attention numerics equal to
-the gemv single-token path) OUT OF S1a-PERF scope and risking the proven
-losslessness. Pivot: the smallest B>1 concurrency-batched path, where the verify +
-commit amortize the target weight read across B requests so the per-request commit
-cost is shared -- the regime where spec decode wins on this engine.
+emit (then commit is a free state-keep, no replay). That is a deep engine change
+(make batched GEMM/attention numerics equal to the gemv single-token path).
+
+## B>1 analysis (MEASURED /tmp/batchdec) -- amortization already belongs to plain decode
+
+Plain BATCHED decode on this engine already amortizes the target weight read across
+requests:
+- B=1: 29.2 ms/step = 29.2 ms/token
+- B=2: 33.8 ms/step = 16.9 ms/token
+- B=4: 33.7 ms/step = 8.4 ms/token
+- B=8: 34.8 ms/step = 4.35 ms/token
+
+Consequence for spec decode: a DFlash step serving B requests, even if its ragged
+commit is batched per replay-position (all B replay token t together, ~10 batched
+decodes ~= 10 x 34 = 340 ms for 8 reqs x ~9 tokens = 72 tokens => ~4.7 ms/token),
+only ~MATCHES plain batched decode (4.35 ms/token) and does not clearly beat it --
+because plain batched decode ALREADY achieves the weight-read amortization spec
+decode fights for. On a 273 GB/s bandwidth-bound engine, batching is the dominant
+weight-amortization lever; spec decode's "fewer target forwards" advantage is
+cancelled by batching already reducing the per-token weight cost.
+
+**Where spec decode CAN win on this engine: low batch (B=1-2, latency-bound) IF the
+commit does NOT re-decode the accepted prefix** -- i.e. the bit-identical batched
+verify above. That single lever gates the whole feature's speedup. Everything else
+(draft head/matmul tuning) is second-order (<= ~40 ms of a 408 ms step). Next:
+quantify how far the batched verify diverges from single-token decode and whether a
+bit-identical batched target forward is achievable without weakening losslessness.
