@@ -752,6 +752,14 @@ qwen35-dflash-verify-block-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_dflash_verify_block $(QWEN35_MODEL)"
 
+# DFlash lossless fast-commit: batched-projection + decode-kernel-recurrence commit must be byte-
+# identical to the sequential commit (argmax + continued greedy) for all j. Uses target GGUF/FP8.
+qwen35-dflash-commit-fast-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dflash_commit_fast.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dflash_commit_fast \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_dflash_commit_fast $(DFLASH_TARGET)"
+
 # DFlash verify-block target-logits self-consistency: the exposed [T,vocab] target logits argmax to
 # the block's per-row argmax (proves they are the real verify distribution). Uses target GGUF/FP8.
 qwen35-dflash-verify-logits-test: lib libdg

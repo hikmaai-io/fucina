@@ -1173,8 +1173,13 @@ static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
 // State (S / ring / FULL K-V) persists in the per-slot arenas across chunks AND across calls, so
 // this is also the chunked-prefill primitive (caller resets the slot once before the first
 // chunk). do_sample=1 argmaxes the LAST row of the LAST chunk into *first_tok_out. Returns 0/-1.
-static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, int T,
-                                      int want_logits, cudaStream_t st) {
+// use_decode_gdn: when nonzero, the GDN/conv recurrence runs token-SEQUENTIALLY with the single-
+// token DECODE kernels (row-offset pointers) instead of the chunked-scan kernels, so the produced
+// per-slot state is BYTE-IDENTICAL to sequential decode (the chunk scan is only ~equal and drifts on
+// some sequences). Weight-heavy projections stay batched over T rows (one pass). Used by the lossless
+// fast-commit; the verify path keeps use_decode_gdn=0 (the chunk scan is fine for scoring argmax).
+static void qwen35_prefill_chunk_body_ex(gemma4_engine_t *eng, int slot, int base, int T,
+                                         int want_logits, int use_decode_gdn, cudaStream_t st) {
     const gemma4_model_config_t *c = &eng->cfg;
     const int H=c->hidden_size, HD=M2_HEAD, NQ=c->n_heads, NKV=c->n_kv_global;
     const int INNER=c->ssm_inner_size, CONVD=(2*M2_KEYD+c->ssm_inner_size), NKH=M2_NKH, NVH=(c->ssm_inner_size/M2_SD), SD=M2_SD, TSR=c->ssm_time_step_rank, ROT=M2_ROT;
@@ -1183,6 +1188,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
     const int maxctx = eng->q35.maxctx;
     const float eps = 1e-6f;
     const size_t smGDNchunk = ((size_t)SD * SD + M2_CHUNK * SD + 3 * M2_CHUNK) * sizeof(float);
+    const size_t smGDN = ((size_t)SD * SD + 3 * SD) * sizeof(float);   // single-token GDN (fast-commit)
     const size_t smATT = (size_t)maxctx * sizeof(float);
     auto Wq = [&](uint64_t off) -> const uint8_t* { return weight_fp8(eng, off); };
     auto Wf = [&](uint64_t off) -> const float*   {
@@ -1247,6 +1253,24 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 q35_proj_gemm(eng, ac,  Tn.ssm.in_a, Tn.ssm.fmt_in_a, xn, H, TSR, T, st, l, WC_A, &Tn.ssm.ref_in_a);   // alpha
                 q35_proj_gemm(eng, bc,  Tn.ssm.in_b, Tn.ssm.fmt_in_b, xn, H, TSR, T, st, l, WC_B, &Tn.ssm.ref_in_b);   // beta
             }
+            m2_decay_beta_kernel<<<grid1d((size_t)T*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(Tn.ssm.a_log), Wf(Tn.ssm.dt_bias), T, TSR);
+            if (use_decode_gdn) {
+                // LOSSLESS recurrence: run conv + delta-rule state per token with the SINGLE-TOKEN
+                // decode kernels (row-offset pointers, B=1), advancing the per-slot ring + state S
+                // exactly as sequential decode. Projections above stayed batched (one weight pass).
+                for (int t = 0; t < T; t++) {
+                    qwen35_b_conv_kernel<<<dim3(grid1d((size_t)CONVD),1),256,0,st>>>(
+                        conv + (size_t)t*CONVD, qkv + (size_t)t*CONVD, eng->q35.ring[l], Wf(Tn.ssm.conv1d), d_slot, CONVD, 1);
+                    qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),1),256,0,st>>>(
+                        qh + (size_t)t*KEYD, kh + (size_t)t*KEYD, vh + (size_t)t*VALD, conv + (size_t)t*CONVD, 1, CONVD, VALD);
+                    m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(qh + (size_t)t*KEYD, NKH, SD, 1);
+                    m2_l2norm_heads_kernel<<<dim3(NKH,1),128,0,st>>>(kh + (size_t)t*KEYD, NKH, SD, 1);
+                    qwen35_b_gdn_kernel<<<dim3(NVH,1),256,smGDN,st>>>(
+                        core + (size_t)t*VALD, qh + (size_t)t*KEYD, kh + (size_t)t*KEYD, vh + (size_t)t*VALD,
+                        gg + (size_t)t*TSR, bb + (size_t)t*TSR, eng->q35.S[l], d_slot,
+                        1, eng->format==FORMAT_FP8_BLOCK, NVH);
+                }
+            } else {
             // RECURRENT: causal conv1d ring — ONE batched launch over the whole T-row tile,
             // reading the per-slot ring for the CK-1 carry positions; then advance the ring.
             qwen35_b_conv_chunk_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(
@@ -1256,7 +1280,6 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(qh, kh, vh, conv, T, CONVD, VALD);
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(qh, NKH, SD, T);
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(kh, NKH, SD, T);
-            m2_decay_beta_kernel<<<grid1d((size_t)T*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(Tn.ssm.a_log), Wf(Tn.ssm.dt_bias), T, TSR);
             // RECURRENT: delta-rule state S update — ONE chunked parallel-scan launch over the
             // whole tile (CHUNK=64), carrying the per-slot fp32 state S in/out of the arena.
             // 512 threads: the O(SD*SD)=16384-element state/matmul loops stride over 4x the lanes.
@@ -1264,6 +1287,7 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
                 core, qh, kh, vh, gg, bb, eng->q35.S[l],
                 workspace_data<float>(eng->q35.gdn_workspace),slot,T,NPAD,
                 eng->format==FORMAT_FP8_BLOCK, NVH);
+            }
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T, NVH, VALD);
             moe_profile_activation(eng, l, 1, gnorm, (size_t)T*INNER, st);
             q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, l, WC_OUT, &Tn.ssm.ref_out);
@@ -1321,6 +1345,12 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             gemv_batched_w(eng, eng->d_sb[11], Wq(eng->tensors.output_weight), xn, H, VOC, T, st, eng->tensors.output_fmt);
         argmax_rows_kernel<<<T,1024,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, T, VOC);
     }
+}
+
+// Back-compat wrapper: verify/prefill path uses the chunked GDN scan (use_decode_gdn=0).
+static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, int T,
+                                      int want_logits, cudaStream_t st) {
+    qwen35_prefill_chunk_body_ex(eng, slot, base, T, want_logits, /*use_decode_gdn=*/0, st);
 }
 
 static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t *tokens, int n,
@@ -1981,6 +2011,40 @@ static int q35_gdn_commit(gemma4_engine_t *eng, int slot, const int32_t *accepte
     return 0;
 }
 
+// Lossless FAST commit: replay the j accepted tokens in ONE weight pass (batched projections) with
+// the GDN/conv recurrence run token-sequentially via the DECODE kernels (use_decode_gdn=1), so the
+// committed per-slot state is byte-identical to j sequential decodes -- but ~1 weight read instead
+// of j. want_logits=2 captures each committed row's argmax (the decode-body correction) in one pass.
+// out_argmax[i] = greedy token after committing accepted[i]. Replaces the j-fold q35_gdn_commit loop.
+static int q35_gdn_commit_fast(gemma4_engine_t *eng, int slot, const int32_t *accepted, int j,
+                               int32_t *out_argmax) {
+    if (!eng || eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -1;
+    if (slot < 0 || slot >= eng->q35.capacity || !eng->slots[slot].used || j < 0) return -1;
+    if (q35_gdn_restore_snapshot(eng, slot) != 0) return -1;
+    if (j == 0) { eng->q35.gdn_snap_ntokens[slot] = -1; return 0; }
+    gemma4_seq *s = &eng->slots[slot];
+    int base = s->n_tokens;
+    if (base + j > eng->q35.maxctx) { eng->q35.gdn_snap_ntokens[slot] = -1; return -1; }
+    if (q35_slot_kv_reserve(eng, slot, base + j) != 0) { eng->q35.gdn_snap_ntokens[slot] = -1; return -1; }
+    cudaStream_t st = eng->stream;
+    int32_t *d_tok = workspace_data<int32_t>(eng->q35.prefill_token_workspace);
+    int     *d_pos = workspace_data<int>(eng->q35.prefill_position_workspace);
+    int     *d_slot = workspace_data<int>(eng->q35.routing_workspace);
+    int h_pos[GEMMA4_MAX_SEQS], h_slot[GEMMA4_MAX_SEQS];
+    for (int t = 0; t < j; t++) { h_pos[t] = base + t; h_slot[t] = slot; }
+    cudaMemcpyAsync(d_tok, accepted, (size_t)j*sizeof(int32_t), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(d_pos, h_pos, (size_t)j*sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(d_slot, h_slot, (size_t)j*sizeof(int), cudaMemcpyHostToDevice, st);
+    qwen35_prefill_chunk_body_ex(eng, slot, base, j, out_argmax ? 2 : 0, /*use_decode_gdn=*/1, st);
+    if (out_argmax)
+        cudaMemcpyAsync(out_argmax, eng->d_ms_outtok, (size_t)j*sizeof(int32_t), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    if (cudaGetLastError() != cudaSuccess) { eng->q35.gdn_snap_ntokens[slot] = -1; return -1; }
+    s->n_tokens = base + j;
+    eng->q35.gdn_snap_ntokens[slot] = -1;
+    return 0;
+}
+
 // ─── S1a P4: target (1+K) verify forward with all-row argmax capture + GDN rollback ─────
 //
 // Runs the target over a (1+K)-token block appended at the slot's current position, capturing the
@@ -2070,18 +2134,18 @@ static int qwen35_dflash_greedy_step(gemma4_engine_t *eng, int slot, int32_t bon
     // tokens (different kernels/accumulation order), so the EMITTED tokens must be validated against
     // the decode body, never the chunk-body argmax am[] (trusting am[] drifts from true sequential
     // decode over many steps -- a real losslessness bug on some sequences).
+    // The emitted tokens must equal what the DECODE body produces (the chunk-body am[] argmax can
+    // diverge from the decode body at some positions -- a real losslessness bug), so the accept
+    // length and correction are re-derived from q35_gdn_commit's per-step DECODE-body argmax
+    // out_next[]. (q35_gdn_commit_fast produces byte-identical STATE in ~one weight pass and is a
+    // validated primitive, but its want_logits argmax uses the chunk-body head and is NOT decode-
+    // identical at all positions, so it is not used for the emitted correction here.)
     int32_t commit_toks[GEMMA4_MAX_SEQS], out_next[GEMMA4_MAX_SEQS];
     commit_toks[0] = bonus;
     for (int i = 0; i < jhat; i++) commit_toks[1 + i] = block[1 + i];
     if (q35_gdn_commit(eng, slot, commit_toks, 1 + jhat, out_next) != 0) return -1;
-    // Re-derive the greedy-accepted length from the DECODE body: out_next[i] is the greedy token the
-    // committed state predicts after replaying commit_toks[i]; draft i (== commit_toks[1+i]) is
-    // truly accepted iff it equals out_next[i]. Find the first decode-body disagreement.
     int j = 0;
     while (j < jhat && block[1 + j] == out_next[j]) j++;
-    // If the decode body rejects earlier than the chunk body (j < jhat), the committed state has
-    // over-advanced; re-commit exactly the decode-accepted prefix so the slot state is byte-
-    // identical to j sequential decodes and the emitted correction is the decode token at base+j.
     if (j < jhat) {
         for (int i = 0; i < j; i++) commit_toks[1 + i] = block[1 + i];
         if (q35_gdn_commit(eng, slot, commit_toks, 1 + j, out_next) != 0) return -1;

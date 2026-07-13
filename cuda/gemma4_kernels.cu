@@ -15678,6 +15678,11 @@ extern "C" int gemma4_engine_q35_gdn_commit(gemma4_engine_t *eng, int slot,
                                             const int32_t *accepted, int j, int32_t *out_next) {
     return q35_gdn_commit(eng, slot, accepted, j, out_next);
 }
+// Lossless fast commit (batched projections + decode-kernel GDN recurrence). See q35_gdn_commit_fast.
+extern "C" int gemma4_engine_q35_gdn_commit_fast(gemma4_engine_t *eng, int slot,
+                                                 const int32_t *accepted, int j, int32_t *out_argmax) {
+    return q35_gdn_commit_fast(eng, slot, accepted, j, out_argmax);
+}
 extern "C" int gemma4_engine_q35_gdn_rewind(gemma4_engine_t *eng, int slot) {
     return q35_gdn_commit(eng, slot, nullptr, 0, nullptr);
 }
