@@ -8,6 +8,27 @@ distribution-preserving (P1 rejection, proven TV=0.0015), assembled + functional
 a wall-clock speedup (current draft kernels are unoptimized fp64-accum reference
 code -- NO speedup claimed), and B>1 concurrency tuning.
 
+## Honest performance status (2026-07-12) — NOT yet net-faster
+
+MEASURED on the real FP8 target + z-lab draft, single-stream B=1:
+- target plain decode: **29.2 ms/tok**.
+- DFlash greedy step: **1409 ms/step**, emitting 9.2 tokens/step => **153 ms per
+  emitted token** — i.e. DFlash is currently **~5.2x SLOWER per token** despite a
+  high 9.2 accept.
+- The draft step dominates; a micro-profile of the draft forward (K=16, ctx=32)
+  shows the LM-head sampling is the bottleneck (head ~286 ms vs query_fwd 28 ms,
+  precompute 9 ms). The draft head does K serial H-dot-products per vocab token in
+  a single thread — compute-bound, not bandwidth-bound.
+
+Optimization so far (draft forward, MEASURED, parity preserved): fp64->fp32 warp
+matmul + shared-mem head (1059.5->477.8 ms), batched head one-weight-pass
+(477.8->327.1 ms). These are real but insufficient: **no end-to-end speedup is
+claimed; DFlash is not yet wall-clock competitive.** The decisive remaining lever
+is a warp/tensor-core cooperative draft head (the K*vocab*H serial MAC loop), then
+S2 graph capture of the fixed-shape query forward. The lossless/distribution-
+preserving CORRECTNESS is complete and gated; PERFORMANCE is open and honestly
+unfinished.
+
 ## Certified P5 gate matrix (2026-07-12, ALL PASS)
 
 Host (8): dflash-rng, -loader, -plan, -commit, -pipeline, -pcgeom, -prob-dist
