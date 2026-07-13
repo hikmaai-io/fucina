@@ -1,9 +1,25 @@
 # S1a DFlash design and architecture gate
 
-Status: **LOSSLESS GREEDY DFLASH WORKING on real weights, all gates green** (2026-07-12).
-Measured single-stream acceptance 3.56 drafts/step (aggregate), emitted byte-
-identical to plain greedy decode on every tested prompt. Remaining: probabilistic
-path, kernel optimization for wall-clock speedup, concurrency B>1 tuning.
+Status: **BOTH DFLASH SERVING PATHS COMPLETE on real weights, full gate matrix green**
+(2026-07-12). Greedy: lossless (emitted byte-identical to plain greedy decode on
+every prompt), measured single-stream acceptance 3.56 drafts/step. Probabilistic:
+distribution-preserving (P1 rejection, proven TV=0.0015), assembled + functional
+(deterministic per seed on the real FP8 target). Remaining: kernel optimization for
+a wall-clock speedup (current draft kernels are unoptimized fp64-accum reference
+code -- NO speedup claimed), and B>1 concurrency tuning.
+
+## Certified P5 gate matrix (2026-07-12, ALL PASS)
+
+Host (8): dflash-rng, -loader, -plan, -commit, -pipeline, -pcgeom, -prob-dist
+(TV=0.0015), -real-load. GPU numerical parity (real weights): -parity (CPU==CUDA),
+-verify (greedy accept), -verify-prob (prob accept, 10 seeds), -sample-prob,
+-verify-logits, plus precompute/backbone/attn/ctxkv/residency/forward/query/combine.
+GPU end-to-end (real FP8 target + z-lab draft): -gdn-rollback (commit(j) byte-
+identical), -measure (GREEDY byte-identical to plain greedy on all prompts, mean
+emitted/step 4.556 = accepted 3.556), -prob-step (probabilistic assembly: in-vocab
++ deterministic per seed). Regression: -batch (row-independence + graph-on==off +
+M3-parity + self-chain), full make lib libdg fucina + Go tests. DFlash-off byte-
+identity preserved throughout.
 
 ## Certified gate matrix (2026-07-12, all PASS)
 
