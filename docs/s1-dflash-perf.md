@@ -145,9 +145,42 @@ genuinely requires decode-body validation, i.e. the j-sequential-decode commit
 UNAVAILABLE while that 2% exists.
 
 => The speedup is gated entirely on driving the batched-verify-vs-single-token
-divergence to EXACTLY ZERO (bit-identical). 2% is small enough that it is likely a
-few fp accumulation-order / tensor-core-vs-gemv rounding flips at tight logit
-margins -- a candidate for a higher-precision or accumulation-order-matched batched
-head/final-norm, NOT a fundamental barrier. But it is a target-engine numerics
-change (the FP8 batched GEMM + batched LM head path), broader than the DFlash
-feature, and it must not weaken the existing byte-losslessness gate.
+divergence to EXACTLY ZERO (bit-identical).
+
+## Where the 2% divergence lives (evidence)
+
+The single-token B=1 decode and the (1+K) batched verify differ in TWO places that
+both feed the argmax:
+1. **LM head**: B=1 decode uses the EXACT two-pass Q8 head (q8_head_gemv +
+   bf16 rescore, qwen35_runtime.cuh ~469); the batched verify uses the BF16 batched
+   head (bf16_head_gemv_batched, ~490). Different kernels/accumulation.
+2. **Upstream hidden**: the batched mixer GEMMs (cutlass/nvjet tensor-core, T rows)
+   + batched FULL-attention over T rows produce a per-row final hidden that is only
+   ~equal (not bitwise) to the single-token gemv + single-token attention path. A
+   head fix alone cannot close an upstream state difference.
+
+So bit-identity requires matching BOTH the head AND the entire batched mixer/
+attention accumulation to the single-token path across all 32 target layers -- a
+pervasive target-engine numerics change, far broader than the DFlash feature, and
+directly risking the proven byte-losslessness gate (which currently HOLDS precisely
+because the commit re-decodes with the trusted single-token path). It is not a
+safe, scoped S1a-PERF change.
+
+## CONCLUSION
+
+At B=1, greedy DFlash on this bandwidth-bound engine is structurally >= plain
+decode: the exact-lossless commit re-decodes the accepted prefix (293 ms of a 408
+ms step), which is the same target work plain decode does, plus draft+verify
+overhead. The one lever that would win (~1.2x) -- a fast-commit that skips the
+re-decode -- is blocked by a small (2.0%) but real batched-verify-vs-single-token
+argmax divergence, whose removal is a deep, pervasive target-forward numerics change
+out of scope and hazardous to losslessness. At B>1, plain batched decode already
+captures the weight-read amortization spec decode seeks (B=8: 4.35 ms/token), so a
+batched DFlash step only ~matches it. Landed + kept: L1 (draft head -> tuned batched
+head, 435->408 ms/step, lossless, gates green).
+
+S1A_PERF_BLOCKED -- evidence-backed, no gate weakened. Concrete next lever (a
+separate, larger workstream): make the target's (1+K) batched verify forward
+bit-identical to single-token decode (accumulation-order-matched batched head +
+mixer/attention), enabling a re-decode-free fast-commit; only then is B=1 greedy
+DFlash a net win.
