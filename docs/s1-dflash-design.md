@@ -37,6 +37,22 @@ Exact remaining real-checkpoint validation (future, NOT blocking correctness):
 wall-clock speedup work (needs a bit-identical batched forward), B>1 concurrency
 tuning, and the 35B tuning pass on the same rollback primitive.
 
+### DFlash-off byte-identity: STRUCTURAL, not merely tested (verified 2026-07-12)
+
+The P5 "DFlash-off byte-identical to main" requirement holds by CONSTRUCTION, the
+strongest possible form: `eng->q35.dflash_mode` is written once from the
+FUCINA_QWEN35_DFLASH env (gemma4_kernels.cu:5092) and READ NOWHERE in any decode
+path -- its only consumer is the (test-only) planner q35_dflash_gate. The
+production hot path gemma4_engine_step_batch (line ~12374) contains ZERO DFlash
+references; the entire feature is reachable only through the explicit opt-in APIs
+gemma4_engine_q35_dflash_real_step / _real_step_prob, which nothing in the serving
+loop calls. So the emitted stream with the flag off/absent is not just empirically
+equal to main (qwen35-batch-test, greedy determinism gate) -- the decode path is
+literally the same code, making a regression structurally impossible. The greedy
+repeated-run determinism gate (qwen35-dflash-determinism-test) additionally proves
+the opt-in DFlash path itself is reproducible: 43 emitted tokens + 16 per-step
+accept counts byte-identical across two independent runs.
+
 ---
 
 Status: **BOTH DFLASH SERVING PATHS COMPLETE on real weights, full gate matrix green**
