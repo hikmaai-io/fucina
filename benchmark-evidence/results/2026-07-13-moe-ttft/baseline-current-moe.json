@@ -1,0 +1,231 @@
+{
+  "label": "baseline-current",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 82.83176802797243,
+    "decode_tps": 62.01814686511358,
+    "ntok": 128,
+    "sample": "Continuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous "
+  },
+  "single_long": {
+    "ttft_ms": 4287.128291995032,
+    "decode_tps": 54.04213904572341,
+    "ntok": 128,
+    "sample": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+  },
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 59.87963366660065,
+      "median_ttft_ms": 58.21701098466292,
+      "p95_ttft_ms": 58.21701098466292,
+      "ttfts_ms_raw": [
+        58.22
+      ],
+      "median_per_stream_tps": 61.58511051059825,
+      "wall_s": 2.1209214589907788,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: P"
+        }
+      ]
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 61.08342603670751,
+      "median_ttft_ms": 100.73670951533131,
+      "p95_ttft_ms": 110.44066702015698,
+      "ttfts_ms_raw": [
+        91.03,
+        110.44
+      ],
+      "median_per_stream_tps": 57.0834844444175,
+      "wall_s": 2.177350037964061,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris is capital of France.\n\n"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is the process of the plant of the plant of the plant of the plant of the plant of the plant of the plant of the plant of the plant of "
+        }
+      ]
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 132.14670475871662,
+      "median_ttft_ms": 162.49135648831725,
+      "p95_ttft_ms": 163.2990759680979,
+      "ttfts_ms_raw": [
+        139.62,
+        162.47,
+        162.51,
+        163.3
+      ],
+      "median_per_stream_tps": 46.71027681977945,
+      "wall_s": 2.8831592940259725,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is the process of the plant's energy to the plant's energy.\nPhotosynthesis is the process of the plant's energy to the plant's energy.\n"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers below 20 are 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265"
+        }
+      ]
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 226.10220192942438,
+      "median_ttft_ms": 276.0135970020201,
+      "p95_ttft_ms": 276.5454690088518,
+      "ttfts_ms_raw": [
+        240.92,
+        243.21,
+        274.81,
+        275.85,
+        276.18,
+        276.19,
+        276.48,
+        276.55
+      ],
+      "median_per_stream_tps": 30.12813124367748,
+      "wall_s": 4.493543146993034,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris is the capital of France.\n\nAnswer: Paris is the capital of France.\n\nAnswer: Paris is the capital of France.\n\nAnswer: Paris is the capital of Fr"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is the process of the plant of the plant of the plant of the plant of the plant of the plant of the plant of the plant of the plant of "
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers are 20.\n\nThe prime numbers are 20.\n\nThe prime numbers are 20.\n\nThe prime numbers are 20.\n\nThe prime numbers are 20.\n\nThe prime numbe"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "391\n\n137 + 265 = 391\n\n137 + 265 = 391\n\n137 + 265 = 391\n\n137 + 265 = 391\n\n137 + 265 = 391\n\n137 + 265 = 391\n\n137 + 265 = 391\n\n137 + 265 = 391\n\n137 + 265"
+        }
+      ]
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 307.2900003240756,
+      "median_ttft_ms": 480.51029301132075,
+      "p95_ttft_ms": 483.01813000580296,
+      "ttfts_ms_raw": [
+        434.63,
+        435.05,
+        436.98,
+        478.2,
+        479.2,
+        479.27,
+        480.21,
+        480.25,
+        480.77,
+        481.55,
+        481.77,
+        482.17,
+        482.71,
+        482.74,
+        483.02,
+        526.5
+      ],
+      "median_per_stream_tps": 22.229399907228846,
+      "wall_s": 6.1993556509842165,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capit"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is the process of the process of the process of the process of the process of the process of the process of the process of the process "
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers below 20 are 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265 = 400\n\n137 + 265"
+        }
+      ]
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 448.4772900722033,
+      "median_ttft_ms": 870.9448490117211,
+      "p95_ttft_ms": 874.514052993618,
+      "ttfts_ms_raw": [
+        797.63,
+        797.65,
+        799.27,
+        802.19,
+        803.0,
+        803.65,
+        865.51,
+        867.7,
+        868.28,
+        868.45,
+        868.86,
+        869.01,
+        869.33,
+        869.86,
+        869.87,
+        870.68,
+        871.21,
+        871.6,
+        871.73,
+        872.35,
+        873.0,
+        873.64,
+        873.67,
+        873.76,
+        873.76,
+        873.9,
+        873.94,
+        874.02,
+        874.43,
+        874.51,
+        875.52,
+        986.17
+      ],
+      "median_per_stream_tps": 17.938733174579156,
+      "wall_s": 7.958039523975458,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris\n\n"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is the process of the photosynthesis is.\n\n\nPhotos.\nPhotosynthesis is the process of the photosynthesis is.\nPhotos.\nPhotosynthesis is th"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "400.\n\n\n\nThe answer: 400.\n\nThe answer: 400.\n\nThe answer: 400.\n\nThe answer: 400.\n\nThe answer: 400.\n\nThe answer: 400.\n\nThe answer: 400.\n\nThe answer: 400."
+        }
+      ]
+    }
+  ],
+  "diverse": true
+}
