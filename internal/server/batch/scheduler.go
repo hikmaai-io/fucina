@@ -388,6 +388,15 @@ type Scheduler struct {
 	chunkMin      int
 	chunkAdaptive bool // one-shot long prompts when the batch is idle (chunk-hinting engines)
 
+	// Idle burst-coalescing windows (config-not-constants; env-overridable). After the first
+	// request wakes an idle scheduler, wait coalesceWindow for a second; once a second lands keep
+	// collecting until coalesceQuiet passes with no arrival, hard-capped at coalesceMax (or engine
+	// capacity). Wider windows capture more of a synchronized N=32 burst into ONE batched prefill
+	// (tighter TTFT p95 — fewer straggler waves) at the cost of a lone request's worst-case wait.
+	coalesceWindow time.Duration
+	coalesceQuiet  time.Duration
+	coalesceMax    time.Duration
+
 	// corpus is the server-global suffix-decoding ring: the token streams (prompt+output)
 	// of recently finished sequences, capped at specCorpusCap. The drafter falls back to it
 	// when a sequence's own history has no match — the cross-request half of suffix decoding
@@ -491,6 +500,25 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	}
 	// Chunked prefill is a DEFAULT-on capability: if the engine can prefill a slot
 	// in pieces, long prompts are prefilled interleaved with decode so they never
+	// Idle burst-coalescing windows: defaults from the tuned constants, env-overridable (ms).
+	s.coalesceWindow = burstCoalesceWindow
+	s.coalesceQuiet = burstCoalesceQuiet
+	s.coalesceMax = burstCoalesceMax
+	if v := os.Getenv("FUCINA_BURST_COALESCE_WINDOW_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			s.coalesceWindow = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := os.Getenv("FUCINA_BURST_COALESCE_QUIET_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			s.coalesceQuiet = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := os.Getenv("FUCINA_BURST_COALESCE_MAX_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			s.coalesceMax = time.Duration(n) * time.Millisecond
+		}
+	}
 	// block the batch. No effect on engines that don't implement it.
 	if ce, ok := engine.(ChunkPrefillEngine); ok {
 		s.chunk = ce
@@ -718,15 +746,15 @@ func (s *Scheduler) run() {
 				// probe window; the moment a second request lands the window
 				// extends per-arrival (quiet-period), bounded by the burst cap,
 				// so the whole burst is admitted as one lockstep batch.
-				probe := time.After(burstCoalesceWindow)
+				probe := time.After(s.coalesceWindow)
 				var quiet <-chan time.Time // armed after the 2nd arrival
-				capHard := time.After(burstCoalesceMax)
+				capHard := time.After(s.coalesceMax)
 			coalesce:
 				for len(waiting) < s.engine.Capacity() {
 					select {
 					case r2 := <-s.submit:
 						waiting = append(waiting, r2)
-						quiet = time.After(burstCoalesceQuiet)
+						quiet = time.After(s.coalesceQuiet)
 					case <-probe:
 						if quiet == nil {
 							break coalesce // lone request: stop probing
@@ -836,10 +864,11 @@ func (s *Scheduler) drainSubmit(waiting *[]Request) {
 	}
 }
 
-// Idle burst-coalescing windows: after the first request wakes an idle scheduler, wait
-// burstCoalesceWindow for a second one (the only cost a lone request ever pays). Once a
-// second request arrives the burst is real: keep collecting until no new request lands
-// for burstCoalesceQuiet, hard-capped at burstCoalesceMax (or engine capacity), then
+// Idle burst-coalescing window DEFAULTS (tuned constants; the live values are the
+// Scheduler.coalesce* fields, env-overridable via FUCINA_BURST_COALESCE_{WINDOW,QUIET,MAX}_MS).
+// After the first request wakes an idle scheduler, wait coalesceWindow for a second one (the only
+// cost a lone request ever pays). Once a second arrives the burst is real: keep collecting until
+// no new request lands for coalesceQuiet, hard-capped at coalesceMax (or engine capacity), then
 // admit everything in one pass — the rows prefill back-to-back and decode in lockstep.
 const (
 	burstCoalesceWindow = 3 * time.Millisecond
@@ -884,9 +913,22 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		// with a BLOCKING single-seq SeqAdd each (measured 32x~52 ms serial). When the engine
 		// supports it, prefill the leading run of short prompts in ONE forward instead.
 		if ma, ok := s.engine.(MultiseqAdmitEngine); ok {
-			if s.admitBatched(active, waiting, ma) {
+			if s.admitBatched(active, waiting, ma, s.engine.Capacity()) {
 				admitted = true
 			}
+		}
+	} else if ma, ok := s.engine.(MultiseqAdmitEngine); ok && len(*waiting) >= 2 {
+		// BUSY-path batched admission (p95 lever): a burst whose stragglers arrive AFTER the
+		// first coalesced group started decoding used to serialize one blocking AddSeq per pass
+		// (~40 ms/seq on the 35B MoE) under the maxOneShotAdmitsPerPass=1 cap — a serial ramp
+		// that inflated N=32 TTFT p95 (and any back-to-back burst whose predecessor hadn't fully
+		// drained). ONE batched prefill of the free-slot-bounded straggler run is a SINGLE
+		// blocking forward (same decode-stall budget as the one serial AddSeq the cap already
+		// permits), but admits them all at once. Bounded to free capacity so it never overfills.
+		free := s.engine.Capacity() - (len(active) + len(*prefill) + len(s.pendingFin))
+		if free >= 2 && s.admitBatched(active, waiting, ma, free) {
+			admitted = true
+			oneShotAdmits++ // the batched forward counts as this pass's ONE blocking admit
 		}
 	}
 	w := *waiting
@@ -970,10 +1012,13 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 // budget, prefills them together, and delivers each first token. Returns true if it admitted
 // anything. Any unsupported/failed batch falls back to the serial loop (returns false), so this
 // is purely additive. Chunked (long) prompts and the turn-2 snapshot cache stay on the serial path.
-func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma MultiseqAdmitEngine) bool {
+func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma MultiseqAdmitEngine, maxAdmit int) bool {
 	const maxBatchTokens = 4096 // stay well under the engine's prefill tile
 	w := *waiting
 	capacity := s.engine.Capacity()
+	if maxAdmit < capacity {
+		capacity = maxAdmit // busy path: never claim more than the free slots
+	}
 	var reqs []Request
 	var prompts [][]int32
 	var params []SeqParams
