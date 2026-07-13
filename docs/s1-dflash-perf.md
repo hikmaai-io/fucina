@@ -1,0 +1,60 @@
+# S1a-PERF: DFlash net-speedup profiling + attribution
+
+ABOUTME: Profile-driven perf work to make greedy DFlash a NET speedup at B=1 on GB10,
+ABOUTME: not just lossless. Measured numbers only; losslessness gates stay green + unweakened.
+
+## Baseline (MEASURED, real FP8 target + real z-lab draft, B=1, K=16 / T=17)
+
+`/tmp/rstep` on `/opt/spark/models/models--Qwen--Qwen3.5-9B-FP8` + z-lab draft:
+- target plain greedy decode: **29.2 ms/tok**
+- DFlash greedy step: **435 ms/step**, emitting **9.2 tok/step** = **47.3 ms/emitted-token**
+- => DFlash is **~1.6x SLOWER per token**. Break-even accept would need the step under
+  9.2 * 29.2 = 269 ms; it is 435 ms.
+
+## Per-kernel attribution (nsys, 10 DFlash steps ONLY, cudaProfilerApi-scoped)
+
+Per step (total / 10):
+
+| kernel | ms/step | %step | what |
+|---|---|---|---|
+| q35df_head_argmax_batched | 38.5 | 23.9 | DRAFT greedy LM head (my warp kernel) |
+| q35df_matmul | 32.2 | 20.0 | DRAFT dense projections (my warp kernel) |
+| nvjet_sm121 mma 64x144x64 | 32.2 | 20.0 | TARGET verify GEMMs (tensor core) |
+| cutlass bf16 32x32_128x1 align8 | 25.9 | 16.0 | TARGET verify GEMMs (tensor core) |
+| cutlass bf16 32x32_128x1 align2 | 10.3 | 6.4 | TARGET verify GEMMs |
+| bf16_head_gemv_batched<17,6> | 10.1 | 6.3 | TARGET LM head over 17 rows |
+| qwen35_b_gdn_chunk_kernel | 5.5 | 3.4 | TARGET GDN recurrence |
+| (rmsnorm/rope/attn/silu/misc) | ~8 | ~5 | draft + target elementwise |
+
+Draft-forward subtotal (head+matmul+draft rmsnorm/rope/attn) ≈ **~90 ms/step** — the
+DOMINANT cost, MORE than the whole target verify (~78 ms/step incl. LM head).
+
+## Root cause (NOT the target verify amortization)
+
+The target (1+K) verify forward already rides tensor-core GEMMs (nvjet/cutlass) and
+the weight-read-once batched LM head (`bf16_head_gemv_batched<17,6>`, 10 ms for 17
+rows) — it is NOT re-reading weights per row. The amortization is fine on the target
+side. The REAL excess is the DRAFT forward's own kernels:
+
+1. **Draft LM head** `q35df_head_argmax_batched` = **38.5 ms** for 16 rows, vs the
+   target's `bf16_head_gemv_batched` = **10.1 ms** for 17 rows on the SAME [vocab,H]
+   — the draft head is **~3.8x slower** because it is a hand-rolled warp-per-token
+   kernel, not the tuned transpose + weight-read-once batched head.
+2. **Draft projections** `q35df_matmul` = **32.2 ms**, a hand-rolled warp GEMM, vs
+   the target's cutlass/nvjet tensor-core GEMMs for the same class of matmul.
+
+Both are safe to optimize: the DRAFT is NOT required to be bit-identical. Greedy
+losslessness comes from the TARGET verify + decode-body commit (a wrong/most-drafts
+only changes accepted length j, never the emitted tokens). So the draft head+matmul
+can be swapped to the engine's tuned tensor-core kernels without touching the
+losslessness contract.
+
+## Levers (in priority order, each gated by the existing losslessness + determinism gates)
+
+- L1: draft LM head -> reuse the engine's `bf16_head_gemv_batched_launch` + argmax
+  (target-parity kernel). Expected ~38.5 -> ~10 ms/step (-28 ms).
+- L2: draft dense projections -> route through the tensor-core `gemm_bf16` path
+  instead of `q35df_matmul`. Expected ~32 -> ~? ms/step.
+- Re-measure end-to-end after each; report real tok/s + break-even accept length.
+
+(Filled in as each lever lands.)
