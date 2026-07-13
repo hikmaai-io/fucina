@@ -106,4 +106,20 @@ Qwen3.5/Gemma/diffusion gates. Re-measure N=1..32 MoE TTFT + aggregate after eac
 
 ## Results log
 
-(pending F1/F2 implementation + measurement)
+### F1 — batched LM head (LANDED)
+
+Microbench (`gemma4_engine_seq_add_multiseq`, CUDA events, 12 reps median):
+
+| M | pre-F1 ms | F1 ms | Δ |
+|---|---|---|---|
+| 1 | 53.75 | 53.76 | 0 |
+| 8 | 198.22 | 161.65 | −37 |
+| 16 | 346.71 | 269.64 | −77 |
+| 32 | **653.79** | **503.75** | **−150** |
+
+Linear fit `ms = 43.4 + 14.37·M` (was `40.0 + 19.21·M`) — the 18% head serial tail
+is gone (−4.84 ms/seq slope; −150 ms at M=32, matching the predicted 32×→1× head
+read). Gate: `qwen35-multiseq-prefill-test` PASS with UNCHANGED bounds (MoE
+≤0.0946, dense ≤0.0029) — bitwise-identical by construction.
+
+### F2 — batched GDN chunk scan across sequences (pending)

@@ -1487,13 +1487,20 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
     for (int i = 0; i < M; i++)
         cudaMemcpyAsync(xhead + (size_t)i*H, xn + (size_t)(offs[i]+lens[i]-1)*H,
                         (size_t)H*sizeof(float), cudaMemcpyDeviceToDevice, st);
-    // BF16 head per row — the SAME path gemma4_engine_seq_add uses (bf16_head_gemv_launch), so the
-    // batched first token is bit-identical to standalone (the FP4-activation decode head would flip
-    // tiny-margin argmaxes and is a first-token accuracy regression vs seq_add). One GEMV per row.
+    // BF16 head — weight-read-ONCE batched GEMV in ≤32-row chunks (F1, the SAME P2 decode recipe:
+    // qwen35_decode_multiseq_body). Was a per-row serial loop that re-read the ~1 GB BF16 head M
+    // times (32× = 32.5 GB / 273 GB/s ≈ 119 ms, the nsys-measured 18% of the N=32 TTFT prefill).
+    // The K≤32 kernel narrows the warp row-tile instead of splitting the batch; per-(token,row)
+    // k-order is ascending and identical to the per-row bf16_head_gemv_launch ⇒ logits
+    // bitwise-identical (same first token as gemma4_engine_seq_add, no tiny-margin argmax flip).
     if (eng->format == FORMAT_FP8_BLOCK) {
-        for (int i = 0; i < M; i++)
-            bf16_head_gemv_launch(eng->d_sb[11] + (size_t)i * VOC, eng->d_lmhead_bf16,
-                                  xhead + (size_t)i * H, H, VOC, st);
+        float *xt = ws(Q35_QG);   // per-layer scratch, free at head time; row 2·NQ·HD ≥ 2H ⇒ ≥ H·32 floats
+        for (int r0 = 0; r0 < M; r0 += 32) {
+            int K = (M - r0 < 32) ? (M - r0) : 32;
+            nvfp4_xT_launch(xt, xhead + (size_t)r0 * H, H, K, st);
+            bf16_head_gemv_batched_launch(eng->d_sb[11] + (size_t)r0 * VOC,
+                                          eng->d_lmhead_bf16, xt, H, VOC, K, st);
+        }
     } else {
         for (int i = 0; i < M; i++)
             gemv_w(eng, eng->d_sb[11] + (size_t)i * VOC, weight_fp8(eng, eng->tensors.output_weight),
