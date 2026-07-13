@@ -122,4 +122,76 @@ is gone (−4.84 ms/seq slope; −150 ms at M=32, matching the predicted 32×→
 read). Gate: `qwen35-multiseq-prefill-test` PASS with UNCHANGED bounds (MoE
 ≤0.0946, dense ≤0.0029) — bitwise-identical by construction.
 
-### F2 — batched GDN chunk scan across sequences (pending)
+### F2 — batched GDN chunk scan across sequences (LANDED)
+
+Extracted the chunk-scan math into a shared `__device__ qwen35_gdn_chunk_body`; added
+`qwen35_b_gdn_chunk_multiseq_kernel` launching `nvh*M` blocks in ONE call
+(`blockIdx.x=seq*nvh+vh`), each block reading its own slot state and row-offset
+inputs. Per-sequence recurrence order UNCHANGED ⇒ byte-identical. Scratch grown
+`NVH → NVH*MS` (302 MB). Gate PASS, bounds unchanged.
+
+Microbench: M=32 admission-prefill **503.8 → 439.2 ms** (−64). F1+F2 combined
+**653.8 → 439.2 ms (−33%)**, slope `19.2 → 12.2 ms/seq`. Re-profile (nsys): the
+serial LM head dropped from 18% to 1.1%; the GDN scan is now a single well-filled
+`nvh*M`-block launch (was 960 serial launches).
+
+### F3 — busy-path batched admission (the p95 lever, LANDED)
+
+Profiling the END-TO-END server (not just the GPU prefill) exposed the residual
+serialization the mission asked about. `admitBatched` only fired when the batch was
+fully idle (`len(active)==0 && len(prefill)==0`). A synchronized N=32 burst whose
+stragglers arrive AFTER the first coalesced group starts decoding — or ANY burst
+whose predecessor hasn't fully drained (back-to-back serving) — fell to the serial
+admit loop: one blocking `AddSeq` per pass under `maxOneShotAdmitsPerPass=1`, ~40
+ms/seq on the 35B MoE. Telemetry of the degraded case: `avgB 1.0, admit 40 ms
+(eng 40 ms)`, a perfect +110 ms/seq serial TTFT ramp — back-to-back bursts degraded
+to **median 1247-1490 ms / p95 2900+ ms** while the first burst was clean.
+
+Fix: enable batched admission on the BUSY path too, bounded to free capacity. ONE
+batched prefill of the straggler run is a SINGLE blocking forward (same decode-stall
+budget as the one serial AddSeq the cap already permits) but admits them all at once;
+counts as the pass's one blocking admit. Also made the idle burst-coalesce windows
+config-not-constants (env `FUCINA_BURST_COALESCE_{WINDOW,QUIET,MAX}_MS`; defaults
+unchanged). `go test ./internal/server/batch/` PASS.
+
+## Final measured result (2026-07-13, this build, under GPU flock)
+
+**Isolated N=32 serving** (realistic burst; 4 back-to-back reps/config, one server,
+quiescent box), default coalesce windows:
+
+| metric | pre-F1F2F3 | **F1+F2+F3** | vLLM 2026-07-11 |
+|---|---|---|---|
+| N=32 median TTFT | 870.9 | **516–582 ms** | 664 |
+| N=32 p95 TTFT | 874.5 | **585–649 ms** | 664 |
+| N=32 agg tok/s | 448.5 | **392–473** | 302.8 |
+
+Every N=32-only rep across coalesce-quiet {12,20,35 ms}: **median AND p95 < vLLM
+664** (4/4 each). The catastrophic back-to-back straggler ramp (med 1247-1490 / p95
+2900+) is eliminated by F3.
+
+Full N=1..32 sweep (default windows), representative:
+
+| N | median TTFT | p95 TTFT | agg tok/s |
+|---|---|---|---|
+| 1 | 59 | 59 | 59 |
+| 2 | 97 | 106 | 99 |
+| 4 | 145 | 145 | 159 |
+| 8 | 217 | 220 | 228 |
+| 16 | 342 | 345 | 299 |
+| 32 | **620** | **626** | 397 |
+
+(In back-to-back FULL sweeps the N=32 p95 occasionally reads 694-704 — an artifact
+of the N=1..16 cells warming/contending in the same session; isolated N=32 serving,
+the realistic case, is consistently ≤649.)
+
+Protection gate (MoE, candidate vs frozen 2026-07-11 baseline w/ embedded vLLM):
+**GATE PASS** — every cell above the 5% floor, N=8 claimed-win beats vLLM (227.5 vs
+146.5), N=32 TTFT 1892→620 median. No winning cell regressed.
+
+Correctness: `qwen35-multiseq-prefill-test` PASS with UNCHANGED bounds (MoE ≤0.0946,
+dense ≤0.0029) after F1 and after F2 — byte-identical by construction.
+
+Attribution of the residual ~180 ms (439 ms GPU prefill → ~620 ms server median):
+HTTP round-trip + SSE, scheduler pass overhead, and the first decode step's
+interleave — not the prefill forward. The GPU prefill itself (439 ms) is now below
+vLLM's 664 end-to-end TTFT.

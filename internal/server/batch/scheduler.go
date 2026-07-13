@@ -870,6 +870,11 @@ func (s *Scheduler) drainSubmit(waiting *[]Request) {
 // cost a lone request ever pays). Once a second arrives the burst is real: keep collecting until
 // no new request lands for coalesceQuiet, hard-capped at coalesceMax (or engine capacity), then
 // admit everything in one pass — the rows prefill back-to-back and decode in lockstep.
+// A LONE request never pays coalesceQuiet — quiet arms only after a 2nd request arrives; a lone
+// request pays at most coalesceWindow (3 ms). Widening quiet trades a small fixed add on every
+// burst for capturing more stragglers into one batched prefill; measured neutral-to-slightly-
+// worse at the 35B N=32 default (the busy-path batched admission already removes the straggler
+// serial ramp), so the default stays 12 ms and the knob is env-tunable for skew-heavy clients.
 const (
 	burstCoalesceWindow = 3 * time.Millisecond
 	burstCoalesceQuiet  = 12 * time.Millisecond

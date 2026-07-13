@@ -1,0 +1,143 @@
+{
+  "label": "f3",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 82.69351301714778,
+    "decode_tps": 61.44583296117154,
+    "ntok": 128,
+    "sample": "Continuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous "
+  },
+  "single_long": {
+    "ttft_ms": 4242.68968499382,
+    "decode_tps": 53.46487291395138,
+    "ntok": 128,
+    "sample": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+  },
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 59.246761272657764,
+      "median_ttft_ms": 57.871905039064586,
+      "p95_ttft_ms": 57.871905039064586,
+      "ttfts_ms_raw": [
+        57.87
+      ],
+      "median_per_stream_tps": 60.90778095410406,
+      "wall_s": 2.143577087961603
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 99.76352321629382,
+      "median_ttft_ms": 96.90726798726246,
+      "p95_ttft_ms": 107.62875096406788,
+      "ttfts_ms_raw": [
+        86.19,
+        107.63
+      ],
+      "median_per_stream_tps": 51.870762155236676,
+      "wall_s": 2.546020747977309
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 134.50428110520792,
+      "median_ttft_ms": 142.88216002751142,
+      "p95_ttft_ms": 143.03746400400996,
+      "ttfts_ms_raw": [
+        119.88,
+        142.75,
+        143.01,
+        143.04
+      ],
+      "median_per_stream_tps": 46.34050153333111,
+      "wall_s": 2.884666546015069
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 228.04146093567627,
+      "median_ttft_ms": NaN,
+      "p95_ttft_ms": 251.9580369698815,
+      "ttfts_ms_raw": [
+        184.26,
+        186.9,
+        220.3,
+        NaN,
+        219.8,
+        219.96,
+        220.06,
+        251.96
+      ],
+      "median_per_stream_tps": NaN,
+      "wall_s": 4.455330165976193
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 298.368974365258,
+      "median_ttft_ms": 369.21120446641,
+      "p95_ttft_ms": 372.69306095549837,
+      "ttfts_ms_raw": [
+        321.62,
+        322.32,
+        324.57,
+        366.6,
+        367.34,
+        367.43,
+        367.79,
+        369.2,
+        369.22,
+        369.56,
+        371.36,
+        371.8,
+        372.41,
+        372.46,
+        372.69,
+        372.94
+      ],
+      "median_per_stream_tps": 21.129319774656622,
+      "wall_s": 6.384712097002193
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 398.01017279783576,
+      "median_ttft_ms": 631.0606150072999,
+      "p95_ttft_ms": 699.9866490368731,
+      "ttfts_ms_raw": [
+        552.89,
+        553.69,
+        555.99,
+        559.13,
+        559.29,
+        560.71,
+        625.26,
+        625.96,
+        627.18,
+        627.82,
+        627.95,
+        629.11,
+        629.82,
+        629.97,
+        630.04,
+        630.97,
+        631.15,
+        631.25,
+        631.93,
+        632.2,
+        633.46,
+        633.97,
+        634.86,
+        635.11,
+        635.18,
+        635.84,
+        636.82,
+        637.06,
+        697.91,
+        699.99,
+        705.75,
+        706.06
+      ],
+      "median_per_stream_tps": 13.72546717489718,
+      "wall_s": 9.891706969006918
+    }
+  ],
+  "diverse": true
+}

@@ -1,0 +1,199 @@
+{
+  "label": "def3",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 82.41562300827354,
+    "decode_tps": 61.318187830846114,
+    "ntok": 128,
+    "sample": "Continuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous "
+  },
+  "single_long": {
+    "ttft_ms": 4244.9544130358845,
+    "decode_tps": 53.23021207731583,
+    "ntok": 128,
+    "sample": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+  },
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 59.126354388038855,
+      "median_ttft_ms": 59.36705804197118,
+      "p95_ttft_ms": 59.36705804197118,
+      "ttfts_ms_raw": [
+        59.37
+      ],
+      "median_per_stream_tps": 60.81840038127904,
+      "wall_s": 2.147942340001464,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: P"
+        }
+      ]
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 99.29667954684467,
+      "median_ttft_ms": 96.60069650271907,
+      "p95_ttft_ms": 106.22482799226418,
+      "ttfts_ms_raw": [
+        86.98,
+        106.22
+      ],
+      "median_per_stream_tps": 51.62675689543855,
+      "wall_s": 2.557990872999653,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: P"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is the process of the energy of the energy of the energy of the energy of the energy of the energy of the energy of the energy of the e"
+        }
+      ]
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 158.96782586117803,
+      "median_ttft_ms": 144.8269839747809,
+      "p95_ttft_ms": 145.24872798938304,
+      "ttfts_ms_raw": [
+        120.95,
+        144.56,
+        145.09,
+        145.25
+      ],
+      "median_per_stream_tps": 41.64718477053229,
+      "wall_s": 3.1956151960184798,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: Paris is capital of France.\n\nAnswer: P"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is the process of the plant.\n\nPhotosynthesis is the process of the plant.\n\nPhotosynthesis is the process of the plant.\n\nPhotosynthesis "
+        }
+      ]
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 227.50789381123946,
+      "median_ttft_ms": 217.49031599028967,
+      "p95_ttft_ms": 219.67901097377762,
+      "ttfts_ms_raw": [
+        182.4,
+        185.27,
+        216.45,
+        217.38,
+        217.6,
+        218.71,
+        218.73,
+        219.68
+      ],
+      "median_per_stream_tps": 29.9143813164591,
+      "wall_s": 4.46577911201166,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capit"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is a process that that plants and the plants.\n\nPhotosynthesis is a process that that plants and the plants.\n\nPhotosynthesis is a proces"
+        }
+      ]
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 278.18043585530427,
+      "median_ttft_ms": 341.6117110173218,
+      "p95_ttft_ms": 344.74381303880364,
+      "ttfts_ms_raw": [
+        295.15,
+        295.53,
+        297.48,
+        339.66,
+        339.77,
+        340.64,
+        340.86,
+        341.5,
+        341.72,
+        342.83,
+        343.53,
+        343.87,
+        344.02,
+        344.41,
+        344.74,
+        385.69
+      ],
+      "median_per_stream_tps": 24.386210078527995,
+      "wall_s": 5.553949167020619,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is a process that the plants that the plants that the plants that the plants that the plants that the plants that the plants that the p"
+        }
+      ]
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 379.0731615974628,
+      "median_ttft_ms": 619.728468998801,
+      "p95_ttft_ms": 626.053738000337,
+      "ttfts_ms_raw": [
+        543.18,
+        543.48,
+        545.54,
+        549.01,
+        549.16,
+        550.95,
+        614.78,
+        615.51,
+        616.43,
+        616.44,
+        617.38,
+        618.72,
+        618.75,
+        618.82,
+        618.84,
+        619.29,
+        620.16,
+        621.25,
+        621.92,
+        621.99,
+        622.72,
+        623.76,
+        623.99,
+        624.17,
+        624.36,
+        624.43,
+        624.43,
+        624.69,
+        625.05,
+        626.05,
+        686.79,
+        692.9
+      ],
+      "median_per_stream_tps": 15.064589935604413,
+      "wall_s": 9.058937292022165,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris is the capital of France.\n\nAnswer: Paris is the capital of France.\n\nAnswer: Paris is the capital of France.\n\nAnswer: Paris is the capital of Fr"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "Photosynthesis is the process of the process of the process of the process of the process of the process of the process of the process of the process "
+        }
+      ]
+    }
+  ],
+  "diverse": true
+}
