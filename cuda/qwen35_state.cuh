@@ -101,6 +101,8 @@ struct qwen35_runtime_state {
     WorkspaceRef decode_workspace[24];
     float   *chunk_scr;
     WorkspaceRef gdn_workspace;
+    // F2: per-seq metadata for the batched multiseq GDN kernel (slots|offs|lens, each [MS]).
+    int     *d_pf_seqmeta;   // device buffer, 3*MS ints: [0..M) slots, [MS..MS+M) offs, [2MS..) lens
     int     *pf_pos;
     int32_t *pf_tok;
     WorkspaceRef prefill_position_workspace;

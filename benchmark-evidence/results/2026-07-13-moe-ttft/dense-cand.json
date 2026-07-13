@@ -1,0 +1,199 @@
+{
+  "label": "dense-cand",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 124.93690301198512,
+    "decode_tps": 34.3856818380607,
+    "ntok": 128,
+    "sample": "Continuous batching is a technique used in Large Language Model (LLM) inference to significantly improve throughput by maximizing GPU utilization. It works by processing multiple requests in parallel "
+  },
+  "single_long": {
+    "ttft_ms": 3454.3104069598485,
+    "decode_tps": 31.845541698557476,
+    "ntok": 128,
+    "sample": "1. The decode phase is bandwidth bound while the prefill phase is compute bound. 2. Continuous batching interleaves prefill and decode to keep the accelerator busy. 3. Throughput and latency are gover"
+  },
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 33.12591374671402,
+      "median_ttft_ms": 89.87382700433955,
+      "p95_ttft_ms": 89.87382700433955,
+      "ttfts_ms_raw": [
+        89.87
+      ],
+      "median_per_stream_tps": 33.92577088753685,
+      "wall_s": 3.8338565079611726,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        }
+      ]
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 57.09986703197391,
+      "median_ttft_ms": 111.01161100668833,
+      "p95_ttft_ms": 111.09505099011585,
+      "ttfts_ms_raw": [
+        110.93,
+        111.1
+      ],
+      "median_per_stream_tps": 29.285597469313423,
+      "wall_s": 4.448346610995941,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        }
+      ]
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 113.06516831427486,
+      "median_ttft_ms": 151.02112651220523,
+      "p95_ttft_ms": 168.8662330270745,
+      "ttfts_ms_raw": [
+        133.6,
+        133.62,
+        168.42,
+        168.87
+      ],
+      "median_per_stream_tps": 29.257494206552817,
+      "wall_s": 4.492984069045633,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        }
+      ]
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 197.04389108198347,
+      "median_ttft_ms": 205.4552129993681,
+      "p95_ttft_ms": 207.13466801680624,
+      "ttfts_ms_raw": [
+        167.83,
+        169.59,
+        169.68,
+        205.31,
+        205.6,
+        205.99,
+        206.08,
+        207.13
+      ],
+      "median_per_stream_tps": 27.2592945462315,
+      "wall_s": 4.866935964033473,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        }
+      ]
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 312.03222098618096,
+      "median_ttft_ms": 282.1638759924099,
+      "p95_ttft_ms": 285.0724190357141,
+      "ttfts_ms_raw": [
+        235.07,
+        235.42,
+        236.82,
+        237.27,
+        280.08,
+        281.49,
+        281.57,
+        282.12,
+        282.21,
+        282.75,
+        282.78,
+        284.22,
+        284.73,
+        284.9,
+        285.07,
+        286.06
+      ],
+      "median_per_stream_tps": 22.318320248398585,
+      "wall_s": 5.97694684896851,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        }
+      ]
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 389.2354414576846,
+      "median_ttft_ms": 486.3033370056655,
+      "p95_ttft_ms": 492.9992950055748,
+      "ttfts_ms_raw": [
+        396.96,
+        397.06,
+        398.95,
+        399.21,
+        402.28,
+        403.32,
+        404.93,
+        405.32,
+        483.61,
+        484.17,
+        485.18,
+        485.21,
+        485.33,
+        485.56,
+        485.7,
+        485.93,
+        486.68,
+        486.84,
+        487.63,
+        488.28,
+        489.27,
+        489.56,
+        489.69,
+        491.09,
+        491.16,
+        491.53,
+        491.63,
+        491.74,
+        492.4,
+        493.0,
+        493.78,
+        494.24
+      ],
+      "median_per_stream_tps": 13.974531931318522,
+      "wall_s": 9.582888922013808,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        }
+      ]
+    }
+  ],
+  "diverse": true
+}

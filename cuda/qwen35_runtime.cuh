@@ -49,7 +49,7 @@ static inline void q35_account_sub(gemma4_engine_t *eng, size_t bytes) {
 static void q35_workspace_rollback(gemma4_engine_t *eng) {
     for (int i = 0; i < 24; i++) { if (eng->q35.sb[i]) cudaFree(eng->q35.sb[i]); eng->q35.sb[i] = NULL; }
     #define Q35_ROLLBACK(p) do { if (eng->q35.p) cudaFree(eng->q35.p); eng->q35.p = NULL; } while (0)
-    Q35_ROLLBACK(rowslot); Q35_ROLLBACK(chunk_scr); Q35_ROLLBACK(pf_pos); Q35_ROLLBACK(pf_tok);
+    Q35_ROLLBACK(rowslot); Q35_ROLLBACK(chunk_scr); Q35_ROLLBACK(d_pf_seqmeta); Q35_ROLLBACK(pf_pos); Q35_ROLLBACK(pf_tok);
     Q35_ROLLBACK(part_m); Q35_ROLLBACK(part_l); Q35_ROLLBACK(part_o);
     if (eng->q35.wbf16[0]) cudaFree(eng->q35.wbf16[0]); eng->q35.wbf16[0] = NULL;
     if (eng->q35.wbf16[1]) cudaFree(eng->q35.wbf16[1]); eng->q35.wbf16[1] = NULL;
@@ -123,7 +123,10 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     for (int i = 0; i < 24 && ok; i++)
         ok &= cudaMalloc(&eng->q35.sb[i], (size_t)PF * SBSZ[i] * sizeof(float)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->q35.rowslot, (size_t)PF * sizeof(int)) == cudaSuccess;
-    ok = ok && cudaMalloc(&eng->q35.chunk_scr, (size_t)NVH * Q35_GDN_SCR * sizeof(float)) == cudaSuccess;
+    // F2: sized NVH*MS so the batched multiseq GDN kernel (nvh*M concurrent blocks, M<=MS) gives
+    // each block its own scratch slab. Decode/per-seq launches use the first NVH slabs unchanged.
+    ok = ok && cudaMalloc(&eng->q35.chunk_scr, (size_t)NVH * MS * Q35_GDN_SCR * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&eng->q35.d_pf_seqmeta, (size_t)3 * MS * sizeof(int)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->q35.pf_pos, (size_t)PF * sizeof(int)) == cudaSuccess;
     ok = ok && cudaMalloc(&eng->q35.pf_tok, (size_t)PF * sizeof(int32_t)) == cudaSuccess;
     // S2a persistent per-slot decode state (last token id + next position), capacity-indexed.
@@ -161,7 +164,8 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     // what fits both physical free memory and --gpu-mem-util, leaving graph/MoE working headroom.
     size_t workspace = (size_t)PF * (sizeof(int) * 2 + sizeof(int32_t));
     for (int i = 0; i < 24; i++) workspace += (size_t)PF * SBSZ[i] * sizeof(float);
-    workspace += (size_t)NVH * Q35_GDN_SCR * sizeof(float);
+    workspace += (size_t)NVH * MS * Q35_GDN_SCR * sizeof(float);   // F2: NVH*MS multiseq GDN scratch
+    workspace += (size_t)3 * MS * sizeof(int);                       // F2: d_pf_seqmeta
     workspace += 2 * wbf_max * sizeof(__nv_bfloat16) + xbf_max * sizeof(__nv_bfloat16);
     workspace += 2ull * (size_t)L * MS * sizeof(void*); // two state pointer tables per layer
     workspace += (size_t)MS * NQ * eng->q35.attn_splits *
@@ -260,6 +264,8 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDN) == cudaSuccess;
     ok = ok && cudaFuncSetAttribute(qwen35_b_gdn_chunk_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDNchunk) == cudaSuccess;
+    ok = ok && cudaFuncSetAttribute(qwen35_b_gdn_chunk_multiseq_kernel,   // F2: same shared-mem opt-in
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDNchunk) == cudaSuccess;
     ok = ok && cudaFuncSetAttribute(qwen35_b_attn_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, maxctx * (int)sizeof(float)) == cudaSuccess;
     if (!ok) {
@@ -268,7 +274,7 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     }
     bind_workspace(eng->q35.routing_workspace,eng->q35.rowslot,(size_t)PF*sizeof(int),WorkspaceKind::DECODE);
     bind_workspace(eng->q35.gdn_workspace,eng->q35.chunk_scr,
-                   (size_t)NVH*Q35_GDN_SCR*sizeof(float),WorkspaceKind::RECURRENT_STATE);
+                   (size_t)NVH*MS*Q35_GDN_SCR*sizeof(float),WorkspaceKind::RECURRENT_STATE);
     bind_workspace(eng->q35.prefill_position_workspace,eng->q35.pf_pos,
                    (size_t)PF*sizeof(int),WorkspaceKind::PREFILL);
     bind_workspace(eng->q35.prefill_token_workspace,eng->q35.pf_tok,
@@ -1393,6 +1399,19 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
     auto grid1d = [](size_t n){ return (unsigned)((n + 255) / 256); };
     const int T = Ttot;
 
+    // F2: stage per-seq metadata (slots|offs|lens) to the device once, so the batched multiseq GDN
+    // kernel derives each block's (slot,off,len) on-GPU. Layout: [0..M) slots, [MS..) offs, [2MS..) lens.
+    int *d_meta = eng->q35.d_pf_seqmeta;
+    const int MScap = eng->q35.capacity;
+    {
+        static int h_meta[3 * GEMMA4_CAP_EXPERTS];
+        for (int i = 0; i < M; i++) { h_meta[i] = slots[i]; h_meta[MScap + i] = offs[i]; h_meta[2*MScap + i] = lens[i]; }
+        cudaMemcpyAsync(d_meta, h_meta, (size_t)M*sizeof(int), cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(d_meta + MScap, h_meta + MScap, (size_t)M*sizeof(int), cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(d_meta + 2*MScap, h_meta + 2*MScap, (size_t)M*sizeof(int), cudaMemcpyHostToDevice, st);
+    }
+    int *d_meta_slots = d_meta, *d_meta_offs = d_meta + MScap, *d_meta_lens = d_meta + 2*MScap;
+
     embed_w(eng, x, eng->d_token_embd, d_tok, T, H, st);
 
     for (int l = 0; l < L; l++) {
@@ -1450,17 +1469,15 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(qh, NKH, SD, T);
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(kh, NKH, SD, T);
             m2_decay_beta_kernel<<<grid1d((size_t)T*TSR),256,0,st>>>(gg, bb, ac, bc, Wf(Tn.ssm.a_log), Wf(Tn.ssm.dt_bias), T, TSR);
-            // RECURRENT delta-rule state S — PER SEQUENCE (each seq's tokens are one contiguous
-            // 64-token chunked scan carrying S[l][slot_i]), row-offset pointers.
-            for (int i = 0; i < M; i++) {
-                int off = offs[i], len = lens[i], slot = slots[i];
-                int NPAD_i = ((len + M2_CHUNK - 1) / M2_CHUNK) * M2_CHUNK;
-                qwen35_b_gdn_chunk_kernel<<<NVH,512,smGDNchunk,st>>>(
-                    core + (size_t)off*NVH*SD, qh + (size_t)off*NKH*SD, kh + (size_t)off*NKH*SD,
-                    vh + (size_t)off*NVH*SD, gg + (size_t)off*NVH, bb + (size_t)off*NVH, eng->q35.S[l],
-                    workspace_data<float>(eng->q35.gdn_workspace), slot, len, NPAD_i,
-                    eng->format==FORMAT_FP8_BLOCK, NVH);
-            }
+            // RECURRENT delta-rule state S — batched across sequences in ONE launch (F2): nvh*M
+            // blocks, blockIdx.x=seq*nvh+vh, each scanning its own sequence's contiguous 64-token
+            // chunks carrying S[l][slots[seq]]. Per-seq recurrence order is unchanged => byte-
+            // identical to the per-seq loop; fills nvh*M blocks (was nvh) and drops the serial tail.
+            qwen35_b_gdn_chunk_multiseq_kernel<<<NVH*M,512,smGDNchunk,st>>>(
+                core, qh, kh, vh, gg, bb, eng->q35.S[l],
+                workspace_data<float>(eng->q35.gdn_workspace),
+                d_meta_slots, d_meta_offs, d_meta_lens,
+                eng->format==FORMAT_FP8_BLOCK, NVH);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T, NVH, VALD);
             moe_profile_activation(eng, l, 1, gnorm, (size_t)T*INNER, st);
             q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, l, WC_OUT, &Tn.ssm.ref_out);
@@ -1487,13 +1504,20 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
     for (int i = 0; i < M; i++)
         cudaMemcpyAsync(xhead + (size_t)i*H, xn + (size_t)(offs[i]+lens[i]-1)*H,
                         (size_t)H*sizeof(float), cudaMemcpyDeviceToDevice, st);
-    // BF16 head per row — the SAME path gemma4_engine_seq_add uses (bf16_head_gemv_launch), so the
-    // batched first token is bit-identical to standalone (the FP4-activation decode head would flip
-    // tiny-margin argmaxes and is a first-token accuracy regression vs seq_add). One GEMV per row.
+    // BF16 head — weight-read-ONCE batched GEMV in ≤32-row chunks (F1, the SAME P2 decode recipe:
+    // qwen35_decode_multiseq_body). Was a per-row serial loop that re-read the ~1 GB BF16 head M
+    // times (32× = 32.5 GB / 273 GB/s ≈ 119 ms, the nsys-measured 18% of the N=32 TTFT prefill).
+    // The K≤32 kernel narrows the warp row-tile instead of splitting the batch; per-(token,row)
+    // k-order is ascending and identical to the per-row bf16_head_gemv_launch ⇒ logits
+    // bitwise-identical (same first token as gemma4_engine_seq_add, no tiny-margin argmax flip).
     if (eng->format == FORMAT_FP8_BLOCK) {
-        for (int i = 0; i < M; i++)
-            bf16_head_gemv_launch(eng->d_sb[11] + (size_t)i * VOC, eng->d_lmhead_bf16,
-                                  xhead + (size_t)i * H, H, VOC, st);
+        float *xt = ws(Q35_QG);   // per-layer scratch, free at head time; row 2·NQ·HD ≥ 2H ⇒ ≥ H·32 floats
+        for (int r0 = 0; r0 < M; r0 += 32) {
+            int K = (M - r0 < 32) ? (M - r0) : 32;
+            nvfp4_xT_launch(xt, xhead + (size_t)r0 * H, H, K, st);
+            bf16_head_gemv_batched_launch(eng->d_sb[11] + (size_t)r0 * VOC,
+                                          eng->d_lmhead_bf16, xt, H, VOC, K, st);
+        }
     } else {
         for (int i = 0; i < M; i++)
             gemv_w(eng, eng->d_sb[11] + (size_t)i * VOC, weight_fp8(eng, eng->tensors.output_weight),

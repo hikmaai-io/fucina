@@ -1,0 +1,62 @@
+{
+  "label": "c8",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 82.59021199773997,
+    "decode_tps": 61.24681455040391,
+    "ntok": 128,
+    "sample": "Continuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous "
+  },
+  "single_long": {
+    "ttft_ms": 4245.448387024226,
+    "decode_tps": 53.29873429044963,
+    "ntok": 128,
+    "sample": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+  },
+  "concurrency": [
+    {
+      "N": 32,
+      "agg_decode_tps": 411.816639501882,
+      "median_ttft_ms": 583.9058975107037,
+      "p95_ttft_ms": 591.6115100262687,
+      "ttfts_ms_raw": [
+        86.62,
+        108.35,
+        108.93,
+        506.98,
+        507.97,
+        510.77,
+        513.02,
+        514.55,
+        578.84,
+        578.97,
+        579.04,
+        579.34,
+        581.31,
+        582.64,
+        583.09,
+        583.26,
+        584.56,
+        585.03,
+        585.54,
+        586.52,
+        586.98,
+        587.8,
+        587.94,
+        588.13,
+        588.26,
+        588.7,
+        589.19,
+        589.21,
+        589.76,
+        591.61,
+        648.69,
+        655.15
+      ],
+      "median_per_stream_tps": 14.669834280137149,
+      "wall_s": 9.25169027800439
+    }
+  ],
+  "diverse": true
+}
