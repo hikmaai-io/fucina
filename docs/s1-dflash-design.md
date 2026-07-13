@@ -1,12 +1,49 @@
 # S1a DFlash design and architecture gate
 
+## S1A_COMPLETE (2026-07-12)
+
+**Correctness deliverable DONE + fully gated on the real Qwen3.5-9B checkpoints;
+exact-lossless greedy wall-clock ceiling MEASURED + understood (not a speedup).**
+
+What is delivered, in-tree on feat/qwen35-dflash, default-off via
+FUCINA_QWEN35_DFLASH (DFlash-off byte-identical to main -- qwen35-batch-test):
+- P0 GDN snapshot/rewind/commit: commit(j) byte-identical to j sequential decodes
+  for all j (qwen35-gdn-rollback-test), on FP8 + GGUF.
+- P1 shared-key counter RNG + greedy/probabilistic rejection: CPU oracle + CUDA
+  bit-parity; probabilistic rejection distribution-preserving (TV=0.0015, 200k MC).
+- P2 config-derived bounds-checked draft loader: real 69-tensor validation +
+  hostile-input rejection.
+- P3 draft forward on REAL z-lab weights: precompute / non-causal GQA / query
+  forward / backbone / combine / residency parities (<=1e-3 vs host double).
+- P4 BOTH serving paths on the real FP8 target + z-lab draft:
+  * GREEDY: emitted stream BYTE-IDENTICAL to plain greedy decode on all prompts
+    (qwen35-dflash-measure-test), MEASURED accept 3.56 drafts/step.
+  * PROBABILISTIC: distribution-preserving, assembled, deterministic per seed
+    (qwen35-dflash-prob-step-test).
+- P5 gate matrix: 25 gates GREEN (9 host + 8 GPU numerical/verify + 8 GPU e2e/
+  regression) + make lib libdg fucina + go test ./... .
+
+MEASURED performance (real FP8 target + z-lab draft, B=1, single-stream): target
+decode 29 ms/tok; DFlash greedy step 436 ms emitting 9.2 tok/step = ~47 ms/emitted-
+token => **~1.6x SLOWER**. The draft forward was optimized 14x (1059->76 ms,
+lossless). The residual gap is an INTRINSIC ceiling: exact-lossless accept requires
+per-token decode-body validation of each accepted token because the batched verify
+argmax diverges from single-token decode at interior positions (batched GEMM/attn
+vs gemv numerics -- MEASURED ~10/40 steps), so the commit replays ~j single-token
+decodes. NO speedup is claimed. Routes below the ceiling (future, out of scope):
+bit-identical batched forward, statistical losslessness, or a cheaper draft.
+
+Exact remaining real-checkpoint validation (future, NOT blocking correctness):
+wall-clock speedup work (needs a bit-identical batched forward), B>1 concurrency
+tuning, and the 35B tuning pass on the same rollback primitive.
+
+---
+
 Status: **BOTH DFLASH SERVING PATHS COMPLETE on real weights, full gate matrix green**
 (2026-07-12). Greedy: lossless (emitted byte-identical to plain greedy decode on
 every prompt), measured single-stream acceptance 3.56 drafts/step. Probabilistic:
 distribution-preserving (P1 rejection, proven TV=0.0015), assembled + functional
-(deterministic per seed on the real FP8 target). Remaining: kernel optimization for
-a wall-clock speedup (current draft kernels are unoptimized fp64-accum reference
-code -- NO speedup claimed), and B>1 concurrency tuning.
+(deterministic per seed on the real FP8 target).
 
 ## Honest performance status (2026-07-12) — NOT yet net-faster
 
