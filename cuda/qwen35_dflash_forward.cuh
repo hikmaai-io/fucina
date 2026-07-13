@@ -29,12 +29,18 @@ __global__ void q35df_rmsnorm(const float* x,const __nv_bfloat16* w,float* y,int
     __shared__ double ss; if(threadIdx.x==0) ss=buf[0]; __syncthreads();
     double inv=1.0/sqrt(ss/H+eps); for(int i=threadIdx.x;i<H;i+=blockDim.x) yr[i]=(float)((double)xr[i]*inv*(double)__bfloat162float(w[i]));
 }
-// O[rows,outd] = A[rows,in] @ W[outd,in]^T ; W is BF16.
+// O[rows,outd] = A[rows,in] @ W[outd,in]^T ; W is BF16. Warp-per-output (32 threads cooperate on
+// the inner product), fp32 accumulation. blockDim.x must be 32*(outputs-per-block); grid.y covers
+// outd. Row A is cached in shared memory once per block. Kept within the parity tolerance (1e-3);
+// fp32 vs the old fp64 accumulate is well inside it for the draft's in<=32768 dot products.
 __global__ void q35df_matmul(const float* A,const __nv_bfloat16* W,float* O,int rows,int in,int outd){
-    int r=blockIdx.x; int o=blockIdx.y*blockDim.x+threadIdx.x; if(r>=rows||o>=outd) return;
+    int r=blockIdx.x; int lane=threadIdx.x&31; int wpb=blockDim.x>>5; int o=blockIdx.y*wpb+(threadIdx.x>>5);
+    if(r>=rows||o>=outd) return;
     const float* a=A+(size_t)r*in; const __nv_bfloat16* w=W+(size_t)o*in;
-    double acc=0; for(int i=0;i<in;i++) acc+=(double)a[i]*(double)__bfloat162float(w[i]);
-    O[(size_t)r*outd+o]=(float)acc;
+    float acc=0.0f; for(int i=lane;i<in;i+=32) acc+=a[i]*__bfloat162float(w[i]);
+    // warp reduce
+    for(int s=16;s>0;s>>=1) acc+=__shfl_down_sync(0xffffffff,acc,s);
+    if(lane==0) O[(size_t)r*outd+o]=acc;
 }
 __global__ void q35df_headnorm(float* X,const __nv_bfloat16* w,int rows,int nh,int HD,float eps){
     int r=blockIdx.x; int h=blockIdx.y; if(r>=rows||h>=nh) return; float* v=X+((size_t)r*nh+h)*HD;
@@ -119,21 +125,21 @@ static inline void q35_dflash_backbone_forward(const q35_dflash_residency& R, q3
     for(int l=0;l<g.L;l++){
         const q35_dflash_layer_w& w=R.layers[l];
         q35df_rmsnorm<<<rows,256,0,st>>>(x,w.input_norm,s.h1,H,rows,eps);
-        q35df_matmul<<<dim3(rows,(qd+255)/256),256,0,st>>>(s.h1,w.q_proj,s.q,rows,H,qd);
-        q35df_matmul<<<dim3(rows,(kvd+255)/256),256,0,st>>>(s.h1,w.k_proj,s.k,rows,H,kvd);
-        q35df_matmul<<<dim3(rows,(kvd+255)/256),256,0,st>>>(s.h1,w.v_proj,s.v,rows,H,kvd);
+        q35df_matmul<<<dim3(rows,(qd+7)/8),256,0,st>>>(s.h1,w.q_proj,s.q,rows,H,qd);
+        q35df_matmul<<<dim3(rows,(kvd+7)/8),256,0,st>>>(s.h1,w.k_proj,s.k,rows,H,kvd);
+        q35df_matmul<<<dim3(rows,(kvd+7)/8),256,0,st>>>(s.h1,w.v_proj,s.v,rows,H,kvd);
         q35df_headnorm<<<dim3(rows,NQ),128,0,st>>>(s.q,w.q_norm,rows,NQ,HD,eps);
         q35df_headnorm<<<dim3(rows,NKV),128,0,st>>>(s.k,w.k_norm,rows,NKV,HD,eps);
         q35df_rope<<<dim3(rows,NQ),64,0,st>>>(s.q,dpos,rows,NQ,HD,theta);
         q35df_rope<<<dim3(rows,NKV),64,0,st>>>(s.k,dpos,rows,NKV,HD,theta);
         q35df_attn<<<dim3(rows,NQ),128,(size_t)ctx*sizeof(double),st>>>(s.q,s.k,s.v,s.attn,rows,ctx,NQ,NKV,HD);
-        q35df_matmul<<<dim3(rows,(H+255)/256),256,0,st>>>(s.attn,w.o_proj,s.mix,rows,qd,H);
+        q35df_matmul<<<dim3(rows,(H+7)/8),256,0,st>>>(s.attn,w.o_proj,s.mix,rows,qd,H);
         q35df_residual<<<gr(rows*H),256,0,st>>>(x,s.mix,rows*H);
         q35df_rmsnorm<<<rows,256,0,st>>>(x,w.post_norm,s.h2,H,rows,eps);
-        q35df_matmul<<<dim3(rows,(I+255)/256),256,0,st>>>(s.h2,w.gate_proj,s.g,rows,H,I);
-        q35df_matmul<<<dim3(rows,(I+255)/256),256,0,st>>>(s.h2,w.up_proj,s.u,rows,H,I);
+        q35df_matmul<<<dim3(rows,(I+7)/8),256,0,st>>>(s.h2,w.gate_proj,s.g,rows,H,I);
+        q35df_matmul<<<dim3(rows,(I+7)/8),256,0,st>>>(s.h2,w.up_proj,s.u,rows,H,I);
         q35df_siluglu<<<gr(rows*I),256,0,st>>>(s.g,s.u,s.ff,rows*I);
-        q35df_matmul<<<dim3(rows,(H+255)/256),256,0,st>>>(s.ff,w.down_proj,s.mix,rows,I,H);
+        q35df_matmul<<<dim3(rows,(H+7)/8),256,0,st>>>(s.ff,w.down_proj,s.mix,rows,I,H);
         q35df_residual<<<gr(rows*H),256,0,st>>>(x,s.mix,rows*H);
     }
     q35df_rmsnorm<<<rows,256,0,st>>>(x,R.final_norm,s.out,H,rows,eps);
@@ -168,7 +174,7 @@ static inline void q35_dflash_combine_aux(const q35_dflash_residency& R, const f
         float* out, int rows, cudaStream_t st){
     const qwen35dflash::Geometry& g=R.geom;
     // fc: out[rows,H] = concat_aux[rows, F*H] @ fc^T ; fc is [H, F*H].
-    q35df_matmul<<<dim3(rows,(g.H+255)/256),256,0,st>>>(concat_aux, R.fc, out, rows, g.fc_in(), g.H);
+    q35df_matmul<<<dim3(rows,(g.H+7)/8),256,0,st>>>(concat_aux, R.fc, out, rows, g.fc_in(), g.H);
 }
 
 // ── Context-KV precompute (the DFlash cross-attention trick) ──
@@ -206,8 +212,8 @@ static inline void q35_dflash_precompute_context_kv_at(const q35_dflash_residenc
     for(int l=0;l<g.L;l++){
         const q35_dflash_layer_w& w=R.layers[l];
         float* kdst=ctxK[l]+(size_t)dst_row*kvd; float* vdst=ctxV[l]+(size_t)dst_row*kvd;
-        q35df_matmul<<<dim3(num_ctx,(kvd+255)/256),256,0,st>>>(c.normed,w.k_proj,kdst,num_ctx,H,kvd);
-        q35df_matmul<<<dim3(num_ctx,(kvd+255)/256),256,0,st>>>(c.normed,w.v_proj,vdst,num_ctx,H,kvd);
+        q35df_matmul<<<dim3(num_ctx,(kvd+7)/8),256,0,st>>>(c.normed,w.k_proj,kdst,num_ctx,H,kvd);
+        q35df_matmul<<<dim3(num_ctx,(kvd+7)/8),256,0,st>>>(c.normed,w.v_proj,vdst,num_ctx,H,kvd);
         q35df_headnorm<<<dim3(num_ctx,NKV),128,0,st>>>(kdst,w.k_norm,num_ctx,NKV,HD,eps);
         q35df_rope<<<dim3(num_ctx,NKV),64,0,st>>>(kdst,ctx_pos,num_ctx,NKV,HD,theta);
     }
@@ -237,21 +243,21 @@ static inline void q35_dflash_query_forward(const q35_dflash_residency& R, q35_d
         // (per vLLM _resolve_layer_attention). Causal masking needs device absolute positions.
         int causal = (l < (int)g.layer_attn.size() && g.layer_attn[l]==qwen35dflash::ATTN_SLIDING) ? 1 : 0;
         q35df_rmsnorm<<<rows,256,0,st>>>(x,w.input_norm,s.h1,H,rows,eps);
-        q35df_matmul<<<dim3(rows,(qd+255)/256),256,0,st>>>(s.h1,w.q_proj,s.q,rows,H,qd);
-        q35df_matmul<<<dim3(rows,(kvd+255)/256),256,0,st>>>(s.h1,w.k_proj,s.k,rows,H,kvd);
-        q35df_matmul<<<dim3(rows,(kvd+255)/256),256,0,st>>>(s.h1,w.v_proj,s.v,rows,H,kvd);
+        q35df_matmul<<<dim3(rows,(qd+7)/8),256,0,st>>>(s.h1,w.q_proj,s.q,rows,H,qd);
+        q35df_matmul<<<dim3(rows,(kvd+7)/8),256,0,st>>>(s.h1,w.k_proj,s.k,rows,H,kvd);
+        q35df_matmul<<<dim3(rows,(kvd+7)/8),256,0,st>>>(s.h1,w.v_proj,s.v,rows,H,kvd);
         q35df_headnorm<<<dim3(rows,NQ),128,0,st>>>(s.q,w.q_norm,rows,NQ,HD,eps);
         q35df_headnorm<<<dim3(rows,NKV),128,0,st>>>(s.k,w.k_norm,rows,NKV,HD,eps);
         q35df_rope<<<dim3(rows,NQ),64,0,st>>>(s.q,dpos,rows,NQ,HD,theta);
         q35df_rope<<<dim3(rows,NKV),64,0,st>>>(s.k,dpos,rows,NKV,HD,theta);
         q35df_attn_ctx<<<dim3(rows,NQ),128,smem,st>>>(s.q,ctxK[l],ctxV[l],s.k,s.v,s.attn,rows,num_ctx,NQ,NKV,HD,causal,dctx_pos,dpos);
-        q35df_matmul<<<dim3(rows,(H+255)/256),256,0,st>>>(s.attn,w.o_proj,s.mix,rows,qd,H);
+        q35df_matmul<<<dim3(rows,(H+7)/8),256,0,st>>>(s.attn,w.o_proj,s.mix,rows,qd,H);
         q35df_residual<<<gr(rows*H),256,0,st>>>(x,s.mix,rows*H);
         q35df_rmsnorm<<<rows,256,0,st>>>(x,w.post_norm,s.h2,H,rows,eps);
-        q35df_matmul<<<dim3(rows,(I+255)/256),256,0,st>>>(s.h2,w.gate_proj,s.g,rows,H,I);
-        q35df_matmul<<<dim3(rows,(I+255)/256),256,0,st>>>(s.h2,w.up_proj,s.u,rows,H,I);
+        q35df_matmul<<<dim3(rows,(I+7)/8),256,0,st>>>(s.h2,w.gate_proj,s.g,rows,H,I);
+        q35df_matmul<<<dim3(rows,(I+7)/8),256,0,st>>>(s.h2,w.up_proj,s.u,rows,H,I);
         q35df_siluglu<<<gr(rows*I),256,0,st>>>(s.g,s.u,s.ff,rows*I);
-        q35df_matmul<<<dim3(rows,(H+255)/256),256,0,st>>>(s.ff,w.down_proj,s.mix,rows,I,H);
+        q35df_matmul<<<dim3(rows,(H+7)/8),256,0,st>>>(s.ff,w.down_proj,s.mix,rows,I,H);
         q35df_residual<<<gr(rows*H),256,0,st>>>(x,s.mix,rows*H);
     }
     q35df_rmsnorm<<<rows,256,0,st>>>(x,R.final_norm,s.out,H,rows,eps);
@@ -267,10 +273,14 @@ static inline void q35_dflash_query_forward(const q35_dflash_residency& R, q35_d
 __global__ void q35df_head_argmax(const float* hidden, const __nv_bfloat16* lm_head, int H, int vocab,
                                   int32_t* out_tok){
     int row=blockIdx.x; const float* h=hidden+(size_t)row*H;
-    __shared__ double bestv[256]; __shared__ int besti[256];
-    double bv=-1e300; int bi=0;
+    // Cache the hidden row in shared memory (H<=8192 floats = 32KB) so the vocab loop reads it fast.
+    extern __shared__ float hs[];
+    for(int i=threadIdx.x;i<H;i+=blockDim.x) hs[i]=h[i];
+    __syncthreads();
+    __shared__ float bestv[256]; __shared__ int besti[256];
+    float bv=-1e30f; int bi=0;
     for(int o=threadIdx.x;o<vocab;o+=blockDim.x){
-        const __nv_bfloat16* w=lm_head+(size_t)o*H; double acc=0; for(int i=0;i<H;i++) acc+=(double)h[i]*(double)__bfloat162float(w[i]);
+        const __nv_bfloat16* w=lm_head+(size_t)o*H; float acc=0.0f; for(int i=0;i<H;i++) acc+=hs[i]*__bfloat162float(w[i]);
         if(acc>bv || (acc==bv && o<bi)){ bv=acc; bi=o; }
     }
     bestv[threadIdx.x]=bv; besti[threadIdx.x]=bi; __syncthreads();
@@ -283,7 +293,7 @@ __global__ void q35df_head_argmax(const float* hidden, const __nv_bfloat16* lm_h
 // the shared BF16 [vocab, H]; out_tok receives K draft token ids.
 static inline void q35_dflash_sample_greedy(const float* sampled_hidden, const __nv_bfloat16* lm_head,
         int K, int H, int vocab, int32_t* out_tok, cudaStream_t st){
-    q35df_head_argmax<<<K,256,0,st>>>(sampled_hidden, lm_head, H, vocab, out_tok);
+    q35df_head_argmax<<<K,256,(size_t)H*sizeof(float),st>>>(sampled_hidden, lm_head, H, vocab, out_tok);
 }
 
 // Probabilistic draft sampling with the shared-key uniform: row r samples from softmax(logits_r/T)
