@@ -57,4 +57,21 @@ losslessness contract.
   instead of `q35df_matmul`. Expected ~32 -> ~? ms/step.
 - Re-measure end-to-end after each; report real tok/s + break-even accept length.
 
-(Filled in as each lever lands.)
+## Landed / measured
+
+- **L1 (landed, commit e34c74d)**: draft LM head -> engine tuned batched head.
+  nsys: draft head 38.5 -> 9.2 ms/step. End-to-end 435 -> 408 ms/step (47.3 ->
+  44.3 ms/emitted-token). Lossless + determinism gates green, same 3.556 accept.
+- **L2 attempt #1 (REVERTED)**: a register-blocked weight-read-once batched draft
+  matmul (`acc[K]` per warp) REGRESSED to 488 ms/step. K=17 register array +
+  wide out_dim (I=12288) => heavy register pressure / low occupancy, worse than the
+  memory-bound `q35df_matmul`. Weight-read-once alone is not enough; the draft
+  projections need REAL tensor cores (cutlass/nvjet), like the target verify GEMMs.
+  Note: a stale-build hazard was found + fixed here (the Makefile does not list
+  qwen35_dflash_forward.cuh as a dep of gemma4_kernels.o, so header-only edits
+  require `rm -f cuda/gemma4_kernels.o` before `make lib` to actually rebuild the
+  engine path -- earlier "no-change" measurements were stale).
+- **L2 attempt #2 (next)**: route the draft's big projections (gate/up/down, q/k/v/o)
+  through the engine's tensor-core `gemm_bf16` (cutlass) with a bf16 activation
+  transpose, exactly as the target verify does -- needs the draft head done in the
+  engine like L1, or a draft-forward variant that takes an engine cuBLAS/gemm hook.
