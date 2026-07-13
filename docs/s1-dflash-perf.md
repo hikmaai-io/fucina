@@ -125,6 +125,29 @@ cancelled by batching already reducing the per-token weight cost.
 **Where spec decode CAN win on this engine: low batch (B=1-2, latency-bound) IF the
 commit does NOT re-decode the accepted prefix** -- i.e. the bit-identical batched
 verify above. That single lever gates the whole feature's speedup. Everything else
-(draft head/matmul tuning) is second-order (<= ~40 ms of a 408 ms step). Next:
-quantify how far the batched verify diverges from single-token decode and whether a
-bit-identical batched target forward is achievable without weakening losslessness.
+(draft head/matmul tuning) is second-order (<= ~40 ms of a 408 ms step).
+
+## Divergence quantified (MEASURED /tmp/divclean, 50 steps, K=16, numeric prompt)
+
+With the accepted block == the true greedy continuation: the batched (T=17) verify
+argmax vs single-token decode diverges on **16/800 = 2.0% of accepted-prefix rows**
+(plus 1/50 correction rows). Small but NONZERO. (An earlier 0% reading was a buggy
+harness that re-ran verify twice, mutating slot state; a 10/640 reading was a
+different harness passing a bad slot pointer -- both discarded. /tmp/divclean uses
+the clean single-decode reference.)
+
+Consequence: because ~2% of accepted-prefix argmaxes flip between the batched
+verify and single-token decode, TRUSTING verify am[] to accept + emit would emit a
+non-greedy token ~1 every ~3 steps -> NOT byte-lossless. So the accepted prefix
+genuinely requires decode-body validation, i.e. the j-sequential-decode commit
+(293 ms). The correct fast path (fast-commit STATE ~30 ms + 1 correction decode
+~29 ms = ~59 ms, which WOULD make DFlash ~24 ms/emitted-token = ~1.2x win) is
+UNAVAILABLE while that 2% exists.
+
+=> The speedup is gated entirely on driving the batched-verify-vs-single-token
+divergence to EXACTLY ZERO (bit-identical). 2% is small enough that it is likely a
+few fp accumulation-order / tensor-core-vs-gemv rounding flips at tight logit
+margins -- a candidate for a higher-precision or accumulation-order-matched batched
+head/final-norm, NOT a fundamental barrier. But it is a target-engine numerics
+change (the FP8 batched GEMM + batched LM head path), broader than the DFlash
+feature, and it must not weaken the existing byte-losslessness gate.
