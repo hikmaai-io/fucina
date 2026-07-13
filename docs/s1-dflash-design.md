@@ -37,14 +37,32 @@ using the CHUNK body was tried and REVERTED: the chunk GDN kernel
 losslessness (this is also why greedy_step must derive the emitted token from the
 DECODE body, not the chunk-body argmax).
 
-PRECISE lossless fast-commit design (next): a commit that does the weight-heavy
-projections ONCE (batched over the j accepted rows, like the chunk body) but runs
-the GDN/conv recurrence token-SEQUENTIALLY with the DECODE kernel
-(qwen35_b_gdn_kernel, B=1 row-offset) instead of the chunk kernel -- yielding
-decode-body-identical state in ~one weight pass instead of j. That removes the
-commit-replay cost losslessly and should push DFlash below the target per-token
-time. CORRECTNESS is complete + gated; PERFORMANCE is honestly ~1.6x-slower and
-open, with the exact remaining lever identified.
+Lossless fast-commit STATE primitive (DONE, q35_gdn_commit_fast, gated byte-
+identical for all j): batches the weight-heavy projections once but runs the
+GDN/conv recurrence token-sequentially with the DECODE kernels -> per-slot state
+byte-identical to j sequential decodes in ~one weight pass.
+
+BUT it does NOT remove the commit-replay cost, because of a deeper finding
+(MEASURED, /tmp/divg): the batched (T-row) verify argmax diverges from single-
+token decode at ~10 INTERIOR positions per 40 steps (K=16), NOT just the
+correction -- and switching the verify GDN recurrence to the decode kernel does
+NOT fix it. The divergence comes from batched GEMM/attention vs single-token
+gemv numerics across the 8 FULL-attention + projection layers. CONSEQUENCE: a
+lossless accept decision REQUIRES per-token decode-body validation of each
+ACCEPTED token; the fast-commit gives lossless STATE but not a trustworthy accept
+argmax. So greedy_step keeps the sequential q35_gdn_commit (j decode steps for j
+accepted tokens). This is an INTRINSIC performance ceiling for the exact-losslessness
+contract with the current batched kernels: at accept ~9.2 the commit replays ~10
+single-token decodes (~290 ms), so DFlash sits ~1.6x SLOWER per token.
+
+The ONLY ways below this ceiling (future, out of current scope): (a) a batched
+verify forward that is BIT-IDENTICAL to single-token decode (make the batched
+GEMM/attention deterministic-equal to gemv -- a deep engine change), or (b) relax
+to a *statistical* losslessness (probabilistic acceptance already is), or (c) a
+draft/target where the draft is cheap enough that even with replay the amortized
+cost wins at higher accept. CORRECTNESS is complete + gated; the exact-lossless
+greedy path is ~1.6x slower and the ceiling is now understood + measured, not
+hand-waved.
 
 ## Certified P5 gate matrix (2026-07-12, ALL PASS)
 
