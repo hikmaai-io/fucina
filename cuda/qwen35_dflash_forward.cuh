@@ -300,22 +300,28 @@ __global__ void q35df_head_argmax(const float* hidden, const __nv_bfloat16* lm_h
 // row partial argmax is written to scratch [K, nblocks] then reduced. To keep it simple + still
 // read weights once, we use one launch that atomically maintains a per-row best via a block-local
 // reduction into global per-row {val,idx} using a lock-free max on a packed 64-bit (val,idx).
+// Warp-per-vocab-token: 32 threads cooperate on each token's H-dot (strided + warp-shuffle reduce),
+// reading the weight row once and accumulating against all K hidden rows (cached in shared memory).
+// Lane 0 updates the per-row global best via atomicMax on a packed (sortable-float<<32 | ~idx) key
+// => (max value, lowest index) tie-break. Reads the 2 GB head once for all K rows AND parallelizes
+// the H-loop 32x. Block: 256 threads = 8 warps; grid.x = ceil(vocab/8). Shared: K*H floats hidden.
 __global__ void q35df_head_argmax_batched(const float* hidden, const __nv_bfloat16* lm_head, int H,
                                           int vocab, int K, unsigned long long* row_best){
-    // hidden [K, H] cached in shared memory (K*H floats). K<=~17, H<=8192 -> up to ~544KB: too big.
-    // Instead cache one hidden row at a time is the old path; here we cache NOTHING and read hidden
-    // from global (H*K reads per weight row is fine; the WEIGHT read is what we cut K-fold).
-    int o = blockIdx.x*blockDim.x + threadIdx.x; if(o>=vocab) return;
+    // No shared cache (K*H too large); hidden [K,H] is small and stays L2-resident. The 2 GB WEIGHT
+    // read is the cost, done once per token here (reused across the K rows), with the H-dot split
+    // across the warp.
+    int lane=threadIdx.x&31; int warp=threadIdx.x>>5; int wpb=blockDim.x>>5;
+    int o = blockIdx.x*wpb + warp; if(o>=vocab) return;
     const __nv_bfloat16* w = lm_head + (size_t)o*H;
-    // Load the weight row once; accumulate against all K hidden rows.
     for(int r=0;r<K;r++){
         const float* h = hidden + (size_t)r*H;
-        float acc=0.0f; for(int i=0;i<H;i++) acc+=h[i]*__bfloat162float(w[i]);
-        // pack (val,idx): higher val wins; on tie lower idx wins. Encode as (float_bits_monotonic<<32)|(~idx).
-        // Use a monotonic ordering: map float to sortable uint, then combine so max picks (max val, min idx).
-        unsigned int fb = __float_as_uint(acc); fb ^= (fb>>31)?0xffffffffu:0x80000000u;
-        unsigned long long packed = ((unsigned long long)fb<<32) | (unsigned int)(0xffffffffu - (unsigned)o);
-        atomicMax(&row_best[r], packed);
+        float acc=0.0f; for(int i=lane;i<H;i+=32) acc+=h[i]*__bfloat162float(w[i]);
+        for(int s=16;s>0;s>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,s);
+        if(lane==0){
+            unsigned int fb = __float_as_uint(acc); fb ^= (fb>>31)?0xffffffffu:0x80000000u;
+            unsigned long long packed = ((unsigned long long)fb<<32) | (unsigned int)(0xffffffffu - (unsigned)o);
+            atomicMax(&row_best[r], packed);
+        }
     }
 }
 __global__ void q35df_head_best_decode(const unsigned long long* row_best, int K, int32_t* out_tok){
@@ -329,7 +335,8 @@ static inline void q35_dflash_sample_greedy(const float* sampled_hidden, const _
     static unsigned long long* row_best=nullptr; static int rb_cap=0;
     if(rb_cap<K){ if(row_best) cudaFree(row_best); cudaMalloc(&row_best,(size_t)K*sizeof(unsigned long long)); rb_cap=K; }
     cudaMemsetAsync(row_best,0,(size_t)K*sizeof(unsigned long long),st);
-    int blk=256; q35df_head_argmax_batched<<<(vocab+blk-1)/blk,blk,0,st>>>(sampled_hidden,lm_head,H,vocab,K,row_best);
+    int blk=256; int wpb=blk>>5;   // 8 warps/block, one warp per vocab token
+    q35df_head_argmax_batched<<<(vocab+wpb-1)/wpb,blk,0,st>>>(sampled_hidden,lm_head,H,vocab,K,row_best);
     q35df_head_best_decode<<<(K+31)/32,32,0,st>>>(row_best,K,out_tok);
 }
 
