@@ -188,8 +188,26 @@ Protection gate (MoE, candidate vs frozen 2026-07-11 baseline w/ embedded vLLM):
 **GATE PASS** — every cell above the 5% floor, N=8 claimed-win beats vLLM (227.5 vs
 146.5), N=32 TTFT 1892→620 median. No winning cell regressed.
 
-Correctness: `qwen35-multiseq-prefill-test` PASS with UNCHANGED bounds (MoE ≤0.0946,
-dense ≤0.0029) after F1 and after F2 — byte-identical by construction.
+Correctness gates (this build, HEAD F1+F2+F3):
+- `qwen35-multiseq-prefill-test` PASS, UNCHANGED bounds (MoE ≤0.0946, dense ≤0.0029)
+  after F1 and after F2 — byte-identical by construction.
+- `qwen35-parity-test` PASS (8/8 greedy vs llama.cpp).
+- `qwen35-batch-test` (dense-9B batched-decode) PASS: row-independence=PASS,
+  graph-on==off=PASS, M3-parity 8/8, sampling=PASS, self-chain=PASS.
+- `qwen35-state-test` PASS (16/16 bit-identical cross-slot restore).
+- `qwen35-chunk-parity-test` PASS.
+- `go test ./...` PASS.
+
+**Pre-existing gate note (NOT a regression):** `qwen35-moe-fp8-engine-test`'s
+batched-decode SELF-consistency sub-check (row-independence / graph-on==off /
+self-chain at MoE B>1) FAILS — but the ORACLE parity passes 8/8 (correct tokens).
+Verified by building and running the PRISTINE baseline `daef575` (pre-F1): it fails
+IDENTICALLY (same 8/8 oracle, same self-test FAIL). F1 (LM head, prefill-only) and
+F2 (GDN scan, prefill-only) touch no decode-path math; the dense-9B equivalent
+(`qwen35-batch-test`) passes self-consistency fully. This is the known MoE
+grouped-GEMM run-to-run nondeterminism on GB10 (`grouped-gemm-broken-gb10`), a
+decode-path MoE-GEMM issue orthogonal to this TTFT work. The gate is UNCHANGED by
+this branch.
 
 Attribution of the residual ~180 ms (439 ms GPU prefill → ~620 ms server median):
 HTTP round-trip + SSE, scheduler pass overhead, and the first decode step's
