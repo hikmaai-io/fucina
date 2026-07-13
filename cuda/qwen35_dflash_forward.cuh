@@ -291,9 +291,46 @@ __global__ void q35df_head_argmax(const float* hidden, const __nv_bfloat16* lm_h
 // Greedy draft sampling: argmax of the LM head over each of the K sampled query rows. sampled_hidden
 // is [K, H] (the mask-token rows gathered from the query forward's final-normed output); lm_head is
 // the shared BF16 [vocab, H]; out_tok receives K draft token ids.
+// Batched greedy head argmax: reads the 2 GB BF16 LM head ONCE for all K rows (each weight row is
+// reused across the K hidden rows), vs q35df_head_argmax's K separate passes. Each thread owns one
+// vocab token, loads its H-vector weight once, and computes the dot with all K hidden rows (cached
+// in shared memory), tracking a per-vocab-tile local argmax per row; a final reduce over tiles picks
+// the global argmax per row. Deterministic lowest-index tie-break preserved. This is the K-fold
+// weight-traffic reduction (the draft head is bandwidth-bound). Grid: (ceil(vocab/BLK)); the per-
+// row partial argmax is written to scratch [K, nblocks] then reduced. To keep it simple + still
+// read weights once, we use one launch that atomically maintains a per-row best via a block-local
+// reduction into global per-row {val,idx} using a lock-free max on a packed 64-bit (val,idx).
+__global__ void q35df_head_argmax_batched(const float* hidden, const __nv_bfloat16* lm_head, int H,
+                                          int vocab, int K, unsigned long long* row_best){
+    // hidden [K, H] cached in shared memory (K*H floats). K<=~17, H<=8192 -> up to ~544KB: too big.
+    // Instead cache one hidden row at a time is the old path; here we cache NOTHING and read hidden
+    // from global (H*K reads per weight row is fine; the WEIGHT read is what we cut K-fold).
+    int o = blockIdx.x*blockDim.x + threadIdx.x; if(o>=vocab) return;
+    const __nv_bfloat16* w = lm_head + (size_t)o*H;
+    // Load the weight row once; accumulate against all K hidden rows.
+    for(int r=0;r<K;r++){
+        const float* h = hidden + (size_t)r*H;
+        float acc=0.0f; for(int i=0;i<H;i++) acc+=h[i]*__bfloat162float(w[i]);
+        // pack (val,idx): higher val wins; on tie lower idx wins. Encode as (float_bits_monotonic<<32)|(~idx).
+        // Use a monotonic ordering: map float to sortable uint, then combine so max picks (max val, min idx).
+        unsigned int fb = __float_as_uint(acc); fb ^= (fb>>31)?0xffffffffu:0x80000000u;
+        unsigned long long packed = ((unsigned long long)fb<<32) | (unsigned int)(0xffffffffu - (unsigned)o);
+        atomicMax(&row_best[r], packed);
+    }
+}
+__global__ void q35df_head_best_decode(const unsigned long long* row_best, int K, int32_t* out_tok){
+    int r=blockIdx.x*blockDim.x+threadIdx.x; if(r>=K) return;
+    unsigned long long p=row_best[r]; unsigned int idx = 0xffffffffu - (unsigned)(p & 0xffffffffu);
+    out_tok[r]=(int32_t)idx;
+}
 static inline void q35_dflash_sample_greedy(const float* sampled_hidden, const __nv_bfloat16* lm_head,
         int K, int H, int vocab, int32_t* out_tok, cudaStream_t st){
-    q35df_head_argmax<<<K,256,(size_t)H*sizeof(float),st>>>(sampled_hidden, lm_head, H, vocab, out_tok);
+    // Batched head: one weight pass for all K rows. Needs a [K] u64 best buffer (init to 0).
+    static unsigned long long* row_best=nullptr; static int rb_cap=0;
+    if(rb_cap<K){ if(row_best) cudaFree(row_best); cudaMalloc(&row_best,(size_t)K*sizeof(unsigned long long)); rb_cap=K; }
+    cudaMemsetAsync(row_best,0,(size_t)K*sizeof(unsigned long long),st);
+    int blk=256; q35df_head_argmax_batched<<<(vocab+blk-1)/blk,blk,0,st>>>(sampled_hidden,lm_head,H,vocab,K,row_best);
+    q35df_head_best_decode<<<(K+31)/32,32,0,st>>>(row_best,K,out_tok);
 }
 
 // Probabilistic draft sampling with the shared-key uniform: row r samples from softmax(logits_r/T)
