@@ -22,12 +22,29 @@ MEASURED on the real FP8 target + z-lab draft, single-stream B=1:
 
 Optimization so far (draft forward, MEASURED, parity preserved): fp64->fp32 warp
 matmul + shared-mem head (1059.5->477.8 ms), batched head one-weight-pass
-(477.8->327.1 ms). These are real but insufficient: **no end-to-end speedup is
-claimed; DFlash is not yet wall-clock competitive.** The decisive remaining lever
-is a warp/tensor-core cooperative draft head (the K*vocab*H serial MAC loop), then
-S2 graph capture of the fixed-shape query forward. The lossless/distribution-
-preserving CORRECTNESS is complete and gated; PERFORMANCE is open and honestly
-unfinished.
+(477.8->327.1 ms), warp-cooperative head (327->76 ms, 14x cumulative). All
+lossless (measure gate byte-identical on all prompts).
+
+UPDATED end-to-end (MEASURED, real FP8 target + z-lab draft, B=1, head opt +
+SEQUENTIAL lossless commit): target decode 29.1 ms/tok; DFlash step 436 ms
+emitting 9.2 tok/step = **47.4 ms/emitted-token => ~1.6x slower** (down from 5.2x).
+
+The remaining bottleneck is `q35_gdn_commit`: it replays the 1+j accepted tokens
+as j SEQUENTIAL decode-body steps (MEASURED 293 ms for 10 tokens). A batched-commit
+using the CHUNK body was tried and REVERTED: the chunk GDN kernel
+(qwen35_b_gdn_chunk_kernel) is NOT bit-identical to the single-token decode kernel
+(qwen35_b_gdn_kernel) -- it drifts by ~position 45 on the numeric prompt, breaking
+losslessness (this is also why greedy_step must derive the emitted token from the
+DECODE body, not the chunk-body argmax).
+
+PRECISE lossless fast-commit design (next): a commit that does the weight-heavy
+projections ONCE (batched over the j accepted rows, like the chunk body) but runs
+the GDN/conv recurrence token-SEQUENTIALLY with the DECODE kernel
+(qwen35_b_gdn_kernel, B=1 row-offset) instead of the chunk kernel -- yielding
+decode-body-identical state in ~one weight pass instead of j. That removes the
+commit-replay cost losslessly and should push DFlash below the target per-token
+time. CORRECTNESS is complete + gated; PERFORMANCE is honestly ~1.6x-slower and
+open, with the exact remaining lever identified.
 
 ## Certified P5 gate matrix (2026-07-12, ALL PASS)
 
