@@ -93,6 +93,29 @@ layers ≈ **2.6 ms**, i.e. only ~12% of the ~21.7 ms single-stream step. **The 
 decode step is dominated by the NON-expert path** (mixer GDN/attn, LM head, shared
 expert) + the small per-layer MoE glue kernels — all read-once / graph-replayed.
 
+## Measured: LM-head read is already at floor; the Q8 half-read does NOT batch (DEBUNKED)
+
+`cuda/bench_head_lowc.cu` (`make bench-head-lowc`) — isolated head GEMV at VOC=248320,
+H=2048, weight-read-once, B=1..8, GB10, 300 iters. The candidate lever was: extend the
+B==1 Q8_0 half-read head (0.54 GB vs 1.02 GB BF16) to B≤8 greedy for a ~1.9× head win.
+
+| B | bf16 ms | bf16 GB/s | q8 ms | q8 GB/s | q8 speedup |
+|---|---|---|---|---|---|
+| 1 | 5.96 | 171 | 5.04 | 107 | 1.18× |
+| 2 | 5.30 | 192 | 9.01 | 60 | **0.59×** |
+| 4 | 4.98 | 204 | 17.54 | 31 | **0.28×** |
+| 8 | 5.24 | 194 | 34.69 | 16 | **0.15×** |
+
+**The BF16 head is already weight-read-once and FLAT at ~5 ms (~200 GB/s, 74–85% of
+peak) across B=1..8** — the P2 F1 read-once form is optimal at low B. **The Q8 half-read
+does the opposite of help: it is compute-bound** (scalar int8 dequant, low ILP), so its
+time scales ~linearly with B (5→9→17.5→35 ms) and it is *slower than BF16* for every B≥2,
+even after hoisting the dequant out of the row loop. The byte savings never materialise
+because the kernel is ALU-limited, not bandwidth-limited, once B>1. **Lever rejected** —
+a bandwidth-bound batched Q8/NVFP4 head is a speculative kernel-rewrite on a component the
+mission plan de-prioritises (head tuning is an explicit non-goal), with the BF16 head
+already at its bandwidth floor. No head win at B=2/4.
+
 ## What the profile rules OUT as low-B levers
 
 - **Expert grouped GEMM tuning** (FP8_GMAXB, acc-registers, slot packing): the default
@@ -105,6 +128,21 @@ expert) + the small per-layer MoE glue kernels — all read-once / graph-replaye
   (`qwen35_ms_graph_ensure`); launch gaps are hidden (same result P2 measured for dense:
   GPU busy ≈ wall). Router uses cublasSgemm on-device; `dg_moe_route_inv` is one small
   block; no per-step host sync on the non-SSD fp4 path.
+- **LM-head Q8 half-read at B>1**: measured slower than the read-once BF16 head (compute-
+  bound); BF16 head already at bandwidth floor. See the head-microbench table above.
+
+## Bottom line (measured kernel evidence)
+
+Every dominant component of the low-B MoE decode step is bandwidth-bound at its floor:
+expert GEMM ~80–85% peak (linear in active experts), BF16 LM head ~75–85% peak (read
+once, flat in B), mixer/shared read-once, launches graph-hidden. The two candidate low-B
+levers (expert-GEMM slot packing; Q8 head half-read) are both **measured dead** — the
+first is already floored, the second is compute-bound and slower than the incumbent at
+B≥2. There is no non-speculative decode lever for N=2/4 on this build; the low-B win comes
+from batching amortising the read-once weights, which fucina already does. The remaining
+task is to CONFIRM the served N=2/4 cells are competitive/winning vs a contemporaneous
+vLLM (memory `moe-vllm-rebaseline-jul8` — current source of truth — reports fucina winning
+agg N=1..16 post-F1F2F3), which is GPU-contended (85 GiB vLLM-27B service resident).
 
 ## Open (GPU-contended — an 85 GiB vLLM-27B service holds the box; ~20 GiB free)
 

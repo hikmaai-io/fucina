@@ -602,6 +602,10 @@ bench-moe-lowc-fp4:   # run under flock: flock /tmp/fucina_gpu.lock -c '/tmp/fuc
 	$(NVCC) -std=c++17 -O3 -arch=$(CUDA_ARCH) --expt-relaxed-constexpr --expt-extended-lambda \
 		-DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include \
 		cuda/bench_moe_lowc_fp4.cu -o /tmp/fucina_moe_lowc_fp4
+# L-moe-lowc: isolated LM-head decode read cost, BF16 (1.0 GB) vs Q8_0 (0.53 GB), weight-read-once B=1..8.
+bench-head-lowc:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/bench_head_lowc.cu -o /tmp/fucina_head_lowc
+	@echo "run: flock /tmp/fucina_gpu.lock -c '/tmp/fucina_head_lowc'"
 dg-fp4-parity: cuda/diffusion_gemma_kernels.o cuda/dg_fp4_moe.o   # FP4 grouped vs dequant ref on real weights
 	$(NVCC) -std=c++17 -O3 -arch=$(CUDA_ARCH) -dc --expt-relaxed-constexpr --expt-extended-lambda \
 		-DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include \
