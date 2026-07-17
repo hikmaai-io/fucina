@@ -156,3 +156,14 @@ Still to measure on a quiescent box (harnesses built and staged):
 
 Harnesses: `make bench-moe-lowc-fp4` (done, above), `make qwen35-moe-decode-bench`
 (built `/tmp/fucina_moe_decode_bench`).
+
+## RESOLVED (2026-07-13): serving sweep confirms N=2/4 are decisive WINS
+
+The open gate question is answered by the quiescent-box re-baseline
+(`benchmark-evidence/results/2026-07-13-rebaseline/`, main 60b109a):
+MoE N=2 fucina **106.8** vs vLLM 71.1 (+50%); N=4 **161.5** vs 105.0 (+54%).
+The frozen "vLLM wins N=2/4" premise predated P1/F1/F2/F3 and is stale — every
+MoE cell is now a win. Combined with the kernel-level floor evidence above
+(NVFP4 expert GEMM 80-85% peak linear in active experts; BF16 head read-once
+flat; Q8 half-read debunked at B>=2), **L-moe-lowc is CLOSED: no lever needed,
+none exists**. Verdict: MOE_LOWC_ALREADY_WON (profile: floored; serving: won).
