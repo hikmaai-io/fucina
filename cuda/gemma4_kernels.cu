@@ -1886,8 +1886,11 @@ __global__ void mmvq_q4_k_packedT_batched_kernel(
 // SAME lane order regardless of chunking ⇒ outputs BITWISE-identical to the single-chunk
 // kernel and to the ladder it replaces. `ntok` guards the ≤8-token tail chunk.
 // (Tried and rejected: PIPE=4 — 323 vs 366 agg @ B=16; 2-row register blocking — spills.)
-template<int NK>
-__global__ void __launch_bounds__(256, 4) mmvq_q4_k_packedT_multi_kernel(
+// D32: MINBLK is a template arg so the wider NK=16 tile (16 acc regs vs 8) can trade a little
+// occupancy for HALF the chunk count at K>16 (B=32 → 2 chunks not 4), cutting the redundant
+// L2 weight bandwidth + per-chunk Q4_K dequant ALU that measured 65% of the B=16→32 step growth.
+template<int NK, int MINBLK = 4>
+__global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi_kernel(
     float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
     int in_dim, int out_dim, int K)
 {
@@ -1978,10 +1981,31 @@ static void mmvq_q4_k_packedT_batched_launch(
         default: break;
     }
     #undef LPT_Q4K
-    // K>8: one multi-chunk launch, weight read once (chunk-major dispatch → L2 reuse across
-    // the ≤8-token chunks of each row group). Bitwise-identical to the old NK=16/8/rem ladder
-    // (same per-(row,token) ascending-b accumulation; chunking only changes WHICH block computes
-    // a (row, token) pair, not its arithmetic).
+    // K>8: one multi-chunk launch, weight read once (chunk-major dispatch → L2 reuse across the
+    // per-chunk token groups of each row group). Bitwise-identical to the old NK=16/8/rem ladder
+    // AND to the NK=8 multi-kernel (same per-(row,token) ascending-b accumulation; chunking only
+    // changes WHICH block computes a (row,token) pair, not its arithmetic — NK-independent).
+    // D32: for K>16 a wider chunk tile HALVES the chunk count (B=32 → 2 chunks at NK=16, 3 at
+    // NK=12, vs 4 at NK=8), cutting the redundant L2 weight bandwidth + per-chunk Q4_K dequant
+    // that measured 65% of the B=16→32 step growth — but a wider acc[] costs registers (occupancy).
+    // The NK/MINBLK for K>16 is config-selectable (FUCINA_Q4K_BIGCHUNK={8,12,16}, default 16) so
+    // the chunk-width vs occupancy tradeoff is MEASURED per box, not hardcoded. Every variant is
+    // bitwise-identical (NK-independent per-(row,token) ascending-b accumulation). K≤16 keeps NK=8.
+    if (K > 16) {
+        static int bigchunk = -1;
+        if (bigchunk < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bigchunk = e ? atoi(e) : 16; }
+        if (bigchunk == 8) {
+            dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
+            mmvq_q4_k_packedT_multi_kernel<8><<<gm, b, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+        } else if (bigchunk == 12) {
+            dim3 gm((unsigned)((K + 11) / 12), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
+            mmvq_q4_k_packedT_multi_kernel<12, 3><<<gm, b, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+        } else {
+            dim3 gm((unsigned)((K + 15) / 16), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
+            mmvq_q4_k_packedT_multi_kernel<16, 3><<<gm, b, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+        }
+        return;
+    }
     dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
     mmvq_q4_k_packedT_multi_kernel<8><<<gm, b, 0, stream>>>(
         out, w, qxT, dx, sx, in_dim, out_dim, K);
