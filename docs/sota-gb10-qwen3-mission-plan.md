@@ -29,13 +29,23 @@ bit-identical `(1+K)` batched verify enabling re-decode-free fast-commit (~1.2×
 at B=1 interactive) — a large separate workstream, low priority.
 
 ### New priority order (evidence-ranked)
-1. **M-TTFT (ACTIVE)**: MoE N=32 TTFT 866/874 ms (med/p95) vs vLLM 664 ms — the
-   last cell where vLLM wins (fucina already wins MoE N=32 aggregate 405 vs 303).
-   Branch `perf/qwen35-moe-ttft`.
-2. MoE N=2/4 low-concurrency cells.
-3. Re-freeze protection baselines with a fresh contemporaneous vLLM sweep after
-   S2 + P2 landed on main.
-4. Phase E distributed (parked).
+1. ~~**M-TTFT**~~ **DONE (merged 60b109a)**: N=32 TTFT 866→641/647 ms serving-confirmed,
+   below vLLM 664 on median AND p95. All 6 MoE cells now won.
+2. ~~MoE N=2/4~~ **CLOSED (merged 7496820)**: already won (106.8/161.5 vs 71.1/105.0);
+   kernel path measured at floor (NVFP4 grouped 80–85% peak; Q8 head debunked).
+3. ~~Re-baseline~~ **DONE (merged d9333ee)**: 2026-07-13 sweep archived. Caveat:
+   vLLM column carried forward from 07-11 — rerun the container before freezing
+   the official claim.
+4. **D32 (ACTIVE)**: dense N=32 aggregate — THE ONLY LOSING CELL LEFT
+   (392.4 vs vLLM 501.9; was 303 pre-P2 — gap halved, not closed). P2's own
+   attribution names the suspect: at B=32 the mixer takes the single
+   `NK=32` monolithic tile which is "register-crippled, 75 GB/s effective"
+   (vs ~270 for the ≤8 tiles); P2 fixed the 8<K<32 ladder (multi-chunk
+   weight-read-once) but left K=32 on the old kernel. Extending the F2
+   multi-chunk dispatch to K=32 (4×8-chunks, weight read once, NK≤8 register
+   footprint) is the measured, non-speculative lever. Branch
+   `perf/qwen35-dense32`.
+5. Phase E distributed (parked).
 
 ## Mission
 
