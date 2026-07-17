@@ -37,14 +37,15 @@ at B=1 interactive) — a large separate workstream, low priority.
    vLLM column carried forward from 07-11 — rerun the container before freezing
    the official claim.
 4. **D32 (ACTIVE)**: dense N=32 aggregate — THE ONLY LOSING CELL LEFT
-   (392.4 vs vLLM 501.9; was 303 pre-P2 — gap halved, not closed). P2's own
-   attribution names the suspect: at B=32 the mixer takes the single
-   `NK=32` monolithic tile which is "register-crippled, 75 GB/s effective"
-   (vs ~270 for the ≤8 tiles); P2 fixed the 8<K<32 ladder (multi-chunk
-   weight-read-once) but left K=32 on the old kernel. Extending the F2
-   multi-chunk dispatch to K=32 (4×8-chunks, weight read once, NK≤8 register
-   footprint) is the measured, non-speculative lever. Branch
-   `perf/qwen35-dense32`.
+   (392.4 vs vLLM 501.9; was 303 pre-P2 — gap halved, not closed).
+   CORRECTION (code-verified): the F2 multi-chunk dispatch ALREADY covers
+   K=32 (switch K≤8, default → multi_kernel<8>, ceil(K/8) chunks, weight
+   read once) — yet B=32 gained only +4.4% from F2 vs +28.6% at B=30. The
+   remaining ~2×-above-floor step time (~80 ms measured vs ~28–35 ms
+   theoretical for 3.89 GB mixer + 2.03 GB head + 1.5 GB GDN state at
+   273 GB/s) has an UNKNOWN dominant cost — requires fresh ncu/nsys
+   attribution at B=32 on the post-F1/F2 build before any fix. No assumed
+   lever. Branch `perf/qwen35-dense32`.
 5. Phase E distributed (parked).
 
 ## Mission
