@@ -399,6 +399,14 @@ qwen35-decode-bench: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_decode_bench $(QWEN35_MODEL) $(QWEN35_BENCH_NSTEP)"
 
+# L-moe-lowc: served MoE decode-step ms + agg tok/s at B=1,2,4,8 (engine-only, no HTTP/TTFT).
+QWEN35_MOE_MODEL ?= /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/0b2752837483aa34b3db6e83e151b150c0e00e49
+qwen35-moe-decode-bench: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/bench_qwen35_moe_decode.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_moe_decode_bench \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	@echo "built /tmp/fucina_moe_decode_bench — run under flock when GPU free"
+
 # ─── Qwen3.5 FP8 same-checkpoint single-stream bench (GPU) ───────────────
 # P7 apples-to-apples anchor: single-stream decode tok/s + prefill latency of the FP8
 # reference path on the SAME official Qwen3.5-9B-FP8 checkpoint vLLM serves. Isolates
@@ -589,6 +597,15 @@ dg-fp4-grouped:   # CUTLASS grouped FP4 microbench (speed vs dp4a); run: /tmp/dg
 	$(NVCC) -std=c++17 -O3 -arch=$(CUDA_ARCH) --expt-relaxed-constexpr --expt-extended-lambda \
 		-DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include \
 		cuda/test_dg_fp4_grouped.cu -o /tmp/dg_fp4_grouped
+# Low-conc MoE decode attribution: NVFP4 grouped expert GEMM at Qwen3.5-35B-A3B shapes, active-expert sweep.
+bench-moe-lowc-fp4:   # run under flock: flock /tmp/fucina_gpu.lock -c '/tmp/fucina_moe_lowc_fp4 [R] [tok]'
+	$(NVCC) -std=c++17 -O3 -arch=$(CUDA_ARCH) --expt-relaxed-constexpr --expt-extended-lambda \
+		-DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include \
+		cuda/bench_moe_lowc_fp4.cu -o /tmp/fucina_moe_lowc_fp4
+# L-moe-lowc: isolated LM-head decode read cost, BF16 (1.0 GB) vs Q8_0 (0.53 GB), weight-read-once B=1..8.
+bench-head-lowc:
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/bench_head_lowc.cu -o /tmp/fucina_head_lowc
+	@echo "run: flock /tmp/fucina_gpu.lock -c '/tmp/fucina_head_lowc'"
 dg-fp4-parity: cuda/diffusion_gemma_kernels.o cuda/dg_fp4_moe.o   # FP4 grouped vs dequant ref on real weights
 	$(NVCC) -std=c++17 -O3 -arch=$(CUDA_ARCH) -dc --expt-relaxed-constexpr --expt-extended-lambda \
 		-DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include \
