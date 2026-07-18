@@ -1953,6 +1953,8 @@ __global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi_kernel(
             #pragma unroll
             for (int n = 0; n < NK; n++) {
                 if (n >= ntok) break;
+                // D32B: __ldg on activations measured NEUTRAL (455 vs 465, within noise) — they are
+                // already L1-served at 90% hit, so the read-only path doesn't cut the latency.
                 uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);        // xqs[0..3]
                 uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);  // xqs[4..7]
                 int sumi;

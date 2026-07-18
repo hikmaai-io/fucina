@@ -128,6 +128,21 @@ serves the duplicate at 90% hit — the latency is per-LDG-issue, not per-DRAM-f
 **Occupancy is the binding constraint; trading it for load-sharing loses.** This is the
 key negative result: the latency wall is occupancy-bound, not load-count-bound.
 
+### (6) `__ldg` on activation loads (read-only data cache) — MEASURED NEUTRAL
+
+The activation loads (A,B) are the `long_scoreboard` stall source and were plain global
+loads. Routing them through `__ldg` (read-only data cache) is bit-identical (same bytes).
+
+| activation load path | B=32 tok/s | hash |
+|---|---|---|
+| plain `*(const uint4*)` (default) | 456–465 | c6ab45eab1f2751c |
+| `__ldg` | 455.5 | c6ab45eab1f2751c |
+
+**Neutral** (within run noise): the activations are already L1-served at 90% hit, so the
+read-only path does not change the per-issue load latency. Confirms candidate #3 (wider
+vectorized loads) is already satisfied — the kernel uses `uint4` 128-bit loads for BOTH
+weights (hh/hq) and activations (A/B); there is no wider legal load. Reverted (no-op).
+
 ## 3. Final mixer config (shipped defaults) + zero-regression sweep
 
 Defaults: **BIGCHUNK=12, MINBLK=4, DPSPLIT=2, PIPE=2, NWARPS=8** (K>16 path only;
