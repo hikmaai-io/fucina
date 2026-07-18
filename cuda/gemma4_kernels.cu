@@ -25,6 +25,7 @@
 #include <mma.h>              // nvcuda::wmma tf32 tensor cores (GDN chunk-scan matmuls)
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cuda_pipeline.h>   // D32B: cp.async (__pipeline_memcpy_async) for smem weight prefetch
 
 // POSIX headers for host-side file loading (mmap, open, etc.)
 #include <fcntl.h>
@@ -1998,6 +1999,110 @@ __global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi_kernel(
     }
 }
 
+// D32B: cp.async DEEP-PREFETCH variant. The register-staged PIPE=3/4 sweep spilled because the
+// prefetched uint4 hh/hq live in REGISTERS. __pipeline_memcpy_async (cp.async) copies global->
+// shared DIRECTLY, bypassing registers, so prefetch depth (STAGES) is decoupled from register
+// pressure — the exact latency-hiding CUTLASS/Marlin use. Each warp owns one row; per b-window
+// it stages (hh,hq) = 32 bytes/lane into a STAGES-deep smem ring, keeping STAGES weight epochs
+// in flight to hide the long-scoreboard weight-load latency occupancy alone could not. The dp4a
+// accumulation over b (ascending, lane-strided) is UNCHANGED — cp.async only moves the SAME
+// bytes earlier — so the output is BITWISE-identical (hash-verified). smem/block = nwarps*32*32*
+// STAGES bytes (8 warps, STAGES=3 => 24 KiB) — well within the 48 KiB default.
+template<int NK, int MINBLK = 4, int DPSPLIT = 1, int STAGES = 3>
+__global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_cpasync_kernel(
+    float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.y * nwarps + warp;
+    if (idx >= out_dim) return;
+    const int t0 = (int)blockIdx.x * NK;
+    const int ntok = (K - t0 < NK) ? (K - t0) : NK;
+    const int8_t *qxTc = qxT + (size_t)t0 * in_dim;
+    const float  *dxc  = dx + (size_t)t0 * (in_dim >> 5);
+    const int    *sxc  = sx + (size_t)t0 * (in_dim >> 5);
+    float        *outc = out + (size_t)t0 * out_dim;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * 144;
+    // smem ring: [warp][stage][lane] each holds hh(uint4)+hq(uint4) = 32 bytes.
+    extern __shared__ uint4 cpa_smem[];
+    uint4 *myh = cpa_smem + (size_t)warp * STAGES * 32 * 2;   // 2 uint4 (hh,hq) per lane
+    float acc[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
+    // Prime the pipeline: issue STAGES async copies for the first STAGES b-windows.
+    auto issue = [&](int stage, int b) {
+        uint4 *dsth = myh + (size_t)stage * 32 * 2 + (size_t)lane * 2;
+        if (b < nb32) {
+            const uint8_t *blk = wrow + (size_t)(b >> 3) * 144;
+            __pipeline_memcpy_async(dsth,     (const uint4 *)blk, sizeof(uint4));
+            __pipeline_memcpy_async(dsth + 1, (const uint4 *)(blk + 16 + (size_t)(b & 7) * 16), sizeof(uint4));
+        }
+        __pipeline_commit();
+    };
+    int nb_iters = (nb32 - lane + 32 - 1) / 32;   // # b-windows this lane walks (b = lane, lane+32, ...)
+    #pragma unroll 1
+    for (int s = 0; s < STAGES; s++) {
+        int b = lane + 32 * s;
+        issue(s, b);
+    }
+    #pragma unroll 1
+    for (int it = 0; it < nb_iters; it++) {
+        int b = lane + 32 * it;
+        int stage = it % STAGES;
+        __pipeline_wait_prior(STAGES - 1);   // wait until this stage's copy is done
+        __syncwarp();
+        uint4 *srch = myh + (size_t)stage * 32 * 2 + (size_t)lane * 2;
+        uint4 h = srch[0];
+        uint4 q = srch[1];
+        int j = b & 7;
+        __half_raw hd; hd.x = (uint16_t)(h.x & 0xFFFF);
+        __half_raw hm; hm.x = (uint16_t)(h.x >> 16);
+        float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+        int s_, m_; q4k_scale_min_reg(h.y, h.z, h.w, j, &s_, &m_);
+        float ds = d*(float)s_, dm = dmin*(float)m_;
+        int wv[8];
+        int w0=(int)q.x, w1=(int)q.y, w2=(int)q.z, w3=(int)q.w;
+        wv[0]=w0&0x0F0F0F0F; wv[1]=(w0>>4)&0x0F0F0F0F;
+        wv[2]=w1&0x0F0F0F0F; wv[3]=(w1>>4)&0x0F0F0F0F;
+        wv[4]=w2&0x0F0F0F0F; wv[5]=(w2>>4)&0x0F0F0F0F;
+        wv[6]=w3&0x0F0F0F0F; wv[7]=(w3>>4)&0x0F0F0F0F;
+        const int8_t *xbase = qxTc + (size_t)(b >> 5)*1024 + (size_t)(b & 31)*16;
+        #pragma unroll
+        for (int n = 0; n < NK; n++) {
+            if (n >= ntok) break;
+            uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);
+            uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);
+            int sumi;
+            if (DPSPLIT >= 2) {
+                int q0=0,q1=0;
+                q0 = __dp4a(wv[0], (int)A.x, q0); q0 = __dp4a(wv[1], (int)B.x, q0);
+                q0 = __dp4a(wv[2], (int)A.y, q0); q0 = __dp4a(wv[3], (int)B.y, q0);
+                q1 = __dp4a(wv[4], (int)A.z, q1); q1 = __dp4a(wv[5], (int)B.z, q1);
+                q1 = __dp4a(wv[6], (int)A.w, q1); q1 = __dp4a(wv[7], (int)B.w, q1);
+                sumi = q0 + q1;
+            } else {
+                sumi = 0;
+                sumi = __dp4a(wv[0], (int)A.x, sumi); sumi = __dp4a(wv[1], (int)B.x, sumi);
+                sumi = __dp4a(wv[2], (int)A.y, sumi); sumi = __dp4a(wv[3], (int)B.y, sumi);
+                sumi = __dp4a(wv[4], (int)A.z, sumi); sumi = __dp4a(wv[5], (int)B.z, sumi);
+                sumi = __dp4a(wv[6], (int)A.w, sumi); sumi = __dp4a(wv[7], (int)B.w, sumi);
+            }
+            acc[n] += dxc[(size_t)n*nb32 + b] *
+                      (ds*(float)sumi - dm*(float)sxc[(size_t)n*nb32 + b]);
+        }
+        // Refill this stage with the b-window STAGES iterations ahead.
+        int bnext = lane + 32 * (it + STAGES);
+        issue(stage, bnext);
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) {
+        if (n >= ntok) break;
+        float v = warp_reduce_sum_all(acc[n]);
+        if (lane==0) outc[(size_t)n*out_dim+idx] = v;
+    }
+}
+
 // D32B: 2-OUTPUT-ROWS-PER-WARP variant (the doc's named candidate #1, re-measured in the
 // occupancy-tuned context). The dominant stall is long_scoreboard on the ACTIVATION loads
 // (A,B) which depend ONLY on (token n, b-window) — NOT on the output row. So one warp owning
@@ -2167,6 +2272,32 @@ static void mmvq_q4_k_packedT_batched_launch(
         } else {
             mmvq_q4_k_packedT_multi2row_kernel<4,4,1,2><<<gm, mb_threads, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
         }
+        return;
+    }
+    // D32B: cp.async deep-prefetch variant (FUCINA_Q4K_CPASYNC=1, FUCINA_Q4K_STAGES={2,3,4,6}).
+    // Stages weights global->smem bypassing registers => deep prefetch without the PIPE spill.
+    // Bit-identical (moves same bytes earlier; dp4a order unchanged). NK per BIGCHUNK env.
+    static int cpasync = -1, stages_env = -1;
+    if (cpasync < 0)    { const char *e = getenv("FUCINA_Q4K_CPASYNC"); cpasync    = e ? atoi(e) : 0; }
+    if (stages_env < 0) { const char *e = getenv("FUCINA_Q4K_STAGES");  stages_env = e ? atoi(e) : 3; }
+    if (cpasync == 1 && K > 16) {
+        static int bcc = -1; if (bcc < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bcc = e ? atoi(e) : 12; }
+        int nkc = (bcc == 8) ? 8 : (bcc == 16 ? 16 : 12);
+        int mb = minblk_env > 0 ? minblk_env : 4;
+        dim3 gm((unsigned)((K + nkc - 1) / nkc), (unsigned)((out_dim + MW - 1) / MW));
+        size_t smem = (size_t)MW * 32 * 2 * sizeof(uint4) * stages_env;   // nwarps*32 lanes*2 uint4*STAGES
+        #define CPA(NK,MB,ST) mmvq_q4_k_packedT_cpasync_kernel<NK,MB,2,ST><<<gm, mb_threads, smem, stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K)
+        if (nkc == 8) {
+            if (mb>=4){ if(stages_env>=6) CPA(8,4,6); else if(stages_env==4) CPA(8,4,4); else if(stages_env==2) CPA(8,4,2); else CPA(8,4,3); }
+            else      { if(stages_env>=6) CPA(8,3,6); else if(stages_env==4) CPA(8,3,4); else if(stages_env==2) CPA(8,3,2); else CPA(8,3,3); }
+        } else if (nkc == 16) {
+            if (mb>=4){ if(stages_env>=6) CPA(16,4,6); else if(stages_env==4) CPA(16,4,4); else if(stages_env==2) CPA(16,4,2); else CPA(16,4,3); }
+            else      { if(stages_env>=6) CPA(16,3,6); else if(stages_env==4) CPA(16,3,4); else if(stages_env==2) CPA(16,3,2); else CPA(16,3,3); }
+        } else {
+            if (mb>=4){ if(stages_env>=6) CPA(12,4,6); else if(stages_env==4) CPA(12,4,4); else if(stages_env==2) CPA(12,4,2); else CPA(12,4,3); }
+            else      { if(stages_env>=6) CPA(12,3,6); else if(stages_env==4) CPA(12,3,4); else if(stages_env==2) CPA(12,3,2); else CPA(12,3,3); }
+        }
+        #undef CPA
         return;
     }
     // Dispatch a (NK, MINBLK) tile across the DPSPLIT×PIPE grid. MINBLK is fixed per NK for register

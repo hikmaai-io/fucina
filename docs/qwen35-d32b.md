@@ -157,6 +157,33 @@ read-only path does not change the per-issue load latency. Confirms candidate #3
 vectorized loads) is already satisfied — the kernel uses `uint4` 128-bit loads for BOTH
 weights (hh/hq) and activations (A/B); there is no wider legal load. Reverted (no-op).
 
+### (7) cp.async deep-prefetch (global→smem, register-bypass) — MEASURED COUNTERPRODUCTIVE
+
+The canonical CUTLASS/Marlin latency-hiding technique, and the one lever that could beat
+the PIPE spill: `__pipeline_memcpy_async` (cp.async) stages weights global→**shared**
+DIRECTLY, bypassing registers, so prefetch depth decouples from register pressure. New
+kernel `mmvq_q4_k_packedT_cpasync_kernel` (STAGES-deep smem ring), `FUCINA_Q4K_CPASYNC=1`,
+`FUCINA_Q4K_STAGES={2,3,4,6}`. **Bit-identical** — hashes match all B (c6ab45eab1f2751c
+@ B=32): cp.async only moves the SAME bytes earlier; the dp4a order is untouched.
+
+| STAGES | B=32 tok/s | vs register-staged 465 |
+|---|---|---|
+| 2 | 350.6 | −25% |
+| 3 | 343.6 | −26% |
+| 4 | 308.5 | −34% |
+| 6 | 274.0 | −41% |
+
+**Slower, and worse with depth.** ncu (STAGES=2, `<12,4,2,2>`): long_scoreboard **30**
+(vs 16 register-staged), inst/cycle **0.19-0.22** (vs 0.31), 64 regs, 66% occ. Root
+cause: on GB10 the weights are already L1/L2-hot (89-90% hit) — the kernel is
+**cache-latency-bound, not DRAM-bound**, so there is no DRAM latency for cp.async to
+hide. `__pipeline_wait_prior` instead SERIALIZES the warp on the smem-arrival scoreboard
+(a blocking wait counted as long_scoreboard) and the extra global→smem→register
+round-trip adds latency the direct L1-hot load did not have. This is the definitive
+negative result: **the very technique GEMMs use to hide DRAM latency backfires when the
+bottleneck is cache-hit-latency**, confirming the D32 diagnosis that the mixer sits
+~2× above the memory floor. Kept env-gated (default off) as evidence.
+
 ## 3. Final mixer config (shipped defaults) + zero-regression sweep
 
 Defaults: **BIGCHUNK=12, MINBLK=4, DPSPLIT=2, PIPE=2, NWARPS=8** (K>16 path only;
@@ -256,6 +283,9 @@ gates green. The gap vs the FRESH vLLM N=32 (521.8) narrowed from **−22% (07-1
 | NWARPS | 8 best | launch_bounds caps at 8 warps |
 | **BIGCHUNK=12 + MINBLK=4** | **+9.1%** | **occupancy 53→70-86%, regs 77→64 — the win** |
 | 2-rows-per-warp | −23% | register cliff (80 regs, occ 45%); load-sharing doesn't cut the stall |
+| PIPE×MINBLK full cross | no better point | deeper staging unrescuable by lower MINBLK |
+| `__ldg` activations | neutral | activations already L1-hot (90%) |
+| cp.async deep-prefetch | −25 to −41% | cache-latency-bound, not DRAM-bound: smem round-trip + wait_prior backfire (long_scoreboard 16→30) |
 
 After the occupancy lever the mixer sits at **SM 37%, warps 70–86%, inst/cycle 0.31**,
 with the residual **long_scoreboard ~16 cyc/issue irreducible** for the dp4a
