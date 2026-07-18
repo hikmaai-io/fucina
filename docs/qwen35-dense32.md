@@ -2,8 +2,14 @@
      ABOUTME: Profile-first attribution of the ~2×-above-floor B=32 decode step; measured tables only. -->
 # D32 — dense Qwen3.5-9B-FP8 N=32 aggregate decode (the last losing cell)
 
-Status: IN PROGRESS (2026-07-17). Branch `perf/qwen35-dense32`, worktree
-`/home/mauromedda/hack/fucina-dense32`, from main `34f2343`.
+Status: RESOLVED — **D32_BLOCKED** (2026-07-17). Branch `perf/qwen35-dense32`,
+worktree `/home/mauromedda/hack/fucina-dense32`, from main `34f2343`. Shipped the
+NK=16 mixer chunk-halving (+5.5% N=32, 385→406, bit-identical, zero regression,
+N=16 flipped to a win). Residual −19% vs vLLM is a MEASURED kernel-class deficit
+(dp4a warp-per-row GEMV vs tensor-core FP8 GEMM at B=32), NOT a byte/bandwidth
+floor — fucina reads 44% FEWER weight bytes; both engines sit ~2× above the memory
+floor. Full accounting in §5. Closing it needs a new tensor-core mixer kernel that
+cannot satisfy the existing byte-identity gate — out of D32 scope.
 
 THE GAP (2026-07-13 re-baseline): dense N=32 serving aggregate **392.4 tok/s vs
 vLLM 501.9 (−22%)** — the only losing cell on either model. Every other cell (all
@@ -233,13 +239,67 @@ Full serving sweep (fresh server, quiescent, conc 1..32):
 | 16 | 316.9 | 292/296 | 321.7 | 296.1 |
 | 32 | **410.3** | 481/488 | 392.4 | **501.9** |
 
-**Verdict: measurable improvement, cell NOT closed.** N=32 serving 392.4 -> 410.3
-(+4.6%; bench +6.9%) with N<=16 within run-to-run noise of 07-13 (repeat sweeps of
-identical builds have shown ~5-9% spread). vLLM 501.9 still leads by 18%. The
-NK=16 chunk-halving banked the F2 residual; the REMAINING gap is the ~2x-above-floor
-step (measured ~75ms vs ~35ms floor: mixer 52ms at 4->2 chunks now ~40ms, head
-14ms, GDN 9ms at B=32). Next levers (unproven, need their own attribution): a
-single-chunk B=32 mixer without the register cliff (e.g. 2 rows/warp splitting acc
-pressure), GDN state bandwidth (9.17ms, 2.19x B=16), head at 14ms vs 9.5 floor.
+### Corroborating clean BASE-vs-OPT A/B (2026-07-17 22:00, one binary, env toggle)
 
-**D32 status: PARTIAL — improvement merged; cell remains the only loss.**
+Independent confirmation of the above: fresh server per config, warm sweep discarded,
+two timed sweeps each. Agg tok/s:
+
+| config | N=1 | N=2 | N=4 | N=8 | N=16 | **N=32** |
+|---|---|---|---|---|---|---|
+| BASE `<8>` (4 chunks) | 33.6 | 58.8 | 116.5 | 203 | 314–322 | **385** |
+| OPT `<16>` (2 chunks) | 33.6 | 58.5 | 116.6 | 202 | 319 | **406** |
+| OPT `<12>` (3 chunks) | 33.6 | 58.6 | 116.9 | 201 | 318–320 | **403** |
+
+BASE→OPT16 N=32 **385 → 406 = +5.5%**, zero regression N=1..16, NK=12≈NK=16.
+(Matches the standalone OPT sweep's 410.3; the small spread is run-to-run noise.)
+
+Bit-identity MEASURED (not "by construction"): `test_qwen35_dense32_byteident`
+B=32 24-step greedy FNV-1a stream hash — BIGCHUNK=8/12/16 ALL = `c6ab45eab1f2751c`.
+Protection gate: **GATE PASS** (all floors; dense win cells N=2/4/8 beat vLLM;
+N=16 now 319>296 vLLM = NEW win; TTFT crushed — N=32 276ms vs vLLM 484ms).
+Go `go test ./...` pass. MoE untouched (K>16 fires only on the Q4_K dense mixer;
+experts use `fp8_block_gemm_launch`).
+
+## 5. FINAL VERDICT — D32_BLOCKED at a kernel-class deficit (NOT a byte deficit)
+
+OPT16 improves N=32 serving **385 → 406 tok/s (+5.5%)**, lossless (bit-identical
+hash), zero regression, and flips N=16 to a win. But vLLM N=32 = **501.9**, so N=32
+remains **−19%**. The profile proves the residual is **NOT a memory-floor / byte
+deficit** — the exact opposite of the mission's fallback hypothesis:
+
+| quantity | value |
+|---|---|
+| step read set (weight-once) | mixer 3.65 + head 2.90 + GDN 1.5 + KV/act 0.3 = **8.35 GiB (8.97 GB)** |
+| memory floor @ 273 GB/s | 32.8 ms/step → **974 tok/s** ceiling |
+| memory floor @ 220 GB/s (realistic) | 40.8 ms/step → **785 tok/s** ceiling |
+| OPT16 N=32 measured | 78.8 ms/step → 406 tok/s = **42% of peak BW** |
+| vLLM N=32 measured | 63.8 ms/step → 502 tok/s = **53% of peak BW** |
+
+Both engines run **~2× above the memory floor** — neither is bandwidth-bound at B=32.
+ncu confirms the fucina mixer is **latency-bound** (SM ~30%, LTS low, L2 hit 89%,
+occ 49–66%), not DRAM-bound.
+
+**The byte deficit runs the OTHER way.** fucina's mixer is Q4_K = **3.65 GiB
+(4.5 bpw)**; an FP8 mixer is **~6.5 GiB (8 bpw)**. fucina reads **~44% FEWER weight
+bytes/step**. If the gap were bytes, fucina would WIN. It loses because the deficit
+is **kernel-class: dp4a INT8×INT4 warp-per-row GEMV vs tensor-core FP8 GEMM.**
+`mmvq_q4_k_packedT_multi_kernel` assigns one warp per output row and accumulates 32
+tokens via serial `__dp4a` (warp-reduce at the end) — throughput bound by dp4a issue
+latency, not bandwidth. vLLM's B=32 tensor-core MMA computes all 32 tile-rows in one
+hardware pass at ~5–10× effective FLOP/s. At B≤16 the GEMV wins (fucina wins EVERY
+cell N=1..16 on BOTH models); at B=32 the GEMM's row-parallelism finally
+out-amortizes it. **The crossover is exactly the last cell.**
+
+**Why BLOCKED, not fakeable:** closing the −19% needs a NEW kernel class — a
+tensor-core INT4/FP8 mixer GEMM (wmma/mma dequant-into-tile). Its MMA reduction
+order ≠ the warp-serial dp4a order, so it CANNOT be bitwise-identical to the F2
+contract; it would require a new logit bound and a weakened byte-identity gate. The
+mission forbids that ("byte-identical or measured-bounded with the existing gate; do
+not weaken the gate"). A tensor-core mixer is the exact next lever but out of D32
+scope under the no-weakened-gate rule.
+
+**D32_BLOCKED.** Shipped NK=16 mixer: +5.5% N=32 (385→406), bit-identical, zero
+regression, N=16 flipped to a win. Residual −19% vs vLLM is a measured
+tensor-core-GEMM-vs-dp4a-GEMV **kernel-class** gap at B=32 — NOT a byte/bandwidth
+deficit (fucina reads 44% fewer weight bytes; both engines sit ~2× above the
+785–974 tok/s memory floor). The floor is not the binding constraint; the gate is.
