@@ -119,6 +119,23 @@ to hide the load latency. D32 shipped MINBLK=3; D32B finds **MINBLK=4** is the l
 | **`<12,4>` (D32B best)** | **465** | **64** | **70–86%** | **0.29–0.31** |
 | `<8,4>` (4 chunks) | 398 | — | — | — |
 
+**Complete BIGCHUNK curve (best MINBLK per tile) — NK=12 is the GLOBAL optimum:**
+The full width sweep including the wide end (NK=24 = 2 chunks, NK=32 = 1 chunk = weights
+dequantized exactly ONCE across all 32 tokens) confirms a single interior peak. All
+bit-identical (hash c6ab45eab1f2751c).
+
+| NK (chunks @ B=32) | best B=32 tok/s |
+|---|---|
+| 8 (4 chunks) | 398 |
+| **12 (3 chunks)** | **465** ← peak |
+| 16 (2 chunks) | 449 |
+| 24 (2 chunks) | 416 |
+| 32 (1 chunk, dequant-once) | 411 |
+
+The wide tiles' acc[24]/acc[32] register pressure crushes occupancy faster than the
+dequant-reuse benefit helps — even NK=32 (weights dequantized only once) loses to NK=12.
+The register-vs-reuse tradeoff has one interior optimum at NK=12; candidate #4 exhausted.
+
 The NK=12 tile (3 chunks @ B=32) at MINBLK=4 drops registers 77→64, lifts occupancy
 53%→70–86%, and issue rate 0.20→0.31 → **B=32 426→465 (+9.1%)**, bit-identical.
 NK=16 was register-crippled; NK=8's 4 chunks cost too much redundant L2/dequant.

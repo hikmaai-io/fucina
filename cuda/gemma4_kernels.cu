@@ -2326,6 +2326,16 @@ static void mmvq_q4_k_packedT_batched_launch(
         } else if (bigchunk == 12) {
             dim3 gm((unsigned)((K + 11) / 12), (unsigned)((out_dim + MW - 1) / MW));
             D32B_DISP(12, 4, gm);   // D32B: MINBLK=4 measured-best (occ 53%→70%, +9.3% @ B=32)
+        } else if (bigchunk == 24) {
+            // D32B: wide end — NK=24 (2 chunks @ B=32) dequants weights fewer times but acc[24]
+            // costs registers. Untested wide corner of candidate #4. Bit-identical.
+            dim3 gm((unsigned)((K + 23) / 24), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(24, 2, gm);
+        } else if (bigchunk == 32) {
+            // D32B: widest — NK=32 (1 chunk @ B=32) dequants each row's weights EXACTLY ONCE
+            // across all 32 tokens (max dequant reuse) but acc[32] is maximal register pressure.
+            dim3 gm((unsigned)((K + 31) / 32), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(32, 2, gm);
         } else {
             dim3 gm((unsigned)((K + 15) / 16), (unsigned)((out_dim + MW - 1) / MW));
             D32B_DISP(16, 3, gm);
