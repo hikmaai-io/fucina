@@ -399,6 +399,21 @@ qwen35-decode-bench: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_decode_bench $(QWEN35_MODEL) $(QWEN35_BENCH_NSTEP)"
 
+# ─── D32B dense N=32 mixer-ILP harnesses (build-only; run by hand under flock) ───────────
+# Batch decode bench (agg tok/s per B) over the served step_batch path. Args: <model> NSTEP BMAX BMIN.
+qwen35-dense32-bench: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_batch_bench.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dense32_bench \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	@echo "built /tmp/fucina_dense32_bench — run under flock: flock /tmp/fucina_gpu.lock -c '/tmp/fucina_dense32_bench $(QWEN35_FP8_MODEL) 96 32 1'"
+
+# Byte-identity gate: FNV-1a greedy token stream hash. Args: <model> NSTEP B. B=32/24 must be c6ab45eab1f2751c.
+qwen35-dense32-byteident: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_dense32_byteident.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_dense32_byteident \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	@echo "built /tmp/fucina_dense32_byteident — run under flock: flock /tmp/fucina_gpu.lock -c '/tmp/fucina_dense32_byteident $(QWEN35_FP8_MODEL) 24 32'"
+
 # L-moe-lowc: served MoE decode-step ms + agg tok/s at B=1,2,4,8 (engine-only, no HTTP/TTFT).
 QWEN35_MOE_MODEL ?= /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/0b2752837483aa34b3db6e83e151b150c0e00e49
 qwen35-moe-decode-bench: lib libdg

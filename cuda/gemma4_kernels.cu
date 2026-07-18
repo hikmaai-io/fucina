@@ -1889,12 +1889,23 @@ __global__ void mmvq_q4_k_packedT_batched_kernel(
 // D32: MINBLK is a template arg so the wider NK=16 tile (16 acc regs vs 8) can trade a little
 // occupancy for HALF the chunk count at K>16 (B=32 → 2 chunks not 4), cutting the redundant
 // L2 weight bandwidth + per-chunk Q4_K dequant ALU that measured 65% of the B=16→32 step growth.
-template<int NK, int MINBLK = 4>
+// D32B: DPSPLIT breaks the 8-deep SERIAL __dp4a chain (one `sumi` threaded through 8 dp4a =
+// an 8-long ALU dependency chain, measured as the 23-28 cyc/inst warp latency at inst/cycle 0.2
+// — pure latency starvation) into DPSPLIT INDEPENDENT partial sums that issue in parallel, then
+// sums them at the end. Two's-complement int32 addition is associative AND commutative, so the
+// final `sumi` is the sum of the SAME 8 dot4(wv,x) terms regardless of grouping → BITWISE-
+// identical (hash-verified, not asserted). Near-zero register cost (DPSPLIT-1 extra int regs),
+// shortens the per-token critical path 8→8/DPSPLIT for latency hiding without touching occupancy.
+// D32B: PIPE (staged superblock epochs) is a template arg so deeper weight staging (PIPE=3/4 =
+// more in-flight independent LDGs per warp) can be measured against the long-scoreboard stall
+// (ncu: 17-20 cyc/issue on activation+weight loads = the dominant stall) that occupancy alone
+// (53%, register-capped) cannot hide. Bit-identical: PIPE only changes how many b-windows are
+// prefetched, not the per-(row,token) ascending-b accumulation order.
+template<int NK, int MINBLK = 4, int DPSPLIT = 1, int PIPE = 2>
 __global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi_kernel(
     float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
     int in_dim, int out_dim, int K)
 {
-    constexpr int PIPE = 2;                      // superblock epochs staged per chunk
     int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int idx = blockIdx.y * nwarps + warp;        // output row (grid.y = row groups)
     if (idx >= out_dim) return;
@@ -1944,15 +1955,34 @@ __global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi_kernel(
                 if (n >= ntok) break;
                 uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);        // xqs[0..3]
                 uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);  // xqs[4..7]
-                int sumi = 0;
-                sumi = __dp4a(wv[0], (int)A.x, sumi);
-                sumi = __dp4a(wv[1], (int)B.x, sumi);
-                sumi = __dp4a(wv[2], (int)A.y, sumi);
-                sumi = __dp4a(wv[3], (int)B.y, sumi);
-                sumi = __dp4a(wv[4], (int)A.z, sumi);
-                sumi = __dp4a(wv[5], (int)B.z, sumi);
-                sumi = __dp4a(wv[6], (int)A.w, sumi);
-                sumi = __dp4a(wv[7], (int)B.w, sumi);
+                int sumi;
+                if (DPSPLIT >= 4) {
+                    // 4 independent dp4a chains (2-deep each) → shortest critical path.
+                    int s0=0,s1=0,s2=0,s3=0;
+                    s0 = __dp4a(wv[0], (int)A.x, s0); s0 = __dp4a(wv[1], (int)B.x, s0);
+                    s1 = __dp4a(wv[2], (int)A.y, s1); s1 = __dp4a(wv[3], (int)B.y, s1);
+                    s2 = __dp4a(wv[4], (int)A.z, s2); s2 = __dp4a(wv[5], (int)B.z, s2);
+                    s3 = __dp4a(wv[6], (int)A.w, s3); s3 = __dp4a(wv[7], (int)B.w, s3);
+                    sumi = (s0 + s1) + (s2 + s3);   // int32 add is exact & associative
+                } else if (DPSPLIT == 2) {
+                    // 2 independent dp4a chains (4-deep each).
+                    int s0=0,s1=0;
+                    s0 = __dp4a(wv[0], (int)A.x, s0); s0 = __dp4a(wv[1], (int)B.x, s0);
+                    s0 = __dp4a(wv[2], (int)A.y, s0); s0 = __dp4a(wv[3], (int)B.y, s0);
+                    s1 = __dp4a(wv[4], (int)A.z, s1); s1 = __dp4a(wv[5], (int)B.z, s1);
+                    s1 = __dp4a(wv[6], (int)A.w, s1); s1 = __dp4a(wv[7], (int)B.w, s1);
+                    sumi = s0 + s1;
+                } else {
+                    sumi = 0;
+                    sumi = __dp4a(wv[0], (int)A.x, sumi);
+                    sumi = __dp4a(wv[1], (int)B.x, sumi);
+                    sumi = __dp4a(wv[2], (int)A.y, sumi);
+                    sumi = __dp4a(wv[3], (int)B.y, sumi);
+                    sumi = __dp4a(wv[4], (int)A.z, sumi);
+                    sumi = __dp4a(wv[5], (int)B.z, sumi);
+                    sumi = __dp4a(wv[6], (int)A.w, sumi);
+                    sumi = __dp4a(wv[7], (int)B.w, sumi);
+                }
                 acc[n] += dxc[(size_t)n*nb32 + b] *
                           (ds*(float)sumi - dm*(float)sxc[(size_t)n*nb32 + b]);
             }
@@ -1970,6 +2000,9 @@ static void mmvq_q4_k_packedT_batched_launch(
     float *out, const uint8_t *w, const int8_t *qxT, const float *dx, const int *sx,
     int in_dim, int out_dim, int K, cudaStream_t stream)
 {
+    // D32B: NWARPS (block size = 32*NWARPS) is env-tunable for the K>16 multi-kernel only
+    // (FUCINA_Q4K_NWARPS={4,8,16}, default 8) — more warps/block can raise resident-warp count to
+    // hide the long-scoreboard load latency. K≤16 keeps NWARPS=8 (untouched winning path).
     const int NWARPS = 8; int b = NWARPS*32; dim3 g((out_dim + NWARPS - 1) / NWARPS);
     #define LPT_Q4K(NK,O) mmvq_q4_k_packedT_batched_kernel<NK><<<g,b,0,stream>>>( \
         out + (size_t)(O)*out_dim, w, qxT + (size_t)(O)*in_dim, \
@@ -1988,27 +2021,69 @@ static void mmvq_q4_k_packedT_batched_launch(
     // D32: for K>16 a wider chunk tile HALVES the chunk count (B=32 → 2 chunks at NK=16, 3 at
     // NK=12, vs 4 at NK=8), cutting the redundant L2 weight bandwidth + per-chunk Q4_K dequant
     // that measured 65% of the B=16→32 step growth — but a wider acc[] costs registers (occupancy).
-    // The NK/MINBLK for K>16 is config-selectable (FUCINA_Q4K_BIGCHUNK={8,12,16}, default 16) so
+    // The NK/MINBLK for K>16 is config-selectable (FUCINA_Q4K_BIGCHUNK={8,12,16}, default 12) so
     // the chunk-width vs occupancy tradeoff is MEASURED per box, not hardcoded. Every variant is
     // bitwise-identical (NK-independent per-(row,token) ascending-b accumulation). K≤16 keeps NK=8.
+    // D32B: the mixer is latency-bound (ncu: long_scoreboard 17-20 cyc/issue on activation+weight
+    // loads, inst/cycle 0.2, occ 53% register-capped). Three orthogonal, bitwise-identical ILP
+    // knobs are config-selectable to hunt the latency wall (all hash-verified c6ab45eab1f2751c):
+    //   FUCINA_Q4K_DPSPLIT={1,2,4}  — split the 8-deep serial __dp4a chain (int32 add associative)
+    //   FUCINA_Q4K_PIPE={2,3,4}     — deeper superblock staging = more in-flight LDGs per warp
+    //   FUCINA_Q4K_MINBLK={2,3,4,5} — __launch_bounds__ min-blocks/SM = occupancy vs register tradeoff
+    // None change the per-(row,token) ascending-b accumulation order → bit-identical by construction.
+    static int dpsplit = -1, pipe = -1, minblk_env = -1, nw_env = -1;
+    if (dpsplit < 0)    { const char *e = getenv("FUCINA_Q4K_DPSPLIT"); dpsplit    = e ? atoi(e) : 1; }
+    if (pipe < 0)       { const char *e = getenv("FUCINA_Q4K_PIPE");    pipe       = e ? atoi(e) : 2; }
+    if (minblk_env < 0) { const char *e = getenv("FUCINA_Q4K_MINBLK");  minblk_env = e ? atoi(e) : 0; }
+    if (nw_env < 0)     { const char *e = getenv("FUCINA_Q4K_NWARPS");  nw_env     = e ? atoi(e) : 8; }
+    const int MW = nw_env > 0 ? nw_env : 8; const int mb_threads = MW*32;
+    // Dispatch a (NK, MINBLK) tile across the DPSPLIT×PIPE grid. MINBLK is fixed per NK for register
+    // headroom (env override MINBLK applies to the wide NK=16/12 tiles only where occupancy bites).
+    #define D32B_DISP(NK, MB, gm) do { \
+        int mb = minblk_env > 0 ? minblk_env : (MB); const int b = mb_threads; \
+        if (mb <= 2) { \
+            if (dpsplit==4){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,2,4,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,2,4,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,2,4,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else if(dpsplit==2){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,2,2,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,2,2,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,2,2,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else { if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,2,1,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,2,1,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,2,1,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+        } else if (mb == 3) { \
+            if (dpsplit==4){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,3,4,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,3,4,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,3,4,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else if(dpsplit==2){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,3,2,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,3,2,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,3,2,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else { if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,3,1,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,3,1,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,3,1,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+        } else { \
+            if (dpsplit==4){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,4,4,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,4,4,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,4,4,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else if(dpsplit==2){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,4,2,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,4,2,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,4,2,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else { if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,4,1,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,4,1,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,4,1,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+        } } while(0)
     if (K > 16) {
         static int bigchunk = -1;
-        if (bigchunk < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bigchunk = e ? atoi(e) : 16; }
+        if (bigchunk < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bigchunk = e ? atoi(e) : 12; }
         if (bigchunk == 8) {
-            dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
-            mmvq_q4_k_packedT_multi_kernel<8><<<gm, b, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+            dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(8, 4, gm);
         } else if (bigchunk == 12) {
-            dim3 gm((unsigned)((K + 11) / 12), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
-            mmvq_q4_k_packedT_multi_kernel<12, 3><<<gm, b, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+            dim3 gm((unsigned)((K + 11) / 12), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(12, 4, gm);   // D32B: MINBLK=4 measured-best (occ 53%→70%, +9.3% @ B=32)
         } else {
-            dim3 gm((unsigned)((K + 15) / 16), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
-            mmvq_q4_k_packedT_multi_kernel<16, 3><<<gm, b, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+            dim3 gm((unsigned)((K + 15) / 16), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(16, 3, gm);
         }
         return;
     }
-    dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
-    mmvq_q4_k_packedT_multi_kernel<8><<<gm, b, 0, stream>>>(
-        out, w, qxT, dx, sx, in_dim, out_dim, K);
+    // K in (8,16]: keep the untouched winning NK=8/2-chunk path at fixed NWARPS=8 (NWARPS env is
+    // a K>16-only tuning knob) but still honor DPSPLIT/PIPE/MINBLK (all bit-identical).
+    {
+        const int b8 = 8*32;
+        dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + 8 - 1) / 8));
+        int mb = minblk_env > 0 ? minblk_env : 4;
+        if (mb <= 3) {
+            if (dpsplit==2) mmvq_q4_k_packedT_multi_kernel<8,3,2,2><<<gm,b8,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K);
+            else            mmvq_q4_k_packedT_multi_kernel<8,3,1,2><<<gm,b8,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K);
+        } else {
+            if (dpsplit==2) mmvq_q4_k_packedT_multi_kernel<8,4,2,2><<<gm,b8,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K);
+            else            mmvq_q4_k_packedT_multi_kernel<8,4,1,2><<<gm,b8,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K);
+        }
+    }
+    #undef D32B_DISP
 }
 
 // ─── Native Q4_K / Q6_K → BF16 dequant (fast Qwen3 prefill) ─────────────────────────
