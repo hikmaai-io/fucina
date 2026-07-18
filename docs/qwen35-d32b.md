@@ -293,6 +293,28 @@ Serving 438 vs bench 465 (the ~27 tok/s gap is admission/scheduler overhead in t
 Protection gate (`scripts/protection_gate.py`): **GATE PASS both models** — all
 claimed-win cells beat the fresh contemporaneous vLLM; no floor regressions.
 
+## 5b. Pipe-utilization proof — no functional unit is saturated (ncu, MEASURED)
+
+A final counter-hypothesis check: is the dp4a (FMA/DP) pipe itself the ceiling? ncu
+pipe-utilization on the shipped `<12,4,2,2>` at B=32 proves NO — every pipe is idle,
+the SM is purely stalled:
+
+| pipe | % of peak sustained-active |
+|---|---|
+| FMA (dp4a runs here) | **14.1%** |
+| ALU | 10.1% |
+| LSU (loads) | 10.4% |
+| issue slots active | **33.3%** |
+| inst issued / cycle | 0.33 |
+
+No functional unit exceeds 15%; issue is active only a third of cycles. The mixer is
+**neither compute-bound nor LSU-bound — it is latency-stalled**. This rules out the "dp4a
+units saturated" explanation: there is ample FMA headroom (86% idle), but the warp-per-row
+GEMV cannot expose enough independent work to fill it, because occupancy is register-
+capped (4 blocks/SM) and every latency-hiding restructure either spills or forces
+chunk-count overhead. The ceiling is pure dependency latency, structurally un-hideable
+under the byte-identity constraint.
+
 ## 6. Gates — all green
 
 - **Byte-identity**: FNV hash `c6ab45eab1f2751c` (B=32/24) unchanged for every variant;
