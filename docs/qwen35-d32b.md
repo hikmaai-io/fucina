@@ -293,7 +293,16 @@ gates green. The gap vs the FRESH vLLM N=32 (521.8) narrowed from **−22% (07-1
 
 After the occupancy lever the mixer sits at **SM 37%, warps 70–86%, inst/cycle 0.31**,
 with the residual **long_scoreboard ~16 cyc/issue irreducible** for the dp4a
-warp-per-row GEMV kernel class. Occupancy is now saturated (MINBLK≥4 plateaus). The
+warp-per-row GEMV kernel class.
+
+**The occupancy ceiling is REGISTER-BOUND, quantitatively proven** (ncu
+`launch__occupancy_limit_*`, `<12,4,2,2>`): the resident-block limiter is **registers = 4
+blocks/SM**, below warps (6) and block-count (24). At 64 regs/thread × 256 threads =
+16,384 regs/block, the SM's 65,536-reg file admits exactly 4 blocks. To raise occupancy
+further needs <64 regs/thread, but MINBLK=4 already cut 77→64 and lower forces spills
+(measured regressions). The live set — `acc[NK=12]` + `wv[8]` + the Q4_K dequant
+temporaries — is all essential to the bit-identical arithmetic; **no legal register
+reduction remains**. The wall is structural, not a tuning gap. The
 remaining −16% is the SAME tensor-core-GEMM-vs-dp4a-GEMV kernel-class deficit D32
 identified: vLLM's B=32 tensor-core MMA computes all 32 tile-rows in one hardware pass;
 the dp4a GEMV issues one warp per row and is bound by per-LDG-issue latency that
