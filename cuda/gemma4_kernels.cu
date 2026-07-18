@@ -2216,6 +2216,87 @@ __global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi2row_kerne
     }
 }
 
+// D32B: 4-OUTPUT-ROWS-PER-WARP (the mission's "2 OR 4 rows per warp" candidate, upper end).
+// Maximal activation-load amortization: one A/B load per (token,b) feeds FOUR independent
+// weight streams (rows row0..row0+3) => the long-scoreboard load is shared 4-way and there are
+// 4x independent dp4a chains per warp. acc[] = 4*NK (heavy register pressure => NK<=4 only).
+// Bit-identical: each row's per-(row,token) ascending-b accumulation is UNCHANGED; only the
+// row->warp mapping changes (rows 4w..4w+3 share a warp). Hash-verified, not asserted.
+template<int NK, int MINBLK = 4, int DPSPLIT = 1, int PIPE = 2>
+__global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi4row_kernel(
+    float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row0 = (blockIdx.y * nwarps + warp) * 4;
+    if (row0 >= out_dim) return;
+    const int nrow = min(4, out_dim - row0);
+    const int t0 = (int)blockIdx.x * NK;
+    const int ntok = (K - t0 < NK) ? (K - t0) : NK;
+    const int8_t *qxTc = qxT + (size_t)t0 * in_dim;
+    const float  *dxc  = dx + (size_t)t0 * (in_dim >> 5);
+    const int    *sxc  = sx + (size_t)t0 * (in_dim >> 5);
+    float        *outc = out + (size_t)t0 * out_dim;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    float acc[4][NK];
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        #pragma unroll
+        for (int n = 0; n < NK; n++) acc[r][n] = 0.0f;
+    }
+    for (int b0 = lane; b0 < nb32; b0 += 32*PIPE) {
+        #pragma unroll
+        for (int p = 0; p < PIPE; p++) {
+            int b = b0 + 32*p;
+            if (b >= nb32) break;
+            int j = b & 7;
+            const int8_t *xbase = qxTc + (size_t)(b >> 5)*1024 + (size_t)(b & 31)*16;
+            // load the shared activations once per (token,b)
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                if (r >= nrow) break;
+                const uint8_t *blk = (weight + (size_t)(row0+r) * (size_t)n_super * 144) + (size_t)(b >> 3) * 144;
+                uint4 h = __ldg((const uint4 *)blk);
+                uint4 q = __ldg((const uint4 *)(blk + 16 + (size_t)(b & 7) * 16));
+                __half_raw hd; hd.x = (uint16_t)(h.x & 0xFFFF);
+                __half_raw hm; hm.x = (uint16_t)(h.x >> 16);
+                float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+                int s_, m_; q4k_scale_min_reg(h.y, h.z, h.w, j, &s_, &m_);
+                float ds = d*(float)s_, dm = dmin*(float)m_;
+                int wv[8];
+                int w0=(int)q.x, w1=(int)q.y, w2=(int)q.z, w3=(int)q.w;
+                wv[0]=w0&0x0F0F0F0F; wv[1]=(w0>>4)&0x0F0F0F0F;
+                wv[2]=w1&0x0F0F0F0F; wv[3]=(w1>>4)&0x0F0F0F0F;
+                wv[4]=w2&0x0F0F0F0F; wv[5]=(w2>>4)&0x0F0F0F0F;
+                wv[6]=w3&0x0F0F0F0F; wv[7]=(w3>>4)&0x0F0F0F0F;
+                #pragma unroll
+                for (int n = 0; n < NK; n++) {
+                    if (n >= ntok) break;
+                    uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);
+                    uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);
+                    int sumi = 0;
+                    sumi = __dp4a(wv[0], (int)A.x, sumi); sumi = __dp4a(wv[1], (int)B.x, sumi);
+                    sumi = __dp4a(wv[2], (int)A.y, sumi); sumi = __dp4a(wv[3], (int)B.y, sumi);
+                    sumi = __dp4a(wv[4], (int)A.z, sumi); sumi = __dp4a(wv[5], (int)B.z, sumi);
+                    sumi = __dp4a(wv[6], (int)A.w, sumi); sumi = __dp4a(wv[7], (int)B.w, sumi);
+                    acc[r][n] += dxc[(size_t)n*nb32 + b] *
+                                 (ds*(float)sumi - dm*(float)sxc[(size_t)n*nb32 + b]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (r >= nrow) break;
+        #pragma unroll
+        for (int n = 0; n < NK; n++) {
+            if (n >= ntok) break;
+            float v = warp_reduce_sum_all(acc[r][n]);
+            if (lane==0) outc[(size_t)n*out_dim+row0+r] = v;
+        }
+    }
+}
+
 static void mmvq_q4_k_packedT_batched_launch(
     float *out, const uint8_t *w, const int8_t *qxT, const float *dx, const int *sx,
     int in_dim, int out_dim, int K, cudaStream_t stream)
@@ -2272,6 +2353,17 @@ static void mmvq_q4_k_packedT_batched_launch(
         } else {
             mmvq_q4_k_packedT_multi2row_kernel<4,4,1,2><<<gm, mb_threads, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
         }
+        return;
+    }
+    // D32B: 4-rows-per-warp (FUCINA_Q4K_2ROW=2) — max activation-load amortization (mission's
+    // "2 OR 4 rows"). acc=4*NK => NK<=4 only. grid.y quarters. Bit-identical (per-row order kept).
+    if (tworow == 2 && K > 16) {
+        static int bc4 = -1; if (bc4 < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bc4 = e ? atoi(e) : 4; }
+        int nk4 = (bc4 >= 4) ? 4 : bc4;
+        int mb = minblk_env > 0 ? minblk_env : 4;
+        dim3 gm((unsigned)((K + nk4 - 1) / nk4), (unsigned)((out_dim + MW*4 - 1) / (MW*4)));
+        if (mb >= 4) mmvq_q4_k_packedT_multi4row_kernel<4,4,1,2><<<gm, mb_threads, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+        else         mmvq_q4_k_packedT_multi4row_kernel<4,3,1,2><<<gm, mb_threads, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
         return;
     }
     // D32B: cp.async deep-prefetch variant (FUCINA_Q4K_CPASYNC=1, FUCINA_Q4K_STAGES={2,3,4,6}).

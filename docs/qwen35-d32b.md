@@ -163,6 +163,24 @@ BIGCHUNK analysis quantified. Neither 2-row corner beats the 1-row occupancy lev
 **Occupancy is the binding constraint; trading it for load-sharing loses.** This is the
 key negative result: the latency wall is occupancy-bound, not load-count-bound.
 
+**4-rows-per-warp (the mission's "2 OR 4 rows" upper end) — MEASURED, informative:**
+`mmvq_q4_k_packedT_multi4row_kernel` (`FUCINA_Q4K_2ROW=2`), one warp feeds FOUR weight
+streams from one shared A/B load. Bit-identical (hash c6ab45eab1f2751c).
+
+| config | B=32 tok/s | regs | warps_active | long_scoreboard | inst/cycle |
+|---|---|---|---|---|---|
+| 4ROW `<4,5>` (NK=4, acc[4][4], 8 chunks) | **429** | 64 | 62% | **14.1 (BEST)** | **0.33 (BEST)** |
+| 1-row `<12,4>` | 465 | 64 | 70-86% | 16.6 | 0.31 |
+
+**The activation-sharing hypothesis is CONFIRMED at the micro level** — 4-way sharing cuts
+long_scoreboard to 14.1 (best of any variant) and lifts inst/cycle to 0.33 (best). But it
+still loses (429 < 465) because NK=4 forces 8 chunks at B=32, and the chunk-count overhead
+(8× redundant weight dequant/L2) swamps the load-latency saving. It cannot be combined
+with the winning NK=12 tile — acc[4][12]=48 regs would spill. So the load-sharing win is
+real but structurally un-combinable with the occupancy/chunk-count optimum. Both rungs of
+the mission's "2 or 4 rows" candidate are now MEASURED (not asserted): dead by the same
+register/chunk-count wall.
+
 ### (6) `__ldg` on activation loads (read-only data cache) — MEASURED NEUTRAL
 
 The activation loads (A,B) are the `long_scoreboard` stall source and were plain global
