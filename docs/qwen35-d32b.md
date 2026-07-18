@@ -133,12 +133,16 @@ long-scoreboard latency. Implemented as `mmvq_q4_k_packedT_multi2row_kernel`, be
 
 | config | B=32 tok/s | regs | warps_active | long_scoreboard |
 |---|---|---|---|---|
-| 2ROW `<8,3>` | 358 | 80 | **45%** | **17.4 (unchanged)** |
+| 2ROW `<8,3>` (NK=8, acc[16]) | 358 | 80 | **45%** | **17.4 (unchanged)** |
+| 2ROW `<4,·>` (NK=4, acc[8], 8 chunks) | 185 | — | — | chunk-count dominated |
 | 1-row `<12,4>` | 465 | 64 | 70–86% | 16.6 |
 
 **Measured dead** (not merely asserted, as D32 did): doubling `acc[]` (2×NK) costs 80
 regs → occupancy 45% (WORSE), and the load sharing does NOT cut the stall (L1 already
 serves the duplicate at 90% hit — the latency is per-LDG-issue, not per-DRAM-fetch).
+Dropping to NK=4 to relieve the register cliff (acc[8]) is far WORSE (185) — 8 chunks at
+B=32 means 8× redundant weight re-reads + dequant, exactly the chunk-count cost D32's
+BIGCHUNK analysis quantified. Neither 2-row corner beats the 1-row occupancy lever.
 **Occupancy is the binding constraint; trading it for load-sharing loses.** This is the
 key negative result: the latency wall is occupancy-bound, not load-count-bound.
 
