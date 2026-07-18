@@ -84,6 +84,20 @@ More in-flight LDGs per warp via PIPE=3/4 (was constexpr 2, now template arg).
 
 PIPE≥3 spills (matches the D32 doc's rejected PIPE=4 note). Kept PIPE=2.
 
+**PIPE × MINBLK cross (BIGCHUNK=12) — lower MINBLK does NOT rescue deeper staging:**
+The hypothesis that PIPE=3/4 spilled only because MINBLK=4 starved it of registers was
+tested across the full cross — disproven. Peak is PIPE=2/MINBLK=4 at every point.
+
+| B=32 tok/s | MINBLK=2 | MINBLK=3 | MINBLK=4 |
+|---|---|---|---|
+| PIPE=2 | 421 | 421 | **457** |
+| PIPE=3 | 343 | 361 | 412 |
+| PIPE=4 | 347 | 408 | 397 |
+
+Deeper staging's extra `uint4 hh/hq × PIPE` registers crush occupancy faster than the
+added in-flight loads help — no MINBLK point recovers it. All PIPE variants bit-identical
+(hash c6ab45eab1f2751c). PIPE=2 confirmed optimal across the whole 2D sweep.
+
 ### (3) NWARPS — block size — 8 is best
 
 | NWARPS | B=32 tok/s |
