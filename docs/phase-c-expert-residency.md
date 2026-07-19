@@ -1,8 +1,9 @@
 # Phase C: expert residency and streaming
 
-Phase C consumes the measured expert heat map rather than assuming all experts are equally hot.
+Phase C consumes measured expert heat rather than assuming all experts are equally hot.
 The implementation is intentionally split at the CUDA boundary so storage policy can be tested
-without a 35B checkpoint.
+without a 35B checkpoint. For observational telemetry from the live SSD path, exact global-LRU
+capacity replay, and deterministic hotlist generation, see `docs/qwen35-expert-policy.md`.
 
 ## C1 foundations
 
@@ -60,7 +61,9 @@ When supplied, the residency manifest seeds the slot pool with the highest-impor
 assigned to its VRAM tier. Demand routing then maintains the cross-layer LRU. After each router
 step, fucina issues asynchronous `POSIX_FADV_WILLNEED` hints for the same expert IDs in the next
 layer (`FUCINA_EXPERT_PREFETCH=0` disables this heuristic). Timing output reports SSD bytes,
-checksum failures, slot-cache hit ratio, and prefetch hints.
+checksum failures, slot-cache hit ratio, and prefetch hints. `FUCINA_EXPERT_PROFILE_OUT` can now
+observe that already-required routing readback and atomically emit `fucina-expert-profile-v1` at
+shutdown; it remains off and allocation-free unless SSD streaming is active.
 
 Run the foundation gates with:
 

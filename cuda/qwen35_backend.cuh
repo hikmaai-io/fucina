@@ -615,7 +615,11 @@ static int q35_enable_ssd_expert_stream(gemma4_engine_t *eng, int L, int E, int 
         fsync(eng->fp4m_ssd_fd);
         if(q35_seed_ssd_residency(eng,getenv("FUCINA_EXPERT_RESIDENCY_PLAN"),L,E,MI,H)!=0)ok=false;
         posix_fadvise(eng->fp4m_ssd_fd,0,off,POSIX_FADV_DONTNEED);
-        if(ok)eng->fp4m_ssd_stream=1;
+        if(ok){
+            eng->fp4m_ssd_stream=1;
+            eng->ssd_expert_profile=fucina_expert_profile_create(
+                /*ssd_active=*/1,L,E,eng->fp4m_slots);
+        }
     }
     if(!ok) { fprintf(stderr,"fucina: SSD expert streaming setup failed\n"); return -1; }
     fprintf(stderr,"fucina: expert SSD streaming ON (slots=%d, device staging %.2f GiB, backing %.2f GiB)\n",

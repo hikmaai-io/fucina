@@ -12,6 +12,7 @@
 #include "tensor_types.h"
 #include "model_plan.h"
 #include "device_allocation_set.h"
+#include "expert_profile.h"
 #include "gemma4_detect.h"   // M0: runtime arch auto-detection (gemma4_detect_from_gguf/_config_json)
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -4261,6 +4262,7 @@ struct gemma4_engine {
     uint64_t       *h_fp4m_slot_age, fp4m_slot_clock;
     uint64_t        fp4m_ssd_reads, fp4m_ssd_bytes, fp4m_ssd_checksum_fail;
     uint64_t        fp4m_cache_hits, fp4m_cache_misses, fp4m_prefetch_advice;
+    fucina_expert_profile_t *ssd_expert_profile; // NULL unless SSD + explicit profile env gate
     ExpertWeightRef ref_fp4m_gu[GEMMA4_CAP_LAYERS];
     ExpertWeightRef ref_fp4m_dn[GEMMA4_CAP_LAYERS];
     ExpertWeightRef ref_moe_gate[GEMMA4_CAP_LAYERS];
@@ -6681,6 +6683,15 @@ gemma4_engine_t* gemma4_engine_create(
 
 void gemma4_engine_destroy(gemma4_engine_t *eng) {
     if (!eng) return;
+
+    if (eng->ssd_expert_profile) {
+        fucina_expert_stream_stats_t stats = {
+            eng->fp4m_cache_hits, eng->fp4m_cache_misses, eng->fp4m_ssd_reads,
+            eng->fp4m_ssd_bytes, eng->fp4m_ssd_checksum_fail, eng->fp4m_prefetch_advice};
+        if (fucina_expert_profile_finish(eng->ssd_expert_profile, &stats) != 0)
+            fprintf(stderr, "fucina: failed to atomically write SSD expert profile; inference result is unaffected\n");
+        eng->ssd_expert_profile = NULL;
+    }
 
     delete eng->device_allocations;
     eng->device_allocations = nullptr;
@@ -9601,6 +9612,8 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
                 cudaMemcpyAsync(hc_stream.data(),eng->d_moe_count,E*sizeof(int),cudaMemcpyDeviceToHost,stream);
                 cudaStreamSynchronize(stream);
                 for(int e=0;e<E;e++)if(hc_stream[e]>0)active_stream.push_back(e);
+                if(eng->ssd_expert_profile)
+                    fucina_expert_profile_record(eng->ssd_expert_profile,l,hc_stream.data(),E);
                 const char *pf=getenv("FUCINA_EXPERT_PREFETCH");
                 if(!pf||pf[0]!='0') { // asynchronous page-cache lookahead for the next layer
                     int nl=(l+1)%eng->cfg.n_layers;const size_t gp=(size_t)GU*(H/2),gsp=(size_t)eng->fp4m_gu_sfB;

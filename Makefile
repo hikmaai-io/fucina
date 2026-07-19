@@ -29,7 +29,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
 .PHONY: all clean test cuda lib libdg fucina fucina-calibrate smoke profile model-plan-test allocation-set-test nvfp4-test e4b-test \
         e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
         e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
-        go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test \
+        go-test go-test-race go-test-cgo vet lint check expert-policy-test paged-kv-test paged-prefix-test \
         gpu-gates qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-moe-fp8-engine-test \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
         qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen36-ssd-stream-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
@@ -58,8 +58,12 @@ cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh cuda/gemma
                        cuda/paged_prefix.h cuda/safetensors.h cuda/nvfp4.h \
                        cuda/nvfp4_loader.h cuda/nvfp4_gemv.cuh cuda/fp8_block.cuh \
                        cuda/qwen35_fp8_loader.h cuda/qwen35_state.cuh cuda/qwen35_kernels.cuh \
-                       cuda/qwen35_jspace.cuh cuda/qwen35_runtime.cuh cuda/qwen35_backend.cuh Makefile
+                       cuda/qwen35_jspace.cuh cuda/qwen35_runtime.cuh cuda/qwen35_backend.cuh \
+                       cuda/expert_profile.h Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
+
+cuda/expert_profile.o: cuda/expert_profile.cc cuda/expert_profile.h Makefile
+	g++ -std=c++17 -O2 -Wall -Wextra -Werror -c -o $@ cuda/expert_profile.cc
 
 # The standalone Gemma-4-E4B engine (runtime dims, Per-Layer Embeddings, KV-sharing)
 # is bundled into the same archive so the Go cgo bridge (internal/engine/e4b) links it.
@@ -72,7 +76,7 @@ cuda/e4b_engine.o: cuda/e4b_engine.cu cuda/e4b_engine.h cuda/gemma4_e4b.h \
 cuda/gemma4_kernels_link.o: cuda/gemma4_kernels.o cuda/e4b_engine.o Makefile
 	$(NVCC) $(NVCCFLAGS) -dlink -o $@ cuda/gemma4_kernels.o cuda/e4b_engine.o
 
-cuda/libfucina.a: cuda/gemma4_kernels.o cuda/e4b_engine.o cuda/gemma4_kernels_link.o
+cuda/libfucina.a: cuda/gemma4_kernels.o cuda/e4b_engine.o cuda/gemma4_kernels_link.o cuda/expert_profile.o
 	ar rcs $@ $^
 	@arches="$$($(CUDA_HOME)/bin/cuobjdump --list-elf $@ 2>/dev/null | sed -n 's/.*\.\(sm_[0-9a-z]*\)\.cubin/\1/p' | sort -u)"; \
 	echo "libfucina.a cubin arch(es): $$arches"; \
@@ -517,7 +521,13 @@ go-test-cgo: lib libdg
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	$(GO) test $(GO_TEST_CGO_PKGS) -count=1
 
-go-test:
+expert-policy-test:
+	PYTHONPATH=scripts python3 -m unittest scripts/test_expert_residency_plan.py
+	g++ -std=c++17 -O2 -Wall -Wextra -Werror -Icuda \
+		cuda/expert_profile.cc cuda/expert_profile_test.cc -o /tmp/fucina_expert_profile_test
+	/tmp/fucina_expert_profile_test
+
+go-test: expert-policy-test
 	$(GO) test $(GO_TEST_PKGS) -count=1
 
 phase-b-test:

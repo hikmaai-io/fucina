@@ -50,6 +50,9 @@ jobs:
           # cmd/ need libfucina.a and are excluded, mirroring the Makefile.
           args: ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 
+      - name: DS4 expert-policy hostile-input and host-recorder tests
+        run: make expert-policy-test
+
       - name: go test (race)
         run: go test $PKGS -race -count=1
 
