@@ -9,9 +9,9 @@ folds in the vLLM subsystem analysis (vLLM @ 5f8e73cb).
 ## OFFICIAL POSITION (enshrined 2026-07-18, main @ 82a6392)
 
 **fucina is the state-of-the-art Qwen3.5 inference engine on the NVIDIA GB10,
-winning 11 of 12 concurrency cells against fresh contemporaneous vLLM
-(2026-07-18) while providing byte-identical run-to-run determinism that vLLM
-does not offer. The 12th cell is the measured, proven price of that guarantee
+winning 11 of 12 aggregate-throughput concurrency cells against fresh
+contemporaneous vLLM (2026-07-18) while providing byte-identical run-to-run
+determinism that vLLM does not offer. The 12th cell is the measured, proven price of that guarantee
 — and we choose the guarantee.**
 
 ### The scoreboard (fresh contemporaneous vLLM, 2026-07-18, quiescent GB10)
@@ -37,9 +37,11 @@ does not offer. The 12th cell is the measured, proven price of that guarantee
 | 16 | 313.1 | 280.8 | +12% |
 | 32 | 438.8 | 521.8 | **−16% (the accepted trade-off)** |
 
-Plus: MoE N=32 TTFT 641/647 ms (med/p95) vs vLLM 664; single-stream, long-prompt
-TTFT, and warm/state-cache TTFT all won. Evidence:
-`benchmark-evidence/results/2026-07-18-d32b/`, `docs/qwen35-d32b.md`.
+The 11/12 claim is aggregate throughput, not every TTFT cell. Fresh 2026-07-18
+MoE N=32 burst TTFT was 670/722 ms (med/p95) vs vLLM 312/316; fucina retained
+the single long-prompt TTFT win (4,367 vs 5,837 ms) plus warm/state-cache TTFT.
+Evidence: `benchmark-evidence/results/2026-07-18-d32b/`,
+`docs/qwen35-d32b.md`.
 
 ### Why the 12th cell is a principled boundary, not a tuning gap
 

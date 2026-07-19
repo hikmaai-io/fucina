@@ -349,8 +349,8 @@ dp4a MMVQ kernels (the same ones the 12B uses), **2.6× faster than BF16 decode 
 `bench_serving.py` per [`benchmark-evidence/PROTOCOL.md`](benchmark-evidence/PROTOCOL.md); full record in
 [`docs/sota-gb10-qwen3-mission-plan.md`](docs/sota-gb10-qwen3-mission-plan.md)):**
 
-**fucina wins 11 of 12 concurrency cells while providing byte-identical run-to-run
-determinism that vLLM does not offer.**
+**fucina wins 11 of 12 aggregate-throughput concurrency cells while providing
+byte-identical run-to-run determinism that vLLM does not offer.**
 
 **Qwen3.5-35B-A3B-FP8 (MoE) — all 6 cells won** (agg tok/s):
 
@@ -359,7 +359,9 @@ determinism that vLLM does not offer.**
 | fucina | 59.0 | 101.4 | 134.0 | 229.8 | 320.1 | **472.4** |
 | vLLM | 14.0* | 74.1 | 111.7 | 155.2 | 207.2 | 321.3 |
 
-Plus N=32 TTFT 641/647 ms (med/p95) vs vLLM 664 — fucina leads TTFT too.
+The 11/12 claim is aggregate throughput, not every burst-TTFT cell. In the same fresh
+2026-07-18 sweep, MoE N=32 TTFT was 670/722 ms (med/p95) vs vLLM 312/316; fucina's
+single 3,500-token TTFT remained ahead (4,367 vs 5,837 ms).
 
 **Qwen3.5-9B-FP8 (dense) — 5 of 6 cells won** (agg tok/s):
 
