@@ -266,6 +266,8 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDNchunk) == cudaSuccess;
     ok = ok && cudaFuncSetAttribute(qwen35_b_gdn_chunk_multiseq_kernel,   // F2: same shared-mem opt-in
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDNchunk) == cudaSuccess;
+    ok = ok && cudaFuncSetAttribute(qwen35_b_gdn_chunk_multiseq_clean_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smGDNchunk) == cudaSuccess;
     ok = ok && cudaFuncSetAttribute(qwen35_b_attn_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, maxctx * (int)sizeof(float)) == cudaSuccess;
     if (!ok) {
@@ -1140,6 +1142,8 @@ static void qwen35_slot_reset(gemma4_engine_t *eng, int slot, cudaStream_t st) {
         cudaMemsetAsync(eng->q35.ring_slot[l][slot], 0,
                         (size_t)CONVD*(CK-1)*sizeof(float), st);
     }
+    eng->slots[slot].q35_state_is_clean=1;
+    eng->slots[slot].q35_conv_is_empty=1;
 }
 
 // ── Qwen3.5 (qwen35) BATCHED single-pass prefill — kills the token-by-token 149 s ────────────
@@ -1355,6 +1359,64 @@ static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t 
     return 0;
 }
 
+// Admission-only CUDA-event attribution. The default specialization emits none of this code;
+// qwen35_seq_add_multiseq dispatches once from the startup-cached env bit. Timing deliberately
+// synchronizes and creates events, so it must never be used for throughput measurements.
+enum q35_pf_phase {
+    Q35_PF_H2D=0, Q35_PF_PROJECTION, Q35_PF_CONV_RING, Q35_PF_FULL_ATTN,
+    Q35_PF_GDN_SCAN, Q35_PF_FFN, Q35_PF_LM_HEAD, Q35_PF_D2H,
+    Q35_PF_EMBED_OTHER, Q35_PF_PHASES
+};
+struct q35_pf_span { cudaEvent_t begin, end; int phase; };
+struct q35_pf_trace {
+    cudaEvent_t total_begin, total_end;
+    q35_pf_span spans[256];
+    int nspans;
+};
+static const char *q35_pf_phase_name(int phase) {
+    static const char *names[Q35_PF_PHASES]={
+        "h2d", "projection", "conv_ring", "full_attention", "gdn_scan",
+        "ffn", "lm_head", "d2h", "embed_other"
+    };
+    return (phase >= 0 && phase < Q35_PF_PHASES) ? names[phase] : "invalid";
+}
+static void q35_pf_trace_init(q35_pf_trace *trace, cudaStream_t stream) {
+    trace->nspans=0;
+    cudaEventCreate(&trace->total_begin); cudaEventCreate(&trace->total_end);
+    cudaEventRecord(trace->total_begin,stream);
+}
+static int q35_pf_trace_begin(q35_pf_trace *trace, int phase, cudaStream_t stream) {
+    if (trace->nspans >= (int)(sizeof(trace->spans)/sizeof(trace->spans[0]))) return -1;
+    int span=trace->nspans++;
+    trace->spans[span].phase=phase;
+    cudaEventCreate(&trace->spans[span].begin); cudaEventCreate(&trace->spans[span].end);
+    cudaEventRecord(trace->spans[span].begin,stream);
+    return span;
+}
+static void q35_pf_trace_end(q35_pf_trace *trace, int span, cudaStream_t stream) {
+    if (span >= 0) cudaEventRecord(trace->spans[span].end,stream);
+}
+static void q35_pf_trace_report(q35_pf_trace *trace, cudaStream_t stream, int experts,
+                                int M, int rows, double host_ms, double sync_ms) {
+    cudaEventRecord(trace->total_end,stream); cudaEventSynchronize(trace->total_end);
+    float total=0.f; cudaEventElapsedTime(&total,trace->total_begin,trace->total_end);
+    double phase_ms[Q35_PF_PHASES]={0};
+    for (int i=0;i<trace->nspans;i++) {
+        float ms=0.f; cudaEventElapsedTime(&ms,trace->spans[i].begin,trace->spans[i].end);
+        if (trace->spans[i].phase >= 0 && trace->spans[i].phase < Q35_PF_PHASES)
+            phase_ms[trace->spans[i].phase] += ms;
+        cudaEventDestroy(trace->spans[i].begin); cudaEventDestroy(trace->spans[i].end);
+    }
+    cudaEventDestroy(trace->total_begin); cudaEventDestroy(trace->total_end);
+    double attributed=0; for(int p=0;p<Q35_PF_PHASES;p++) attributed+=phase_ms[p];
+    fprintf(stderr,"fucina: qwen35 admission timing model=%s M=%d rows=%d gpu_total=%.3f ms host=%.3f ms sync=%.3f ms attributed=%.1f%%",
+            experts>0?"moe":"dense",M,rows,total,host_ms,sync_ms,total>0?100.0*attributed/total:0.0);
+    for(int p=0;p<Q35_PF_PHASES;p++)
+        fprintf(stderr," %s=%.3f(%.1f%%)",q35_pf_phase_name(p),phase_ms[p],total>0?100.0*phase_ms[p]/total:0.0);
+    double other=(double)total-attributed; if(other<0) other=0;
+    fprintf(stderr," unclassified=%.3f(%.1f%%)\n",other,total>0?100.0*other/total:0.0);
+}
+
 // ── Qwen3.5 BATCHED MULTI-SEQUENCE prefill (P1: kills serial admission-prefill) ──────────────
 // Prefill M freshly-opened sequences in ONE forward. Each seq i occupies rows [offs[i],offs[i]+
 // lens[i]) of the flattened Ttot-row buffers at absolute positions [0,lens[i]) (fresh slots).
@@ -1370,9 +1432,10 @@ static int qwen35_prefill_batched(gemma4_engine_t *eng, int slot, const int32_t 
 // + continuation byte-identical to per-sequence qwen35_prefill_batched. Caller must have reset
 // each slot (n_tokens==0, S/ring zeroed) via the seq_add prologue. d_tok/d_pos/d_slot must be
 // uploaded for the Ttot rows before this call. Argmaxes each seq's LAST row into d_ms_outtok[i].
+template <bool Timing, bool CleanGDN>
 static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
                                          const int *offs, const int *lens, int M, int Ttot,
-                                         cudaStream_t st) {
+                                         cudaStream_t st, q35_pf_trace *trace) {
     const gemma4_model_config_t *c = &eng->cfg;
     const int H=c->hidden_size, HD=M2_HEAD, NQ=c->n_heads, NKV=c->n_kv_global;
     const int INNER=c->ssm_inner_size, CONVD=(2*M2_KEYD+c->ssm_inner_size), NKH=M2_NKH, NVH=(c->ssm_inner_size/M2_SD), SD=M2_SD, TSR=c->ssm_time_step_rank, ROT=M2_ROT;
@@ -1412,13 +1475,17 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
     }
     int *d_meta_slots = d_meta, *d_meta_offs = d_meta + MScap, *d_meta_lens = d_meta + 2*MScap;
 
+    int phase_span=-1;
+    if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_EMBED_OTHER,st);
     embed_w(eng, x, eng->d_token_embd, d_tok, T, H, st);
+    if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
 
     for (int l = 0; l < L; l++) {
         const auto &Tn = eng->tensors.layers[l];
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.attn_norm), H, T, eps);
         moe_profile_activation(eng, l, 0, xn, (size_t)T*H, st);
         if (c->attn_kind[l] == GEMMA4_ATTN_FULL) {
+            if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_PROJECTION,st);
             q35_proj_gemm(eng, qg, Tn.attn_q, Tn.fmt_q, xn, H, 2*NQ*HD, T, st, l, WC_Q, &Tn.ref_q);
             q35_proj_gemm(eng, kb, Tn.attn_k, Tn.fmt_k, xn, H, NKV*HD,  T, st, l, WC_K, &Tn.ref_k);
             q35_proj_gemm(eng, vb, Tn.attn_v, Tn.fmt_v, xn, H, NKV*HD,  T, st, l, WC_V, &Tn.ref_v);
@@ -1429,6 +1496,8 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
             qwen35_b_rope_kernel<<<dim3((ROT/2+31)/32,NKV,T),32,0,st>>>(kb, NKV, d_pos, T);
             qwen35_b_kv_write_kernel<<<dim3(grid1d((size_t)NKV*HD),T),256,0,st>>>(
                 eng->q35.Kc[l], eng->q35.Vc[l], kb, vb, d_pos, d_slot, maxctx, T, NKV);
+            if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
+            if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_FULL_ATTN,st);
             // MULTI-SEQ FULL-attn: per SEQUENCE, via the SAME base==0 tensor-core kernel the
             // standalone prefill uses (byte-identical: same kernel, same rows, same length) —
             // NOT one batched call (that would mix rows across sequences). Scalar cache-read path
@@ -1443,10 +1512,14 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
                         attn + (size_t)aoff*NQ*HD, qb + (size_t)aoff*NQ*HD, eng->q35.Kc[l], eng->q35.Vc[l],
                         d_pos + aoff, d_slot + aoff, maxctx, alen, NKV, NQ);
             }
+            if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
+            if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_PROJECTION,st);
             m2_sigmoid_gate_mul_kernel<<<grid1d((size_t)T*NQ*HD),256,0,st>>>(attn, gate, T*NQ*HD);
             moe_profile_activation(eng, l, 1, attn, (size_t)T*NQ*HD, st);
             q35_proj_gemm(eng, mix, Tn.attn_output, Tn.fmt_o, attn, NQ*HD, H, T, st, l, WC_O, &Tn.ref_o);
+            if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
         } else {
+            if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_PROJECTION,st);
             q35_proj_gemm(eng, qkv, Tn.ssm.in_qkv, Tn.ssm.fmt_in_qkv, xn, H, CONVD, T, st, l, WC_QKV, &Tn.ssm.ref_in_qkv);
             q35_proj_gemm(eng, zc,  Tn.ssm.in_z,   Tn.ssm.fmt_in_z,   xn, H, INNER, T, st, l, WC_Z, &Tn.ssm.ref_in_z);
             if (eng->format == FORMAT_FP8_BLOCK) {
@@ -1456,6 +1529,8 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
                 q35_proj_gemm(eng, ac,  Tn.ssm.in_a, Tn.ssm.fmt_in_a, xn, H, TSR, T, st, l, WC_A, &Tn.ssm.ref_in_a);
                 q35_proj_gemm(eng, bc,  Tn.ssm.in_b, Tn.ssm.fmt_in_b, xn, H, TSR, T, st, l, WC_B, &Tn.ssm.ref_in_b);
             }
+            if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
+            if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_CONV_RING,st);
             // RECURRENT conv1d ring — PER SEQUENCE (each keyed to its own slot ring), row-offset
             // pointers into the flattened Ttot-row qkv/conv buffers.
             for (int i = 0; i < M; i++) {
@@ -1465,6 +1540,7 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
                 qwen35_b_ring_update_kernel<<<grid1d((size_t)CONVD),256,0,st>>>(
                     eng->q35.ring[l], qkv + (size_t)off*CONVD, slot, CONVD, len);
             }
+            if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
             qwen35_b_split_qkv_kernel<<<dim3(grid1d((size_t)CONVD),T),256,0,st>>>(qh, kh, vh, conv, T, CONVD, VALD);
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(qh, NKH, SD, T);
             m2_l2norm_heads_kernel<<<dim3(NKH,T),128,0,st>>>(kh, NKH, SD, T);
@@ -1473,15 +1549,25 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
             // blocks, blockIdx.x=seq*nvh+vh, each scanning its own sequence's contiguous 64-token
             // chunks carrying S[l][slots[seq]]. Per-seq recurrence order is unchanged => byte-
             // identical to the per-seq loop; fills nvh*M blocks (was nvh) and drops the serial tail.
-            qwen35_b_gdn_chunk_multiseq_kernel<<<NVH*M,512,smGDNchunk,st>>>(
-                core, qh, kh, vh, gg, bb, eng->q35.S[l],
-                workspace_data<float>(eng->q35.gdn_workspace),
-                d_meta_slots, d_meta_offs, d_meta_lens,
-                eng->format==FORMAT_FP8_BLOCK, NVH);
+            if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_GDN_SCAN,st);
+            if constexpr (CleanGDN)
+                qwen35_b_gdn_chunk_multiseq_clean_kernel<<<NVH*M,512,smGDNchunk,st>>>(
+                    core,qh,kh,vh,gg,bb,eng->q35.S[l],workspace_data<float>(eng->q35.gdn_workspace),
+                    d_meta_slots,d_meta_offs,d_meta_lens,eng->format==FORMAT_FP8_BLOCK,NVH);
+            else
+                qwen35_b_gdn_chunk_multiseq_kernel<<<NVH*M,512,smGDNchunk,st>>>(
+                    core, qh, kh, vh, gg, bb, eng->q35.S[l],
+                    workspace_data<float>(eng->q35.gdn_workspace),
+                    d_meta_slots, d_meta_offs, d_meta_lens,
+                    eng->format==FORMAT_FP8_BLOCK, NVH);
+            if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
+            if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_PROJECTION,st);
             m2_gated_norm_kernel<<<dim3(NVH,T),128,0,st>>>(gnorm, core, zc, Wf(Tn.ssm.norm), T, NVH, VALD);
             moe_profile_activation(eng, l, 1, gnorm, (size_t)T*INNER, st);
             q35_proj_gemm(eng, mix, Tn.ssm.out, Tn.ssm.fmt_out, gnorm, INNER, H, T, st, l, WC_OUT, &Tn.ssm.ref_out);
+            if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
         }
+        if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_FFN,st);
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
         rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(Tn.ffn_norm), H, T, eps);
         moe_profile_activation(eng, l, 2, xn, (size_t)T*H, st);
@@ -1495,8 +1581,10 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
         }
         residual_add_kernel<<<grid1d((size_t)T*H),256,0,st>>>(x, mix, T*H);
         q35_jspace_after_layer(eng, x, T, l, st);
+        if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
     }
 
+    if constexpr (Timing) phase_span=q35_pf_trace_begin(trace,Q35_PF_LM_HEAD,st);
     // Final norm over all rows, then the batched LM head on ONLY the M last-rows (one per seq).
     rms_norm_rows_kernel<<<T,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, T, eps);
     // Gather each sequence's last row into a contiguous M×H buffer (attn is free at head time).
@@ -1524,6 +1612,7 @@ static void qwen35_prefill_multiseq_body(gemma4_engine_t *eng, const int *slots,
                    xhead + (size_t)i * H, H, VOC, st, eng->tensors.output_fmt);
     }
     argmax_rows_kernel<<<M,1024,0,st>>>(eng->d_sb[11], eng->d_ms_outtok, M, VOC);
+    if constexpr (Timing) q35_pf_trace_end(trace,phase_span,st);
 }
 
 static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_prompt,
@@ -1552,6 +1641,7 @@ static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_pro
             s->used = 0; return -1;
         }
         s->n_tokens = n_prompt; s->n_sampled = 1;
+        s->q35_state_is_clean=0; s->q35_conv_is_empty=0;
         if (first_token_out) *first_token_out = ft;
         return slot;
     }
@@ -1567,6 +1657,7 @@ static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_pro
       if (e != cudaSuccess) { fprintf(stderr, "qwen35_seq_add: CUDA error during prefill: %s\n",
                                       cudaGetErrorString(e)); s->used = 0; return -1; } }
     s->n_tokens = n_prompt; s->n_sampled = 1;
+    s->q35_state_is_clean=0; s->q35_conv_is_empty=0;
     if (first_token_out) *first_token_out = first;
     return slot;
 }
@@ -1576,16 +1667,21 @@ static int qwen35_seq_add(gemma4_engine_t *eng, const int32_t *prompt, int n_pro
 // multi-seq prefill body (weights amortized across all rows), samples each seq's first token.
 // Byte-identical greedy to M separate qwen35_seq_add calls. Returns M on success (out_slots/
 // out_first filled), -1 on any error (all allocated slots freed). Ttot must fit the prefill tile.
-static int qwen35_seq_add_multiseq(gemma4_engine_t *eng, const int32_t *tokens_flat,
-                                   const int *lens, int M, const float *temps, const int *topks,
-                                   const float *topps, const float *minps, const uint64_t *seeds,
-                                   int *out_slots, int32_t *out_first) {
+template <bool Timing, bool CleanGDN>
+static int qwen35_seq_add_multiseq_impl(gemma4_engine_t *eng, const int32_t *tokens_flat,
+                                        const int *lens, int M, const float *temps, const int *topks,
+                                        const float *topps, const float *minps, const uint64_t *seeds,
+                                        int *out_slots, int32_t *out_first) {
+    struct timespec host_begin={0,0};
+    if constexpr (Timing) clock_gettime(CLOCK_MONOTONIC,&host_begin);
     if (!eng || !eng->loaded || !tokens_flat || !lens || M <= 0 || M > eng->q35.capacity) return -1;
     if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
     int Ttot = 0;
     for (int i = 0; i < M; i++) { if (lens[i] <= 0) return -1; Ttot += lens[i]; }
     if (Ttot > QWEN35_PF_TILE || Ttot > eng->q35.maxctx) return -1;   // caller splits / falls back
     cudaStream_t st = eng->stream;
+    q35_pf_trace trace;
+    if constexpr (Timing) q35_pf_trace_init(&trace,st);
 
     int slots[GEMMA4_CAP_EXPERTS], offs[GEMMA4_CAP_EXPERTS];   // M <= capacity (small)
     int nalloc = 0;
@@ -1611,11 +1707,18 @@ static int qwen35_seq_add_multiseq(gemma4_engine_t *eng, const int32_t *tokens_f
         for (int r = 0; r < lens[i]; r++) {
             int row = offs[i] + r; h_tok[row] = tokens_flat[row]; h_pos[row] = r; h_slot[row] = slots[i];
         }
+    int phase_span=-1;
+    if constexpr (Timing) phase_span=q35_pf_trace_begin(&trace,Q35_PF_H2D,st);
     cudaMemcpyAsync(workspace_data<int32_t>(eng->q35.prefill_token_workspace), h_tok, (size_t)Ttot*sizeof(int32_t), cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(workspace_data<int>(eng->q35.prefill_position_workspace), h_pos, (size_t)Ttot*sizeof(int), cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(workspace_data<int>(eng->q35.routing_workspace), h_slot, (size_t)Ttot*sizeof(int), cudaMemcpyHostToDevice, st);
+    if constexpr (Timing) q35_pf_trace_end(&trace,phase_span,st);
 
-    qwen35_prefill_multiseq_body(eng, slots, offs, lens, M, Ttot, st);
+    if constexpr (CleanGDN) {
+        for(int i=0;i<M;i++) if(!eng->slots[slots[i]].q35_state_is_clean ||
+                                 !eng->slots[slots[i]].q35_conv_is_empty) { rollback(); return -1; }
+    }
+    qwen35_prefill_multiseq_body<Timing,CleanGDN>(eng,slots,offs,lens,M,Ttot,st,Timing?&trace:nullptr);
 
     // Greedy argmax already in d_ms_outtok; re-sample rows with temp>0 (row-independent, matches
     // per-seq qwen35_seq_add which only sample_rows when that seq's temp>0).
@@ -1627,15 +1730,41 @@ static int qwen35_seq_add_multiseq(gemma4_engine_t *eng, const int32_t *tokens_f
         qwen35_sample_rows(eng, slv, eng->d_sb[11], M, st);
     }
     int32_t firsts[GEMMA4_CAP_EXPERTS];
+    if constexpr (Timing) phase_span=q35_pf_trace_begin(&trace,Q35_PF_D2H,st);
     cudaMemcpyAsync(firsts, eng->d_ms_outtok, (size_t)M*sizeof(int32_t), cudaMemcpyDeviceToHost, st);
+    if constexpr (Timing) q35_pf_trace_end(&trace,phase_span,st);
+    struct timespec sync_begin={0,0}, sync_end={0,0}, host_end={0,0};
+    if constexpr (Timing) clock_gettime(CLOCK_MONOTONIC,&sync_begin);
     cudaStreamSynchronize(st);
+    if constexpr (Timing) {
+        clock_gettime(CLOCK_MONOTONIC,&sync_end); host_end=sync_end;
+        auto elapsed_ms=[](const struct timespec &a,const struct timespec &b){
+            return (double)(b.tv_sec-a.tv_sec)*1000.0+(double)(b.tv_nsec-a.tv_nsec)/1.0e6; };
+        q35_pf_trace_report(&trace,st,eng->cfg.n_experts,M,Ttot,
+                            elapsed_ms(host_begin,host_end),elapsed_ms(sync_begin,sync_end));
+    }
     if (cudaGetLastError() != cudaSuccess) { rollback(); return -1; }
     for (int i = 0; i < M; i++) {
         gemma4_seq *s = &eng->slots[slots[i]];
         s->n_tokens = lens[i]; s->n_sampled = 1;
+        s->q35_state_is_clean=0; s->q35_conv_is_empty=0;
         out_slots[i] = slots[i]; out_first[i] = firsts[i];
     }
     return M;
+}
+
+static int qwen35_seq_add_multiseq(gemma4_engine_t *eng, const int32_t *tokens_flat,
+                                   const int *lens, int M, const float *temps, const int *topks,
+                                   const float *topps, const float *minps, const uint64_t *seeds,
+                                   int *out_slots, int32_t *out_first) {
+    if(eng && eng->q35.clean_gdn) {
+        if(eng->q35.prefill_timing)
+            return qwen35_seq_add_multiseq_impl<true,true>(eng,tokens_flat,lens,M,temps,topks,topps,minps,seeds,out_slots,out_first);
+        return qwen35_seq_add_multiseq_impl<false,true>(eng,tokens_flat,lens,M,temps,topks,topps,minps,seeds,out_slots,out_first);
+    }
+    if (eng && eng->q35.prefill_timing)
+        return qwen35_seq_add_multiseq_impl<true,false>(eng,tokens_flat,lens,M,temps,topks,topps,minps,seeds,out_slots,out_first);
+    return qwen35_seq_add_multiseq_impl<false,false>(eng,tokens_flat,lens,M,temps,topks,topps,minps,seeds,out_slots,out_first);
 }
 
 static int qwen35_seq_open(gemma4_engine_t *eng, float temp, int top_k, float top_p,
@@ -1671,6 +1800,7 @@ static int qwen35_seq_prefill_chunk(gemma4_engine_t *eng, int slot, const int32_
         if (qwen35_prefill_batched(eng, slot, tokens, n, /*base=*/s->n_tokens, do_sample, &ft) != 0)
             return -1;
         s->n_tokens += n;
+        s->q35_state_is_clean=0; s->q35_conv_is_empty=0;
         if (do_sample) s->n_sampled++;
         if (do_sample && first_token_out) *first_token_out = ft;
         return 0;
@@ -1685,6 +1815,7 @@ static int qwen35_seq_prefill_chunk(gemma4_engine_t *eng, int slot, const int32_
     cudaStreamSynchronize(st);
     if (cudaGetLastError() != cudaSuccess) return -1;
     s->n_tokens += n;
+    s->q35_state_is_clean=0; s->q35_conv_is_empty=0;
     if (do_sample) s->n_sampled++;
     if (do_sample && first_token_out) *first_token_out = first;
     return 0;
@@ -1799,6 +1930,7 @@ extern "C" int gemma4_engine_q35_state_restore(gemma4_engine_t *eng, int slot,
     s->n_tokens = n_tokens;
     s->n_sampled = 0;
     s->mtp_h_valid = 0;
+    s->q35_state_is_clean=0; s->q35_conv_is_empty=0;
     return 0;
 }
 
@@ -1937,6 +2069,7 @@ static int q35_gdn_restore_snapshot(gemma4_engine_t *eng, int slot) {
     s->n_tokens  = eng->q35.gdn_snap_ntokens[slot];
     s->n_sampled = 0;
     s->mtp_h_valid = 0;
+    s->q35_state_is_clean=0; s->q35_conv_is_empty=0;
     return 0;
 }
 

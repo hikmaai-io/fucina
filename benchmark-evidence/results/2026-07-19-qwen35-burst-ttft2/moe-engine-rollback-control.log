@@ -1,0 +1,58 @@
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_qwen35_moe_fp8_engine.cu \
+	cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_moe_fp8_engine \
+	-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_moe_fp8_engine /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8"
+fucina: loaded /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8 (directory)
+fucina: qwen35 geometry (runtime-derived) — NQ=16 NKV=2 NVH=32 INNER=4096 CONVD=8192 (M2 baked NQ16/NVH32/INNER4096)
+fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)
+fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine
+fucina: qwen35 tensor plan finalized: entries=900 core=0.88 GiB scales=0.01 MiB
+fucina: qwen35-Q4K mixer repacked in place (130 tensors → packed dp4a GEMV)
+fucina: qwen35 allocation decision: source=block-FP8 mixer=Q4_K experts=NVFP4 d_weights=0.88 GiB
+fucina: qwen35 allocation ledger: experts=16.88 core=0.88 scales=0.00 embed=3.35 head=1.45 moe-scratch=0.58 misc=0.00 total=23.13 GiB
+fucina: qwen35 free-memory trace: enter=40.84 after-experts=21.82 after-core=21.28 before-scratch=15.94 after-scratch=15.35 final=15.35 GiB
+fucina: qwen35 host-memory trace: free 40.84->15.35 available 111.01->85.53 cached 71.27->71.27 reclaimable 0.42->0.42 GiB
+fucina: qwen35 observed deltas: experts=+19.02 core=+0.54 embed/head=+5.34 moe-scratch=+0.58 fill-total=+25.48 ledger-residual=+2.35 GiB
+fucina: qwen35 Q4_K-MoE served via batched engine (40 layers, vocab 248320, H 2048, NKV 2, E-experts slabbed, 0.88 GiB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    41.02 GiB  (shared box: 78.67 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :    25.67 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 4096, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 4096)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :    25.67 GiB  (within budget by 82.06 GiB)
+fucina: engine initialized (0.88 GB model, 4096 ctx, Q8_0)
+fucina: 30 sliding + 10 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=4096 maxctx=4096 cuda-free=15.43 GiB available=85.61 GiB model-resident=23.13 GiB (ledger) workspace=1.39 GiB reserve/slot=0.11 GiB (max 0.11) physical-room=85.11 GiB budget-room=84.59 GiB chosen-room=84.59 GiB fit=755
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 5.23 GiB, cuda-free 14.03 GiB, available 84.20 GiB, physical=fit, budget=fit, reserved-before 4.91 GiB, room 84.59 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=4096 slotctx=4096 slots=32/32 workspace=1.39 GiB reserve/slot=0.11 GiB (recurrent 0.03 + KV 0.08; max-KV 0.08) committed=1.39 GiB reserved=10.15 GiB
+fucina: qwen35 M4 batch graph captured (nt=3 nr=3 utc=1)
+qwen35 M4 seq 0 (prompt=5, decode pos 5..28): B=3(graph) vs B=1(per-kernel) 6/24 bit-identical  first-mismatch@; graph-on vs graph-off 6/24
+qwen35 M4   seq 0 first mismatch step 6 (B=1 9338 vs B=3 11751)
+qwen35 M4 seq 1 (prompt=8, decode pos 8..31): B=3(graph) vs B=1(per-kernel) 3/24 bit-identical  first-mismatch@; graph-on vs graph-off 2/24
+qwen35 M4   seq 1 first mismatch step 2 (B=1 15 vs B=3 13)
+qwen35 M4 seq 2 (prompt=11, decode pos 11..34): B=3(graph) vs B=1(per-kernel) 1/24 bit-identical  first-mismatch@; graph-on vs graph-off 1/24
+qwen35 M4   seq 2 first mismatch step 1 (B=1 497 vs B=3 400)
+qwen35 M4 seq 0 vs M3 forward (France->Paris): 11751,13,198,760,6511,314,9338,369  (M3: 11751,13,198,760,6511,314,9338,369)  8/8
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+qwen35 M4 self-chain (seed-once, 24 graph replays, no host feedback): FAIL
+qwen35 M4 batched-decode gate: row-independence=FAIL graph-on==off=FAIL M3-parity=PASS(8/8) sampling=FAIL self-chain=FAIL — FAIL
+pos | engine | oracle
+  0 |  11751 |  11751
+  1 |     13 |     13
+  2 |    198 |    198
+  3 |    760 |    760
+  4 |   6511 |   6511
+  5 |    314 |    314
+  6 |   9338 |   9338
+  7 |    369 |    369
+MoE FP8 engine oracle-parity: 8/8
+FAIL — qwen35 MoE-35B-A3B FP8 served through the batched engine (oracle 8/8, self-test FAIL)
+make: *** [Makefile:356: qwen35-moe-fp8-engine-test] Error 1

@@ -1,0 +1,7 @@
+make: Nothing to be done for 'lib'.
+make: Nothing to be done for 'libdg'.
+rm -f fucina
+CGO_CFLAGS="-I/usr/local/cuda-13/include" \
+CGO_LDFLAGS="-L/usr/local/cuda-13/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm" \
+/usr/local/go/bin/go build -a -ldflags="-s -w" -o fucina ./cmd/fucina/
+fucina: OK — device weight-upload path linked

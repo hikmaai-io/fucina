@@ -1,0 +1,13 @@
+ok  	github.com/hikmaai-io/fucina/cmd/fucina	0.049s
+ok  	github.com/hikmaai-io/fucina/cmd/fucina-calibrate	0.049s
+ok  	github.com/hikmaai-io/fucina/internal/chat	0.011s
+ok  	github.com/hikmaai-io/fucina/internal/dist	0.008s
+?   	github.com/hikmaai-io/fucina/internal/engine/cuda	[no test files]
+?   	github.com/hikmaai-io/fucina/internal/engine/diffusion	[no test files]
+?   	github.com/hikmaai-io/fucina/internal/engine/e4b	[no test files]
+ok  	github.com/hikmaai-io/fucina/internal/grammar	0.007s
+ok  	github.com/hikmaai-io/fucina/internal/sampler	0.018s
+ok  	github.com/hikmaai-io/fucina/internal/server	0.060s
+ok  	github.com/hikmaai-io/fucina/internal/server/batch	(cached)
+ok  	github.com/hikmaai-io/fucina/internal/session	0.026s
+ok  	github.com/hikmaai-io/fucina/internal/tokenizer	3.452s

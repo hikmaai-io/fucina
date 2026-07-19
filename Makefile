@@ -30,7 +30,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
         e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test \
-        gpu-gates qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-moe-fp8-engine-test \
+        gpu-gates qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-meta-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
         qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen36-ssd-stream-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench phase-b-test \
@@ -121,8 +121,8 @@ test: fucina go-test go-test-cgo paged-kv-test
 # none was a prerequisite of `test`, so all could be silently forgotten. This
 # umbrella chains them so a regression in any cannot pass unnoticed. Requires
 # the Qwen3.5 FP8/NVFP4 checkpoints and a GPU; run each under the shared GPU flock.
-gpu-gates: qwen35-parity-test qwen35-batch-test qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-moe-fp8-engine-test
-	@echo "gpu-gates: all Qwen3.5 dense+MoE parity/batch/state/chunk/multiseq-prefill/MoE-engine gates passed"
+gpu-gates: qwen35-parity-test qwen35-batch-test qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test
+	@echo "gpu-gates: all Qwen3.5 dense+MoE parity/batch/state/chunk/multiseq-prefill/clean-GDN/MoE-engine gates passed"
 
 
 # ─── Paged-KV allocator unit test (host-only, no GPU) ───────────────────
@@ -341,6 +341,16 @@ qwen35-multiseq-prefill-test: lib libdg
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_multiseq_prefill $(if $(MODEL),$(MODEL),$(QWEN35_MOE_FP8_MODEL)) $(QWEN35_FP8_MODEL)"
 
+qwen35-clean-gdn-meta-test:
+	$(CXX) -O2 -std=c++17 -Icuda cuda/test_qwen35_clean_gdn_meta.cc -o /tmp/fucina_qwen35_clean_gdn_meta
+	/tmp/fucina_qwen35_clean_gdn_meta
+
+qwen35-clean-gdn-test: qwen35-clean-gdn-meta-test lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_clean_gdn.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_clean_gdn \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 3600 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_clean_gdn $(if $(MODEL),$(MODEL),$(QWEN35_FP8_MODEL))"
+
 qwen35-moe-fp8-engine-test: lib libdg
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_moe_fp8_engine.cu \
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_moe_fp8_engine \
@@ -517,7 +527,7 @@ go-test-cgo: lib libdg
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	$(GO) test $(GO_TEST_CGO_PKGS) -count=1
 
-go-test:
+go-test: qwen35-clean-gdn-meta-test
 	$(GO) test $(GO_TEST_PKGS) -count=1
 
 phase-b-test:

@@ -3585,6 +3585,8 @@ typedef struct gemma4_seq {
     int             d_slid_cap;      // capacity of d_slid_blocks (elems)
     int             d_glob_cap;      // capacity of d_glob_blocks (elems)
     int             used;            // 1 if this slot is allocated to a live sequence
+    int             q35_state_is_clean; // explicit zero-GDN state proof for clean-prefix dispatch
+    int             q35_conv_is_empty;  // explicit zero conv-ring proof; cleared after first prefill
 
     // ── Per-sequence sampling params (continuous-batching batch path) ──────
     // Stored once at seq_add and applied on-device to THIS row's logits each
@@ -5203,7 +5205,10 @@ gemma4_engine_t* gemma4_engine_create(
     eng->q35.model_bytes = eng->q35.workspace_bytes = eng->q35.per_slot_recurrent_bytes = 0;
     eng->q35.per_slot_kv_bytes = eng->q35.reserved_slot_kv_bytes = 0;
     eng->q35.committed_bytes = eng->q35.reserved_bytes = eng->q35.peak_bytes = 0;
-    eng->q35.prefill_timing = getenv("FUCINA_QWEN35_PREFILL_TIMINGS") ? 1 : 0;
+    eng->q35.prefill_timing =
+        (getenv("FUCINA_QWEN35_PREFILL_TIMING") || getenv("FUCINA_QWEN35_PREFILL_TIMINGS")) ? 1 : 0;
+    const char *clean_gdn_env=getenv("FUCINA_QWEN35_CLEAN_GDN");
+    eng->q35.clean_gdn=!clean_gdn_env || atoi(clean_gdn_env)!=0; // measured keeper; =0 rollback
     eng->q35.prefill_dequant_ms = eng->q35.prefill_router_ms = 0;
     eng->q35.prefill_expert_ms = eng->q35.prefill_shared_ms = 0;
     eng->q35.jspace_enabled = eng->q35.jspace_topk = eng->q35.jspace_nlayers = 0;
@@ -12323,6 +12328,12 @@ extern "C" int gemma4_engine_debug_logits(gemma4_engine_t *eng, float *out, int 
     if (!src) return -1;
     cudaMemcpy(out, src, (size_t)nrows * VOC * sizeof(float), cudaMemcpyDeviceToHost);
     return (cudaGetLastError() == cudaSuccess) ? VOC : -1;   // returns VOC on success
+}
+
+extern "C" int gemma4_engine_debug_set_q35_clean_gdn(gemma4_engine_t *eng, int enabled) {
+    if(!eng || !eng->loaded || eng->cfg.arch!=GEMMA4_ARCH_QWEN3_5) return -1;
+    eng->q35.clean_gdn=enabled?1:0;
+    return 0;
 }
 
 // ─── Chunked prefill (interleaved with decode) ───────────────────────────────

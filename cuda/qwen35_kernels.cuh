@@ -1,6 +1,7 @@
 // Qwen3.5 device kernels and single-sequence numerical oracle.
 // Internal implementation fragment: included once by gemma4_kernels.cu.
 #pragma once
+#include "qwen35_clean_gdn_meta.h"
 
 // ─── Qwen3.5 hybrid (qwen35) M2: GDN + gated-full-attn mixer kernels + parity self-test ─────
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -1371,6 +1372,7 @@ __device__ inline void wmma_gemm_tf32(float *C, const float *A, const float *B,
 // (blockIdx.x=seq*nvh+vh) run the SAME math per (seq,vh) => byte-identical. `vh` is this block's
 // v-head; `scr_blk` is the global block id used to index the per-block scratch slab; q/k/v/g/beta
 // are already row-offset to this sequence's rows.
+template <bool CleanFirstChunk>
 __device__ __forceinline__ void qwen35_gdn_chunk_body(
         float *core, const float *q, const float *k, const float *v, const float *g,
         const float *beta, __nv_bfloat16 *const *S_slots, float *scratch,
@@ -1397,42 +1399,49 @@ __device__ __forceinline__ void qwen35_gdn_chunk_body(
     __nv_bfloat16 *Sg = S_slots[slot] + (size_t)vh * SD * SD;
     float scale = rsqrtf((float)SD);
     int warp = tid >> 5, n_warps = blockDim.x >> 5;
-    for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = __bfloat162float(Sg[idx]);   // carry-in
+    __shared__ int clean_finite;
+    for (int idx = tid; idx < SD * SD; idx += blockDim.x) {
+        if constexpr (CleanFirstChunk) S[idx]=0.f;
+        else S[idx]=__bfloat162float(Sg[idx]);
+    }
     __syncthreads();
 
     int n_chunks = NPAD / CS;
     for (int c = 0; c < n_chunks; c++) {
-        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+        int active_cs=CS;
+        if constexpr (CleanFirstChunk) if(c==0 && N<=CS)
+            active_cs=q35_clean_gdn_length_class(N);
+        for (int idx = tid; idx < active_cs * SD; idx += blockDim.x) {
             int r = idx / SD, d = idx % SD;
             int gt = c * CS + r;
             kch[idx] = (gt < N) ? k[((size_t)gt * M2_NKH + kh) * SD + d] : 0.f;
         }
-        for (int r = tid; r < CS; r += blockDim.x) {
+        for (int r = tid; r < active_cs; r += blockDim.x) {
             int gt = c * CS + r;
             bet[r] = (gt < N) ? beta[(size_t)gt * nvh + vh] : 0.f;
         }
         __syncthreads();
         if (tid == 0) {
             float acc = 0.f;
-            for (int r = 0; r < CS; r++) {
+            for (int r = 0; r < active_cs; r++) {
                 int gt = c * CS + r;
                 acc += (gt < N) ? g[(size_t)gt * nvh + vh] : 0.f;
                 gc[r] = acc;
             }
         }
         __syncthreads();
-        for (int idx = tid; idx < CS * CS; idx += blockDim.x) {
-            int i = idx / CS, j = idx % CS;
+        for (int idx = tid; idx < active_cs * active_cs; idx += blockDim.x) {
+            int i = idx / active_cs, j = idx % active_cs;
             float val = 0.f;
             if (i > j) {
                 float dot = 0.f;
                 for (int d = 0; d < SD; d++) dot += kch[i * SD + d] * bet[i] * kch[j * SD + d];
                 val = -dot * __expf(gc[i] - gc[j]);
             }
-            Tm[idx] = val;
+            Tm[i * CS + j] = val;
         }
         __syncthreads();
-        for (int i = 1; i < CS; i++) {
+        for (int i = 1; i < active_cs; i++) {
             for (int m = tid; m < i; m += blockDim.x) rowb[m] = Tm[i * CS + m];
             __syncthreads();
             for (int m = tid; m < i; m += blockDim.x) {
@@ -1442,12 +1451,12 @@ __device__ __forceinline__ void qwen35_gdn_chunk_body(
             }
             __syncthreads();
         }
-        for (int i = tid; i < CS; i += blockDim.x) Tm[i * CS + i] += 1.f;
+        for (int i = tid; i < active_cs; i += blockDim.x) Tm[i * CS + i] += 1.f;
         __syncthreads();
-        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+        for (int idx = tid; idx < active_cs * SD; idx += blockDim.x) {
             int i = idx / SD, d = idx % SD;
             float su = 0.f, sk = 0.f;
-            for (int s = 0; s < CS; s++) {
+            for (int s = 0; s < active_cs; s++) {
                 float t = Tm[i * CS + s];
                 int gt = c * CS + s;
                 float vv = (gt < N) ? v[((size_t)gt * nvh + vh) * SD + d] : 0.f;
@@ -1457,13 +1466,27 @@ __device__ __forceinline__ void qwen35_gdn_chunk_body(
             u[idx] = su; kcd[idx] = sk;
         }
         __syncthreads();
-        // vnew = u - kcd@S  (tensor-core: vnew←kcd@S, then subtract u)
-        wmma_gemm_tf32(vnew, kcd, S, CS, SD, SD, SD, SD, SD, warp, n_warps, false);
-        __syncthreads();
-        for (int idx = tid; idx < CS * SD; idx += blockDim.x) vnew[idx] = u[idx] - vnew[idx];
+        // Fresh first chunk: S is explicitly +0, so kcd@S is identically zero for finite kcd.
+        // Keep the subtraction itself (signed-zero behavior) and fall back on non-finite inputs,
+        // where IEEE 0*Inf/NaN must still poison the result exactly like the incumbent WMMA.
+        bool omit_state_interaction=false;
+        if constexpr (CleanFirstChunk) {
+            if (c==0) {
+                if (tid==0) clean_finite=1; __syncthreads();
+                for(int idx=tid;idx<active_cs*SD;idx+=blockDim.x)
+                    if(!isfinite(kcd[idx])) atomicExch(&clean_finite,0);
+                __syncthreads(); omit_state_interaction=clean_finite!=0;
+            }
+        }
+        if (!omit_state_interaction) {
+            wmma_gemm_tf32(vnew, kcd, S, active_cs, SD, SD, SD, SD, SD, warp, n_warps, false);
+            __syncthreads();
+        }
+        for (int idx = tid; idx < active_cs * SD; idx += blockDim.x)
+            vnew[idx] = u[idx] - (omit_state_interaction ? 0.f : vnew[idx]);
         // aintra[i,j] = <q[i],k[j]>·exp(gc[i]-gc[j]) (i>=j); qgs[i,d] = q·scale·exp(gc[i])
-        for (int idx = tid; idx < CS * CS; idx += blockDim.x) {
-            int i = idx / CS, j = idx % CS;
+        for (int idx = tid; idx < active_cs * active_cs; idx += blockDim.x) {
+            int i = idx / active_cs, j = idx % active_cs;
             float val = 0.f;
             if (i >= j) {
                 int gti = c * CS + i;
@@ -1474,30 +1497,44 @@ __device__ __forceinline__ void qwen35_gdn_chunk_body(
                 }
                 val = dot * __expf(gc[i] - gc[j]);
             }
-            aintra[idx] = val;
+            aintra[i * CS + j] = val;
         }
-        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+        for (int idx = tid; idx < active_cs * SD; idx += blockDim.x) {
             int i = idx / SD, d = idx % SD, gti = c * CS + i;
             qgs[idx] = (gti < N) ? q[((size_t)gti * M2_NKH + kh) * SD + d] * scale * __expf(gc[i]) : 0.f;
         }
         __syncthreads();
-        // core = qgs@S (inter) + aintra@vnew (intra), into ctmp, then N-guarded copy to core
-        wmma_gemm_tf32(ctmp, qgs, S, CS, SD, SD, SD, SD, SD, warp, n_warps, false);
+        // core = qgs@S (inter) + aintra@vnew (intra). On a finite clean first chunk the
+        // inter term is +0; initialize it explicitly, but retain the incumbent WMMA for NaN/Inf.
+        bool omit_core_interaction=false;
+        if constexpr (CleanFirstChunk) {
+            if(c==0) {
+                if(tid==0) clean_finite=1; __syncthreads();
+                for(int idx=tid;idx<active_cs*SD;idx+=blockDim.x)
+                    if(!isfinite(qgs[idx])) atomicExch(&clean_finite,0);
+                __syncthreads(); omit_core_interaction=clean_finite!=0;
+            }
+        }
+        if (omit_core_interaction) {
+            for(int idx=tid;idx<active_cs*SD;idx+=blockDim.x) ctmp[idx]=0.f;
+        } else {
+            wmma_gemm_tf32(ctmp, qgs, S, active_cs, SD, SD, SD, SD, SD, warp, n_warps, false);
+        }
         __syncthreads();
-        wmma_gemm_tf32(ctmp, aintra, vnew, CS, SD, CS, SD, CS, SD, warp, n_warps, true);
+        wmma_gemm_tf32(ctmp, aintra, vnew, active_cs, SD, active_cs, SD, CS, SD, warp, n_warps, true);
         __syncthreads();
-        for (int idx = tid; idx < CS * SD; idx += blockDim.x) {
+        for (int idx = tid; idx < active_cs * SD; idx += blockDim.x) {
             int i = idx / SD, d = idx % SD, gti = c * CS + i;
             if (gti < N) core[((size_t)gti * nvh + vh) * SD + d] = ctmp[idx];
         }
         // S = S·exp(glast) + (k·decay)^T @ vnew  (tensor-core)
-        float glast = gc[CS - 1];
-        for (int idx = tid; idx < SD * CS; idx += blockDim.x) {
-            int kd = idx / CS, r = idx % CS;                 // kchsT[kd][r] = kch[r][kd]·exp(glast-gc[r])
-            kchsT[idx] = kch[r * SD + kd] * __expf(glast - gc[r]);
+        float glast = gc[active_cs - 1];
+        for (int idx = tid; idx < SD * active_cs; idx += blockDim.x) {
+            int kd = idx / active_cs, r = idx % active_cs;                 // kchsT[kd][r] = kch[r][kd]·exp(glast-gc[r])
+            kchsT[kd * CS + r] = kch[r * SD + kd] * __expf(glast - gc[r]);
         }
         __syncthreads();
-        wmma_gemm_tf32(Stmp, kchsT, vnew, SD, SD, CS, SD, CS, SD, warp, n_warps, false);
+        wmma_gemm_tf32(Stmp, kchsT, vnew, SD, SD, active_cs, SD, CS, SD, warp, n_warps, false);
         __syncthreads();
         for (int idx = tid; idx < SD * SD; idx += blockDim.x) S[idx] = S[idx] * __expf(glast) + Stmp[idx];
         __syncthreads();
@@ -1511,8 +1548,8 @@ __global__ void qwen35_b_gdn_chunk_kernel(float *core, const float *q, const flo
                                           __nv_bfloat16 *const *S_slots, float *scratch,
                                           int slot, int N, int NPAD, int interleave, int nvh) {
     int vh = blockIdx.x;
-    qwen35_gdn_chunk_body(core, q, k, v, g, beta, S_slots, scratch, slot, N, NPAD,
-                          interleave, nvh, vh, /*scr_blk=*/vh);
+    qwen35_gdn_chunk_body<false>(core, q, k, v, g, beta, S_slots, scratch, slot, N, NPAD,
+                                 interleave, nvh, vh, /*scr_blk=*/vh);
 }
 
 // Multiseq GDN chunk scan: ONE launch of nvh*M blocks (F2, kills the per-seq serial loop in the
@@ -1532,13 +1569,31 @@ __global__ void qwen35_b_gdn_chunk_multiseq_kernel(
     int NPAD = ((N + M2_CHUNK - 1) / M2_CHUNK) * M2_CHUNK;
     // Row-offset the flattened Ttot-row buffers to this sequence's rows (same offsets the per-seq
     // launch passes as base pointers). q/k indexed [row,NKH,SD]; core/v/g/beta [row,NVH*...].
-    qwen35_gdn_chunk_body(core + (size_t)off * nvh * M2_SD,
-                          q + (size_t)off * M2_NKH * M2_SD,
-                          k + (size_t)off * M2_NKH * M2_SD,
-                          v + (size_t)off * nvh * M2_SD,
-                          g + (size_t)off * nvh,
-                          beta + (size_t)off * nvh,
-                          S_slots, scratch, slot, N, NPAD, interleave, nvh, vh,
-                          /*scr_blk=*/blockIdx.x);
+    qwen35_gdn_chunk_body<false>(core + (size_t)off * nvh * M2_SD,
+                                 q + (size_t)off * M2_NKH * M2_SD,
+                                 k + (size_t)off * M2_NKH * M2_SD,
+                                 v + (size_t)off * nvh * M2_SD,
+                                 g + (size_t)off * nvh,
+                                 beta + (size_t)off * nvh,
+                                 S_slots, scratch, slot, N, NPAD, interleave, nvh, vh,
+                                 /*scr_blk=*/blockIdx.x);
+}
+
+// Clean-prefix specialization. The host dispatch requires both explicit slot-state-clean and
+// conv-ring-empty bits; only the first chunk omits zero-state interactions, later chunks execute
+// the incumbent body unchanged.
+__global__ void qwen35_b_gdn_chunk_multiseq_clean_kernel(
+        float *core, const float *q, const float *k, const float *v, const float *g,
+        const float *beta, __nv_bfloat16 *const *S_slots, float *scratch,
+        const int *slots, const int *offs, const int *lens, int interleave, int nvh) {
+    int seq=blockIdx.x/nvh, vh=blockIdx.x%nvh;
+    int off=offs[seq], N=lens[seq], slot=slots[seq];
+    int NPAD=((N+M2_CHUNK-1)/M2_CHUNK)*M2_CHUNK;
+    qwen35_gdn_chunk_body<true>(core+(size_t)off*nvh*M2_SD,
+                                q+(size_t)off*M2_NKH*M2_SD,
+                                k+(size_t)off*M2_NKH*M2_SD,
+                                v+(size_t)off*nvh*M2_SD,
+                                g+(size_t)off*nvh,beta+(size_t)off*nvh,
+                                S_slots,scratch,slot,N,NPAD,interleave,nvh,vh,blockIdx.x);
 }
 

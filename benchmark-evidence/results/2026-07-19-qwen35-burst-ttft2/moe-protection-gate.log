@@ -1,0 +1,22 @@
+# protection gate: model=moe tol=5%
+  N           metric       cand       base    floor       vLLM     edge
+  1   agg_decode_tps       58.9       59.0     56.0       14.0
+  1   median_ttft_ms       58.7       58.7     61.6     6340.6
+  1      p95_ttft_ms       58.7       58.7     61.6     6340.6
+  2   agg_decode_tps      101.0      101.4     96.3       74.1
+  2   median_ttft_ms       84.1       97.5    102.3      105.5
+  2      p95_ttft_ms       93.8      107.1    112.5      105.6
+  4   agg_decode_tps      162.5      134.0    127.3      111.7
+  4   median_ttft_ms      123.8      149.8    157.3      146.6
+  4      p95_ttft_ms      124.2      150.2    157.7      147.1
+  8   agg_decode_tps      227.5      229.8    218.3      155.2      WIN
+  8   median_ttft_ms      191.9      226.7    238.0      216.7
+  8      p95_ttft_ms      193.5      261.5    274.6      218.2
+ 16   agg_decode_tps      321.2      320.1    304.1      207.2
+ 16   median_ttft_ms      254.7      366.7    385.0      245.1
+ 16      p95_ttft_ms      295.0      369.7    388.2      356.0
+ 32   agg_decode_tps      468.2      472.4    448.8      321.3
+ 32   median_ttft_ms      531.7      670.1    703.6      312.0
+ 32      p95_ttft_ms      555.6      722.4    758.5      315.6
+
+GATE PASS — all cells within floor; claimed-win cells beat contemporaneous vLLM.

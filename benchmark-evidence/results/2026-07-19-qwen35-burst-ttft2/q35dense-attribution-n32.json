@@ -1,0 +1,60 @@
+{
+  "N": 32,
+  "agg_decode_tps": 64.69723847283214,
+  "median_ttft_ms": 1149.5321540132863,
+  "p95_ttft_ms": 1388.1271569989622,
+  "ttfts_ms_raw": [
+    620.48,
+    746.98,
+    885.65,
+    887.98,
+    889.42,
+    890.5,
+    909.32,
+    924.96,
+    927.85,
+    1091.84,
+    1098.11,
+    1103.37,
+    1132.97,
+    1142.32,
+    1145.96,
+    1149.09,
+    1149.97,
+    1151.8,
+    1152.29,
+    1152.33,
+    1312.08,
+    1371.72,
+    1372.19,
+    1374.1,
+    1376.6,
+    1377.35,
+    1378.73,
+    1383.94,
+    1386.28,
+    1388.13,
+    1389.0,
+    1392.09
+  ],
+  "median_per_stream_tps": 10.296251740627179,
+  "wall_s": 1.4838345850002952,
+  "samples": [
+    {
+      "prompt": "Reply with one short sentence: what is the capital of France",
+      "text": " Paris.\n\nWait"
+    },
+    {
+      "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+      "text": " Photosynthesis is the"
+    },
+    {
+      "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+      "text": "2, "
+    },
+    {
+      "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+      "text": "402"
+    }
+  ]
+}

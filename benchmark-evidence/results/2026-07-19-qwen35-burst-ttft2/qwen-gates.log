@@ -1,0 +1,418 @@
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_qwen35_batch.cu \
+	cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_batch \
+	-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_batch /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf"
+fucina: loaded /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf (5.24 GB)
+fucina: token_embd is Q4_K — will convert to Q8_0 at load
+fucina: detected Qwen3.5 hybrid arch: 32 layers (8 FULL softmax-GQA / 24 LINEAR gated-deltanet, full every 4), hidden 4096, FFN 12288, 16 heads, 4 KV heads, head_dim 256, rotary_dim 64, vocab 248320, rope_theta 10000000
+fucina: qwen35 layout — hidden=4096 head_dim=256 (q-heads 16, kv-heads 4), intermediate=12288, conv_dim=8192, state=128x128, rotary_dim=64, full-interval=4
+  L 0 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 1 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 2 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 3 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L 4 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 5 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 6 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 7 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L 8 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 9 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L10 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L11 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L12 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L13 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L14 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L15 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L16 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L17 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L18 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L19 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L20 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L21 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L22 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L23 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L24 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L25 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L26 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L27 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L28 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L29 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L30 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L31 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+fucina: qwen35 layers: 8 FULL / 24 LINEAR (expected 8 FULL by (i+1)%4==0); shape errors=0
+fucina: uploading 5.23 GB of weights to device...
+fucina: requantized 24 Qwen3.5 GDN in_qkv Q5_K tensor(s) -> Q8_0
+fucina: token_embd Q4_K->Q8_0 converted (1.01 GB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    40.96 GiB  (shared box: 78.73 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :     7.94 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 4096, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 4096)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :     7.94 GiB  (within budget by 99.78 GiB)
+fucina: engine initialized (5.24 GB model, 4096 ctx, Q8_0)
+fucina: 24 sliding + 8 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=4096 maxctx=4096 cuda-free=32.98 GiB available=103.08 GiB model-resident=7.99 GiB (free-delta) workspace=2.22 GiB reserve/slot=0.15 GiB (max 0.15) physical-room=102.58 GiB budget-room=99.74 GiB chosen-room=99.74 GiB fit=647
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 17.00 GiB, cuda-free 30.73 GiB, available 100.83 GiB, physical=fit, budget=fit, reserved-before 7.05 GiB, room 99.74 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=4096 slotctx=4096 slots=32/32 workspace=2.22 GiB reserve/slot=0.15 GiB (recurrent 0.03 + KV 0.12; max-KV 0.12) committed=2.22 GiB reserved=24.05 GiB
+fucina: qwen35 M4 batch graph captured (nt=3 nr=3 utc=1)
+qwen35 M4 seq 0 (prompt=5, decode pos 5..28): B=3(graph) vs B=1(per-kernel) 24/24 bit-identical; graph-on vs graph-off 24/24
+qwen35 M4 seq 1 (prompt=8, decode pos 8..31): B=3(graph) vs B=1(per-kernel) 24/24 bit-identical; graph-on vs graph-off 24/24
+qwen35 M4 seq 2 (prompt=11, decode pos 11..34): B=3(graph) vs B=1(per-kernel) 24/24 bit-identical; graph-on vs graph-off 24/24
+qwen35 M4 seq 0 vs M3 forward (France->Paris): 11751,13,198,57590,369,279,6511,314  (M3: 11751,13,198,57590,369,279,6511,314)  8/8
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+qwen35 M4 self-chain (seed-once, 24 graph replays, no host feedback): PASS
+qwen35 M4 batched-decode gate: row-independence=PASS graph-on==off=PASS M3-parity=PASS(8/8) sampling=PASS self-chain=PASS — PASS
+qwen35 block-KV gate: 256->512 growth + graph replay — PASS
+qwen35 memory-plan gate: workspace=2.22 GiB committed=15.23 GiB reserved=24.05 GiB capacity=32 allocated=3 slotctx=4096 maxctx=4096 — PASS
+PASS — qwen35 M4 batched-decode gate
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_qwen35_state.cu \
+	cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_state \
+	-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_state /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf"
+fucina: loaded /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf (5.24 GB)
+fucina: token_embd is Q4_K — will convert to Q8_0 at load
+fucina: detected Qwen3.5 hybrid arch: 32 layers (8 FULL softmax-GQA / 24 LINEAR gated-deltanet, full every 4), hidden 4096, FFN 12288, 16 heads, 4 KV heads, head_dim 256, rotary_dim 64, vocab 248320, rope_theta 10000000
+fucina: qwen35 layout — hidden=4096 head_dim=256 (q-heads 16, kv-heads 4), intermediate=12288, conv_dim=8192, state=128x128, rotary_dim=64, full-interval=4
+  L 0 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 1 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 2 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 3 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L 4 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 5 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 6 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 7 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L 8 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 9 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L10 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L11 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L12 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L13 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L14 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L15 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L16 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L17 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L18 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L19 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L20 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L21 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L22 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L23 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L24 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L25 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L26 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L27 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L28 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L29 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L30 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L31 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+fucina: qwen35 layers: 8 FULL / 24 LINEAR (expected 8 FULL by (i+1)%4==0); shape errors=0
+fucina: uploading 5.23 GB of weights to device...
+fucina: requantized 24 Qwen3.5 GDN in_qkv Q5_K tensor(s) -> Q8_0
+fucina: token_embd Q4_K->Q8_0 converted (1.01 GB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    40.98 GiB  (shared box: 78.72 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :     7.86 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 4096, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 4096)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :     7.86 GiB  (within budget by 99.86 GiB)
+fucina: engine initialized (5.24 GB model, 4096 ctx, Q8_0)
+fucina: 24 sliding + 8 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=4096 maxctx=4096 cuda-free=33.07 GiB available=103.19 GiB model-resident=7.91 GiB (free-delta) workspace=2.22 GiB reserve/slot=0.15 GiB (max 0.15) physical-room=102.69 GiB budget-room=99.82 GiB chosen-room=99.82 GiB fit=647
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 17.00 GiB, cuda-free 30.83 GiB, available 100.95 GiB, physical=fit, budget=fit, reserved-before 7.05 GiB, room 99.82 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=4096 slotctx=4096 slots=32/32 workspace=2.22 GiB reserve/slot=0.15 GiB (recurrent 0.03 + KV 0.12; max-KV 0.12) committed=2.22 GiB reserved=24.05 GiB
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+saved slot 0 at 29 tokens (27.2 MiB)
+state diff: 7083426/7118848 floats differ, first@1, max|d|=4.12371e+11
+PASS — qwen35 state snapshot gate: warm==ref 16/16 bit-identical (cross-slot restore); cold boundary ok, cold agrees 16/16 (informational)
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_qwen35_gdn_rollback.cu \
+	cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_gdn_rollback \
+	-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_gdn_rollback /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf"
+fucina: loaded /opt/spark/models/Qwen3.5-9B-abliterated-Q4_K_M.gguf (5.24 GB)
+fucina: token_embd is Q4_K — will convert to Q8_0 at load
+fucina: detected Qwen3.5 hybrid arch: 32 layers (8 FULL softmax-GQA / 24 LINEAR gated-deltanet, full every 4), hidden 4096, FFN 12288, 16 heads, 4 KV heads, head_dim 256, rotary_dim 64, vocab 248320, rope_theta 10000000
+fucina: qwen35 layout — hidden=4096 head_dim=256 (q-heads 16, kv-heads 4), intermediate=12288, conv_dim=8192, state=128x128, rotary_dim=64, full-interval=4
+  L 0 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 1 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 2 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 3 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L 4 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 5 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 6 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 7 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L 8 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L 9 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L10 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L11 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L12 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L13 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L14 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L15 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L16 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L17 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L18 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L19 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L20 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L21 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L22 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L23 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L24 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L25 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L26 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L27 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+  L28 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L29 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L30 LINEAR qkv[4096->8192] z[4096->4096] a/b[4096->32] A_log[32] dt[32] conv[4x8192] norm[128] out[4096->4096]
+  L31 FULL   attn_q[4096->8192] k/v[4096->1024] o[4096->4096] q/k_norm[256] ffn[4096->12288->4096]
+fucina: qwen35 layers: 8 FULL / 24 LINEAR (expected 8 FULL by (i+1)%4==0); shape errors=0
+fucina: uploading 5.23 GB of weights to device...
+fucina: requantized 24 Qwen3.5 GDN in_qkv Q5_K tensor(s) -> Q8_0
+fucina: token_embd Q4_K->Q8_0 converted (1.01 GB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    41.16 GiB  (shared box: 78.53 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :     8.08 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 4096, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 4096)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :     8.08 GiB  (within budget by 99.65 GiB)
+fucina: engine initialized (5.24 GB model, 4096 ctx, Q8_0)
+fucina: 24 sliding + 8 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=4096 maxctx=4096 cuda-free=33.04 GiB available=103.18 GiB model-resident=8.12 GiB (free-delta) workspace=2.22 GiB reserve/slot=0.15 GiB (max 0.15) physical-room=102.68 GiB budget-room=99.61 GiB chosen-room=99.61 GiB fit=646
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 17.00 GiB, cuda-free 30.80 GiB, available 100.94 GiB, physical=fit, budget=fit, reserved-before 7.05 GiB, room 99.61 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=4096 slotctx=4096 slots=32/32 workspace=2.22 GiB reserve/slot=0.15 GiB (recurrent 0.03 + KV 0.12; max-KV 0.12) committed=2.22 GiB reserved=24.05 GiB
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+  j=0: ntokens=25 state=ok
+  j=1: ntokens=26 state=ok
+  j=2: ntokens=27 state=ok
+  j=3: ntokens=28 state=ok
+  j=4: ntokens=29 state=ok
+  j=5: ntokens=30 state=ok
+  j=6: ntokens=31 state=ok
+PASS — qwen35 GDN rollback gate: commit(j) byte-identical to j sequential decodes for all j in 0..6 (rewind j=0 and full-accept j=6 included)
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_qwen35_chunk_parity.cu \
+	cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_chunk_parity \
+	-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_chunk_parity \
+	/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8 /home/mauromedda/hack/fucina-burst-ttft2/cuda/qwen35_longctx_4k.ids"
+fucina: loaded /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8 (directory)
+fucina: qwen35 geometry (runtime-derived) — NQ=16 NKV=2 NVH=32 INNER=4096 CONVD=8192 (M2 baked NQ16/NVH32/INNER4096)
+fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)
+fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine
+fucina: qwen35 tensor plan finalized: entries=900 core=0.88 GiB scales=0.01 MiB
+fucina: qwen35-Q4K mixer repacked in place (130 tensors → packed dp4a GEMV)
+fucina: qwen35 allocation decision: source=block-FP8 mixer=Q4_K experts=NVFP4 d_weights=0.88 GiB
+fucina: qwen35 allocation ledger: experts=16.88 core=0.88 scales=0.00 embed=3.35 head=1.45 moe-scratch=0.58 misc=0.00 total=23.13 GiB
+fucina: qwen35 free-memory trace: enter=40.61 after-experts=21.65 after-core=21.07 before-scratch=16.15 after-scratch=15.57 final=15.57 GiB
+fucina: qwen35 host-memory trace: free 40.61->15.57 available 110.76->85.73 cached 71.25->71.25 reclaimable 0.42->0.42 GiB
+fucina: qwen35 observed deltas: experts=+18.96 core=+0.58 embed/head=+4.92 moe-scratch=+0.58 fill-total=+25.04 ledger-residual=+1.91 GiB
+fucina: qwen35 Q4_K-MoE served via batched engine (40 layers, vocab 248320, H 2048, NKV 2, E-experts slabbed, 0.88 GiB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    40.79 GiB  (shared box: 78.91 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :    25.22 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 8192, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 8192)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :    25.22 GiB  (within budget by 82.51 GiB)
+fucina: engine initialized (0.88 GB model, 8192 ctx, Q8_0)
+fucina: 30 sliding + 10 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=8192 maxctx=8192 cuda-free=15.64 GiB available=85.80 GiB model-resident=23.13 GiB (ledger) workspace=2.43 GiB reserve/slot=0.19 GiB (max 0.19) physical-room=85.30 GiB budget-room=84.59 GiB chosen-room=84.59 GiB fit=436
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 5.23 GiB, cuda-free 13.18 GiB, available 83.34 GiB, physical=fit, budget=fit, reserved-before 8.46 GiB, room 84.59 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=8192 slotctx=8192 slots=32/32 workspace=2.43 GiB reserve/slot=0.19 GiB (recurrent 0.03 + KV 0.16; max-KV 0.16) committed=2.43 GiB reserved=13.69 GiB
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+ONESHOT prefill 1975.3 ms first=369
+CHUNKED[scalar] chunk1(T=1024,base=0) 627.2 ms  chunk2(T=1376,base=1024) 2075.4 ms  first=369
+CHUNKED[tc] chunk1(T=1024,base=0) 628.9 ms  chunk2(T=1376,base=1024) 868.8 ms  first=369
+TOKENS ONESHOT   : 369 264 2993 314 5515 421 10583 874 2956 364 10179 11 3482 279 1786 74519 635 777 1056 79240 1036 305 25 781 10033
+TOKENS CHUNK-SCAL: 369 264 2993 314 5515 421 10583 874 2956 364 10179 11 3482 279 1786 74519 635 777 1056 79240 1036 305 25 781 10033
+TOKENS CHUNK-TC  : 369 264 2993 314 5515 421 10583 874 2956 364 10179 11 3482 279 1786 74519 635 777 1056 79240 1036 305 25 781 10033
+PARITY first: oneshot=369 scalar=369 tc=369
+PARITY agree/25: scalar-vs-oneshot=25 tc-vs-oneshot=25 tc-vs-scalar=25
+CHUNK-PARITY PASS
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_qwen35_multiseq_prefill.cu \
+	cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_multiseq_prefill \
+	-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_multiseq_prefill /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8 /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8"
+fucina: loaded /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8 (directory)
+fucina: qwen35 geometry (runtime-derived) — NQ=16 NKV=2 NVH=32 INNER=4096 CONVD=8192 (M2 baked NQ16/NVH32/INNER4096)
+fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)
+fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine
+fucina: qwen35 tensor plan finalized: entries=900 core=0.88 GiB scales=0.01 MiB
+fucina: qwen35-Q4K mixer repacked in place (130 tensors → packed dp4a GEMV)
+fucina: qwen35 allocation decision: source=block-FP8 mixer=Q4_K experts=NVFP4 d_weights=0.88 GiB
+fucina: qwen35 allocation ledger: experts=16.88 core=0.88 scales=0.00 embed=3.35 head=1.45 moe-scratch=0.58 misc=0.00 total=23.13 GiB
+fucina: qwen35 free-memory trace: enter=40.25 after-experts=21.92 after-core=21.37 before-scratch=15.98 after-scratch=15.40 final=15.40 GiB
+fucina: qwen35 host-memory trace: free 40.25->15.40 available 110.40->85.55 cached 71.25->71.25 reclaimable 0.42->0.42 GiB
+fucina: qwen35 observed deltas: experts=+18.33 core=+0.55 embed/head=+5.39 moe-scratch=+0.58 fill-total=+24.85 ledger-residual=+1.72 GiB
+fucina: qwen35 Q4_K-MoE served via batched engine (40 layers, vocab 248320, H 2048, NKV 2, E-experts slabbed, 0.88 GiB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    40.44 GiB  (shared box: 79.26 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :    25.04 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 4096, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 4096)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :    25.04 GiB  (within budget by 82.69 GiB)
+fucina: engine initialized (0.88 GB model, 4096 ctx, Q8_0)
+fucina: 30 sliding + 10 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=4096 maxctx=4096 cuda-free=15.44 GiB available=85.60 GiB model-resident=23.13 GiB (ledger) workspace=1.39 GiB reserve/slot=0.11 GiB (max 0.11) physical-room=85.10 GiB budget-room=84.59 GiB chosen-room=84.59 GiB fit=755
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 5.23 GiB, cuda-free 14.03 GiB, available 84.19 GiB, physical=fit, budget=fit, reserved-before 4.91 GiB, room 84.59 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=4096 slotctx=4096 slots=32/32 workspace=1.39 GiB reserve/slot=0.11 GiB (recurrent 0.03 + KV 0.08; max-KV 0.08) committed=1.39 GiB reserved=10.15 GiB
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+fucina: loaded /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8 (directory)
+fucina: qwen35 geometry (runtime-derived) — NQ=16 NKV=4 NVH=32 INNER=4096 CONVD=8192 (M2 baked NQ16/NVH32/INNER4096)
+fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)
+fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine
+fucina: qwen35 tensor plan finalized: entries=433 core=3.65 GiB scales=0.00 MiB
+fucina: qwen35-Q4K mixer repacked in place (200 tensors → packed dp4a GEMV)
+fucina: qwen35 allocation decision: source=block-FP8 mixer=Q4_K experts=n/a d_weights=3.65 GiB
+fucina: qwen35 allocation ledger: experts=0.00 core=3.65 scales=0.00 embed=6.69 head=2.90 moe-scratch=0.00 misc=0.00 total=13.24 GiB
+fucina: qwen35 free-memory trace: enter=40.20 after-experts=34.71 after-core=34.44 before-scratch=24.89 after-scratch=24.89 final=24.89 GiB
+fucina: qwen35 host-memory trace: free 40.20->24.89 available 110.35->95.04 cached 71.25->71.26 reclaimable 0.42->0.42 GiB
+fucina: qwen35 observed deltas: experts=+5.49 core=+0.27 embed/head=+9.55 moe-scratch=+0.00 fill-total=+15.31 ledger-residual=+2.07 GiB
+fucina: qwen35 Q4_K-dense served via batched engine (32 layers, vocab 248320, H 4096, NKV 4, 3.65 GiB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    40.40 GiB  (shared box: 79.30 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :    15.51 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 4096, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 4096)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :    15.51 GiB  (within budget by 92.21 GiB)
+fucina: engine initialized (3.65 GB model, 4096 ctx, Q8_0)
+fucina: 24 sliding + 8 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=4096 maxctx=4096 cuda-free=24.86 GiB available=95.02 GiB model-resident=13.24 GiB (ledger) workspace=2.22 GiB reserve/slot=0.15 GiB (max 0.15) physical-room=94.52 GiB budget-room=94.48 GiB chosen-room=94.48 GiB fit=612
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 17.00 GiB, cuda-free 22.62 GiB, available 92.77 GiB, physical=fit, budget=fit, reserved-before 7.05 GiB, room 94.48 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=4096 slotctx=4096 slots=32/32 workspace=2.22 GiB reserve/slot=0.15 GiB (recurrent 0.03 + KV 0.12; max-KV 0.12) committed=2.22 GiB reserved=24.05 GiB
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+=== /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8 ===
+  OK  M=1 len=1: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=3: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=17: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=31: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=63: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=64: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=65: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=40: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  K=2 non-aligned {17@0,31@17}: 2 seqs — DET byte-identical, logit rel<=0.0578, first-token flips=0/2
+  OK  K=2 short {12,15}: 2 seqs — DET byte-identical, logit rel<=0.0544, first-token flips=0/2
+  OK  K=3 {17,17,17}: 3 seqs — DET byte-identical, logit rel<=0.0946, first-token flips=0/3
+  OK  K=4 short-burst: 4 seqs — DET byte-identical, logit rel<=0.0589, first-token flips=1/4 (MoE expert-flip, documented)
+  OK  K=2 chunk-boundary {64,65}: 2 seqs — DET byte-identical, logit rel<=0.0488, first-token flips=0/2
+  OK  K=8 heterogeneous: 8 seqs — DET byte-identical, logit rel<=0.0879, first-token flips=0/8
+  OK  K=8 short-burst: 8 seqs — DET byte-identical, logit rel<=0.0667, first-token flips=2/8 (MoE expert-flip, documented)
+=== /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8 ===
+  OK  M=1 len=1: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=3: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=17: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=31: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=63: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=64: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=65: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  M=1 len=40: 1 seqs — DET byte-identical, logit rel<=0.0000, first-token flips=0/1
+  OK  K=2 non-aligned {17@0,31@17}: 2 seqs — DET byte-identical, logit rel<=0.0029, first-token flips=0/2
+  OK  K=2 short {12,15}: 2 seqs — DET byte-identical, logit rel<=0.0021, first-token flips=0/2
+  OK  K=3 {17,17,17}: 3 seqs — DET byte-identical, logit rel<=0.0018, first-token flips=0/3
+  OK  K=4 short-burst: 4 seqs — DET byte-identical, logit rel<=0.0025, first-token flips=0/4
+  OK  K=2 chunk-boundary {64,65}: 2 seqs — DET byte-identical, logit rel<=0.0028, first-token flips=0/2
+  OK  K=8 heterogeneous: 8 seqs — DET byte-identical, logit rel<=0.0029, first-token flips=0/8
+  OK  K=8 short-burst: 8 seqs — DET byte-identical, logit rel<=0.0018, first-token flips=0/8
+PASS — multiseq prefill: deterministic + within measured logit bound + coherent (option-i, rev-2 tolerance clause)
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_qwen35_moe_fp8_engine.cu \
+	cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_moe_fp8_engine \
+	-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_moe_fp8_engine /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8"
+fucina: loaded /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8 (directory)
+fucina: qwen35 geometry (runtime-derived) — NQ=16 NKV=2 NVH=32 INNER=4096 CONVD=8192 (M2 baked NQ16/NVH32/INNER4096)
+fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)
+fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine
+fucina: qwen35 tensor plan finalized: entries=900 core=0.88 GiB scales=0.01 MiB
+fucina: qwen35-Q4K mixer repacked in place (130 tensors → packed dp4a GEMV)
+fucina: qwen35 allocation decision: source=block-FP8 mixer=Q4_K experts=NVFP4 d_weights=0.88 GiB
+fucina: qwen35 allocation ledger: experts=16.88 core=0.88 scales=0.00 embed=3.35 head=1.45 moe-scratch=0.58 misc=0.00 total=23.13 GiB
+fucina: qwen35 free-memory trace: enter=40.37 after-experts=21.83 after-core=21.29 before-scratch=16.26 after-scratch=15.68 final=15.68 GiB
+fucina: qwen35 host-memory trace: free 40.37->15.68 available 110.54->85.86 cached 71.27->71.27 reclaimable 0.42->0.42 GiB
+fucina: qwen35 observed deltas: experts=+18.53 core=+0.55 embed/head=+5.02 moe-scratch=+0.58 fill-total=+24.68 ledger-residual=+1.55 GiB
+fucina: qwen35 Q4_K-MoE served via batched engine (40 layers, vocab 248320, H 2048, NKV 2, E-experts slabbed, 0.88 GiB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    40.56 GiB  (shared box: 79.14 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :    24.87 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 4096, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 4096)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :    24.87 GiB  (within budget by 82.85 GiB)
+fucina: engine initialized (0.88 GB model, 4096 ctx, Q8_0)
+fucina: 30 sliding + 10 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=4096 maxctx=4096 cuda-free=15.73 GiB available=85.90 GiB model-resident=23.13 GiB (ledger) workspace=1.39 GiB reserve/slot=0.11 GiB (max 0.11) physical-room=85.40 GiB budget-room=84.59 GiB chosen-room=84.59 GiB fit=755
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 5.23 GiB, cuda-free 14.33 GiB, available 84.50 GiB, physical=fit, budget=fit, reserved-before 4.91 GiB, room 84.59 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=4096 slotctx=4096 slots=32/32 workspace=1.39 GiB reserve/slot=0.11 GiB (recurrent 0.03 + KV 0.08; max-KV 0.08) committed=1.39 GiB reserved=10.15 GiB
+fucina: qwen35 M4 batch graph captured (nt=3 nr=3 utc=1)
+qwen35 M4 seq 0 (prompt=5, decode pos 5..28): B=3(graph) vs B=1(per-kernel) 6/24 bit-identical  first-mismatch@; graph-on vs graph-off 6/24
+qwen35 M4   seq 0 first mismatch step 6 (B=1 9338 vs B=3 11751)
+qwen35 M4 seq 1 (prompt=8, decode pos 8..31): B=3(graph) vs B=1(per-kernel) 3/24 bit-identical  first-mismatch@; graph-on vs graph-off 2/24
+qwen35 M4   seq 1 first mismatch step 2 (B=1 15 vs B=3 13)
+qwen35 M4 seq 2 (prompt=11, decode pos 11..34): B=3(graph) vs B=1(per-kernel) 1/24 bit-identical  first-mismatch@; graph-on vs graph-off 1/24
+qwen35 M4   seq 2 first mismatch step 1 (B=1 497 vs B=3 400)
+qwen35 M4 seq 0 vs M3 forward (France->Paris): 11751,13,198,760,6511,314,9338,369  (M3: 11751,13,198,760,6511,314,9338,369)  8/8
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+qwen35 M4 self-chain (seed-once, 24 graph replays, no host feedback): FAIL
+qwen35 M4 batched-decode gate: row-independence=FAIL graph-on==off=FAIL M3-parity=PASS(8/8) sampling=FAIL self-chain=FAIL — FAIL
+pos | engine | oracle
+  0 |  11751 |  11751
+  1 |     13 |     13
+  2 |    198 |    198
+  3 |    760 |    760
+  4 |   6511 |   6511
+  5 |    314 |    314
+  6 |   9338 |   9338
+  7 |    369 |    369
+MoE FP8 engine oracle-parity: 8/8
+FAIL — qwen35 MoE-35B-A3B FP8 served through the batched engine (oracle 8/8, self-test FAIL)
+make: *** [Makefile:356: qwen35-moe-fp8-engine-test] Error 1
