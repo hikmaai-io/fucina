@@ -25,6 +25,7 @@
 #include <mma.h>              // nvcuda::wmma tf32 tensor cores (GDN chunk-scan matmuls)
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cuda_pipeline.h>   // D32B: cp.async (__pipeline_memcpy_async) for smem weight prefetch
 
 // POSIX headers for host-side file loading (mmap, open, etc.)
 #include <fcntl.h>
@@ -1889,12 +1890,23 @@ __global__ void mmvq_q4_k_packedT_batched_kernel(
 // D32: MINBLK is a template arg so the wider NK=16 tile (16 acc regs vs 8) can trade a little
 // occupancy for HALF the chunk count at K>16 (B=32 → 2 chunks not 4), cutting the redundant
 // L2 weight bandwidth + per-chunk Q4_K dequant ALU that measured 65% of the B=16→32 step growth.
-template<int NK, int MINBLK = 4>
+// D32B: DPSPLIT breaks the 8-deep SERIAL __dp4a chain (one `sumi` threaded through 8 dp4a =
+// an 8-long ALU dependency chain, measured as the 23-28 cyc/inst warp latency at inst/cycle 0.2
+// — pure latency starvation) into DPSPLIT INDEPENDENT partial sums that issue in parallel, then
+// sums them at the end. Two's-complement int32 addition is associative AND commutative, so the
+// final `sumi` is the sum of the SAME 8 dot4(wv,x) terms regardless of grouping → BITWISE-
+// identical (hash-verified, not asserted). Near-zero register cost (DPSPLIT-1 extra int regs),
+// shortens the per-token critical path 8→8/DPSPLIT for latency hiding without touching occupancy.
+// D32B: PIPE (staged superblock epochs) is a template arg so deeper weight staging (PIPE=3/4 =
+// more in-flight independent LDGs per warp) can be measured against the long-scoreboard stall
+// (ncu: 17-20 cyc/issue on activation+weight loads = the dominant stall) that occupancy alone
+// (53%, register-capped) cannot hide. Bit-identical: PIPE only changes how many b-windows are
+// prefetched, not the per-(row,token) ascending-b accumulation order.
+template<int NK, int MINBLK = 4, int DPSPLIT = 1, int PIPE = 2>
 __global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi_kernel(
     float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
     int in_dim, int out_dim, int K)
 {
-    constexpr int PIPE = 2;                      // superblock epochs staged per chunk
     int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int idx = blockIdx.y * nwarps + warp;        // output row (grid.y = row groups)
     if (idx >= out_dim) return;
@@ -1942,17 +1954,38 @@ __global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi_kernel(
             #pragma unroll
             for (int n = 0; n < NK; n++) {
                 if (n >= ntok) break;
+                // D32B: __ldg on activations measured NEUTRAL (455 vs 465, within noise) — they are
+                // already L1-served at 90% hit, so the read-only path doesn't cut the latency.
                 uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);        // xqs[0..3]
                 uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);  // xqs[4..7]
-                int sumi = 0;
-                sumi = __dp4a(wv[0], (int)A.x, sumi);
-                sumi = __dp4a(wv[1], (int)B.x, sumi);
-                sumi = __dp4a(wv[2], (int)A.y, sumi);
-                sumi = __dp4a(wv[3], (int)B.y, sumi);
-                sumi = __dp4a(wv[4], (int)A.z, sumi);
-                sumi = __dp4a(wv[5], (int)B.z, sumi);
-                sumi = __dp4a(wv[6], (int)A.w, sumi);
-                sumi = __dp4a(wv[7], (int)B.w, sumi);
+                int sumi;
+                if (DPSPLIT >= 4) {
+                    // 4 independent dp4a chains (2-deep each) → shortest critical path.
+                    int s0=0,s1=0,s2=0,s3=0;
+                    s0 = __dp4a(wv[0], (int)A.x, s0); s0 = __dp4a(wv[1], (int)B.x, s0);
+                    s1 = __dp4a(wv[2], (int)A.y, s1); s1 = __dp4a(wv[3], (int)B.y, s1);
+                    s2 = __dp4a(wv[4], (int)A.z, s2); s2 = __dp4a(wv[5], (int)B.z, s2);
+                    s3 = __dp4a(wv[6], (int)A.w, s3); s3 = __dp4a(wv[7], (int)B.w, s3);
+                    sumi = (s0 + s1) + (s2 + s3);   // int32 add is exact & associative
+                } else if (DPSPLIT == 2) {
+                    // 2 independent dp4a chains (4-deep each).
+                    int s0=0,s1=0;
+                    s0 = __dp4a(wv[0], (int)A.x, s0); s0 = __dp4a(wv[1], (int)B.x, s0);
+                    s0 = __dp4a(wv[2], (int)A.y, s0); s0 = __dp4a(wv[3], (int)B.y, s0);
+                    s1 = __dp4a(wv[4], (int)A.z, s1); s1 = __dp4a(wv[5], (int)B.z, s1);
+                    s1 = __dp4a(wv[6], (int)A.w, s1); s1 = __dp4a(wv[7], (int)B.w, s1);
+                    sumi = s0 + s1;
+                } else {
+                    sumi = 0;
+                    sumi = __dp4a(wv[0], (int)A.x, sumi);
+                    sumi = __dp4a(wv[1], (int)B.x, sumi);
+                    sumi = __dp4a(wv[2], (int)A.y, sumi);
+                    sumi = __dp4a(wv[3], (int)B.y, sumi);
+                    sumi = __dp4a(wv[4], (int)A.z, sumi);
+                    sumi = __dp4a(wv[5], (int)B.z, sumi);
+                    sumi = __dp4a(wv[6], (int)A.w, sumi);
+                    sumi = __dp4a(wv[7], (int)B.w, sumi);
+                }
                 acc[n] += dxc[(size_t)n*nb32 + b] *
                           (ds*(float)sumi - dm*(float)sxc[(size_t)n*nb32 + b]);
             }
@@ -1966,10 +1999,311 @@ __global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi_kernel(
     }
 }
 
+// D32B: cp.async DEEP-PREFETCH variant. The register-staged PIPE=3/4 sweep spilled because the
+// prefetched uint4 hh/hq live in REGISTERS. __pipeline_memcpy_async (cp.async) copies global->
+// shared DIRECTLY, bypassing registers, so prefetch depth (STAGES) is decoupled from register
+// pressure — the exact latency-hiding CUTLASS/Marlin use. Each warp owns one row; per b-window
+// it stages (hh,hq) = 32 bytes/lane into a STAGES-deep smem ring, keeping STAGES weight epochs
+// in flight to hide the long-scoreboard weight-load latency occupancy alone could not. The dp4a
+// accumulation over b (ascending, lane-strided) is UNCHANGED — cp.async only moves the SAME
+// bytes earlier — so the output is BITWISE-identical (hash-verified). smem/block = nwarps*32*32*
+// STAGES bytes (8 warps, STAGES=3 => 24 KiB) — well within the 48 KiB default.
+template<int NK, int MINBLK = 4, int DPSPLIT = 1, int STAGES = 3>
+__global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_cpasync_kernel(
+    float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int idx = blockIdx.y * nwarps + warp;
+    if (idx >= out_dim) return;
+    const int t0 = (int)blockIdx.x * NK;
+    const int ntok = (K - t0 < NK) ? (K - t0) : NK;
+    const int8_t *qxTc = qxT + (size_t)t0 * in_dim;
+    const float  *dxc  = dx + (size_t)t0 * (in_dim >> 5);
+    const int    *sxc  = sx + (size_t)t0 * (in_dim >> 5);
+    float        *outc = out + (size_t)t0 * out_dim;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    const uint8_t *wrow = weight + (size_t)idx * (size_t)n_super * 144;
+    // smem ring: [warp][stage][lane] each holds hh(uint4)+hq(uint4) = 32 bytes.
+    extern __shared__ uint4 cpa_smem[];
+    uint4 *myh = cpa_smem + (size_t)warp * STAGES * 32 * 2;   // 2 uint4 (hh,hq) per lane
+    float acc[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) acc[n] = 0.0f;
+    // Prime the pipeline: issue STAGES async copies for the first STAGES b-windows.
+    auto issue = [&](int stage, int b) {
+        uint4 *dsth = myh + (size_t)stage * 32 * 2 + (size_t)lane * 2;
+        if (b < nb32) {
+            const uint8_t *blk = wrow + (size_t)(b >> 3) * 144;
+            __pipeline_memcpy_async(dsth,     (const uint4 *)blk, sizeof(uint4));
+            __pipeline_memcpy_async(dsth + 1, (const uint4 *)(blk + 16 + (size_t)(b & 7) * 16), sizeof(uint4));
+        }
+        __pipeline_commit();
+    };
+    int nb_iters = (nb32 - lane + 32 - 1) / 32;   // # b-windows this lane walks (b = lane, lane+32, ...)
+    #pragma unroll 1
+    for (int s = 0; s < STAGES; s++) {
+        int b = lane + 32 * s;
+        issue(s, b);
+    }
+    #pragma unroll 1
+    for (int it = 0; it < nb_iters; it++) {
+        int b = lane + 32 * it;
+        int stage = it % STAGES;
+        __pipeline_wait_prior(STAGES - 1);   // wait until this stage's copy is done
+        __syncwarp();
+        uint4 *srch = myh + (size_t)stage * 32 * 2 + (size_t)lane * 2;
+        uint4 h = srch[0];
+        uint4 q = srch[1];
+        int j = b & 7;
+        __half_raw hd; hd.x = (uint16_t)(h.x & 0xFFFF);
+        __half_raw hm; hm.x = (uint16_t)(h.x >> 16);
+        float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+        int s_, m_; q4k_scale_min_reg(h.y, h.z, h.w, j, &s_, &m_);
+        float ds = d*(float)s_, dm = dmin*(float)m_;
+        int wv[8];
+        int w0=(int)q.x, w1=(int)q.y, w2=(int)q.z, w3=(int)q.w;
+        wv[0]=w0&0x0F0F0F0F; wv[1]=(w0>>4)&0x0F0F0F0F;
+        wv[2]=w1&0x0F0F0F0F; wv[3]=(w1>>4)&0x0F0F0F0F;
+        wv[4]=w2&0x0F0F0F0F; wv[5]=(w2>>4)&0x0F0F0F0F;
+        wv[6]=w3&0x0F0F0F0F; wv[7]=(w3>>4)&0x0F0F0F0F;
+        const int8_t *xbase = qxTc + (size_t)(b >> 5)*1024 + (size_t)(b & 31)*16;
+        #pragma unroll
+        for (int n = 0; n < NK; n++) {
+            if (n >= ntok) break;
+            uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);
+            uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);
+            int sumi;
+            if (DPSPLIT >= 2) {
+                int q0=0,q1=0;
+                q0 = __dp4a(wv[0], (int)A.x, q0); q0 = __dp4a(wv[1], (int)B.x, q0);
+                q0 = __dp4a(wv[2], (int)A.y, q0); q0 = __dp4a(wv[3], (int)B.y, q0);
+                q1 = __dp4a(wv[4], (int)A.z, q1); q1 = __dp4a(wv[5], (int)B.z, q1);
+                q1 = __dp4a(wv[6], (int)A.w, q1); q1 = __dp4a(wv[7], (int)B.w, q1);
+                sumi = q0 + q1;
+            } else {
+                sumi = 0;
+                sumi = __dp4a(wv[0], (int)A.x, sumi); sumi = __dp4a(wv[1], (int)B.x, sumi);
+                sumi = __dp4a(wv[2], (int)A.y, sumi); sumi = __dp4a(wv[3], (int)B.y, sumi);
+                sumi = __dp4a(wv[4], (int)A.z, sumi); sumi = __dp4a(wv[5], (int)B.z, sumi);
+                sumi = __dp4a(wv[6], (int)A.w, sumi); sumi = __dp4a(wv[7], (int)B.w, sumi);
+            }
+            acc[n] += dxc[(size_t)n*nb32 + b] *
+                      (ds*(float)sumi - dm*(float)sxc[(size_t)n*nb32 + b]);
+        }
+        // Refill this stage with the b-window STAGES iterations ahead.
+        int bnext = lane + 32 * (it + STAGES);
+        issue(stage, bnext);
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) {
+        if (n >= ntok) break;
+        float v = warp_reduce_sum_all(acc[n]);
+        if (lane==0) outc[(size_t)n*out_dim+idx] = v;
+    }
+}
+
+// D32B: 2-OUTPUT-ROWS-PER-WARP variant (the doc's named candidate #1, re-measured in the
+// occupancy-tuned context). The dominant stall is long_scoreboard on the ACTIVATION loads
+// (A,B) which depend ONLY on (token n, b-window) — NOT on the output row. So one warp owning
+// TWO rows issues the A/B load ONCE and feeds it to TWO independent weight streams (wrow0,
+// wrow1) => the load latency is amortized over 2 rows and there are 2× independent dp4a chains
+// in flight to hide it. acc[] doubles to 2*NK (register pressure — hence NK≤8 for this variant).
+// Bit-identical: each row's per-(row,token) ascending-b accumulation is UNCHANGED; only the
+// row→warp mapping changes (row 2w and 2w+1 share a warp). Hash-verified, not asserted.
+template<int NK, int MINBLK = 4, int DPSPLIT = 1, int PIPE = 2>
+__global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi2row_kernel(
+    float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row0 = (blockIdx.y * nwarps + warp) * 2;   // this warp owns rows row0, row0+1
+    if (row0 >= out_dim) return;
+    const bool has1 = (row0 + 1) < out_dim;
+    const int t0 = (int)blockIdx.x * NK;
+    const int ntok = (K - t0 < NK) ? (K - t0) : NK;
+    const int8_t *qxTc = qxT + (size_t)t0 * in_dim;
+    const float  *dxc  = dx + (size_t)t0 * (in_dim >> 5);
+    const int    *sxc  = sx + (size_t)t0 * (in_dim >> 5);
+    float        *outc = out + (size_t)t0 * out_dim;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    const uint8_t *wrow0 = weight + (size_t)row0 * (size_t)n_super * 144;
+    const uint8_t *wrow1 = weight + (size_t)(row0 + 1) * (size_t)n_super * 144;
+    float acc0[NK], acc1[NK];
+    #pragma unroll
+    for (int n = 0; n < NK; n++) { acc0[n] = 0.0f; acc1[n] = 0.0f; }
+    for (int b0 = lane; b0 < nb32; b0 += 32*PIPE) {
+        uint4 hh0[PIPE], hq0[PIPE], hh1[PIPE], hq1[PIPE];
+        #pragma unroll
+        for (int p = 0; p < PIPE; p++) {
+            int b = b0 + 32*p;
+            if (b < nb32) {
+                const uint8_t *blk0 = wrow0 + (size_t)(b >> 3) * 144;
+                hh0[p] = __ldg((const uint4 *)blk0);
+                hq0[p] = __ldg((const uint4 *)(blk0 + 16 + (size_t)(b & 7) * 16));
+                if (has1) {
+                    const uint8_t *blk1 = wrow1 + (size_t)(b >> 3) * 144;
+                    hh1[p] = __ldg((const uint4 *)blk1);
+                    hq1[p] = __ldg((const uint4 *)(blk1 + 16 + (size_t)(b & 7) * 16));
+                }
+            }
+        }
+        #pragma unroll
+        for (int p = 0; p < PIPE; p++) {
+            int b = b0 + 32*p;
+            if (b >= nb32) break;
+            int j = b & 7;
+            // decode row0 scales
+            uint4 h0 = hh0[p];
+            __half_raw hd0; hd0.x = (uint16_t)(h0.x & 0xFFFF);
+            __half_raw hm0; hm0.x = (uint16_t)(h0.x >> 16);
+            float d0 = __half2float(__half(hd0)), dmin0 = __half2float(__half(hm0));
+            int s0i, m0i; q4k_scale_min_reg(h0.y, h0.z, h0.w, j, &s0i, &m0i);
+            float ds0 = d0*(float)s0i, dm0 = dmin0*(float)m0i;
+            uint4 q0 = hq0[p];
+            int wv0[8];
+            { int w0=(int)q0.x, w1=(int)q0.y, w2=(int)q0.z, w3=(int)q0.w;
+              wv0[0]=w0&0x0F0F0F0F; wv0[1]=(w0>>4)&0x0F0F0F0F;
+              wv0[2]=w1&0x0F0F0F0F; wv0[3]=(w1>>4)&0x0F0F0F0F;
+              wv0[4]=w2&0x0F0F0F0F; wv0[5]=(w2>>4)&0x0F0F0F0F;
+              wv0[6]=w3&0x0F0F0F0F; wv0[7]=(w3>>4)&0x0F0F0F0F; }
+            // decode row1 scales (if present)
+            float ds1 = 0.f, dm1 = 0.f; int wv1[8];
+            if (has1) {
+                uint4 h1 = hh1[p];
+                __half_raw hd1; hd1.x = (uint16_t)(h1.x & 0xFFFF);
+                __half_raw hm1; hm1.x = (uint16_t)(h1.x >> 16);
+                float d1 = __half2float(__half(hd1)), dmin1 = __half2float(__half(hm1));
+                int s1i, m1i; q4k_scale_min_reg(h1.y, h1.z, h1.w, j, &s1i, &m1i);
+                ds1 = d1*(float)s1i; dm1 = dmin1*(float)m1i;
+                uint4 q1 = hq1[p];
+                int w0=(int)q1.x, w1=(int)q1.y, w2=(int)q1.z, w3=(int)q1.w;
+                wv1[0]=w0&0x0F0F0F0F; wv1[1]=(w0>>4)&0x0F0F0F0F;
+                wv1[2]=w1&0x0F0F0F0F; wv1[3]=(w1>>4)&0x0F0F0F0F;
+                wv1[4]=w2&0x0F0F0F0F; wv1[5]=(w2>>4)&0x0F0F0F0F;
+                wv1[6]=w3&0x0F0F0F0F; wv1[7]=(w3>>4)&0x0F0F0F0F;
+            }
+            const int8_t *xbase = qxTc + (size_t)(b >> 5)*1024 + (size_t)(b & 31)*16;
+            #pragma unroll
+            for (int n = 0; n < NK; n++) {
+                if (n >= ntok) break;
+                uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);        // shared across BOTH rows
+                uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);
+                int si0 = 0;
+                si0 = __dp4a(wv0[0], (int)A.x, si0); si0 = __dp4a(wv0[1], (int)B.x, si0);
+                si0 = __dp4a(wv0[2], (int)A.y, si0); si0 = __dp4a(wv0[3], (int)B.y, si0);
+                si0 = __dp4a(wv0[4], (int)A.z, si0); si0 = __dp4a(wv0[5], (int)B.z, si0);
+                si0 = __dp4a(wv0[6], (int)A.w, si0); si0 = __dp4a(wv0[7], (int)B.w, si0);
+                float xd = dxc[(size_t)n*nb32 + b]; int xs = sxc[(size_t)n*nb32 + b];
+                acc0[n] += xd * (ds0*(float)si0 - dm0*(float)xs);
+                if (has1) {
+                    int si1 = 0;
+                    si1 = __dp4a(wv1[0], (int)A.x, si1); si1 = __dp4a(wv1[1], (int)B.x, si1);
+                    si1 = __dp4a(wv1[2], (int)A.y, si1); si1 = __dp4a(wv1[3], (int)B.y, si1);
+                    si1 = __dp4a(wv1[4], (int)A.z, si1); si1 = __dp4a(wv1[5], (int)B.z, si1);
+                    si1 = __dp4a(wv1[6], (int)A.w, si1); si1 = __dp4a(wv1[7], (int)B.w, si1);
+                    acc1[n] += xd * (ds1*(float)si1 - dm1*(float)xs);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < NK; n++) {
+        if (n >= ntok) break;
+        float v0 = warp_reduce_sum_all(acc0[n]);
+        if (lane==0) outc[(size_t)n*out_dim+row0] = v0;
+        if (has1) { float v1 = warp_reduce_sum_all(acc1[n]); if (lane==0) outc[(size_t)n*out_dim+row0+1] = v1; }
+    }
+}
+
+// D32B: 4-OUTPUT-ROWS-PER-WARP (the mission's "2 OR 4 rows per warp" candidate, upper end).
+// Maximal activation-load amortization: one A/B load per (token,b) feeds FOUR independent
+// weight streams (rows row0..row0+3) => the long-scoreboard load is shared 4-way and there are
+// 4x independent dp4a chains per warp. acc[] = 4*NK (heavy register pressure => NK<=4 only).
+// Bit-identical: each row's per-(row,token) ascending-b accumulation is UNCHANGED; only the
+// row->warp mapping changes (rows 4w..4w+3 share a warp). Hash-verified, not asserted.
+template<int NK, int MINBLK = 4, int DPSPLIT = 1, int PIPE = 2>
+__global__ void __launch_bounds__(256, MINBLK) mmvq_q4_k_packedT_multi4row_kernel(
+    float *out, const uint8_t *weight, const int8_t *qxT, const float *dx, const int *sx,
+    int in_dim, int out_dim, int K)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row0 = (blockIdx.y * nwarps + warp) * 4;
+    if (row0 >= out_dim) return;
+    const int nrow = min(4, out_dim - row0);
+    const int t0 = (int)blockIdx.x * NK;
+    const int ntok = (K - t0 < NK) ? (K - t0) : NK;
+    const int8_t *qxTc = qxT + (size_t)t0 * in_dim;
+    const float  *dxc  = dx + (size_t)t0 * (in_dim >> 5);
+    const int    *sxc  = sx + (size_t)t0 * (in_dim >> 5);
+    float        *outc = out + (size_t)t0 * out_dim;
+    int n_super = in_dim >> 8, nb32 = in_dim >> 5;
+    float acc[4][NK];
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        #pragma unroll
+        for (int n = 0; n < NK; n++) acc[r][n] = 0.0f;
+    }
+    for (int b0 = lane; b0 < nb32; b0 += 32*PIPE) {
+        #pragma unroll
+        for (int p = 0; p < PIPE; p++) {
+            int b = b0 + 32*p;
+            if (b >= nb32) break;
+            int j = b & 7;
+            const int8_t *xbase = qxTc + (size_t)(b >> 5)*1024 + (size_t)(b & 31)*16;
+            // load the shared activations once per (token,b)
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                if (r >= nrow) break;
+                const uint8_t *blk = (weight + (size_t)(row0+r) * (size_t)n_super * 144) + (size_t)(b >> 3) * 144;
+                uint4 h = __ldg((const uint4 *)blk);
+                uint4 q = __ldg((const uint4 *)(blk + 16 + (size_t)(b & 7) * 16));
+                __half_raw hd; hd.x = (uint16_t)(h.x & 0xFFFF);
+                __half_raw hm; hm.x = (uint16_t)(h.x >> 16);
+                float d = __half2float(__half(hd)), dmin = __half2float(__half(hm));
+                int s_, m_; q4k_scale_min_reg(h.y, h.z, h.w, j, &s_, &m_);
+                float ds = d*(float)s_, dm = dmin*(float)m_;
+                int wv[8];
+                int w0=(int)q.x, w1=(int)q.y, w2=(int)q.z, w3=(int)q.w;
+                wv[0]=w0&0x0F0F0F0F; wv[1]=(w0>>4)&0x0F0F0F0F;
+                wv[2]=w1&0x0F0F0F0F; wv[3]=(w1>>4)&0x0F0F0F0F;
+                wv[4]=w2&0x0F0F0F0F; wv[5]=(w2>>4)&0x0F0F0F0F;
+                wv[6]=w3&0x0F0F0F0F; wv[7]=(w3>>4)&0x0F0F0F0F;
+                #pragma unroll
+                for (int n = 0; n < NK; n++) {
+                    if (n >= ntok) break;
+                    uint4 A = *(const uint4 *)(xbase + (size_t)n*in_dim);
+                    uint4 B = *(const uint4 *)(xbase + (size_t)n*in_dim + 512);
+                    int sumi = 0;
+                    sumi = __dp4a(wv[0], (int)A.x, sumi); sumi = __dp4a(wv[1], (int)B.x, sumi);
+                    sumi = __dp4a(wv[2], (int)A.y, sumi); sumi = __dp4a(wv[3], (int)B.y, sumi);
+                    sumi = __dp4a(wv[4], (int)A.z, sumi); sumi = __dp4a(wv[5], (int)B.z, sumi);
+                    sumi = __dp4a(wv[6], (int)A.w, sumi); sumi = __dp4a(wv[7], (int)B.w, sumi);
+                    acc[r][n] += dxc[(size_t)n*nb32 + b] *
+                                 (ds*(float)sumi - dm*(float)sxc[(size_t)n*nb32 + b]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (r >= nrow) break;
+        #pragma unroll
+        for (int n = 0; n < NK; n++) {
+            if (n >= ntok) break;
+            float v = warp_reduce_sum_all(acc[r][n]);
+            if (lane==0) outc[(size_t)n*out_dim+row0+r] = v;
+        }
+    }
+}
+
 static void mmvq_q4_k_packedT_batched_launch(
     float *out, const uint8_t *w, const int8_t *qxT, const float *dx, const int *sx,
     int in_dim, int out_dim, int K, cudaStream_t stream)
 {
+    // D32B: NWARPS (block size = 32*NWARPS) is env-tunable for the K>16 multi-kernel only
+    // (FUCINA_Q4K_NWARPS={4,8,16}, default 8) — more warps/block can raise resident-warp count to
+    // hide the long-scoreboard load latency. K≤16 keeps NWARPS=8 (untouched winning path).
     const int NWARPS = 8; int b = NWARPS*32; dim3 g((out_dim + NWARPS - 1) / NWARPS);
     #define LPT_Q4K(NK,O) mmvq_q4_k_packedT_batched_kernel<NK><<<g,b,0,stream>>>( \
         out + (size_t)(O)*out_dim, w, qxT + (size_t)(O)*in_dim, \
@@ -1988,27 +2322,133 @@ static void mmvq_q4_k_packedT_batched_launch(
     // D32: for K>16 a wider chunk tile HALVES the chunk count (B=32 → 2 chunks at NK=16, 3 at
     // NK=12, vs 4 at NK=8), cutting the redundant L2 weight bandwidth + per-chunk Q4_K dequant
     // that measured 65% of the B=16→32 step growth — but a wider acc[] costs registers (occupancy).
-    // The NK/MINBLK for K>16 is config-selectable (FUCINA_Q4K_BIGCHUNK={8,12,16}, default 16) so
+    // The NK/MINBLK for K>16 is config-selectable (FUCINA_Q4K_BIGCHUNK={8,12,16}, default 12) so
     // the chunk-width vs occupancy tradeoff is MEASURED per box, not hardcoded. Every variant is
     // bitwise-identical (NK-independent per-(row,token) ascending-b accumulation). K≤16 keeps NK=8.
-    if (K > 16) {
-        static int bigchunk = -1;
-        if (bigchunk < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bigchunk = e ? atoi(e) : 16; }
-        if (bigchunk == 8) {
-            dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
-            mmvq_q4_k_packedT_multi_kernel<8><<<gm, b, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
-        } else if (bigchunk == 12) {
-            dim3 gm((unsigned)((K + 11) / 12), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
-            mmvq_q4_k_packedT_multi_kernel<12, 3><<<gm, b, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+    // D32B: the mixer is latency-bound (ncu: long_scoreboard 17-20 cyc/issue on activation+weight
+    // loads, inst/cycle 0.2, occ 53% register-capped). Three orthogonal, bitwise-identical ILP
+    // knobs are config-selectable to hunt the latency wall (all hash-verified c6ab45eab1f2751c):
+    //   FUCINA_Q4K_DPSPLIT={1,2,4}  — split the 8-deep serial __dp4a chain (int32 add associative)
+    //   FUCINA_Q4K_PIPE={2,3,4}     — deeper superblock staging = more in-flight LDGs per warp
+    //   FUCINA_Q4K_MINBLK={2,3,4,5} — __launch_bounds__ min-blocks/SM = occupancy vs register tradeoff
+    // None change the per-(row,token) ascending-b accumulation order → bit-identical by construction.
+    static int dpsplit = -1, pipe = -1, minblk_env = -1, nw_env = -1, tworow = -1;
+    if (dpsplit < 0)    { const char *e = getenv("FUCINA_Q4K_DPSPLIT"); dpsplit    = e ? atoi(e) : 2; }
+    if (pipe < 0)       { const char *e = getenv("FUCINA_Q4K_PIPE");    pipe       = e ? atoi(e) : 2; }
+    if (minblk_env < 0) { const char *e = getenv("FUCINA_Q4K_MINBLK");  minblk_env = e ? atoi(e) : 0; }
+    if (nw_env < 0)     { const char *e = getenv("FUCINA_Q4K_NWARPS");  nw_env     = e ? atoi(e) : 8; }
+    if (tworow < 0)     { const char *e = getenv("FUCINA_Q4K_2ROW");    tworow     = e ? atoi(e) : 0; }
+    const int MW = nw_env > 0 ? nw_env : 8; const int mb_threads = MW*32;
+    // D32B: 2-rows-per-warp variant (NK≤8 only — acc doubles). Shares activation loads across 2
+    // weight streams to amortize the long-scoreboard load latency. Bit-identical (per-row order
+    // unchanged). grid.y halves (each warp owns 2 rows).
+    if (tworow == 1 && K > 16) {
+        static int bc2 = -1; if (bc2 < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bc2 = e ? atoi(e) : 8; }
+        int nk2 = (bc2 >= 8) ? 8 : bc2;   // 2row supports NK≤8
+        dim3 gm((unsigned)((K + nk2 - 1) / nk2), (unsigned)((out_dim + MW*2 - 1) / (MW*2)));
+        int mb = minblk_env > 0 ? minblk_env : 4;
+        if (nk2 == 8) {
+            if (mb >= 4) mmvq_q4_k_packedT_multi2row_kernel<8,4,1,2><<<gm, mb_threads, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+            else         mmvq_q4_k_packedT_multi2row_kernel<8,3,1,2><<<gm, mb_threads, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
         } else {
-            dim3 gm((unsigned)((K + 15) / 16), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
-            mmvq_q4_k_packedT_multi_kernel<16, 3><<<gm, b, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+            mmvq_q4_k_packedT_multi2row_kernel<4,4,1,2><<<gm, mb_threads, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
         }
         return;
     }
-    dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + NWARPS - 1) / NWARPS));
-    mmvq_q4_k_packedT_multi_kernel<8><<<gm, b, 0, stream>>>(
-        out, w, qxT, dx, sx, in_dim, out_dim, K);
+    // D32B: 4-rows-per-warp (FUCINA_Q4K_2ROW=2) — max activation-load amortization (mission's
+    // "2 OR 4 rows"). acc=4*NK => NK<=4 only. grid.y quarters. Bit-identical (per-row order kept).
+    if (tworow == 2 && K > 16) {
+        static int bc4 = -1; if (bc4 < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bc4 = e ? atoi(e) : 4; }
+        int nk4 = (bc4 >= 4) ? 4 : bc4;
+        int mb = minblk_env > 0 ? minblk_env : 4;
+        dim3 gm((unsigned)((K + nk4 - 1) / nk4), (unsigned)((out_dim + MW*4 - 1) / (MW*4)));
+        if (mb >= 4) mmvq_q4_k_packedT_multi4row_kernel<4,4,1,2><<<gm, mb_threads, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+        else         mmvq_q4_k_packedT_multi4row_kernel<4,3,1,2><<<gm, mb_threads, 0, stream>>>(out, w, qxT, dx, sx, in_dim, out_dim, K);
+        return;
+    }
+    // D32B: cp.async deep-prefetch variant (FUCINA_Q4K_CPASYNC=1, FUCINA_Q4K_STAGES={2,3,4,6}).
+    // Stages weights global->smem bypassing registers => deep prefetch without the PIPE spill.
+    // Bit-identical (moves same bytes earlier; dp4a order unchanged). NK per BIGCHUNK env.
+    static int cpasync = -1, stages_env = -1;
+    if (cpasync < 0)    { const char *e = getenv("FUCINA_Q4K_CPASYNC"); cpasync    = e ? atoi(e) : 0; }
+    if (stages_env < 0) { const char *e = getenv("FUCINA_Q4K_STAGES");  stages_env = e ? atoi(e) : 3; }
+    if (cpasync == 1 && K > 16) {
+        static int bcc = -1; if (bcc < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bcc = e ? atoi(e) : 12; }
+        int nkc = (bcc == 8) ? 8 : (bcc == 16 ? 16 : 12);
+        int mb = minblk_env > 0 ? minblk_env : 4;
+        dim3 gm((unsigned)((K + nkc - 1) / nkc), (unsigned)((out_dim + MW - 1) / MW));
+        size_t smem = (size_t)MW * 32 * 2 * sizeof(uint4) * stages_env;   // nwarps*32 lanes*2 uint4*STAGES
+        #define CPA(NK,MB,ST) mmvq_q4_k_packedT_cpasync_kernel<NK,MB,2,ST><<<gm, mb_threads, smem, stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K)
+        if (nkc == 8) {
+            if (mb>=4){ if(stages_env>=6) CPA(8,4,6); else if(stages_env==4) CPA(8,4,4); else if(stages_env==2) CPA(8,4,2); else CPA(8,4,3); }
+            else      { if(stages_env>=6) CPA(8,3,6); else if(stages_env==4) CPA(8,3,4); else if(stages_env==2) CPA(8,3,2); else CPA(8,3,3); }
+        } else if (nkc == 16) {
+            if (mb>=4){ if(stages_env>=6) CPA(16,4,6); else if(stages_env==4) CPA(16,4,4); else if(stages_env==2) CPA(16,4,2); else CPA(16,4,3); }
+            else      { if(stages_env>=6) CPA(16,3,6); else if(stages_env==4) CPA(16,3,4); else if(stages_env==2) CPA(16,3,2); else CPA(16,3,3); }
+        } else {
+            if (mb>=4){ if(stages_env>=6) CPA(12,4,6); else if(stages_env==4) CPA(12,4,4); else if(stages_env==2) CPA(12,4,2); else CPA(12,4,3); }
+            else      { if(stages_env>=6) CPA(12,3,6); else if(stages_env==4) CPA(12,3,4); else if(stages_env==2) CPA(12,3,2); else CPA(12,3,3); }
+        }
+        #undef CPA
+        return;
+    }
+    // Dispatch a (NK, MINBLK) tile across the DPSPLIT×PIPE grid. MINBLK is fixed per NK for register
+    // headroom (env override MINBLK applies to the wide NK=16/12 tiles only where occupancy bites).
+    #define D32B_DISP(NK, MB, gm) do { \
+        int mb = minblk_env > 0 ? minblk_env : (MB); const int b = mb_threads; \
+        if (mb <= 2) { \
+            if (dpsplit==4){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,2,4,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,2,4,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,2,4,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else if(dpsplit==2){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,2,2,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,2,2,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,2,2,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else { if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,2,1,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,2,1,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,2,1,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+        } else if (mb == 3) { \
+            if (dpsplit==4){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,3,4,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,3,4,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,3,4,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else if(dpsplit==2){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,3,2,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,3,2,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,3,2,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else { if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,3,1,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,3,1,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,3,1,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+        } else { \
+            if (dpsplit==4){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,4,4,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,4,4,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,4,4,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else if(dpsplit==2){ if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,4,2,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,4,2,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,4,2,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+            else { if(pipe>=4) mmvq_q4_k_packedT_multi_kernel<NK,4,1,4><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else if(pipe==3) mmvq_q4_k_packedT_multi_kernel<NK,4,1,3><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); else mmvq_q4_k_packedT_multi_kernel<NK,4,1,2><<<gm,b,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K); } \
+        } } while(0)
+    if (K > 16) {
+        static int bigchunk = -1;
+        if (bigchunk < 0) { const char *e = getenv("FUCINA_Q4K_BIGCHUNK"); bigchunk = e ? atoi(e) : 12; }
+        if (bigchunk == 8) {
+            dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(8, 4, gm);
+        } else if (bigchunk == 12) {
+            dim3 gm((unsigned)((K + 11) / 12), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(12, 4, gm);   // D32B: MINBLK=4 measured-best (occ 53%→70%, +9.3% @ B=32)
+        } else if (bigchunk == 24) {
+            // D32B: wide end — NK=24 (2 chunks @ B=32) dequants weights fewer times but acc[24]
+            // costs registers. Untested wide corner of candidate #4. Bit-identical.
+            dim3 gm((unsigned)((K + 23) / 24), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(24, 2, gm);
+        } else if (bigchunk == 32) {
+            // D32B: widest — NK=32 (1 chunk @ B=32) dequants each row's weights EXACTLY ONCE
+            // across all 32 tokens (max dequant reuse) but acc[32] is maximal register pressure.
+            dim3 gm((unsigned)((K + 31) / 32), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(32, 2, gm);
+        } else {
+            dim3 gm((unsigned)((K + 15) / 16), (unsigned)((out_dim + MW - 1) / MW));
+            D32B_DISP(16, 3, gm);
+        }
+        return;
+    }
+    // K in (8,16]: keep the untouched winning NK=8/2-chunk path at fixed NWARPS=8 (NWARPS env is
+    // a K>16-only tuning knob) but still honor DPSPLIT/PIPE/MINBLK (all bit-identical).
+    {
+        const int b8 = 8*32;
+        dim3 gm((unsigned)((K + 7) / 8), (unsigned)((out_dim + 8 - 1) / 8));
+        int mb = minblk_env > 0 ? minblk_env : 4;
+        if (mb <= 3) {
+            if (dpsplit==2) mmvq_q4_k_packedT_multi_kernel<8,3,2,2><<<gm,b8,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K);
+            else            mmvq_q4_k_packedT_multi_kernel<8,3,1,2><<<gm,b8,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K);
+        } else {
+            if (dpsplit==2) mmvq_q4_k_packedT_multi_kernel<8,4,2,2><<<gm,b8,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K);
+            else            mmvq_q4_k_packedT_multi_kernel<8,4,1,2><<<gm,b8,0,stream>>>(out,w,qxT,dx,sx,in_dim,out_dim,K);
+        }
+    }
+    #undef D32B_DISP
 }
 
 // ─── Native Q4_K / Q6_K → BF16 dequant (fast Qwen3 prefill) ─────────────────────────

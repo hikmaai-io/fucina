@@ -1,0 +1,88 @@
+{
+  "label": "d32b-rep2",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 124.14062401512638,
+    "decode_tps": 34.609312311968395,
+    "ntok": 128,
+    "sample": "Continuous batching is a technique used in Large Language Model (LLM) inference to significantly improve throughput by maximizing GPU utilization. It works by processing multiple requests in parallel "
+  },
+  "single_long": {
+    "ttft_ms": 3466.176143003395,
+    "decode_tps": 32.01487485972761,
+    "ntok": 128,
+    "sample": "1. The decode phase is bandwidth bound while the prefill phase is compute bound. 2. Continuous batching interleaves prefill and decode to keep the accelerator busy. 3. Throughput and latency are gover"
+  },
+  "concurrency": [
+    {
+      "N": 16,
+      "agg_decode_tps": 309.78808283481,
+      "median_ttft_ms": 318.67339099699166,
+      "p95_ttft_ms": 366.5665609878488,
+      "ttfts_ms_raw": [
+        134.38,
+        134.61,
+        169.85,
+        170.75,
+        170.79,
+        170.91,
+        171.45,
+        318.52,
+        318.83,
+        364.01,
+        365.45,
+        365.8,
+        365.94,
+        365.98,
+        366.57,
+        367.05
+      ],
+      "median_per_stream_tps": 22.289024739094195,
+      "wall_s": 6.020244494022336
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 433.283161079117,
+      "median_ttft_ms": 511.947022008826,
+      "p95_ttft_ms": 519.680238008732,
+      "ttfts_ms_raw": [
+        130.74,
+        163.64,
+        163.71,
+        164.03,
+        164.04,
+        164.09,
+        438.85,
+        439.44,
+        441.91,
+        441.95,
+        445.12,
+        445.91,
+        448.16,
+        510.8,
+        510.85,
+        511.86,
+        512.03,
+        512.85,
+        513.71,
+        514.28,
+        514.59,
+        514.77,
+        515.53,
+        515.55,
+        515.97,
+        517.73,
+        518.04,
+        518.19,
+        518.32,
+        519.68,
+        519.92,
+        520.85
+      ],
+      "median_per_stream_tps": 15.623754953894085,
+      "wall_s": 8.60868904000381
+    }
+  ],
+  "diverse": true
+}
