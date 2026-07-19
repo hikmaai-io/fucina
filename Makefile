@@ -121,8 +121,8 @@ test: fucina go-test go-test-cgo paged-kv-test
 # none was a prerequisite of `test`, so all could be silently forgotten. This
 # umbrella chains them so a regression in any cannot pass unnoticed. Requires
 # the Qwen3.5 FP8/NVFP4 checkpoints and a GPU; run each under the shared GPU flock.
-gpu-gates: qwen35-parity-test qwen35-batch-test qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-moe-fp8-engine-test
-	@echo "gpu-gates: all Qwen3.5 dense+MoE parity/batch/state/chunk/multiseq-prefill/MoE-engine gates passed"
+gpu-gates: qwen35-parity-test qwen35-batch-test qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test
+	@echo "gpu-gates: all Qwen3.5 dense+MoE parity/batch/state/chunk/multiseq-prefill/clean-GDN/MoE-engine gates passed"
 
 
 # ─── Paged-KV allocator unit test (host-only, no GPU) ───────────────────
@@ -527,7 +527,7 @@ go-test-cgo: lib libdg
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	$(GO) test $(GO_TEST_CGO_PKGS) -count=1
 
-go-test:
+go-test: qwen35-clean-gdn-meta-test
 	$(GO) test $(GO_TEST_PKGS) -count=1
 
 phase-b-test:

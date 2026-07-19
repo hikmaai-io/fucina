@@ -36,6 +36,9 @@ jobs:
             echo "These files are not gofmt-clean:"; echo "$unformatted"; exit 1
           fi
 
+      - name: Qwen3.5 clean-GDN metadata bounds
+        run: make qwen35-clean-gdn-meta-test
+
       - name: go vet
         run: go vet $PKGS
 
