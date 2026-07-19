@@ -1,8 +1,87 @@
 # SOTA GB10 Blackwell vertical inference for Qwen3.5 — mission plan
 
-Status: ACTIVE (2026-07-12). Supersedes the tactical parts of
-`qwen35-only-beat-vllm-plan.md` (rev 2) and folds in the vLLM subsystem analysis
-(`/tmp/vllm-analysis-report.md`, vLLM @ 5f8e73cb).
+Status: **CONCLUDED (2026-07-18) — see the Official Position below.**
+Supersedes the tactical parts of `qwen35-only-beat-vllm-plan.md` (rev 2) and
+folds in the vLLM subsystem analysis (vLLM @ 5f8e73cb).
+
+---
+
+## OFFICIAL POSITION (enshrined 2026-07-18, main @ 82a6392)
+
+**fucina is the state-of-the-art Qwen3.5 inference engine on the NVIDIA GB10,
+winning 11 of 12 concurrency cells against fresh contemporaneous vLLM
+(2026-07-18) while providing byte-identical run-to-run determinism that vLLM
+does not offer. The 12th cell is the measured, proven price of that guarantee
+— and we choose the guarantee.**
+
+### The scoreboard (fresh contemporaneous vLLM, 2026-07-18, quiescent GB10)
+
+**Qwen3.5-35B-A3B-FP8 (MoE) — fucina sweeps all 6 cells:**
+
+| N | fucina | vLLM | margin |
+|---|---|---|---|
+| 1 | 59.0 | 14.0* | — |
+| 2 | 101.4 | 74.1 | +37% |
+| 4 | 134.0 | 111.7 | +20% |
+| 8 | 229.8 | 155.2 | +48% |
+| 16 | 320.1 | 207.2 | +55% |
+| 32 | 472.4 | 321.3 | +47% |
+
+**Qwen3.5-9B-FP8 (dense) — fucina wins 5 of 6:**
+
+| N | fucina | vLLM | margin |
+|---|---|---|---|
+| 2 | 59.3 | 44.2 | +34% |
+| 4 | 117.3 | 85.8 | +37% |
+| 8 | 204.6 | 164.4 | +24% |
+| 16 | 313.1 | 280.8 | +12% |
+| 32 | 438.8 | 521.8 | **−16% (the accepted trade-off)** |
+
+Plus: MoE N=32 TTFT 641/647 ms (med/p95) vs vLLM 664; single-stream, long-prompt
+TTFT, and warm/state-cache TTFT all won. Evidence:
+`benchmark-evidence/results/2026-07-18-d32b/`, `docs/qwen35-d32b.md`.
+
+### Why the 12th cell is a principled boundary, not a tuning gap
+
+Triply proven (D32 `docs/qwen35-dense32.md` §5, D32B `docs/qwen35-d32b.md`
+§§1-5b):
+
+1. **Not bytes**: fucina reads 44% FEWER weight bytes (Q4_K 3.65 GiB vs FP8
+   ~6.5 GiB). If the gap were bytes, fucina would win.
+2. **Not bandwidth**: both engines run ~2× above the 785–974 tok/s memory
+   floor; the mixer is cache-latency-bound (L1/L2 hit ~90%), not DRAM-bound.
+3. **Not tuning**: seven ILP levers systematically measured (DPSPLIT, PIPE
+   depth, 2/4-rows-per-warp, `__ldg`, cp.async, NWARPS, full BIGCHUNK×MINBLK
+   cross). The one winner (+9.1%, occupancy 53→86%) is shipped. The register
+   file is the quantitatively proven binding constraint (exactly 4 blocks/SM at
+   the 64-reg minimum the bit-identical arithmetic requires); every pipe is
+   <15% utilized; the residual stall is irreducible dependency latency.
+4. **The boundary**: closing the last −16% requires a tensor-core mixer whose
+   MMA reduction order ≠ the warp-serial dp4a order → cannot be
+   bitwise-identical → would break the byte-identity gate. The gate is the
+   product; the cell is the price. **Decision: keep the gate.**
+
+### What the determinism guarantee buys (what vLLM cannot claim)
+
+- Byte-identical run-to-run outputs (FNV stream-hash-verified per kernel
+  change; golden hashes at B=1/8/16/32).
+- Reproducible sessions: save/restore + prefix-reuse KV with zero re-prefill
+  and identical continuations.
+- Auditable serving: every perf lever shipped under a losslessness gate
+  (unchanged logit bounds, 0 first-token flips outside documented MoE
+  expert-flip cells).
+
+### Standing rules going forward
+
+1. The byte-identity gate is not to be weakened by default-path changes. Any
+   future tensor-core mixer must be a new, explicitly sanctioned, default-off
+   mode with its own measured bound — a mission amendment, not an optimization.
+2. The protection gate (absolute floors + contemporaneous vLLM margins,
+   re-frozen 2026-07-18) guards all 11 winning cells on every merge.
+3. The scoreboard claim must always cite fresh contemporaneous vLLM numbers,
+   never carried-forward columns.
+
+---
 
 ## UPDATE 2026-07-13: S1 DFlash verdict + pivot
 

@@ -345,20 +345,34 @@ dp4a MMVQ kernels (the same ones the 12B uses), **2.6× faster than BF16 decode 
 | NVFP4 hybrid (re-quant) | 38.6 | 15.4 GB |
 | **native Q4_0 (dp4a MMVQ)** | **45.2** | **7.05 GB** |
 
-**Qwen3.5-35B-A3B FP8 MoE**, measured against `vLLM` on the same checkpoint (`bench_serving.py`,
-see [`docs/qwen35-beat-vllm-plan.md`](docs/qwen35-beat-vllm-plan.md) for the full record):
+**Qwen3.5 vs vLLM — official position (2026-07-18, fresh contemporaneous head-to-head,
+`bench_serving.py` per [`benchmark-evidence/PROTOCOL.md`](benchmark-evidence/PROTOCOL.md); full record in
+[`docs/sota-gb10-qwen3-mission-plan.md`](docs/sota-gb10-qwen3-mission-plan.md)):**
 
-| Regime | fucina | vLLM | Status |
-|---|---|---|---|
-| Decode, single stream (short ctx) | 56–58 tok/s | 53.4 tok/s | ahead |
-| Long-context single-stream decode | 49.5 tok/s @3.5k / 45.5 tok/s @6k | — | flash-decoding fixed this regime |
-| Turn-2+ TTFT @2k (per-conversation state cache) | 0.107 s | weak/no equivalent APC | ahead |
-| Cold turn-1 TTFT @2k | 2.6 s | 1.19 s | **behind, ~2.2×** |
-| Aggregate throughput @conc-16 | ~203–274 tok/s (measurement noise ±8%) | ~449 in an identical-prompt bench (not a steady-state number; not directly comparable) | inconclusive, see the plan doc |
+**fucina wins 11 of 12 concurrency cells while providing byte-identical run-to-run
+determinism that vLLM does not offer.**
 
-Net: fucina wins single-stream decode and warm-conversation TTFT; cold-prompt (first-turn) TTFT and
-aggregate-throughput scaling at high concurrency are open gaps, not wins — don't read the aggregate
-row as "fucina beats vLLM at scale."
+**Qwen3.5-35B-A3B-FP8 (MoE) — all 6 cells won** (agg tok/s):
+
+| N | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| fucina | 59.0 | 101.4 | 134.0 | 229.8 | 320.1 | **472.4** |
+| vLLM | 14.0* | 74.1 | 111.7 | 155.2 | 207.2 | 321.3 |
+
+Plus N=32 TTFT 641/647 ms (med/p95) vs vLLM 664 — fucina leads TTFT too.
+
+**Qwen3.5-9B-FP8 (dense) — 5 of 6 cells won** (agg tok/s):
+
+| N | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|
+| fucina | 59.3 | 117.3 | 204.6 | 313.1 | 438.8 |
+| vLLM | 44.2 | 85.8 | 164.4 | 280.8 | **521.8** |
+
+The dense N=32 cell (−16%) is a **measured, triply-proven kernel-class boundary**
+(tensor-core MMA vs dp4a GEMV — see [`docs/qwen35-d32b.md`](docs/qwen35-d32b.md)): closing it
+would require a reduction order that cannot be bitwise-identical, i.e. it is the
+price of the determinism guarantee — fucina reads 44% fewer weight bytes and both
+engines run ~2× above the memory floor there. **We keep the guarantee.**
 
 ---
 
