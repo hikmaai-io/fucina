@@ -28,6 +28,15 @@ It is observational: recorded values never choose a kernel, expert order, cache 
 Write failures are logged during engine destruction and never turn a successful inference into a
 failure.
 
+### Local host-only synthetic microbenchmark
+
+An independent local review microbenchmark measured the recorder and generator without GPU or SSD
+serving work. With 200,000 synthetic records at 40×256 geometry and 32 active experts, recording
+cost **0.398 µs/event**. Atomically flushing a 65,536-event, **9.1 MiB** JSON profile cost **1.36 s**
+at shutdown. Replaying five generator capacities cost **2.39 s** with **76,632 KiB** maximum RSS.
+These are host-only synthetic measurements for overhead sizing, not p95/p99 serving evidence and
+not a claim about request latency under real inference, SSD contention, or production routing.
+
 ## Configuration
 
 | Environment variable | Meaning |
@@ -38,9 +47,17 @@ failure.
 | `FUCINA_EXPERT_STREAM_SLOTS=N` | Existing runtime global slot capacity, recorded in the profile. |
 | `FUCINA_EXPERT_RESIDENCY_PLAN=/path/plan.json` | Existing loader input used on the subsequent restart. |
 
-In addition to the event limit, the recorder has a 16,777,216-ID safety ceiling. Events that do
-not fit either bound are counted in `events_dropped`; aggregate counters continue to cover them.
-Layer/expert geometry, path length, and all allocation products are bounded and checked.
+In addition to the event limit, the recorder and parser share a **6,291,456-ID** safety ceiling.
+Events that do not fit either bound are counted in `events_dropped`; aggregate counters continue to
+cover them. A conservative compact-JSON proof budgets 4,096 fixed bytes, 65,536 pair rows at 96
+bytes, 256 layer wrappers at 256 bytes, 262,144 event wrappers at 32 bytes, and 6,291,456 IDs at
+five bytes (four-digit ID plus comma). The resulting conservative producer upper bound is
+**46,206,976 bytes (44.066 MiB)**, below the parser's 67,108,864-byte (64 MiB) limit by
+20,901,888 bytes. The default
+65,536-event workload can retain 32 active IDs/event (2,097,152 IDs) without approaching this cap.
+The regression test keeps the C++ and Python cap values equal and proves this bound remains below
+the consumer limit. Layer/expert geometry, path length, and all allocation products are also
+bounded and checked.
 
 ## `fucina-expert-profile-v1`
 

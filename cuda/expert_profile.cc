@@ -21,7 +21,9 @@ namespace {
 
 constexpr uint64_t kDefaultMaxEvents = 65536;
 constexpr uint64_t kHardMaxEvents = 262144;
-constexpr size_t kHardTraceIds = 16 * 1024 * 1024;
+// Paired with scripts/expert_residency_plan.py::MAX_TRACE_IDS. At the compact JSON grammar's
+// proven worst case this keeps producer output <=46,206,976 bytes, below the 64 MiB parser cap.
+constexpr size_t kHardTraceIds = 6 * 1024 * 1024;
 constexpr int kMaxLayers = 256;
 constexpr int kMaxExperts = 4096;
 constexpr size_t kMaxPairs = 65536;

@@ -20,8 +20,17 @@ MAX_LAYERS = 256
 MAX_EXPERTS = 4096
 MAX_PAIRS = 65_536
 MAX_EVENTS = 262_144
+MAX_TRACE_IDS = 6 * 1024 * 1024
 MAX_CAPACITY = 4096
 U64_MAX = (1 << 64) - 1
+
+
+# Conservative compositional proof for expert_profile.cc's compact writer grammar. Bounds include
+# list commas: pair row <=96 B, layer wrapper <=256 B, event wrapper <=32 B, expert ID+comma <=5 B,
+# and 4096 B for fixed root/streamer syntax. Keep the matching regression test when grammar changes.
+def producer_profile_size_upper_bound() -> int:
+    return (4096 + MAX_PAIRS * 96 + MAX_LAYERS * 256 +
+            MAX_EVENTS * 32 + MAX_TRACE_IDS * 5)
 
 
 def _object_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -121,6 +130,7 @@ def load_profile(path: Path, *, raw: bytes | None = None) -> dict[str, Any]:
         raise ValueError("events_recorded does not match trace length (truncated profile)")
     trace_layer_events = [0] * n_layers
     trace_select = [[0] * n_experts for _ in range(n_layers)]
+    trace_id_total = 0
     trace_adj_inter = [0] * n_layers
     trace_adj_union = [0] * n_layers
     previous: list[list[int] | None] = [None] * n_layers
@@ -131,6 +141,9 @@ def load_profile(path: Path, *, raw: bytes | None = None) -> dict[str, Any]:
         experts = _list(event["experts"], f"trace[{event_index}].experts")
         if not experts or len(experts) > n_experts:
             raise ValueError(f"trace[{event_index}].experts has invalid length")
+        trace_id_total += len(experts)
+        if trace_id_total > MAX_TRACE_IDS:
+            raise ValueError(f"trace exceeds the {MAX_TRACE_IDS}-ID producer/consumer contract")
         last = -1
         checked: list[int] = []
         for j, expert_value in enumerate(experts):

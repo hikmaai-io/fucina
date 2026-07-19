@@ -5,11 +5,25 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from expert_residency_plan import build_plan, build_report, load_profile, write_json_atomic
+from expert_residency_plan import (
+    MAX_EVENTS,
+    MAX_EXPERTS,
+    MAX_FILE_BYTES,
+    MAX_LAYERS,
+    MAX_PAIRS,
+    MAX_TRACE_IDS,
+    build_plan,
+    build_report,
+    load_profile,
+    producer_profile_size_upper_bound,
+    write_json_atomic,
+)
 
 
 U64_MAX = (1 << 64) - 1
@@ -66,6 +80,58 @@ class ExpertResidencyPlanTests(unittest.TestCase):
             path = Path(td) / "profile.json"
             path.write_text(json.dumps(value))
             return load_profile(path)
+
+    def test_producer_worst_case_fits_consumer_file_contract(self):
+        source = (Path(__file__).resolve().parents[1] / "cuda" / "expert_profile.cc").read_text()
+        match = re.search(r"kHardTraceIds\s*=\s*(\d+)\s*\*\s*1024\s*\*\s*1024", source)
+        self.assertIsNotNone(match, "producer trace-ID cap must remain an auditable Mi-ID expression")
+        self.assertEqual(int(match.group(1)) * 1024 * 1024, MAX_TRACE_IDS)
+
+        # Compositional maxima for the producer's compact JSON grammar. Each includes its leading
+        # list comma; IDs account for a 4-digit expert ID plus comma. The helper combines these
+        # bounds at maximum producer geometry/event/trace limits.
+        u64 = str(U64_MAX)
+        max_expert, max_layer = MAX_EXPERTS - 1, MAX_LAYERS - 1
+        pair = f',{{"expert":{max_expert},"selection_events":{u64},"selected_rows":{u64}}}'
+        event_wrapper = f',{{"layer":{max_layer},"experts":[]}}'
+        layer_wrapper = (f',{{"layer":{max_layer},"event_count":{u64},'
+                         f'"active_expert_uniqueness":{MAX_EXPERTS},'
+                         f'"adjacent_intersection_count":{u64},'
+                         f'"adjacent_union_count":{u64},"experts":[]}}')
+        self.assertLessEqual(len(pair.encode()), 96)
+        self.assertLessEqual(len(event_wrapper.encode()), 32)
+        self.assertLessEqual(len(layer_wrapper.encode()), 256)
+        self.assertLessEqual(len(f"{max_expert},".encode()), 5)
+        fixed_root = json.dumps({
+            "format": "fucina-expert-profile-v1",
+            "geometry": {"layers": MAX_LAYERS, "experts": MAX_EXPERTS},
+            "configured_slots": 4096,
+            "max_events": MAX_EVENTS,
+            "events_recorded": MAX_EVENTS,
+            "events_dropped": U64_MAX,
+            "layers": [],
+            "streamer": {key: U64_MAX for key in (
+                "cache_hits", "cache_misses", "ssd_reads", "ssd_bytes",
+                "checksum_failures", "prefetch_advice")},
+            "trace": [],
+        }, separators=(",", ":"))
+        self.assertLessEqual(len(fixed_root.encode()), 4096)
+
+        bound = producer_profile_size_upper_bound()
+        self.assertEqual(
+            bound,
+            4096 + MAX_PAIRS * 96 + MAX_LAYERS * 256 + MAX_EVENTS * 32 + MAX_TRACE_IDS * 5,
+        )
+        self.assertLess(bound, MAX_FILE_BYTES)
+        # The default 65,536-event workload named in the review retains every 32-active event.
+        self.assertGreaterEqual(MAX_TRACE_IDS, 65_536 * 32)
+
+        # Exercise the consumer-side total-ID guard without allocating a multi-million-ID fixture.
+        with tempfile.TemporaryDirectory() as td, patch("expert_residency_plan.MAX_TRACE_IDS", 2):
+            path = Path(td) / "too-many-ids.json"
+            path.write_text(json.dumps(tiny_profile()))
+            with self.assertRaisesRegex(ValueError, "producer/consumer contract"):
+                load_profile(path)
 
     def test_golden_global_lru_curves(self):
         profile = self.load(tiny_profile())
