@@ -66,7 +66,7 @@ cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh cuda/gemma
 # It is a device runtime alongside the dense engine. -std=c++17 for gemma4_e4b.h.
 cuda/e4b_engine.o: cuda/e4b_engine.cu cuda/e4b_engine.h cuda/gemma4_e4b.h \
                    cuda/e4b_ple_fp8.cuh cuda/e4b_gguf.cuh cuda/e4b_nvfp4.cuh \
-                   cuda/mmvq.cuh cuda/model_arch.h cuda/safetensors.h Makefile
+                   cuda/mmvq.cuh cuda/safetensors.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -dc -o $@ cuda/e4b_engine.cu
 
 cuda/gemma4_kernels_link.o: cuda/gemma4_kernels.o cuda/e4b_engine.o Makefile
