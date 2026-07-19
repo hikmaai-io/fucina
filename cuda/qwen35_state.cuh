@@ -183,8 +183,10 @@ struct qwen35_runtime_state {
     size_t reserved_bytes;
     size_t peak_bytes;
 
-    // Opt-in prefill phase telemetry (--timings / FUCINA_QWEN35_PREFILL_TIMINGS=1).
+    // Opt-in prefill phase telemetry. FUCINA_QWEN35_PREFILL_TIMING=1 is the
+    // admission-attribution mode; the legacy plural spelling remains accepted.
     int    prefill_timing;
+    int    clean_gdn;
     double prefill_dequant_ms;
     double prefill_router_ms;
     double prefill_expert_ms;

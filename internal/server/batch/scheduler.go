@@ -266,6 +266,8 @@ const MaxVerifyRows = 32
 // generation budget, a cancellation context, the per-token emit sink, and a
 // Done channel that receives the terminal Result.
 type Request struct {
+	// submittedAt is populated only by opt-in admission telemetry.
+	submittedAt time.Time
 	// Tokens is the already-tokenized prompt to prefill.
 	Tokens []int32
 	// Params is the on-device sampling configuration for this sequence.
@@ -333,12 +335,15 @@ var ErrQueueFull = errors.New("batch: submit queue full")
 // seq is the scheduler's private bookkeeping for one admitted sequence. It is
 // touched only by the scheduler goroutine, so it needs no synchronization.
 type seq struct {
-	req       Request
-	slot      int   // engine slot id (valid once admitted)
-	next      int32 // the input token to feed this slot on the next StepBatch
-	remaining int   // generation budget left (counts down from MaxNew)
-	generated int   // tokens emitted so far
-	stops     map[int32]struct{}
+	req                Request
+	slot               int // engine slot id (valid once admitted)
+	admissionID        int64
+	admittedAt         time.Time
+	firstDecodePending bool
+	next               int32 // the input token to feed this slot on the next StepBatch
+	remaining          int   // generation budget left (counts down from MaxNew)
+	generated          int   // tokens emitted so far
+	stops              map[int32]struct{}
 	// prefillPos counts how many of req.Tokens have already been committed to the
 	// slot's KV during a chunked prefill. It is meaningful only while the sequence is
 	// in the prefill backlog (phasePrefill); once prefillPos == len(req.Tokens) the
@@ -396,6 +401,10 @@ type Scheduler struct {
 	coalesceWindow time.Duration
 	coalesceQuiet  time.Duration
 	coalesceMax    time.Duration
+
+	// Exact short-burst attribution, cold-read once at construction. Disabled by default.
+	phaseTiming bool
+	admissionID int64
 
 	// corpus is the server-global suffix-decoding ring: the token streams (prompt+output)
 	// of recently finished sequences, capped at specCorpusCap. The drafter falls back to it
@@ -479,10 +488,11 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 		queueDepth = 1
 	}
 	s := &Scheduler{
-		engine: engine,
-		submit: make(chan Request, queueDepth),
-		quit:   make(chan struct{}),
-		done:   make(chan struct{}),
+		engine:      engine,
+		submit:      make(chan Request, queueDepth),
+		quit:        make(chan struct{}),
+		done:        make(chan struct{}),
+		phaseTiming: os.Getenv("FUCINA_QWEN35_PREFILL_TIMING") == "1",
 	}
 	// Speculative decoding is a DEFAULT-on capability for DENSE models: if the engine
 	// can verify a batched draft step, use it. The drafter is model-agnostic
@@ -590,6 +600,9 @@ func (s *Scheduler) Start() {
 func (s *Scheduler) Submit(req Request) error {
 	if req.MaxNew < 1 {
 		req.MaxNew = 1
+	}
+	if s.phaseTiming {
+		req.submittedAt = time.Now()
 	}
 	// Prefer a shutdown signal over enqueuing, so Submit after Shutdown is
 	// deterministic even when the queue has room.
@@ -986,7 +999,8 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 
 		tAdd := time.Now()
 		slot, first, err := s.engine.AddSeq(req.Tokens, req.Params)
-		s.telAdmitEng += time.Since(tAdd)
+		engineDur := time.Since(tAdd)
+		s.telAdmitEng += engineDur
 		if err != nil {
 			log.Printf("batch: AddSeq failed: %v", err)
 			reply(req, Result{Reason: FinishError, Err: fmt.Errorf("prefill: %w", err)})
@@ -995,6 +1009,14 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		}
 
 		sq := s.newSeq(req, slot)
+		if s.phaseTiming {
+			s.admissionID++
+			sq.admissionID, sq.admittedAt, sq.firstDecodePending = s.admissionID, time.Now(), true
+			wait := tAdd.Sub(req.submittedAt)
+			log.Printf("batch: qwen35 admission id=%d count=1 rows=1 tokens=%d wait=%.3f ms engine=%.3f ms first_token=%.3f ms",
+				s.admissionID, len(req.Tokens), wait.Seconds()*1000, engineDur.Seconds()*1000,
+				time.Since(req.submittedAt).Seconds()*1000)
+		}
 		w = w[1:]
 		admitted = true // a slot was consumed (progress), even if it self-evicts below
 		oneShotAdmits++
@@ -1050,7 +1072,16 @@ func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma Mul
 	if len(reqs) < 2 {
 		return false // not worth a batched call; serial handles a lone prompt
 	}
+	var engineStart time.Time
+	if s.phaseTiming {
+		engineStart = time.Now()
+	}
 	slots, firsts, err := ma.SeqAddMultiseq(prompts, params)
+	var engineDur time.Duration
+	if s.phaseTiming {
+		engineDur = time.Since(engineStart)
+		s.telAdmitEng += engineDur
+	}
 	if err != nil {
 		log.Printf("batch: SeqAddMultiseq failed (%d seqs): %v — serial fallback", len(reqs), err)
 		return false
@@ -1059,11 +1090,41 @@ func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma Mul
 		return false // engine declined (unsupported) → serial path
 	}
 	*waiting = w[len(reqs):]
+	var admissionID int64
+	var admittedAt time.Time
+	if s.phaseTiming {
+		s.admissionID++
+		admissionID = s.admissionID
+		admittedAt = time.Now()
+	}
 	for i, req := range reqs {
 		sq := s.newSeq(req, slots[i])
+		if s.phaseTiming {
+			sq.admissionID, sq.admittedAt, sq.firstDecodePending = admissionID, admittedAt, true
+		}
 		if s.deliver(active, sq, firsts[i]) {
 			active[slots[i]] = sq
 		}
+	}
+	if s.phaseTiming {
+		waitMin, waitMax := time.Duration(1<<63-1), time.Duration(0)
+		firstMax := time.Duration(0)
+		for _, req := range reqs {
+			wait := engineStart.Sub(req.submittedAt)
+			first := time.Since(req.submittedAt)
+			if wait < waitMin {
+				waitMin = wait
+			}
+			if wait > waitMax {
+				waitMax = wait
+			}
+			if first > firstMax {
+				firstMax = first
+			}
+		}
+		log.Printf("batch: qwen35 admission id=%d count=1 rows=%d tokens=%d wait_min=%.3f ms wait_max=%.3f ms engine=%.3f ms first_token_max=%.3f ms",
+			admissionID, len(reqs), ttot, waitMin.Seconds()*1000, waitMax.Seconds()*1000,
+			engineDur.Seconds()*1000, firstMax.Seconds()*1000)
 	}
 	return true
 }
@@ -1335,6 +1396,35 @@ func (s *Scheduler) step(active map[int]*seq) bool {
 	return s.stepPlain(active)
 }
 
+// logFirstDecode attributes the first post-admission decode call by admission group.
+// It allocates only in the explicitly enabled telemetry mode.
+func (s *Scheduler) logFirstDecode(active map[int]*seq, engineDur time.Duration) {
+	if !s.phaseTiming {
+		return
+	}
+	type group struct {
+		rows     int
+		admitted time.Time
+	}
+	groups := make(map[int64]group)
+	for _, sq := range active {
+		if !sq.firstDecodePending {
+			continue
+		}
+		g := groups[sq.admissionID]
+		g.rows++
+		if g.admitted.IsZero() || sq.admittedAt.Before(g.admitted) {
+			g.admitted = sq.admittedAt
+		}
+		groups[sq.admissionID] = g
+		sq.firstDecodePending = false
+	}
+	for id, g := range groups {
+		log.Printf("batch: qwen35 first-decode admission_id=%d rows=%d delay=%.3f ms engine=%.3f ms active=%d",
+			id, g.rows, time.Since(g.admitted).Seconds()*1000, engineDur.Seconds()*1000, len(active))
+	}
+}
+
 // stepSpec is the speculative analogue of step: per active slot it drafts tokens
 // (prompt-lookup over that sequence's history) and verifies them all in ONE batched
 // forward via the engine's StepBatchSpec, then scatters the committed RUN (accepted
@@ -1409,7 +1499,9 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 
 	t0 := time.Now()
 	out, err := s.spec.StepBatchSpec(reqs)
-	s.telEngine += time.Since(t0)
+	engineDur := time.Since(t0)
+	s.telEngine += engineDur
+	s.logFirstDecode(active, engineDur)
 	s.telSteps++
 	s.telBatch += int64(len(slots))
 	if err != nil {
@@ -1468,7 +1560,9 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 
 	t0 := time.Now()
 	out, err := s.engine.StepBatch(slots, inputs)
-	s.telEngine += time.Since(t0)
+	engineDur := time.Since(t0)
+	s.telEngine += engineDur
+	s.logFirstDecode(active, engineDur)
 	s.telSteps++
 	s.telBatch += int64(len(slots))
 	if os.Getenv("FUCINA_P0_DIAG") != "" && len(slots) > 1 {
