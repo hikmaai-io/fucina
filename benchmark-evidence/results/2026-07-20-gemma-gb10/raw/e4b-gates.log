@@ -1,0 +1,193 @@
+===e4b-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_ple_fp8.cu -o /tmp/e4b_ple_test && /tmp/e4b_ple_test /opt/spark/models/hub/models--google--gemma-4-E4B-it/snapshots/fee6332c1abaafb77f6f9624236c63aa2f1d0187
+E4B foundation test — model: /opt/spark/models/hub/models--google--gemma-4-E4B-it/snapshots/fee6332c1abaafb77f6f9624236c63aa2f1d0187
+  detected E4B: hidden=2560 ff=10240 layers=42 heads=8 kv_heads=2
+  ple_dim=256 ple_vocab=262144 ple_width=10752  kv_shared=18 (share@24)  full_layers=7
+  sliding_window=512 softcap=30.0 rms_eps=1e-06 rope(swa/full)=10000/1000000 tie=1
+  PLE tensor model.language_model.embed_tokens_per_layer.weight [262144, 10752] BF16 = 5.64 GB  (FP8 → 2.82 GB)
+  FP8 PLE codec over 512 rows: mean cos=0.999650  worst cos=0.999630 (tok 44118)  worst relL2=2.7188%
+PASS: E4B config detected + FP8 PLE index within accuracy gate (cos≥0.999)
+GATE_RC:e4b-test:0
+===e4b-load-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_load.cu cuda/e4b_engine.cu -o /tmp/e4b_load -lcudart -lcublas && /tmp/e4b_load /opt/spark/models/hub/models--google--gemma-4-E4B-it/snapshots/fee6332c1abaafb77f6f9624236c63aa2f1d0187
+e4b: hybrid decode quant ON (+2.99 GB: content@NVFP4 FFN+V/O 2.02 GB, index@FP8 Q/K+head 0.97 GB; BF16 kept for prefill)
+e4b: loaded Gemma-4-E4B — 42 layers, hidden 2560, 15.44 GB resident (FP8 PLE index saves ~2.82 GB vs BF16; KV 4096 ctx × up to 1 seqs)
+e4b_is_e4b_checkpoint(/opt/spark/models/hub/models--google--gemma-4-E4B-it/snapshots/fee6332c1abaafb77f6f9624236c63aa2f1d0187) = 1
+Gemma-4-E4B engine:
+  hidden=2560 ff=10240 layers=42 (7 full / 35 sliding)
+  heads=8 kv_heads=2 head_dim=256 global_head_dim=512 sliding_window=512
+  PLE: dim=256 width=10752 (FP8 index)   KV-shared tail=18 (share@24)
+  softcap=30.0 rms_eps=1e-06 rope(swa/full)=10000/1000000 tie=1
+  device bytes resident: 15.44 GB
+PASS: E4B checkpoint loaded (BF16 weights + FP8 PLE index)
+GATE_RC:e4b-load-test:0
+===e4b-gguf-load-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_gguf_load.cu cuda/e4b_engine.cu -o /tmp/e4b_gguf_load -lcudart -lcublas && /tmp/e4b_gguf_load /opt/spark/models/hub/models--google--gemma-4-E4B-it-qat-q4_0-gguf/snapshots/bb3b92e6f031fa438b409f898dd9f14f499a0cb0/gemma-4-E4B_q4_0-it.gguf /opt/spark/models/hub/models--google--gemma-4-E4B-it/snapshots/fee6332c1abaafb77f6f9624236c63aa2f1d0187
+e4b-gguf: assuming full-attn partial_rotary_factor=0.25 (not carried in GGUF; Gemma-4 default), softcap=30.0
+e4b: native Q4_0 decode ON (matmuls@Q4_0 + head@Q6_K via shared MMVQ; freed 7.78 GB BF16 projections, prefill dequants on the fly)
+e4b: loaded Gemma-4-E4B — 42 layers, hidden 2560, 7.36 GB resident (FP8 PLE index saves ~2.82 GB vs BF16; KV 4096 ctx × up to 1 seqs)
+e4b: hybrid decode quant ON (+2.99 GB: content@NVFP4 FFN+V/O 2.02 GB, index@FP8 Q/K+head 0.97 GB; BF16 kept for prefill)
+e4b: loaded Gemma-4-E4B — 42 layers, hidden 2560, 15.44 GB resident (FP8 PLE index saves ~2.82 GB vs BF16; KV 4096 ctx × up to 1 seqs)
+e4b_is_e4b_checkpoint(/opt/spark/models/hub/models--google--gemma-4-E4B-it-qat-q4_0-gguf/snapshots/bb3b92e6f031fa438b409f898dd9f14f499a0cb0/gemma-4-E4B_q4_0-it.gguf) = 1
+Gemma-4-E4B engine:
+  hidden=2560 ff=10240 layers=42 (7 full / 35 sliding)
+  heads=8 kv_heads=2 head_dim=256 global_head_dim=512 sliding_window=512
+  PLE: dim=256 width=10752 (FP8 index)   KV-shared tail=18 (share@24)
+  softcap=30.0 rms_eps=1e-06 rope(swa/full)=10000/1000000 tie=1
+  device bytes resident: 7.36 GB
+device_bytes = 7.36 GB
+GGUF prefill argmax = 236761 (logit 26.603)
+BF16 prefill argmax = 236761; GGUF top in BF16 top-5 = yes (top-1 match = yes)
+PASS: E4B Q4_0 GGUF loaded + forward sanity OK
+GATE_RC:e4b-gguf-load-test:0
+===e4b-fwd-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_forward.cu cuda/e4b_engine.cu -o /tmp/e4b_fwd -lcudart -lcublas && /tmp/e4b_fwd /opt/spark/models/hub/models--google--gemma-4-E4B-it/snapshots/fee6332c1abaafb77f6f9624236c63aa2f1d0187
+cannot open /tmp/e4b_ref.bin (run the HF dump first)
+make: *** [Makefile:720: e4b-fwd-test] Error 1
+GATE_RC:e4b-fwd-test:2
+===e4b-gen-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_generate.cu cuda/e4b_engine.cu -o /tmp/e4b_gen -lcudart -lcublas && /tmp/e4b_gen /opt/spark/models/hub/models--google--gemma-4-E4B-it/snapshots/fee6332c1abaafb77f6f9624236c63aa2f1d0187
+open /tmp/e4b_gen_ref.bin
+make: *** [Makefile:724: e4b-gen-test] Error 1
+GATE_RC:e4b-gen-test:2
+===e4b-batch-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_batch.cu cuda/e4b_engine.cu -o /tmp/e4b_batch -lcudart -lcublas && /tmp/e4b_batch /opt/spark/models/hub/models--google--gemma-4-E4B-it/snapshots/fee6332c1abaafb77f6f9624236c63aa2f1d0187
+e4b: hybrid decode quant ON (+2.99 GB: content@NVFP4 FFN+V/O 2.02 GB, index@FP8 Q/K+head 0.97 GB; BF16 kept for prefill)
+e4b: loaded Gemma-4-E4B — 42 layers, hidden 2560, 15.44 GB resident (FP8 PLE index saves ~2.82 GB vs BF16; KV 4096 ctx × up to 8 seqs)
+FAIL: 2 mismatches batched vs independent
+seq capacity: 7
+added slots: 1 2 3 
+seq 0 (len 5): batched=7001 563 7001 563 7001 563 7001 563 | indep=7001 563 7001 563 7001 563 7001 563   ✓
+seq 1 (len 3): batched=669 5279 529 669 5279 529 669 5279 | indep=669 5279 529 669 5279 529 669 5279   ✓
+seq 2 (len 2): batched=818 818 818 818 818 64753 818 64753 | indep=818 818 64753 818 818 64753 818 818   <-- MISMATCH
+make: *** [Makefile:728: e4b-batch-test] Error 1
+GATE_RC:e4b-batch-test:2
+===e4b-mtp-load-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_mtp_load.cu cuda/libfucina.a -o /tmp/e4b_mtp_load -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_mtp_load /opt/spark/models/hub/models--google--gemma-4-E4B-it-qat-q4_0-gguf/snapshots/bb3b92e6f031fa438b409f898dd9f14f499a0cb0/gemma-4-E4B_q4_0-it.gguf /opt/spark/models/hub/models--unsloth--gemma-4-E4B-it-qat-GGUF/snapshots/bbcd9d849c2541ecc2af7ef64b3c3c2c7aa14e96/MTP/gemma-4-E4B-it-Q4_0-MTP.gguf
+/usr/bin/ld: cuda/libfucina.a(gemma4_kernels.o): in function `moe_ffn(gemma4_engine*, int, float const*, float*, int, CUstream_st*)::{lambda(bool)#1}::operator()(bool) const':
+tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x68788): undefined reference to `dg_fp4_moe_grouped_mapped'
+/usr/bin/ld: cuda/libfucina.a(gemma4_kernels.o): in function `q35_fp4_expert_slabs(gemma4_engine*, int, int, unsigned char const**, unsigned short const**, unsigned char const**, unsigned short const**, unsigned char const**, unsigned short const**, q35_nv4src const*, q35_nv4src const*, q35_nv4src const*, int, int, int)':
+tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x6a520): undefined reference to `dg_fp4_sf_strides'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x6a540): undefined reference to `dg_fp4_sf_strides'
+/usr/bin/ld: cuda/libfucina.a(gemma4_kernels.o): in function `moe_ffn(gemma4_engine*, int, float const*, float*, int, CUstream_st*)':
+tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x70cdc): undefined reference to `dg_softmax_topk'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x70db8): undefined reference to `dg_moe_route_inv'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x70ddc): undefined reference to `dg_gather_cols'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71028): undefined reference to `dg_moe_reduce'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x7148c): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71a14): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71ce0): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71e4c): undefined reference to `dg_quantize_q8_1'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71eb8): undefined reference to `dg_mmq_q4_K_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71f14): undefined reference to `dg_mmq_q4_K_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71f40): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71ff8): undefined reference to `dg_quantize_q8_1'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x72054): undefined reference to `dg_mmq_q8_0_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x72a10): undefined reference to `dg_fp4_moe_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x72c64): undefined reference to `dg_fp4_moe_grouped_mapped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x734d0): undefined reference to `dg_fp4_moe_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x736b0): undefined reference to `dg_mmq_q4_K_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x73808): undefined reference to `dg_fp4_moe_grouped_mapped'
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:733: e4b-mtp-load-test] Error 1
+GATE_RC:e4b-mtp-load-test:2
+===e4b-spec-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_spec.cu cuda/libfucina.a -o /tmp/e4b_spec -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_spec /opt/spark/models/hub/models--google--gemma-4-E4B-it-qat-q4_0-gguf/snapshots/bb3b92e6f031fa438b409f898dd9f14f499a0cb0/gemma-4-E4B_q4_0-it.gguf /opt/spark/models/hub/models--unsloth--gemma-4-E4B-it-qat-GGUF/snapshots/bbcd9d849c2541ecc2af7ef64b3c3c2c7aa14e96/MTP/gemma-4-E4B-it-Q4_0-MTP.gguf
+/usr/bin/ld: cuda/libfucina.a(gemma4_kernels.o): in function `moe_ffn(gemma4_engine*, int, float const*, float*, int, CUstream_st*)::{lambda(bool)#1}::operator()(bool) const':
+tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x68788): undefined reference to `dg_fp4_moe_grouped_mapped'
+/usr/bin/ld: cuda/libfucina.a(gemma4_kernels.o): in function `q35_fp4_expert_slabs(gemma4_engine*, int, int, unsigned char const**, unsigned short const**, unsigned char const**, unsigned short const**, unsigned char const**, unsigned short const**, q35_nv4src const*, q35_nv4src const*, q35_nv4src const*, int, int, int)':
+tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x6a520): undefined reference to `dg_fp4_sf_strides'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x6a540): undefined reference to `dg_fp4_sf_strides'
+/usr/bin/ld: cuda/libfucina.a(gemma4_kernels.o): in function `moe_ffn(gemma4_engine*, int, float const*, float*, int, CUstream_st*)':
+tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x70cdc): undefined reference to `dg_softmax_topk'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x70db8): undefined reference to `dg_moe_route_inv'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x70ddc): undefined reference to `dg_gather_cols'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71028): undefined reference to `dg_moe_reduce'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x7148c): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71a14): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71ce0): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71e4c): undefined reference to `dg_quantize_q8_1'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71eb8): undefined reference to `dg_mmq_q4_K_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71f14): undefined reference to `dg_mmq_q4_K_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71f40): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71ff8): undefined reference to `dg_quantize_q8_1'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x72054): undefined reference to `dg_mmq_q8_0_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x72a10): undefined reference to `dg_fp4_moe_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x72c64): undefined reference to `dg_fp4_moe_grouped_mapped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x734d0): undefined reference to `dg_fp4_moe_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x736b0): undefined reference to `dg_mmq_q4_K_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x73808): undefined reference to `dg_fp4_moe_grouped_mapped'
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:740: e4b-spec-test] Error 1
+GATE_RC:e4b-spec-test:2
+===e4b-spec-stream-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_spec_stream.cu cuda/libfucina.a -o /tmp/e4b_spec_stream -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_spec_stream /opt/spark/models/hub/models--google--gemma-4-E4B-it-qat-q4_0-gguf/snapshots/bb3b92e6f031fa438b409f898dd9f14f499a0cb0/gemma-4-E4B_q4_0-it.gguf /opt/spark/models/hub/models--unsloth--gemma-4-E4B-it-qat-GGUF/snapshots/bbcd9d849c2541ecc2af7ef64b3c3c2c7aa14e96/MTP/gemma-4-E4B-it-Q4_0-MTP.gguf
+/usr/bin/ld: cuda/libfucina.a(gemma4_kernels.o): in function `moe_ffn(gemma4_engine*, int, float const*, float*, int, CUstream_st*)::{lambda(bool)#1}::operator()(bool) const':
+tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x68788): undefined reference to `dg_fp4_moe_grouped_mapped'
+/usr/bin/ld: cuda/libfucina.a(gemma4_kernels.o): in function `q35_fp4_expert_slabs(gemma4_engine*, int, int, unsigned char const**, unsigned short const**, unsigned char const**, unsigned short const**, unsigned char const**, unsigned short const**, q35_nv4src const*, q35_nv4src const*, q35_nv4src const*, int, int, int)':
+tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x6a520): undefined reference to `dg_fp4_sf_strides'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x6a540): undefined reference to `dg_fp4_sf_strides'
+/usr/bin/ld: cuda/libfucina.a(gemma4_kernels.o): in function `moe_ffn(gemma4_engine*, int, float const*, float*, int, CUstream_st*)':
+tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x70cdc): undefined reference to `dg_softmax_topk'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x70db8): undefined reference to `dg_moe_route_inv'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x70ddc): undefined reference to `dg_gather_cols'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71028): undefined reference to `dg_moe_reduce'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x7148c): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71a14): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71ce0): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71e4c): undefined reference to `dg_quantize_q8_1'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71eb8): undefined reference to `dg_mmq_q4_K_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71f14): undefined reference to `dg_mmq_q4_K_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71f40): undefined reference to `dg_silu_mul'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x71ff8): undefined reference to `dg_quantize_q8_1'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x72054): undefined reference to `dg_mmq_q8_0_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x72a10): undefined reference to `dg_fp4_moe_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x72c64): undefined reference to `dg_fp4_moe_grouped_mapped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x734d0): undefined reference to `dg_fp4_moe_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x736b0): undefined reference to `dg_mmq_q4_K_grouped'
+/usr/bin/ld: tmpxft_0016cd8d_00000000-6_gemma4_kernels.compute_121a.cudafe1.cpp:(.text+0x73808): undefined reference to `dg_fp4_moe_grouped_mapped'
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:747: e4b-spec-stream-test] Error 1
+GATE_RC:e4b-spec-stream-test:2
+===e4b-nvfp4-test===
+/usr/local/cuda-13/bin/nvcc -O3 -arch=sm_121a -std=c++17 -Icuda cuda/test_e4b_nvfp4.cu -o /tmp/e4b_nvfp4_test -lcudart && /tmp/e4b_nvfp4_test
+──── NVFP4 (4.5-bit, content path) ────
+== gate/up_proj (FFN in) : out=10240 in=2560 ==
+  quantized: 14.75 MB (4.50 bit/elem vs 16.0 BF16)
+  kernel vs oracle : rel_L2=1.51e-03  max_abs=5.05e-03  OK
+  FP4 quant quality: rel_L2=0.1015  SNR=19.9 dB
+  GEMV bandwidth   : 175.9 GB/s  (0.084 ms/call)
+
+== down_proj (FFN out) : out=2560 in=10240 ==
+  quantized: 14.75 MB (4.50 bit/elem vs 16.0 BF16)
+  kernel vs oracle : rel_L2=1.45e-03  max_abs=9.67e-03  OK
+  FP4 quant quality: rel_L2=0.1017  SNR=19.9 dB
+  GEMV bandwidth   : 150.7 GB/s  (0.098 ms/call)
+
+== o_proj (attn content) : out=2560 in=2048 ==
+  quantized: 2.95 MB (4.50 bit/elem vs 16.0 BF16)
+  kernel vs oracle : rel_L2=1.40e-03  max_abs=3.83e-03  OK
+  FP4 quant quality: rel_L2=0.0995  SNR=20.0 dB
+  GEMV bandwidth   : 118.2 GB/s  (0.025 ms/call)
+
+──── FP8 (8-bit, index/decision path) ────
+== [FP8] q_proj (attn index) : out=2048 in=2560 ==
+  quantized: 5.25 MB (8.01 bit/elem)
+  kernel vs oracle : rel_L2=1.48e-03  OK
+  FP8 quant quality: SNR=31.8 dB  (vs ~20 dB NVFP4 — the index/decision precision win)
+  GEMV bandwidth   : 319.5 GB/s
+
+== [FP8] k_proj (attn index) : out=512 in=2560 ==
+  quantized: 1.31 MB (8.01 bit/elem)
+  kernel vs oracle : rel_L2=1.62e-03  OK
+  FP8 quant quality: SNR=31.1 dB  (vs ~20 dB NVFP4 — the index/decision precision win)
+  GEMV bandwidth   : 106.4 GB/s
+
+== [FP8] lm_head (decision) : out=262144 in=2560 ==
+  quantized: 672.14 MB (8.01 bit/elem)
+  kernel vs oracle : rel_L2=1.48e-03  OK
+  FP8 quant quality: SNR=31.8 dB  (vs ~20 dB NVFP4 — the index/decision precision win)
+  GEMV bandwidth   : 233.5 GB/s
+
+PASS: NVFP4+FP8 hybrid E4B foundation validated
+GATE_RC:e4b-nvfp4-test:0

@@ -1,0 +1,27 @@
+===manual-linked-mtp_load===
+e4b-gguf: assuming full-attn partial_rotary_factor=0.25 (not carried in GGUF; Gemma-4 default), softcap=30.0
+e4b: native Q4_0 decode ON (matmuls@Q4_0 + head@Q6_K via shared MMVQ; freed 7.78 GB BF16 projections, prefill dequants on the fly)
+e4b: loaded Gemma-4-E4B — 42 layers, hidden 2560, 7.36 GB resident (FP8 PLE index saves ~2.82 GB vs BF16; KV 4096 ctx × up to 1 seqs)
+e4b-mtp: assistant loaded — 4 layers (3 sliding + 1 global), AH=256 FF=2048 q_heads=4 kv_heads=2, 199.88 MB resident; drafts vs target slot-0 KV (prov_sliding=22, prov_full=23) [forward=dp4a-Q4_0]
+PASS: E4B assistant draft head loaded + resident
+PASS: drafter forward — tok=476 pos=4 -> drafted_id=382 (in range [0,262144))
+DRAFTED_ID=382
+MANUAL_GATE_RC:mtp_load:0
+===manual-linked-spec===
+e4b-gguf: assuming full-attn partial_rotary_factor=0.25 (not carried in GGUF; Gemma-4 default), softcap=30.0
+e4b: native Q4_0 decode ON (matmuls@Q4_0 + head@Q6_K via shared MMVQ; freed 7.78 GB BF16 projections, prefill dequants on the fly)
+e4b: loaded Gemma-4-E4B — 42 layers, hidden 2560, 7.36 GB resident (FP8 PLE index saves ~2.82 GB vs BF16; KV 4096 ctx × up to 1 seqs)
+e4b-mtp: assistant loaded — 4 layers (3 sliding + 1 global), AH=256 FF=2048 q_heads=4 kv_heads=2, 199.88 MB resident; drafts vs target slot-0 KV (prov_sliding=22, prov_full=23) [forward=dp4a-Q4_0]
+baseline greedy: 160 tokens in 2.864s = 55.9 tok/s
+spec greedy:     160 tokens in 0.955s = 167.6 tok/s  (3.00x)
+PASS: greedy spec is BYTE-IDENTICAL to plain greedy over 160 tokens (lossless)
+MANUAL_GATE_RC:spec:0
+===manual-linked-spec_stream===
+e4b-gguf: assuming full-attn partial_rotary_factor=0.25 (not carried in GGUF; Gemma-4 default), softcap=30.0
+e4b: native Q4_0 decode ON (matmuls@Q4_0 + head@Q6_K via shared MMVQ; freed 7.78 GB BF16 projections, prefill dequants on the fly)
+e4b: loaded Gemma-4-E4B — 42 layers, hidden 2560, 7.36 GB resident (FP8 PLE index saves ~2.82 GB vs BF16; KV 4096 ctx × up to 1 seqs)
+e4b-mtp: assistant loaded — 4 layers (3 sliding + 1 global), AH=256 FF=2048 q_heads=4 kv_heads=2, 199.88 MB resident; drafts vs target slot-0 KV (prov_sliding=22, prov_full=23) [forward=dp4a-Q4_0]
+baseline greedy: 160 tokens
+spec_stream:     160 tokens (emitted via cb: 160)
+PASS: spec_stream CONTINUE path is BYTE-IDENTICAL to plain greedy over 160 tokens
+MANUAL_GATE_RC:spec_stream:0

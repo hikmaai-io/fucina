@@ -1,0 +1,4 @@
+# Preserve engine output byte-for-byte; do not whitespace-check raw logs/metrics snapshots.
+raw/*.log -diff
+raw/*.txt -diff
+raw/*.final -diff

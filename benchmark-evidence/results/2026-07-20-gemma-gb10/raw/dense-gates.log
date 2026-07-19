@@ -1,0 +1,38 @@
+/usr/local/cuda-13/bin/nvcc -arch=sm_121a -o /tmp/fucina_paged_kv_device_test \
+	cuda/paged_kv_device_test.cu -diag-suppress 550
+/tmp/fucina_paged_kv_device_test
+paged_kv_device test on: NVIDIA GB10 (sm_121)
+  [global ] nkv=1 hd=512 seqs=3  readback=0 (EXACT)  attn paged-vs-contig=0.0112  paged-vs-host=1.19e-07  batched-vs-single=0  FAIL
+  [sliding] nkv=8 hd=256 seqs=3  readback=0 (EXACT)  attn paged-vs-contig=0  paged-vs-host=1.53e-07  batched-vs-single=0  OK
+  [sliding] nkv=8 hd=256 seqs=3 (recycled base>0)  readback=0 (EXACT)  attn paged-vs-contig=0  paged-vs-host=1.53e-07  batched-vs-single=0  OK
+paged_kv_device: 1 TEST(S) FAILED
+make: *** [Makefile:151: paged-kv-device-test] Error 1
+rm -f fucina
+CGO_CFLAGS="-I/usr/local/cuda-13/include" \
+CGO_LDFLAGS="-L/usr/local/cuda-13/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm" \
+/usr/local/go/bin/go build -a -ldflags="-s -w" -o fucina ./cmd/fucina/
+fucina: OK — device weight-upload path linked
+MODEL=/opt/spark/models/hub/models--google--gemma-4-12B-it-qat-q4_0-gguf/snapshots/f6e7774e6148da3b7f201e42ba37cf084c1db35f/gemma-4-12b-it-qat-q4_0.gguf scripts/bench.sh
+──────────────────────────────────────────────────────────────
+  CORRECTNESS 1 — multi-seq batch == single decodes + sampling (engine self-test)
+──────────────────────────────────────────────────────────────
+  !! batch self-test FAILED
+  !! sampling self-test FAILED
+──────────────────────────────────────────────────────────────
+  CORRECTNESS 2 — greedy byte-identical: default vs continuous-batch path
+──────────────────────────────────────────────────────────────
+  default: France is011111111111
+  batch  : France is011111111111
+  OK (byte-identical)
+──────────────────────────────────────────────────────────────
+  PERF 1 — prefill throughput (long prompt)
+──────────────────────────────────────────────────────────────
+  prefill 642 tokens in 0.65s (983.4 tok/s)
+──────────────────────────────────────────────────────────────
+  PERF 2 — decode throughput (256 tokens)
+──────────────────────────────────────────────────────────────
+  spec OFF: generated 256 tokens in 9.43s (27.1 tok/s)
+  spec ON : generated 256 tokens in 5.43s (47.1 tok/s), 126 drafts accepted (avg 1.97 tokens/step
+──────────────────────────────────────────────────────────────
+  BENCH: correctness FAILED
+make: *** [Makefile:494: bench] Error 1

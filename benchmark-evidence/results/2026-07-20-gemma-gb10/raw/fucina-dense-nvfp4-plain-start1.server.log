@@ -1,0 +1,7 @@
+2026/07/19 18:54:45 fucina: loading model /opt/spark/models/hub/models--RedHatAI--gemma-4-12B-it-NVFP4/snapshots/a1d2478a9b99cc444bc9f64839609d3a82ca9195 (ctx=16384, device=0)...
+fucina: loaded /opt/spark/models/hub/models--RedHatAI--gemma-4-12B-it-NVFP4/snapshots/a1d2478a9b99cc444bc9f64839609d3a82ca9195 (directory)
+fucina: NVFP4 safetensors checkpoint detected (48 layers, compressed-tensors)
+fucina: NVFP4 shape mismatch L5 P1 (packed 983040 vs 7864320, scale 122880 vs 983040)
+fucina: NVFP4 safetensors residency failed
+fucina: NVFP4 residency failed
+2026/07/19 18:54:47 fucina: engine init failed: fucina: engine creation failed for /opt/spark/models/hub/models--RedHatAI--gemma-4-12B-it-NVFP4/snapshots/a1d2478a9b99cc444bc9f64839609d3a82ca9195

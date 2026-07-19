@@ -1,0 +1,2683 @@
+{
+  "schema_version": 1,
+  "modes": {
+    "fucina-dense-q4-mtp": {
+      "starts": 3,
+      "stream_interval_semantics": "token-exact",
+      "startup_ms": {
+        "n": 3,
+        "raw": [
+          26342.0,
+          26340.0,
+          26345.0
+        ],
+        "median": 26342.0,
+        "mean": 26342.333333333332,
+        "cv": 9.553487333785605e-05
+      },
+      "rss_at_ready_bytes": {
+        "n": 3,
+        "raw": [
+          9270775808.0,
+          9270669312.0,
+          9270726656.0
+        ],
+        "median": 9270726656.0,
+        "mean": 9270723925.333334,
+        "cv": 5.749333858003501e-06
+      },
+      "physical_available_at_ready_bytes": {
+        "n": 3,
+        "raw": [
+          68524523520.0,
+          68659343360.0,
+          68688023552.0
+        ],
+        "median": 68659343360.0,
+        "mean": 68623963477.333336,
+        "cv": 0.0012721985337661268
+      },
+      "quality": {
+        "arithmetic": {
+          "output_hashes": [
+            "ee45716911183669fa8f24fa25b7b20d9e108273e58cd26fe4a736339fe646c5",
+            "ee45716911183669fa8f24fa25b7b20d9e108273e58cd26fe4a736339fe646c5",
+            "ee45716911183669fa8f24fa25b7b20d9e108273e58cd26fe4a736339fe646c5"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "9ecba39c8f3d186a414a2613e3c029a8367f5b02ba259ecd774d096bd4755b40",
+            "9ecba39c8f3d186a414a2613e3c029a8367f5b02ba259ecd774d096bd4755b40",
+            "9ecba39c8f3d186a414a2613e3c029a8367f5b02ba259ecd774d096bd4755b40"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "To solve 137 + 265, you can add the numbers column by column:\n\n**Addition:**\n  137\n+ 265\n————\n  402\n\n**Step-by-step:**\n1.  **Units place:** 7 + 5 = 12 (Write down 2, carry over 1)\n2.  **Tens place:** 3 + 6 + 1 (",
+            "To solve 137 + 265, you can add the numbers column by column:\n\n**Addition:**\n  137\n+ 265\n————\n  402\n\n**Step-by-step:**\n1.  **Units place:** 7 + 5 = 12 (Write down 2, carry over 1)\n2.  **Tens place:** 3 + 6 + 1 (",
+            "To solve 137 + 265, you can add the numbers column by column:\n\n**Addition:**\n  137\n+ 265\n————\n  402\n\n**Step-by-step:**\n1.  **Units place:** 7 + 5 = 12 (Write down 2, carry over 1)\n2.  **Tens place:** 3 + 6 + 1 ("
+          ]
+        },
+        "code_python": {
+          "output_hashes": [
+            "0f862dff20a57c6aad7b921486b1bc22025535088ae6eab068b4a608268d2340",
+            "0f862dff20a57c6aad7b921486b1bc22025535088ae6eab068b4a608268d2340",
+            "0f862dff20a57c6aad7b921486b1bc22025535088ae6eab068b4a608268d2340"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "e2cb1666d3e3444ffd3285da167e761baec2d43e320dbe23d3264ce30bac50c1",
+            "e2cb1666d3e3444ffd3285da167e761baec2d43e320dbe23d3264ce30bac50c1",
+            "e2cb1666d3e3444ffd3285da167e761baec2d43e320dbe23d3264ce30bac50c1"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "Here are two ways to solve this. The first is the most common approach using a simple loop, and the second is a more \"Pythonic\" approach using a generator.\n\n### Option 1: Standard Approach (List)\nThis is the most straightforward way to return a list of numbers.\n\n```python\ndef get_fibonacci(n):\n    # Handle cases where n is 0 or negative\n    if n <= 0:\n        return []",
+            "Here are two ways to solve this. The first is the most common approach using a simple loop, and the second is a more \"Pythonic\" approach using a generator.\n\n### Option 1: Standard Approach (List)\nThis is the most straightforward way to return a list of numbers.\n\n```python\ndef get_fibonacci(n):\n    # Handle cases where n is 0 or negative\n    if n <= 0:\n        return []",
+            "Here are two ways to solve this. The first is the most common approach using a simple loop, and the second is a more \"Pythonic\" approach using a generator.\n\n### Option 1: Standard Approach (List)\nThis is the most straightforward way to return a list of numbers.\n\n```python\ndef get_fibonacci(n):\n    # Handle cases where n is 0 or negative\n    if n <= 0:\n        return []"
+          ]
+        },
+        "multilingual": {
+          "output_hashes": [
+            "1d69385065b89bfd8ef4263882dc08a866342f321233b4f61c0758bf34d4f82c",
+            "1d69385065b89bfd8ef4263882dc08a866342f321233b4f61c0758bf34d4f82c",
+            "1d69385065b89bfd8ef4263882dc08a866342f321233b4f61c0758bf34d4f82c"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "bd8f22ad21e5fc1163a755d0c9e6aed2f5bca283c834443621b33015184332c6",
+            "bd8f22ad21e5fc1163a755d0c9e6aed2f5bca283c834443621b33015184332c6",
+            "bd8f22ad21e5fc1163a755d0c9e6aed2f5bca283c834443621b33015184332c6"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "Here is the translation of \"Good morning, where is the train station?\" in French, German, and Japanese:\n\n**French:**\n*   **Bonjour, où est la gare ?**\n    *(Pronunciation: Bon-zhoor, oo ay la gar?)*\n\n**German:**\n*   **Guten Morgen, wo ist der Bahnhof?**\n    *(Pronunciation: Goo-ten Mor-gen, vo ist dare Bahn-hof?)*",
+            "Here is the translation of \"Good morning, where is the train station?\" in French, German, and Japanese:\n\n**French:**\n*   **Bonjour, où est la gare ?**\n    *(Pronunciation: Bon-zhoor, oo ay la gar?)*\n\n**German:**\n*   **Guten Morgen, wo ist der Bahnhof?**\n    *(Pronunciation: Goo-ten Mor-gen, vo ist dare Bahn-hof?)*",
+            "Here is the translation of \"Good morning, where is the train station?\" in French, German, and Japanese:\n\n**French:**\n*   **Bonjour, où est la gare ?**\n    *(Pronunciation: Bon-zhoor, oo ay la gar?)*\n\n**German:**\n*   **Guten Morgen, wo ist der Bahnhof?**\n    *(Pronunciation: Goo-ten Mor-gen, vo ist dare Bahn-hof?)*"
+          ]
+        },
+        "repetition": {
+          "output_hashes": [
+            "037628329ac2e317212b4e0cb061b56ebc2c5d0f2a2b2d5dc5ebf48a164009a6",
+            "037628329ac2e317212b4e0cb061b56ebc2c5d0f2a2b2d5dc5ebf48a164009a6",
+            "037628329ac2e317212b4e0cb061b56ebc2c5d0f2a2b2d5dc5ebf48a164009a6"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "7ab15295638a22c251084ca3d96f55c462f957f0a4298e6226191c0c26821170",
+            "7ab15295638a22c251084ca3d96f55c462f957f0a4298e6226191c0c26821170",
+            "7ab15295638a22c251084ca3d96f55c462f957f0a4298e6226191c0c26821170"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "red blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green",
+            "red blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green",
+            "red blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green"
+          ]
+        },
+        "code_rust": {
+          "output_hashes": [
+            "a14f5c507bb0b7f1998e709a0b49f2e6686f6f2493a51a5ceaa76d50ef8f7589",
+            "a14f5c507bb0b7f1998e709a0b49f2e6686f6f2493a51a5ceaa76d50ef8f7589",
+            "a14f5c507bb0b7f1998e709a0b49f2e6686f6f2493a51a5ceaa76d50ef8f7589"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "d3c58446166b5a1a7c9bfb18dd215e74ce87d64cdbad913b650780c551b54820",
+            "d3c58446166b5a1a7c9bfb18dd215e74ce87d64cdbad913b650780c551b54820",
+            "d3c58446166b5a1a7c9bfb18dd215e74ce87d64cdbad913b650780c551b54820"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "To reverse a string by characters (Unicode Scalar Values) in Rust, you should use the `.chars()` iterator. \n\nIt is important to use `.chars()` rather than `.bytes()`, because UTF-8 characters can be made up of multiple bytes. Reversing by bytes would corrupt any non-ASCII characters (like emojis or accented letters).\n\nHere is the standard way to do it:\n\n```rust\nfn reverse_utf8(input: &str) ->",
+            "To reverse a string by characters (Unicode Scalar Values) in Rust, you should use the `.chars()` iterator. \n\nIt is important to use `.chars()` rather than `.bytes()`, because UTF-8 characters can be made up of multiple bytes. Reversing by bytes would corrupt any non-ASCII characters (like emojis or accented letters).\n\nHere is the standard way to do it:\n\n```rust\nfn reverse_utf8(input: &str) ->",
+            "To reverse a string by characters (Unicode Scalar Values) in Rust, you should use the `.chars()` iterator. \n\nIt is important to use `.chars()` rather than `.bytes()`, because UTF-8 characters can be made up of multiple bytes. Reversing by bytes would corrupt any non-ASCII characters (like emojis or accented letters).\n\nHere is the standard way to do it:\n\n```rust\nfn reverse_utf8(input: &str) ->"
+          ]
+        },
+        "reasoning": {
+          "output_hashes": [
+            "bf2a7624642fc42f0582c09b9f92e27b8eab691db0a88b5806fb6ef0ef7dc956",
+            "bf2a7624642fc42f0582c09b9f92e27b8eab691db0a88b5806fb6ef0ef7dc956",
+            "bf2a7624642fc42f0582c09b9f92e27b8eab691db0a88b5806fb6ef0ef7dc956"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "c944feb26165beb4a0258b8543420e119dd7a88830657a75f684a23391401ede",
+            "c944feb26165beb4a0258b8543420e119dd7a88830657a75f684a23391401ede",
+            "c944feb26165beb4a0258b8543420e119dd7a88830657a75f684a23391401ede"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "To prove that $\\sqrt{2}$ is irrational, we use a **proof by contradiction**.\n\n**1. Assumption:**\nAssume $\\sqrt{2}$ is **rational**. This means it can be written as a fraction $\\frac{a}{b}$ where $a$ and $b$ are integers, $b \\neq 0$, and the fraction is in **simplest form** (meaning $a$ and $b$ have no common factors).\n\n**",
+            "To prove that $\\sqrt{2}$ is irrational, we use a **proof by contradiction**.\n\n**1. Assumption:**\nAssume $\\sqrt{2}$ is **rational**. This means it can be written as a fraction $\\frac{a}{b}$ where $a$ and $b$ are integers, $b \\neq 0$, and the fraction is in **simplest form** (meaning $a$ and $b$ have no common factors).\n\n**",
+            "To prove that $\\sqrt{2}$ is irrational, we use a **proof by contradiction**.\n\n**1. Assumption:**\nAssume $\\sqrt{2}$ is **rational**. This means it can be written as a fraction $\\frac{a}{b}$ where $a$ and $b$ are integers, $b \\neq 0$, and the fraction is in **simplest form** (meaning $a$ and $b$ have no common factors).\n\n**"
+          ]
+        },
+        "long_context_retrieval": {
+          "output_hashes": [
+            "ffb69dc925bab0728859cef2abda5e519914c3649736a88d2ab66dec952abbda",
+            "ffb69dc925bab0728859cef2abda5e519914c3649736a88d2ab66dec952abbda",
+            "ffb69dc925bab0728859cef2abda5e519914c3649736a88d2ab66dec952abbda"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "5829d2c680514970a6e15236b848a7c971e1e585339b11eb4477185268ec9267",
+            "5829d2c680514970a6e15236b848a7c971e1e585339b11eb4477185268ec9267",
+            "5829d2c680514970a6e15236b848a7c971e1e585339b11eb4477185268ec9267"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "The verification code is COBALT-7319.\n\n### Analysis of the Provided Text\n\nThe provided input consists of a repetitive sequence of the NATO",
+            "The verification code is COBALT-7319.\n\n### Analysis of the Provided Text\n\nThe provided input consists of a repetitive sequence of the NATO",
+            "The verification code is COBALT-7319.\n\n### Analysis of the Provided Text\n\nThe provided input consists of a repetitive sequence of the NATO"
+          ]
+        }
+      },
+      "concurrency": {
+        "1": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              35.5835865951564,
+              35.88048344304406,
+              35.70677921083918
+            ],
+            "median": 35.70677921083918,
+            "mean": 35.723616416346545,
+            "cv": 0.004175468671476269
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              266.03222399717197,
+              262.9669059533626,
+              265.84907196229324
+            ],
+            "median": 265.84907196229324,
+            "mean": 264.94940063760924,
+            "cv": 0.006489281631929038
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              266.03222399717197,
+              262.9669059533626,
+              265.84907196229324
+            ],
+            "median": 265.84907196229324,
+            "mean": 264.94940063760924,
+            "cv": 0.006489281631929038
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              266.03222399717197,
+              262.9669059533626,
+              265.84907196229324
+            ],
+            "median": 265.84907196229324,
+            "mean": 264.94940063760924,
+            "cv": 0.006489281631929038
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              0.01742399763315916,
+              0.010943971574306488,
+              0.010959978681057692
+            ],
+            "median": 0.010959978681057692,
+            "mean": 0.013109315962841114,
+            "cv": 0.28503642126026546
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              101.17542239022441,
+              100.98144139628857,
+              101.49944901932031
+            ],
+            "median": 101.17542239022441,
+            "mean": 101.21877093527776,
+            "cv": 0.0025855908665688
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              102.97043452621438,
+              102.38153282785788,
+              103.02923392970115
+            ],
+            "median": 102.97043452621438,
+            "mean": 102.7937337612578,
+            "cv": 0.003484503035073982
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              38.12840496428043,
+              38.437861378732585,
+              38.270523198259546
+            ],
+            "median": 38.270523198259546,
+            "mean": 38.27892984709086,
+            "cv": 0.004046596744361832
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "2": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              46.51916045295531,
+              46.6280494630926,
+              46.491704547621296
+            ],
+            "median": 46.51916045295531,
+            "mean": 46.54630482122307,
+            "cv": 0.0015492463938666656
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              403.07968796696514,
+              400.07474599406123,
+              401.1657820083201
+            ],
+            "median": 401.1657820083201,
+            "mean": 401.44007198978215,
+            "cv": 0.0037891904914075345
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              517.1324327529874,
+              512.7377674623858,
+              514.9905937199946
+            ],
+            "median": 514.9905937199946,
+            "mean": 514.953597978456,
+            "cv": 0.004267503369774454
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              527.2704545117449,
+              522.7522582595702,
+              525.1083547610324
+            ],
+            "median": 525.1083547610324,
+            "mean": 525.0436891774492,
+            "cv": 0.004304007835678545
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              0.009104027412831783,
+              0.01037601032294333,
+              0.01052801962941885
+            ],
+            "median": 0.01037601032294333,
+            "mean": 0.010002685788397988,
+            "cv": 0.07817535049167698
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              154.89634657278657,
+              155.18110606644768,
+              154.37097936228383
+            ],
+            "median": 154.89634657278657,
+            "mean": 154.81614400050603,
+            "cv": 0.0026546020490339837
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              156.50615995342378,
+              156.67030713753775,
+              156.61569466872606
+            ],
+            "median": 156.61569466872606,
+            "mean": 156.5973872532292,
+            "cv": 0.0005337952542993693
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              26.06910753191251,
+              26.102372148488094,
+              25.9419408513078
+            ],
+            "median": 26.06910753191251,
+            "mean": 26.0378068439028,
+            "cv": 0.003251887351865813
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "4": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              48.16937382210311,
+              48.23847160587272,
+              48.17458102632227
+            ],
+            "median": 48.17458102632227,
+            "mean": 48.19414215143271,
+            "cv": 0.0007984086357445332
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              658.7625499814749,
+              652.3331314674579,
+              656.735103984829
+            ],
+            "median": 656.735103984829,
+            "mean": 655.9435951445872,
+            "cv": 0.005011067115156379
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              1000.1394363469444,
+              991.6540022881235,
+              997.5539497449063
+            ],
+            "median": 997.5539497449063,
+            "mean": 996.4491294599915,
+            "cv": 0.004364765170082879
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              1030.3204672667198,
+              1021.8884148530196,
+              1027.934349149
+            ],
+            "median": 1027.934349149,
+            "mean": 1026.714410422913,
+            "cv": 0.004233295274892358
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              0.010671996278688312,
+              0.009839975973591208,
+              0.010159972589462996
+            ],
+            "median": 0.010159972589462996,
+            "mean": 0.010223981613914171,
+            "cv": 0.04104928757054742
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              268.67112778127193,
+              268.4024355869042,
+              268.6108217545552
+            ],
+            "median": 268.6108217545552,
+            "mean": 268.5614617075771,
+            "cv": 0.0005249558959517962
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              271.68170087214094,
+              272.3810285696527,
+              270.43149670702405
+            ],
+            "median": 271.68170087214094,
+            "mean": 271.49807538293925,
+            "cv": 0.0036377880327067057
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              14.230144842355635,
+              14.274550415504887,
+              14.262686365051254
+            ],
+            "median": 14.262686365051254,
+            "mean": 14.255793874303926,
+            "cv": 0.0016127591844388406
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "8": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              62.686588678211514,
+              62.79085395765774,
+              62.74457498718073
+            ],
+            "median": 62.74457498718073,
+            "mean": 62.74067254101666,
+            "cv": 0.0008326667290858668
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              1170.3664570231922,
+              1158.2344990165439,
+              1165.5763994785957
+            ],
+            "median": 1165.5763994785957,
+            "mean": 1164.7257851727773,
+            "cv": 0.00524633784588955
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              1969.8621044895842,
+              1949.2770364449823,
+              1959.4266080210216
+            ],
+            "median": 1959.4266080210216,
+            "mean": 1959.5219163185293,
+            "cv": 0.005252742971311262
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              2040.996269668103,
+              2019.6612784813622,
+              2029.4716087804406
+            ],
+            "median": 2029.4716087804406,
+            "mean": 2030.0430523099685,
+            "cv": 0.005260464162164246
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              0.01631199847906828,
+              0.015664001693949103,
+              0.015631987480446696
+            ],
+            "median": 0.015664001693949103,
+            "mean": 0.01586932921782136,
+            "cv": 0.02417851813050968
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              285.08831323415507,
+              284.76380872598384,
+              284.41586397821084
+            ],
+            "median": 284.76380872598384,
+            "mean": 284.7559953127832,
+            "cv": 0.0011809855336280893
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              286.410544384853,
+              287.50833543017507,
+              286.22271102503873
+            ],
+            "median": 286.410544384853,
+            "mean": 286.7138636133556,
+            "cv": 0.00242197224828786
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              9.487857865374018,
+              10.421385469403997,
+              9.684719256324001
+            ],
+            "median": 9.684719256324001,
+            "mean": 9.864654197034005,
+            "cv": 0.04988398772382607
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "16": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              91.64579592780926,
+              91.84776663230102,
+              91.65680621776643
+            ],
+            "median": 91.65680621776643,
+            "mean": 91.71678959262556,
+            "cv": 0.0012381915894555614
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              2185.2727200021036,
+              2164.8269789875485,
+              2184.7781329997815
+            ],
+            "median": 2184.7781329997815,
+            "mean": 2178.2926106631444,
+            "cv": 0.005354744715944198
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              3898.229880272993,
+              3862.4847800383577,
+              3894.1670242493274
+            ],
+            "median": 3894.1670242493274,
+            "mean": 3884.960561520226,
+            "cv": 0.0050374554893570485
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              4049.582067228039,
+              4013.174326418084,
+              4046.803355231532
+            ],
+            "median": 4046.803355231532,
+            "mean": 4036.5199162925514,
+            "cv": 0.005020551317584438
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              144.07874198514037,
+              144.0855825203471,
+              144.28074602619745
+            ],
+            "median": 144.0855825203471,
+            "mean": 144.14835684389496,
+            "cv": 0.0007957315803106902
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              147.66527480387595,
+              147.9791598248994,
+              147.62155931675807
+            ],
+            "median": 147.66527480387595,
+            "mean": 147.7553313151778,
+            "cv": 0.0013202206153484692
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              149.41066009167116,
+              149.97592335625086,
+              150.65565639932174
+            ],
+            "median": 149.97592335625086,
+            "mean": 150.01407994908126,
+            "cv": 0.004155440630892133
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              6.300508994844067,
+              6.309315363348006,
+              6.301136480271956
+            ],
+            "median": 6.301136480271956,
+            "mean": 6.303653612821343,
+            "cv": 0.0007794284988075045
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "32": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              96.54166498480338,
+              96.78753012789055,
+              96.56301843881144
+            ],
+            "median": 96.56301843881144,
+            "mean": 96.6307378505018,
+            "cv": 0.0014095431935179554
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              4203.334439022001,
+              4154.477581963874,
+              4193.554958997993
+            ],
+            "median": 4193.554958997993,
+            "mean": 4183.788993327956,
+            "cv": 0.006178869622538597
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              7739.341864341986,
+              7656.061019180925,
+              7718.702578105149
+            ],
+            "median": 7718.702578105149,
+            "mean": 7704.701820542687,
+            "cv": 0.005629006062393948
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              8052.199436053634,
+              7969.1033515910385,
+              8033.308034094516
+            ],
+            "median": 8033.308034094516,
+            "mean": 8018.203607246396,
+            "cv": 0.005432457914940068
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              270.2179929765407,
+              269.92496551247314,
+              270.3975474869367
+            ],
+            "median": 270.2179929765407,
+            "mean": 270.1801686586502,
+            "cv": 0.0008829319650058789
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              274.87670263217296,
+              274.98781161848456,
+              274.83197782130446
+            ],
+            "median": 274.87670263217296,
+            "mean": 274.898830690654,
+            "cv": 0.0002918852048409049
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              276.82202735741157,
+              276.9039064930985,
+              276.85357212554663
+            ],
+            "median": 276.85357212554663,
+            "mean": 276.8598353253522,
+            "cv": 0.0001491632903177542
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              3.3229320939321276,
+              3.3280922424058135,
+              3.322727619864806
+            ],
+            "median": 3.3229320939321276,
+            "mean": 3.3245839854009156,
+            "cv": 0.0009143878929007944
+          },
+          "failures": 0,
+          "all_requests_128": true
+        }
+      },
+      "long_3500": {
+        "ttft": {
+          "n": 6,
+          "raw": [
+            37200.07512200391,
+            37196.64414803265,
+            37124.755969969556,
+            37307.177848007996,
+            37122.74525000248,
+            37322.10081600351
+          ],
+          "median": 37198.35963501828,
+          "mean": 37212.24985900335,
+          "cv": 0.0023159543090407178
+        },
+        "wall": {
+          "n": 6,
+          "raw": [
+            44.31461887300247,
+            41.74768120102817,
+            43.59055704402272,
+            43.64596269297181,
+            42.96108273399295,
+            43.680201727023814
+          ],
+          "median": 43.61825986849726,
+          "mean": 43.32335071200699,
+          "cv": 0.020384128813968946
+        },
+        "prompt_tokens": {
+          "n": 0,
+          "raw": [],
+          "median": null,
+          "mean": null,
+          "cv": null
+        }
+      },
+      "context": {
+        "ctx-4000": {
+          "ttft": {
+            "n": 3,
+            "raw": [
+              43608.44075802015,
+              43629.38253802713,
+              43624.80414001038
+            ],
+            "median": 43624.80414001038,
+            "mean": 43620.87581201922,
+            "cv": 0.0002523950658430991
+          },
+          "wall": {
+            "n": 3,
+            "raw": [
+              50.897759683954064,
+              50.24771033000434,
+              48.94188636599574
+            ],
+            "median": 50.24771033000434,
+            "mean": 50.02911879331805,
+            "cv": 0.01991021998596597
+          },
+          "prompt_tokens": {
+            "n": 0,
+            "raw": [],
+            "median": null,
+            "mean": null,
+            "cv": null
+          }
+        },
+        "ctx-16000": {
+          "ttft": {
+            "n": 3,
+            "raw": [
+              263669.3554039812,
+              262676.8495060387,
+              262554.524777981
+            ],
+            "median": 262676.8495060387,
+            "mean": 262966.9098960003,
+            "cv": 0.002325017132401588
+          },
+          "wall": {
+            "n": 3,
+            "raw": [
+              274.3348809070303,
+              273.9588742799824,
+              273.64274083200144
+            ],
+            "median": 273.9588742799824,
+            "mean": 273.97883200633805,
+            "cv": 0.001264701269356297
+          },
+          "prompt_tokens": {
+            "n": 0,
+            "raw": [],
+            "median": null,
+            "mean": null,
+            "cv": null
+          }
+        }
+      },
+      "prefix": {
+        "cold": {
+          "n": 3,
+          "raw": [
+            53377.28588900063,
+            53398.686447006185,
+            53405.09401797317
+          ],
+          "median": 53398.686447006185,
+          "mean": 53393.68878465999,
+          "cv": 0.0002727312011673417
+        },
+        "warm": {
+          "n": 3,
+          "raw": [
+            53390.123303979635,
+            53429.62886299938,
+            53405.58444900671
+          ],
+          "median": 53405.58444900671,
+          "mean": 53408.44553866191,
+          "cv": 0.0003727421403466817
+        }
+      },
+      "mixed": {
+        "active_decode": {
+          "n": 3,
+          "raw": [
+            660.5781795224175,
+            652.8572285023984,
+            648.5579665168189
+          ],
+          "median": 652.8572285023984,
+          "mean": 653.9977915138783,
+          "cv": 0.00931308069317264
+        },
+        "arriving_prefill": {
+          "n": 3,
+          "raw": [
+            41738.99350594729,
+            41714.59643897833,
+            41686.331292032264
+          ],
+          "median": 41714.59643897833,
+          "mean": 41713.30707898596,
+          "cv": 0.0006318073125365447
+        }
+      }
+    },
+    "fucina-dense-q4-plain": {
+      "starts": 3,
+      "stream_interval_semantics": "token-exact",
+      "startup_ms": {
+        "n": 3,
+        "raw": [
+          26354.0,
+          31390.0,
+          25339.0
+        ],
+        "median": 26354.0,
+        "mean": 27694.333333333332,
+        "cv": 0.11701049984584264
+      },
+      "rss_at_ready_bytes": {
+        "n": 3,
+        "raw": [
+          9338327040.0,
+          9334927360.0,
+          9340575744.0
+        ],
+        "median": 9338327040.0,
+        "mean": 9337943381.333334,
+        "cv": 0.00030452845261080087
+      },
+      "physical_available_at_ready_bytes": {
+        "n": 3,
+        "raw": [
+          69268942848.0,
+          68899614720.0,
+          69606948864.0
+        ],
+        "median": 69268942848.0,
+        "mean": 69258502144.0,
+        "cv": 0.005108147386452379
+      },
+      "quality": {
+        "arithmetic": {
+          "output_hashes": [
+            "ee45716911183669fa8f24fa25b7b20d9e108273e58cd26fe4a736339fe646c5",
+            "ee45716911183669fa8f24fa25b7b20d9e108273e58cd26fe4a736339fe646c5",
+            "ee45716911183669fa8f24fa25b7b20d9e108273e58cd26fe4a736339fe646c5"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "9ecba39c8f3d186a414a2613e3c029a8367f5b02ba259ecd774d096bd4755b40",
+            "9ecba39c8f3d186a414a2613e3c029a8367f5b02ba259ecd774d096bd4755b40"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "To solve 137 + 265, you can add the numbers column by column:\n\n**Addition:**\n  137\n+ 265\n————\n  402\n\n**Step-by-step:**\n1.  **Units place:** 7 + 5 = 12 (Write down 2, carry over 1)\n2.  **Tens place:** 3 + 6 + 1 (",
+            "To solve 137 + 265, you can add the numbers column by column:\n\n**Addition:**\n  137\n+ 265\n————\n  402\n\n**Step-by-step:**\n1.  **Units place:** 7 + 5 = 12 (Write down 2, carry over 1)\n2.  **Tens place:** 3 + 6 + 1 (",
+            "To solve 137 + 265, you can add the numbers column by column:\n\n**Addition:**\n  137\n+ 265\n————\n  402\n\n**Step-by-step:**\n1.  **Units place:** 7 + 5 = 12 (Write down 2, carry over 1)\n2.  **Tens place:** 3 + 6 + 1 ("
+          ]
+        },
+        "code_python": {
+          "output_hashes": [
+            "0f862dff20a57c6aad7b921486b1bc22025535088ae6eab068b4a608268d2340",
+            "0f862dff20a57c6aad7b921486b1bc22025535088ae6eab068b4a608268d2340",
+            "0f862dff20a57c6aad7b921486b1bc22025535088ae6eab068b4a608268d2340"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "e2cb1666d3e3444ffd3285da167e761baec2d43e320dbe23d3264ce30bac50c1",
+            "e2cb1666d3e3444ffd3285da167e761baec2d43e320dbe23d3264ce30bac50c1"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "Here are two ways to solve this. The first is the most common approach using a simple loop, and the second is a more \"Pythonic\" approach using a generator.\n\n### Option 1: Standard Approach (List)\nThis is the most straightforward way to return a list of numbers.\n\n```python\ndef get_fibonacci(n):\n    # Handle cases where n is 0 or negative\n    if n <= 0:\n        return []",
+            "Here are two ways to solve this. The first is the most common approach using a simple loop, and the second is a more \"Pythonic\" approach using a generator.\n\n### Option 1: Standard Approach (List)\nThis is the most straightforward way to return a list of numbers.\n\n```python\ndef get_fibonacci(n):\n    # Handle cases where n is 0 or negative\n    if n <= 0:\n        return []",
+            "Here are two ways to solve this. The first is the most common approach using a simple loop, and the second is a more \"Pythonic\" approach using a generator.\n\n### Option 1: Standard Approach (List)\nThis is the most straightforward way to return a list of numbers.\n\n```python\ndef get_fibonacci(n):\n    # Handle cases where n is 0 or negative\n    if n <= 0:\n        return []"
+          ]
+        },
+        "multilingual": {
+          "output_hashes": [
+            "1d69385065b89bfd8ef4263882dc08a866342f321233b4f61c0758bf34d4f82c",
+            "1d69385065b89bfd8ef4263882dc08a866342f321233b4f61c0758bf34d4f82c",
+            "1d69385065b89bfd8ef4263882dc08a866342f321233b4f61c0758bf34d4f82c"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "bd8f22ad21e5fc1163a755d0c9e6aed2f5bca283c834443621b33015184332c6",
+            "bd8f22ad21e5fc1163a755d0c9e6aed2f5bca283c834443621b33015184332c6"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "Here is the translation of \"Good morning, where is the train station?\" in French, German, and Japanese:\n\n**French:**\n*   **Bonjour, où est la gare ?**\n    *(Pronunciation: Bon-zhoor, oo ay la gar?)*\n\n**German:**\n*   **Guten Morgen, wo ist der Bahnhof?**\n    *(Pronunciation: Goo-ten Mor-gen, vo ist dare Bahn-hof?)*",
+            "Here is the translation of \"Good morning, where is the train station?\" in French, German, and Japanese:\n\n**French:**\n*   **Bonjour, où est la gare ?**\n    *(Pronunciation: Bon-zhoor, oo ay la gar?)*\n\n**German:**\n*   **Guten Morgen, wo ist der Bahnhof?**\n    *(Pronunciation: Goo-ten Mor-gen, vo ist dare Bahn-hof?)*",
+            "Here is the translation of \"Good morning, where is the train station?\" in French, German, and Japanese:\n\n**French:**\n*   **Bonjour, où est la gare ?**\n    *(Pronunciation: Bon-zhoor, oo ay la gar?)*\n\n**German:**\n*   **Guten Morgen, wo ist der Bahnhof?**\n    *(Pronunciation: Goo-ten Mor-gen, vo ist dare Bahn-hof?)*"
+          ]
+        },
+        "repetition": {
+          "output_hashes": [
+            "037628329ac2e317212b4e0cb061b56ebc2c5d0f2a2b2d5dc5ebf48a164009a6",
+            "037628329ac2e317212b4e0cb061b56ebc2c5d0f2a2b2d5dc5ebf48a164009a6",
+            "037628329ac2e317212b4e0cb061b56ebc2c5d0f2a2b2d5dc5ebf48a164009a6"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "7ab15295638a22c251084ca3d96f55c462f957f0a4298e6226191c0c26821170",
+            "7ab15295638a22c251084ca3d96f55c462f957f0a4298e6226191c0c26821170"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "red blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green",
+            "red blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green",
+            "red blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green"
+          ]
+        },
+        "code_rust": {
+          "output_hashes": [
+            "a14f5c507bb0b7f1998e709a0b49f2e6686f6f2493a51a5ceaa76d50ef8f7589",
+            "a14f5c507bb0b7f1998e709a0b49f2e6686f6f2493a51a5ceaa76d50ef8f7589",
+            "a14f5c507bb0b7f1998e709a0b49f2e6686f6f2493a51a5ceaa76d50ef8f7589"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "d3c58446166b5a1a7c9bfb18dd215e74ce87d64cdbad913b650780c551b54820",
+            "d3c58446166b5a1a7c9bfb18dd215e74ce87d64cdbad913b650780c551b54820"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "To reverse a string by characters (Unicode Scalar Values) in Rust, you should use the `.chars()` iterator. \n\nIt is important to use `.chars()` rather than `.bytes()`, because UTF-8 characters can be made up of multiple bytes. Reversing by bytes would corrupt any non-ASCII characters (like emojis or accented letters).\n\nHere is the standard way to do it:\n\n```rust\nfn reverse_utf8(input: &str) ->",
+            "To reverse a string by characters (Unicode Scalar Values) in Rust, you should use the `.chars()` iterator. \n\nIt is important to use `.chars()` rather than `.bytes()`, because UTF-8 characters can be made up of multiple bytes. Reversing by bytes would corrupt any non-ASCII characters (like emojis or accented letters).\n\nHere is the standard way to do it:\n\n```rust\nfn reverse_utf8(input: &str) ->",
+            "To reverse a string by characters (Unicode Scalar Values) in Rust, you should use the `.chars()` iterator. \n\nIt is important to use `.chars()` rather than `.bytes()`, because UTF-8 characters can be made up of multiple bytes. Reversing by bytes would corrupt any non-ASCII characters (like emojis or accented letters).\n\nHere is the standard way to do it:\n\n```rust\nfn reverse_utf8(input: &str) ->"
+          ]
+        },
+        "reasoning": {
+          "output_hashes": [
+            "bf2a7624642fc42f0582c09b9f92e27b8eab691db0a88b5806fb6ef0ef7dc956",
+            "bf2a7624642fc42f0582c09b9f92e27b8eab691db0a88b5806fb6ef0ef7dc956",
+            "bf2a7624642fc42f0582c09b9f92e27b8eab691db0a88b5806fb6ef0ef7dc956"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "c944feb26165beb4a0258b8543420e119dd7a88830657a75f684a23391401ede",
+            "c944feb26165beb4a0258b8543420e119dd7a88830657a75f684a23391401ede"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "To prove that $\\sqrt{2}$ is irrational, we use a **proof by contradiction**.\n\n**1. Assumption:**\nAssume $\\sqrt{2}$ is **rational**. This means it can be written as a fraction $\\frac{a}{b}$ where $a$ and $b$ are integers, $b \\neq 0$, and the fraction is in **simplest form** (meaning $a$ and $b$ have no common factors).\n\n**",
+            "To prove that $\\sqrt{2}$ is irrational, we use a **proof by contradiction**.\n\n**1. Assumption:**\nAssume $\\sqrt{2}$ is **rational**. This means it can be written as a fraction $\\frac{a}{b}$ where $a$ and $b$ are integers, $b \\neq 0$, and the fraction is in **simplest form** (meaning $a$ and $b$ have no common factors).\n\n**",
+            "To prove that $\\sqrt{2}$ is irrational, we use a **proof by contradiction**.\n\n**1. Assumption:**\nAssume $\\sqrt{2}$ is **rational**. This means it can be written as a fraction $\\frac{a}{b}$ where $a$ and $b$ are integers, $b \\neq 0$, and the fraction is in **simplest form** (meaning $a$ and $b$ have no common factors).\n\n**"
+          ]
+        },
+        "long_context_retrieval": {
+          "output_hashes": [
+            "ffb69dc925bab0728859cef2abda5e519914c3649736a88d2ab66dec952abbda",
+            "ffb69dc925bab0728859cef2abda5e519914c3649736a88d2ab66dec952abbda",
+            "ffb69dc925bab0728859cef2abda5e519914c3649736a88d2ab66dec952abbda"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "5829d2c680514970a6e15236b848a7c971e1e585339b11eb4477185268ec9267",
+            "5829d2c680514970a6e15236b848a7c971e1e585339b11eb4477185268ec9267"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "The verification code is COBALT-7319.\n\n### Analysis of the Provided Text\n\nThe provided input consists of a repetitive sequence of the NATO",
+            "The verification code is COBALT-7319.\n\n### Analysis of the Provided Text\n\nThe provided input consists of a repetitive sequence of the NATO",
+            "The verification code is COBALT-7319.\n\n### Analysis of the Provided Text\n\nThe provided input consists of a repetitive sequence of the NATO"
+          ]
+        }
+      },
+      "concurrency": {
+        "1": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              17.886839897298728,
+              17.861069912900927,
+              17.985020869474504
+            ],
+            "median": 17.886839897298728,
+            "mean": 17.910976893224717,
+            "cv": 0.0036517104716113254
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              261.6945590125397,
+              267.4650500412099,
+              265.6138659804128
+            ],
+            "median": 265.6138659804128,
+            "mean": 264.92449167805415,
+            "cv": 0.011121529130684982
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              261.6945590125397,
+              267.4650500412099,
+              265.6138659804128
+            ],
+            "median": 265.6138659804128,
+            "mean": 264.92449167805415,
+            "cv": 0.011121529130684982
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              261.6945590125397,
+              267.4650500412099,
+              265.6138659804128
+            ],
+            "median": 265.6138659804128,
+            "mean": 264.92449167805415,
+            "cv": 0.011121529130684982
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              54.54099195776507,
+              54.47312002070248,
+              54.061652976088226
+            ],
+            "median": 54.47312002070248,
+            "mean": 54.35858831818526,
+            "cv": 0.00477170431573879
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              58.352615172043436,
+              58.48135277046822,
+              58.188165503088385
+            ],
+            "median": 58.352615172043436,
+            "mean": 58.34071114853335,
+            "cv": 0.0025189216950097363
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              58.966349149122834,
+              59.05575407319702,
+              59.03655142523348
+            ],
+            "median": 59.03655142523348,
+            "mean": 59.01955154918445,
+            "cv": 0.0007974372950822483
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              18.42145887623003,
+              18.40959457935611,
+              18.537182420427758
+            ],
+            "median": 18.42145887623003,
+            "mean": 18.456078625337966,
+            "cv": 0.0038192300507521116
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "2": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              33.88223302133519,
+              33.9532356426661,
+              34.16746447557388
+            ],
+            "median": 33.9532356426661,
+            "mean": 34.00097771319172,
+            "cv": 0.004367172342181475
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              394.1111970052589,
+              401.9992009853013,
+              402.3345335153863
+            ],
+            "median": 401.9992009853013,
+            "mean": 399.4816438353155,
+            "cv": 0.011650008592593228
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              506.0197808925295,
+              515.9819321008399,
+              516.1641354847234
+            ],
+            "median": 515.9819321008399,
+            "mean": 512.7219494926976,
+            "cv": 0.011321854236877423
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              515.967210571398,
+              526.1137304222211,
+              526.2823223264422
+            ],
+            "median": 526.1137304222211,
+            "mean": 522.7877544400204,
+            "cv": 0.011299740046571126
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              55.76976700103842,
+              55.50307349767536,
+              55.16132598859258
+            ],
+            "median": 55.50307349767536,
+            "mean": 55.478055495768785,
+            "cv": 0.005497507963193949
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              58.72163773456123,
+              58.80124335526489,
+              58.44287840009201
+            ],
+            "median": 58.72163773456123,
+            "mean": 58.65525316330604,
+            "cv": 0.0032082301540186536
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              59.320971344131976,
+              59.99743050779216,
+              59.9889217648888
+            ],
+            "median": 59.9889217648888,
+            "mean": 59.76910787227098,
+            "cv": 0.006493671217573739
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              17.740191116260007,
+              17.799497948497248,
+              17.919286447049945
+            ],
+            "median": 17.799497948497248,
+            "mean": 17.81965850393573,
+            "cv": 0.005119844317962027
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "4": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              62.43560504325828,
+              62.12068155615829,
+              62.363192163131934
+            ],
+            "median": 62.363192163131934,
+            "mean": 62.3064929208495,
+            "cv": 0.0026472410149805704
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              645.1375279866625,
+              655.0427979964297,
+              654.8036754829809
+            ],
+            "median": 654.8036754829809,
+            "mean": 651.6613338220244,
+            "cv": 0.008671753611364364
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              982.1998217026702,
+              1000.3776783822104,
+              996.2612693634582
+            ],
+            "median": 996.2612693634582,
+            "mean": 992.9462564827796,
+            "cv": 0.009599268952015388
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              1012.0294003444724,
+              1030.8959405077621,
+              1026.8496778415283
+            ],
+            "median": 1026.8496778415283,
+            "mean": 1023.2583395645876,
+            "cv": 0.009706998686874472
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              56.82542099384591,
+              57.1046594704967,
+              56.86464597238228
+            ],
+            "median": 56.86464597238228,
+            "mean": 56.93157547890829,
+            "cv": 0.0026553410894556667
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              59.86387146404013,
+              60.212951444555074,
+              60.2274902688805
+            ],
+            "median": 60.212951444555074,
+            "mean": 60.101437725825235,
+            "cv": 0.0034253224480220584
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              62.70176778372843,
+              62.99274027871434,
+              61.20797080686316
+            ],
+            "median": 62.70176778372843,
+            "mean": 62.300826289768644,
+            "cv": 0.015369898070299814
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              16.81643317430465,
+              16.74642410512803,
+              16.816179465831105
+            ],
+            "median": 16.816179465831105,
+            "mean": 16.79301224842126,
+            "cv": 0.0024025895075960695
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "8": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              82.12044804459559,
+              81.74448904285656,
+              81.68341670630537
+            ],
+            "median": 81.74448904285656,
+            "mean": 81.84945126458584,
+            "cv": 0.0028915078455473333
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              1136.8616029794794,
+              1164.114693470765,
+              1155.3606950037647
+            ],
+            "median": 1155.3606950037647,
+            "mean": 1152.1123304846697,
+            "cv": 0.012076861406517914
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              1916.9096006138714,
+              1958.7310545233775,
+              1949.3805800419066
+            ],
+            "median": 1949.3805800419066,
+            "mean": 1941.6737450597184,
+            "cv": 0.011304708923089175
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              1987.0401601318733,
+              2029.1320332715984,
+              2020.674151216517
+            ],
+            "median": 2020.674151216517,
+            "mean": 2012.2821148733294,
+            "cv": 0.011064785486161367
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              83.00132700242102,
+              82.83338748151436,
+              83.19019802729599
+            ],
+            "median": 83.00132700242102,
+            "mean": 83.00830417041045,
+            "cv": 0.002150478441782079
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              85.78803999989759,
+              86.21984376804903,
+              86.1285799765028
+            ],
+            "median": 86.1285799765028,
+            "mean": 86.04548791481648,
+            "cv": 0.0026448593102659187
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              87.270208451082,
+              87.142775816028,
+              88.15047944372054
+            ],
+            "median": 87.270208451082,
+            "mean": 87.52115457027685,
+            "cv": 0.006269606152384794
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              11.210231819899988,
+              11.18096074517777,
+              11.162331662022279
+            ],
+            "median": 11.18096074517777,
+            "mean": 11.184508075700014,
+            "cv": 0.0021589061221868404
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "16": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              92.43383754745491,
+              92.0436435062526,
+              92.08229736210818
+            ],
+            "median": 92.08229736210818,
+            "mean": 92.1865928052719,
+            "cv": 0.002332125482559209
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              2124.606075522024,
+              2172.7460410038475,
+              2160.707925504539
+            ],
+            "median": 2160.707925504539,
+            "mean": 2152.6866806768035,
+            "cv": 0.011637704810261362
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              3788.388652727008,
+              3870.9361929941224,
+              3860.253461272805
+            ],
+            "median": 3860.253461272805,
+            "mean": 3839.859435664645,
+            "cv": 0.011691545020992618
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              3937.172610545531,
+              4024.43822020723,
+              4011.2257498520194
+            ],
+            "median": 4011.2257498520194,
+            "mean": 3990.94552686826,
+            "cv": 0.011785417096711492
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              143.46916900831275,
+              143.65205497597344,
+              143.62394699128345
+            ],
+            "median": 143.62394699128345,
+            "mean": 143.5817236585232,
+            "cv": 0.0006859029569991145
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              147.24873173690867,
+              147.22060454369057,
+              147.1208199101966
+            ],
+            "median": 147.22060454369057,
+            "mean": 147.19671873026527,
+            "cv": 0.0004566541198379127
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              148.90334893832915,
+              148.69570974085946,
+              148.81876049446873
+            ],
+            "median": 148.81876049446873,
+            "mean": 148.80593972455245,
+            "cv": 0.0007016630437981161
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              6.340629120936664,
+              6.326646919865626,
+              6.326107301454543
+            ],
+            "median": 6.326646919865626,
+            "mean": 6.331127780752278,
+            "cv": 0.001300372474977917
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "32": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              97.3034378283617,
+              96.9598536025077,
+              96.97337665010548
+            ],
+            "median": 96.97337665010548,
+            "mean": 97.07888936032496,
+            "cv": 0.0020043718293558345
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              4083.376528491499,
+              4173.352165991673,
+              4156.438158010133
+            ],
+            "median": 4156.438158010133,
+            "mean": 4137.722284164435,
+            "cv": 0.011556740335466404
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              7527.130990687874,
+              7690.28115987021,
+              7663.587389030727
+            ],
+            "median": 7663.587389030727,
+            "mean": 7626.999846529604,
+            "cv": 0.011474072015939425
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              7833.809692747309,
+              8002.429535501869,
+              7975.0468220276525
+            ],
+            "median": 7975.0468220276525,
+            "mean": 7937.095350092277,
+            "cv": 0.011400867218985698
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              269.3051980168093,
+              269.19113998883404,
+              269.4040185015183
+            ],
+            "median": 269.3051980168093,
+            "mean": 269.3001188357205,
+            "cv": 0.0003955813617225471
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              273.8102081697434,
+              273.5824756382499,
+              273.8315750757465
+            ],
+            "median": 273.8102081697434,
+            "mean": 273.7414196279133,
+            "cv": 0.0005043573613094671
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              276.0230933694402,
+              275.73468136426527,
+              276.55018622637726
+            ],
+            "median": 276.0230933694402,
+            "mean": 276.1026536533609,
+            "cv": 0.001497750390613268
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              3.341534845677111,
+              3.3365335037254207,
+              3.335453553108569
+            ],
+            "median": 3.3365335037254207,
+            "mean": 3.3378406341703672,
+            "cv": 0.0009720444909551293
+          },
+          "failures": 0,
+          "all_requests_128": true
+        }
+      },
+      "long_3500": {
+        "ttft": {
+          "n": 6,
+          "raw": [
+            37279.332919977605,
+            37313.00769903464,
+            37220.5880570109,
+            37275.26806102833,
+            37093.83961599087,
+            37326.900411979295
+          ],
+          "median": 37277.30049050297,
+          "mean": 37251.48946083694,
+          "cv": 0.002297378931542262
+        },
+        "wall": {
+          "n": 6,
+          "raw": [
+            45.2970502320095,
+            45.32789557497017,
+            45.24785288301064,
+            45.299742986040656,
+            45.071512420952786,
+            45.31429014203604
+          ],
+          "median": 45.298396609025076,
+          "mean": 45.259724039836634,
+          "cv": 0.0021234860631301473
+        },
+        "prompt_tokens": {
+          "n": 0,
+          "raw": [],
+          "median": null,
+          "mean": null,
+          "cv": null
+        }
+      },
+      "context": {
+        "ctx-4000": {
+          "ttft": {
+            "n": 3,
+            "raw": [
+              43588.11254898319,
+              43441.02093204856,
+              43574.09953203751
+            ],
+            "median": 43574.09953203751,
+            "mean": 43534.41100435642,
+            "cv": 0.0018647569643119933
+          },
+          "wall": {
+            "n": 3,
+            "raw": [
+              51.61996382899815,
+              51.47913477302063,
+              51.56121151102707
+            ],
+            "median": 51.56121151102707,
+            "mean": 51.55343670434862,
+            "cv": 0.001372085357532668
+          },
+          "prompt_tokens": {
+            "n": 0,
+            "raw": [],
+            "median": null,
+            "mean": null,
+            "cv": null
+          }
+        },
+        "ctx-16000": {
+          "ttft": {
+            "n": 3,
+            "raw": [
+              261886.06528000673,
+              262470.23606701987,
+              262905.50701197935
+            ],
+            "median": 262470.23606701987,
+            "mean": 262420.60278633534,
+            "cv": 0.001949275367161118
+          },
+          "wall": {
+            "n": 3,
+            "raw": [
+              271.7373986199964,
+              272.3653381379554,
+              272.7056308289757
+            ],
+            "median": 272.3653381379554,
+            "mean": 272.26945586230914,
+            "cv": 0.0018040428681526696
+          },
+          "prompt_tokens": {
+            "n": 0,
+            "raw": [],
+            "median": null,
+            "mean": null,
+            "cv": null
+          }
+        }
+      },
+      "prefix": {
+        "cold": {
+          "n": 3,
+          "raw": [
+            53381.8259559921,
+            53334.15747899562,
+            53387.6739940024
+          ],
+          "median": 53381.8259559921,
+          "mean": 53367.88580966337,
+          "cv": 0.0005500607719127036
+        },
+        "warm": {
+          "n": 3,
+          "raw": [
+            53367.40704701515,
+            53333.274674019776,
+            53394.06338398112
+          ],
+          "median": 53367.40704701515,
+          "mean": 53364.915035005346,
+          "cv": 0.000570990846785949
+        }
+      },
+      "mixed": {
+        "active_decode": {
+          "n": 3,
+          "raw": [
+            626.6281105054077,
+            648.6802895087749,
+            649.911512969993
+          ],
+          "median": 648.6802895087749,
+          "mean": 641.7399709947252,
+          "cv": 0.020415941911101472
+        },
+        "arriving_prefill": {
+          "n": 3,
+          "raw": [
+            38755.57112600654,
+            38782.901961996686,
+            38806.59004900372
+          ],
+          "median": 38782.901961996686,
+          "mean": 38781.687712335646,
+          "cv": 0.0006583294371230311
+        }
+      }
+    },
+    "vllm-dense-bf16-plain": {
+      "starts": 3,
+      "stream_interval_semantics": "SSE-content-chunk; not guaranteed token ITL",
+      "startup_ms": {
+        "n": 3,
+        "raw": [
+          269928.0,
+          269727.0,
+          266629.0
+        ],
+        "median": 269727.0,
+        "mean": 268761.3333333333,
+        "cv": 0.0068811518879800795
+      },
+      "rss_at_ready_bytes": {
+        "n": 3,
+        "raw": [
+          944758784.0,
+          1224044544.0,
+          984244224.0
+        ],
+        "median": 984244224.0,
+        "mean": 1051015850.6666666,
+        "cv": 0.14380584532783297
+      },
+      "physical_available_at_ready_bytes": {
+        "n": 3,
+        "raw": [
+          4329877504.0,
+          4215988224.0,
+          4349452288.0
+        ],
+        "median": 4329877504.0,
+        "mean": 4298439338.666667,
+        "cv": 0.01676711190499962
+      },
+      "quality": {
+        "arithmetic": {
+          "output_hashes": [
+            "4b161e9176f6a4d880c8014bc37e2b1d0a1d7eea12d183bcb424a9d9c84cc1e7",
+            "4b161e9176f6a4d880c8014bc37e2b1d0a1d7eea12d183bcb424a9d9c84cc1e7",
+            "4b161e9176f6a4d880c8014bc37e2b1d0a1d7eea12d183bcb424a9d9c84cc1e7"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "d8bffdc132c66b42f73abaa6b648721d224905bb1d29ff2b0103676059ab51fe",
+            "d8bffdc132c66b42f73abaa6b648721d224905bb1d29ff2b0103676059ab51fe",
+            "d8bffdc132c66b42f73abaa6b648721d224905bb1d29ff2b0103676059ab51fe"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "To find the sum of 137 and 265, you can add them column by column:\n\n**Addition:**\n  137\n+ 265\n—————\n  **402**\n\n**Step-by-step breakdown:**\n1.  **Units place:** 7 + 5 = 12 (Write down 2, carry over 1)\n2.  **Tens place:** 3 +",
+            "To find the sum of 137 and 265, you can add them column by column:\n\n**Addition:**\n  137\n+ 265\n—————\n  **402**\n\n**Step-by-step breakdown:**\n1.  **Units place:** 7 + 5 = 12 (Write down 2, carry over 1)\n2.  **Tens place:** 3 +",
+            "To find the sum of 137 and 265, you can add them column by column:\n\n**Addition:**\n  137\n+ 265\n—————\n  **402**\n\n**Step-by-step breakdown:**\n1.  **Units place:** 7 + 5 = 12 (Write down 2, carry over 1)\n2.  **Tens place:** 3 +"
+          ]
+        },
+        "code_python": {
+          "output_hashes": [
+            "98bfd4bcb430eff4d721dd4c70d4af26cf91d3ae53df283583d4f9d0dfc66a4e",
+            "98bfd4bcb430eff4d721dd4c70d4af26cf91d3ae53df283583d4f9d0dfc66a4e",
+            "98bfd4bcb430eff4d721dd4c70d4af26cf91d3ae53df283583d4f9d0dfc66a4e"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "07b8eca5c372d72f3b1c5af031a582b86706dc67a1f7415d72a49599e62ce51a",
+            "07b8eca5c372d72f3b1c5af031a582b86706dc67a1f7415d72a49599e62ce51a",
+            "07b8eca5c372d72f3b1c5af031a582b86706dc67a1f7415d72a49599e62ce51a"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "Here are two ways to solve this. The first is the most common approach using a loop, and the second is a more \"Pythonic\" approach using a generator.\n\n### Option 1: Standard Iterative Approach\nThis is the most straightforward way to build a list of Fibonacci numbers.\n\n```python\ndef get_fibonacci(n):\n    \"\"\"Returns a list of the first n Fibonacci numbers.\"\"\"\n    if n <= 0:\n        return []",
+            "Here are two ways to solve this. The first is the most common approach using a loop, and the second is a more \"Pythonic\" approach using a generator.\n\n### Option 1: Standard Iterative Approach\nThis is the most straightforward way to build a list of Fibonacci numbers.\n\n```python\ndef get_fibonacci(n):\n    \"\"\"Returns a list of the first n Fibonacci numbers.\"\"\"\n    if n <= 0:\n        return []",
+            "Here are two ways to solve this. The first is the most common approach using a loop, and the second is a more \"Pythonic\" approach using a generator.\n\n### Option 1: Standard Iterative Approach\nThis is the most straightforward way to build a list of Fibonacci numbers.\n\n```python\ndef get_fibonacci(n):\n    \"\"\"Returns a list of the first n Fibonacci numbers.\"\"\"\n    if n <= 0:\n        return []"
+          ]
+        },
+        "multilingual": {
+          "output_hashes": [
+            "8783c7766622e0c7bffbcaaf5552cbb92c345ca49bd924df237a22da898b547b",
+            "8783c7766622e0c7bffbcaaf5552cbb92c345ca49bd924df237a22da898b547b",
+            "8783c7766622e0c7bffbcaaf5552cbb92c345ca49bd924df237a22da898b547b"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "fab5a15259446921ca1cbc73fc4d6d05046cc4a38caf6f56a93c53b5f5693a15",
+            "fab5a15259446921ca1cbc73fc4d6d05046cc4a38caf6f56a93c53b5f5693a15",
+            "fab5a15259446921ca1cbc73fc4d6d05046cc4a38caf6f56a93c53b5f5693a15"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "Here is the translation of \"Good morning, where is the train station?\" in the three languages:\n\n**French:**\nBonjour, où est la gare ?\n*(Pronunciation: Bon-zhoor, oo ay la gar?)*\n\n**German:**\nGuten Morgen, wo ist der Bahnhof?\n*(Pronunciation: Goo-ten Mor-gen, vo ist dare Bahn-hof?)*\n\n**Japanese:**\nおはようございます、駅はどこですか？",
+            "Here is the translation of \"Good morning, where is the train station?\" in the three languages:\n\n**French:**\nBonjour, où est la gare ?\n*(Pronunciation: Bon-zhoor, oo ay la gar?)*\n\n**German:**\nGuten Morgen, wo ist der Bahnhof?\n*(Pronunciation: Goo-ten Mor-gen, vo ist dare Bahn-hof?)*\n\n**Japanese:**\nおはようございます、駅はどこですか？",
+            "Here is the translation of \"Good morning, where is the train station?\" in the three languages:\n\n**French:**\nBonjour, où est la gare ?\n*(Pronunciation: Bon-zhoor, oo ay la gar?)*\n\n**German:**\nGuten Morgen, wo ist der Bahnhof?\n*(Pronunciation: Goo-ten Mor-gen, vo ist dare Bahn-hof?)*\n\n**Japanese:**\nおはようございます、駅はどこですか？"
+          ]
+        },
+        "repetition": {
+          "output_hashes": [
+            "037628329ac2e317212b4e0cb061b56ebc2c5d0f2a2b2d5dc5ebf48a164009a6",
+            "037628329ac2e317212b4e0cb061b56ebc2c5d0f2a2b2d5dc5ebf48a164009a6",
+            "037628329ac2e317212b4e0cb061b56ebc2c5d0f2a2b2d5dc5ebf48a164009a6"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "7ab15295638a22c251084ca3d96f55c462f957f0a4298e6226191c0c26821170",
+            "7ab15295638a22c251084ca3d96f55c462f957f0a4298e6226191c0c26821170",
+            "7ab15295638a22c251084ca3d96f55c462f957f0a4298e6226191c0c26821170"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "red blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green",
+            "red blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green",
+            "red blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green\nred blue green"
+          ]
+        },
+        "code_rust": {
+          "output_hashes": [
+            "d215f015c353fdd90e6de555ec7c50febd7c0013ee5d0796b14397affe81cae2",
+            "d215f015c353fdd90e6de555ec7c50febd7c0013ee5d0796b14397affe81cae2",
+            "d215f015c353fdd90e6de555ec7c50febd7c0013ee5d0796b14397affe81cae2"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "ae16fc383fc3a3c9de4759603b73e4d437371adb5c52a13fe0dac961de480ffa",
+            "ae16fc383fc3a3c9de4759603b73e4d437371adb5c52a13fe0dac961de480ffa",
+            "ae16fc383fc3a3c9de4759603b73e4d437371adb5c52a13fe0dac961de480ffa"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "To reverse a string by characters (Unicode Scalar Values) in Rust, you should use the `.chars()` iterator. \n\nIt is important to use `.chars()` rather than `.bytes()`, because UTF-8 characters can be composed of multiple bytes. Reversing by bytes would corrupt non-ASCII characters (like emojis or accented letters).\n\nHere is the implementation:\n\n```rust\nfn reverse_string(input: &str) -> String {\n    // .chars",
+            "To reverse a string by characters (Unicode Scalar Values) in Rust, you should use the `.chars()` iterator. \n\nIt is important to use `.chars()` rather than `.bytes()`, because UTF-8 characters can be composed of multiple bytes. Reversing by bytes would corrupt non-ASCII characters (like emojis or accented letters).\n\nHere is the implementation:\n\n```rust\nfn reverse_string(input: &str) -> String {\n    // .chars",
+            "To reverse a string by characters (Unicode Scalar Values) in Rust, you should use the `.chars()` iterator. \n\nIt is important to use `.chars()` rather than `.bytes()`, because UTF-8 characters can be composed of multiple bytes. Reversing by bytes would corrupt non-ASCII characters (like emojis or accented letters).\n\nHere is the implementation:\n\n```rust\nfn reverse_string(input: &str) -> String {\n    // .chars"
+          ]
+        },
+        "reasoning": {
+          "output_hashes": [
+            "214dbec897aa424b9bc65699e89be636ae0a43a4566eede9784fd3285e371e35",
+            "214dbec897aa424b9bc65699e89be636ae0a43a4566eede9784fd3285e371e35",
+            "214dbec897aa424b9bc65699e89be636ae0a43a4566eede9784fd3285e371e35"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "41074e1c8cdf5b073fa312c16180c05337b8b6146ca0f4193726b8bbd897be8a",
+            "41074e1c8cdf5b073fa312c16180c05337b8b6146ca0f4193726b8bbd897be8a",
+            "41074e1c8cdf5b073fa312c16180c05337b8b6146ca0f4193726b8bbd897be8a"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "To prove that $\\sqrt{2}$ is irrational, we use a **proof by contradiction**.\n\n**1. Assumption:**\nAssume $\\sqrt{2}$ is **rational**. This means it can be written as a fraction:\n$$\\sqrt{2} = \\frac{a}{b}$$\nwhere $a$ and $b$ are integers, $b \\neq 0$, and the fraction is in **simplest form** (meaning $a$ and $",
+            "To prove that $\\sqrt{2}$ is irrational, we use a **proof by contradiction**.\n\n**1. Assumption:**\nAssume $\\sqrt{2}$ is **rational**. This means it can be written as a fraction:\n$$\\sqrt{2} = \\frac{a}{b}$$\nwhere $a$ and $b$ are integers, $b \\neq 0$, and the fraction is in **simplest form** (meaning $a$ and $",
+            "To prove that $\\sqrt{2}$ is irrational, we use a **proof by contradiction**.\n\n**1. Assumption:**\nAssume $\\sqrt{2}$ is **rational**. This means it can be written as a fraction:\n$$\\sqrt{2} = \\frac{a}{b}$$\nwhere $a$ and $b$ are integers, $b \\neq 0$, and the fraction is in **simplest form** (meaning $a$ and $"
+          ]
+        },
+        "long_context_retrieval": {
+          "output_hashes": [
+            "a3f789ba5acaf8413bab72f1128a8ca06f2daa49066f18e5ba2c4c5fb8da69ba",
+            "a3f789ba5acaf8413bab72f1128a8ca06f2daa49066f18e5ba2c4c5fb8da69ba",
+            "a3f789ba5acaf8413bab72f1128a8ca06f2daa49066f18e5ba2c4c5fb8da69ba"
+          ],
+          "stable_across_starts": true,
+          "token_event_hashes": [
+            "dc52340ca73bbcb56417e19977e57013f625e618a1707fce47511d1e3cb621a5",
+            "dc52340ca73bbcb56417e19977e57013f625e618a1707fce47511d1e3cb621a5",
+            "dc52340ca73bbcb56417e19977e57013f625e618a1707fce47511d1e3cb621a5"
+          ],
+          "token_events_stable_where_captured": true,
+          "outputs": [
+            "The verification code is COBALT-7319.\n\n### Analysis of Linguistic Repetition and Structural Patterns\n\nThe provided text presents a striking example of",
+            "The verification code is COBALT-7319.\n\n### Analysis of Linguistic Repetition and Structural Patterns\n\nThe provided text presents a striking example of",
+            "The verification code is COBALT-7319.\n\n### Analysis of Linguistic Repetition and Structural Patterns\n\nThe provided text presents a striking example of"
+          ]
+        }
+      },
+      "concurrency": {
+        "1": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              7.617643680966025,
+              7.6156388727009965,
+              7.645691483129056
+            ],
+            "median": 7.617643680966025,
+            "mean": 7.626324678932026,
+            "cv": 0.0022031677482173416
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              296.49535001954064,
+              295.6285689724609,
+              294.4277400383726
+            ],
+            "median": 295.6285689724609,
+            "mean": 295.5172196767914,
+            "cv": 0.0035134761828704416
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              296.49535001954064,
+              295.6285689724609,
+              294.4277400383726
+            ],
+            "median": 295.6285689724609,
+            "mean": 295.5172196767914,
+            "cv": 0.0035134761828704416
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              296.49535001954064,
+              295.6285689724609,
+              294.4277400383726
+            ],
+            "median": 295.6285689724609,
+            "mean": 295.5172196767914,
+            "cv": 0.0035134761828704416
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              131.06546297785826,
+              131.02395200985484,
+              130.4312969732564
+            ],
+            "median": 131.02395200985484,
+            "mean": 130.84023732032315,
+            "cv": 0.002711401426115955
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              140.4456762393238,
+              139.52750302269123,
+              140.81839127175044
+            ],
+            "median": 140.4456762393238,
+            "mean": 140.2638568445885,
+            "cv": 0.0047365963075081995
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              141.51319101802073,
+              141.12691371701658,
+              142.18466028978582
+            ],
+            "median": 141.51319101802073,
+            "mean": 141.60825500827437,
+            "cv": 0.0037797427257335956
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              7.694056673012797,
+              7.6915567760033055,
+              7.721912132108789
+            ],
+            "median": 7.694056673012797,
+            "mean": 7.702508527041631,
+            "cv": 0.00218765597753236
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "2": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              18.66223569362641,
+              18.37865684289396,
+              18.854835391207065
+            ],
+            "median": 18.66223569362641,
+            "mean": 18.631909309242477,
+            "cv": 0.01285608670897652
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              252.04141851281747,
+              306.8021119979676,
+              250.64544653287157
+            ],
+            "median": 252.04141851281747,
+            "mean": 269.8296590145522,
+            "cv": 0.11869225368781287
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              252.09456847514957,
+              356.3622671033954,
+              250.835072476184
+            ],
+            "median": 252.09456847514957,
+            "mean": 286.430636018243,
+            "cv": 0.21145029720568775
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              252.09929291624576,
+              360.7676142238779,
+              250.85192811558954
+            ],
+            "median": 252.09929291624576,
+            "mean": 287.90627841857105,
+            "cv": 0.2191784433880892
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              106.77188349654898,
+              106.45953199127689,
+              105.65040147048421
+            ],
+            "median": 106.45953199127689,
+            "mean": 106.29393898610336,
+            "cv": 0.0054451704881324225
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              116.9604461902054,
+              117.64202259946615,
+              115.95518824760802
+            ],
+            "median": 116.9604461902054,
+            "mean": 116.85255234575986,
+            "cv": 0.007261948753659173
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              117.88736764283385,
+              150.62428108416498,
+              116.89948021725286
+            ],
+            "median": 117.88736764283385,
+            "mean": 128.47037631475055,
+            "cv": 0.14939009415627705
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              9.431882542749703,
+              9.323469441209394,
+              9.530042259459606
+            ],
+            "median": 9.431882542749703,
+            "mean": 9.428464747806233,
+            "cv": 0.010959240378963479
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "4": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              36.62641606364425,
+              36.95981944809806,
+              36.99403688277529
+            ],
+            "median": 36.95981944809806,
+            "mean": 36.860090798172536,
+            "cv": 0.0055097578731513165
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              292.9203390085604,
+              340.1432289974764,
+              293.02581647061743
+            ],
+            "median": 293.02581647061743,
+            "mean": 308.6964614922181,
+            "cv": 0.08822177766369457
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              376.93175487511326,
+              398.64617112325504,
+              397.43304000294296
+            ],
+            "median": 397.43304000294296,
+            "mean": 391.00365533377044,
+            "cv": 0.03120612578792708
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              388.76978140382556,
+              398.7357254442759,
+              412.15485120948864
+            ],
+            "median": 398.7357254442759,
+            "mean": 399.88678601919673,
+            "cv": 0.029345683654217688
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              107.58646699832752,
+              106.56753051443957,
+              105.95413798000664
+            ],
+            "median": 106.56753051443957,
+            "mean": 106.70271183092457,
+            "cv": 0.007727245402005116
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              118.21493270108476,
+              117.50653223134577,
+              116.97544849594124
+            ],
+            "median": 117.50653223134577,
+            "mean": 117.56563780945726,
+            "cv": 0.005289405868315266
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              122.69842655514367,
+              119.0952840668615,
+              123.12319649616256
+            ],
+            "median": 122.69842655514367,
+            "mean": 121.63896903938924,
+            "cv": 0.018194089782856793
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              9.28013989577249,
+              9.399551720307905,
+              9.375147044658638
+            ],
+            "median": 9.375147044658638,
+            "mean": 9.35161288691301,
+            "cv": 0.006746294469292051
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "8": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              72.8419387069318,
+              72.74418141472717,
+              73.30800309789956
+            ],
+            "median": 72.8419387069318,
+            "mean": 72.96470773985284,
+            "cv": 0.004129307421432336
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              368.29389148624614,
+              398.1770609971136,
+              464.5326604950242
+            ],
+            "median": 398.1770609971136,
+            "mean": 410.3345376594613,
+            "cv": 0.12004296478462473
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              417.6859693514416,
+              446.902954930556,
+              466.068209495279
+            ],
+            "median": 446.902954930556,
+            "mean": 443.5523779257589,
+            "cv": 0.05493043423207433
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              417.69183787342627,
+              447.03299980203155,
+              466.3220322917914
+            ],
+            "median": 447.03299980203155,
+            "mean": 443.6822899890831,
+            "cv": 0.05519183013887982
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              108.15644200192764,
+              107.65801998786628,
+              106.85690501122735
+            ],
+            "median": 107.65801998786628,
+            "mean": 107.55712233367376,
+            "cv": 0.006095528767501705
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              118.82652997155674,
+              119.6745274879504,
+              117.97440174268559
+            ],
+            "median": 118.82652997155674,
+            "mean": 118.82515306739758,
+            "cv": 0.00715390375722078
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              120.9329194080783,
+              129.09564969071653,
+              121.05051715043373
+            ],
+            "median": 121.05051715043373,
+            "mean": 123.69302874974285,
+            "cv": 0.03782894217424187
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              9.278787541811244,
+              9.286194394384513,
+              9.406352158582592
+            ],
+            "median": 9.286194394384513,
+            "mean": 9.323778031592783,
+            "cv": 0.007680054557401361
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "16": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              142.49268016665727,
+              142.35117885674205,
+              143.46251007809025
+            ],
+            "median": 142.49268016665727,
+            "mean": 142.7687897004965,
+            "cv": 0.004237138200520588
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              539.4605154870078,
+              599.5597854780499,
+              534.9311894970015
+            ],
+            "median": 539.4605154870078,
+            "mean": 557.9838301540198,
+            "cv": 0.06465596605394801
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              542.2384157573106,
+              601.1047679930925,
+              536.673561000498
+            ],
+            "median": 542.2384157573106,
+            "mean": 560.0055815836337,
+            "cv": 0.06375209672883822
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              542.6940887380624,
+              601.1981664225459,
+              536.6998650191817
+            ],
+            "median": 542.6940887380624,
+            "mean": 560.1973733932633,
+            "cv": 0.06360971080964165
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              109.96787197655067,
+              109.69418351305649,
+              108.92578097991645
+            ],
+            "median": 109.69418351305649,
+            "mean": 109.52927882317454,
+            "cv": 0.0049325852870659515
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              121.29515397828072,
+              120.4355787485838,
+              120.27795620088
+            ],
+            "median": 120.4355787485838,
+            "mean": 120.66956297591484,
+            "cv": 0.004537017741624822
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              129.89334962330724,
+              122.32313673011959,
+              121.79311745974701
+            ],
+            "median": 122.32313673011959,
+            "mean": 124.66986793772462,
+            "cv": 0.036347385139674164
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              9.183122133547212,
+              9.213580018644485,
+              9.244885520498643
+            ],
+            "median": 9.213580018644485,
+            "mean": 9.213862557563447,
+            "cv": 0.0033517607443335025
+          },
+          "failures": 0,
+          "all_requests_128": true
+        },
+        "32": {
+          "aggregate_completion_tps": {
+            "n": 3,
+            "raw": [
+              270.31117024471604,
+              273.12964475437076,
+              273.6611456993799
+            ],
+            "median": 273.12964475437076,
+            "mean": 272.36732023282224,
+            "cv": 0.006610188656658934
+          },
+          "ttft_p50_ms": {
+            "n": 3,
+            "raw": [
+              815.4817939794157,
+              785.0379094888922,
+              734.8901634686626
+            ],
+            "median": 785.0379094888922,
+            "mean": 778.4699556456568,
+            "cv": 0.05227598694066404
+          },
+          "ttft_p95_ms": {
+            "n": 3,
+            "raw": [
+              817.3682433116483,
+              787.7618237340357,
+              737.5463797332486
+            ],
+            "median": 787.7618237340357,
+            "mean": 780.8921489263108,
+            "cv": 0.051674116628230814
+          },
+          "ttft_p99_ms": {
+            "n": 3,
+            "raw": [
+              817.939832979464,
+              788.0594593129354,
+              737.9805740254233
+            ],
+            "median": 788.0594593129354,
+            "mean": 781.3266221059408,
+            "cv": 0.05171024075316786
+          },
+          "itl_p50_ms": {
+            "n": 3,
+            "raw": [
+              114.37181901419535,
+              113.2974895008374,
+              113.67068250547163
+            ],
+            "median": 113.67068250547163,
+            "mean": 113.77999700683479,
+            "cv": 0.004793840360196566
+          },
+          "itl_p95_ms": {
+            "n": 3,
+            "raw": [
+              124.81783501862083,
+              124.87508041085675,
+              126.10668086854275
+            ],
+            "median": 124.87508041085675,
+            "mean": 125.26653209934011,
+            "cv": 0.005812829188064166
+          },
+          "itl_p99_ms": {
+            "n": 3,
+            "raw": [
+              128.12425532145426,
+              129.06475190015044,
+              128.47636894788593
+            ],
+            "median": 128.47636894788593,
+            "mean": 128.5551253898302,
+            "cv": 0.003696226007767918
+          },
+          "per_stream_decode_tps": {
+            "n": 3,
+            "raw": [
+              8.861499001619023,
+              8.940002389069917,
+              8.926598268562504
+            ],
+            "median": 8.926598268562504,
+            "mean": 8.909366553083816,
+            "cv": 0.004713330682831957
+          },
+          "failures": 0,
+          "all_requests_128": true
+        }
+      },
+      "long_3500": {
+        "ttft": {
+          "n": 6,
+          "raw": [
+            1295.984619006049,
+            1332.0791050209664,
+            1287.1783790178597,
+            1333.0523820477538,
+            1287.8769949893467,
+            1341.2643399788067
+          ],
+          "median": 1314.0318620135076,
+          "mean": 1312.9059700101304,
+          "cv": 0.01912494961300464
+        },
+        "wall": {
+          "n": 6,
+          "raw": [
+            17.99015349597903,
+            18.042712875001598,
+            17.895922676019836,
+            18.011080961034168,
+            17.90760869998485,
+            17.944434355013072
+          ],
+          "median": 17.96729392549605,
+          "mean": 17.96531884383876,
+          "cv": 0.003272595834085648
+        },
+        "prompt_tokens": {
+          "n": 6,
+          "raw": [
+            3501.0,
+            3501.0,
+            3501.0,
+            3501.0,
+            3501.0,
+            3501.0
+          ],
+          "median": 3501.0,
+          "mean": 3501.0,
+          "cv": 0.0
+        }
+      },
+      "context": {
+        "ctx-4000": {
+          "ttft": {
+            "n": 3,
+            "raw": [
+              1467.3410910181701,
+              1467.8272280143574,
+              1515.042341023218
+            ],
+            "median": 1467.8272280143574,
+            "mean": 1483.4035533519152,
+            "cv": 0.018471758362361944
+          },
+          "wall": {
+            "n": 3,
+            "raw": [
+              18.18151340103941,
+              18.08062888699351,
+              18.127386196982116
+            ],
+            "median": 18.127386196982116,
+            "mean": 18.129842828338344,
+            "cv": 0.0027847512801031818
+          },
+          "prompt_tokens": {
+            "n": 3,
+            "raw": [
+              4002.0,
+              4002.0,
+              4002.0
+            ],
+            "median": 4002.0,
+            "mean": 4002.0,
+            "cv": 0.0
+          }
+        },
+        "ctx-16000": {
+          "ttft": {
+            "n": 3,
+            "raw": [
+              6308.142365014646,
+              6471.752748999279,
+              6673.182749014813
+            ],
+            "median": 6471.752748999279,
+            "mean": 6484.359287676246,
+            "cv": 0.028198070782213383
+          },
+          "wall": {
+            "n": 3,
+            "raw": [
+              23.188624993956182,
+              23.261495926999487,
+              23.47574171802262
+            ],
+            "median": 23.261495926999487,
+            "mean": 23.30862087965943,
+            "cv": 0.0064030681946373735
+          },
+          "prompt_tokens": {
+            "n": 3,
+            "raw": [
+              15877.0,
+              15877.0,
+              15877.0
+            ],
+            "median": 15877.0,
+            "mean": 15877.0,
+            "cv": 0.0
+          }
+        }
+      },
+      "prefix": {
+        "cold": {
+          "n": 3,
+          "raw": [
+            1725.1051109633408,
+            1737.8605130361393,
+            1752.0411869627424
+          ],
+          "median": 1737.8605130361393,
+          "mean": 1738.3356036540742,
+          "cv": 0.007751277220355706
+        },
+        "warm": {
+          "n": 3,
+          "raw": [
+            284.50733300996944,
+            282.90539502631873,
+            283.30776997609064
+          ],
+          "median": 283.30776997609064,
+          "mean": 283.5734993374596,
+          "cv": 0.0029388250498224443
+        }
+      },
+      "mixed": {
+        "active_decode": {
+          "n": 3,
+          "raw": [
+            1400.3436250204686,
+            269.44496648502536,
+            269.4828695093747
+          ],
+          "median": 269.4828695093747,
+          "mean": 646.4238203382896,
+          "cv": 1.0100396721214993
+        },
+        "arriving_prefill": {
+          "n": 3,
+          "raw": [
+            1275.2748979837634,
+            1376.2693520402536,
+            1372.7191799553111
+          ],
+          "median": 1372.7191799553111,
+          "mean": 1341.4211433264427,
+          "cv": 0.04272470660678207
+        }
+      }
+    }
+  },
+  "comparisons": {
+    "fucina_q4_mtp_vs_plain": {
+      "concurrency": {
+        "1": {
+          "plain": 17.886839897298728,
+          "mtp": 35.70677921083918,
+          "relative": 0.9962597874111694
+        },
+        "2": {
+          "plain": 33.9532356426661,
+          "mtp": 46.51916045295531,
+          "relative": 0.37009506082238297
+        },
+        "4": {
+          "plain": 62.363192163131934,
+          "mtp": 48.17458102632227,
+          "relative": -0.22751579328547789
+        },
+        "8": {
+          "plain": 81.74448904285656,
+          "mtp": 62.74457498718073,
+          "relative": -0.23243051951446736
+        },
+        "16": {
+          "plain": 92.08229736210818,
+          "mtp": 91.65680621776643,
+          "relative": -0.0046207702949517815
+        },
+        "32": {
+          "plain": 96.97337665010548,
+          "mtp": 96.56301843881144,
+          "relative": -0.004231658476477218
+        }
+      },
+      "quality_exact": {
+        "arithmetic": true,
+        "code_python": true,
+        "code_rust": true,
+        "long_context_retrieval": true,
+        "multilingual": true,
+        "reasoning": true,
+        "repetition": true
+      }
+    }
+  }
+}

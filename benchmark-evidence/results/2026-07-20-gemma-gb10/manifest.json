@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-07-19T18:46:00+02:00",
+  "scope": "benchmark/docs only; no runtime source modifications",
+  "repository": {
+    "path": "/home/mauromedda/hack/fucina-gemma-evidence",
+    "branch": "bench/gemma-gb10-2026-07",
+    "commit": "39a96dbd4856f394821021efa10ef31848ad2581",
+    "main_base": "39a96dbd4856f394821021efa10ef31848ad2581"
+  },
+  "machine": {
+    "hostname": "spark",
+    "gpu": "NVIDIA GB10",
+    "sms": 48,
+    "compute_capability": "12.1",
+    "cuda_arch": "sm_121a",
+    "driver": "580.142",
+    "driver_cuda": "13.0",
+    "memory_bytes": 128520736768,
+    "memory_kind": "128 GiB unified LPDDR",
+    "kernel": "Linux 6.17.0-1014-nvidia aarch64",
+    "cpu": "10x Cortex-X925 + 10x Cortex-A725",
+    "cpu_governor": "performance",
+    "gpu_persistence_mode": true,
+    "gpu_default_application_clock_mhz": 2418,
+    "gpu_max_clock_mhz": 3003,
+    "requested_gpu_clock_max": 2400,
+    "clock_equivalence_note": "GB10 reports a fixed default application graphics clock of 2418 MHz; power-cap control is N/A. GPU_CLOCK_MAX=2400 is exported to both engines and the observed application clock is recorded per run.",
+    "power_limit": "N/A"
+  },
+  "toolchains": {
+    "fucina": {
+      "go": "go1.26.4 linux/arm64",
+      "nvcc": "CUDA 13.0 (/usr/local/cuda-13), sm_121a",
+      "build_command": "make lib libdg fucina && go test ./... -count=1",
+      "build_result": "PASS",
+      "build_log": "/tmp/gemma-evidence-build.log"
+    },
+    "vllm_source_audit": {
+      "path": "/tmp/vllm",
+      "commit": "5f8e73cb8b8d41f7a2a5168cddf5b772888fa991",
+      "note": "Source capability audit only; no local image at this exact commit was found."
+    },
+    "vllm_image": {
+      "reference": "vllm/vllm-openai:gemma",
+      "repo_digest": "sha256:9c719fc0c869092c7d0533f8357d6985a38d5ff03b20ffb6a4620c2b4806dd4b",
+      "image_id": "sha256:de71fdd23e93ac46abf251e56992fd91547746010e0256c32551b6660a879589",
+      "commit": "74b5964f02c7e023fadd3004cfac8a61c52eef1f",
+      "vllm": "0.22.1rc1.dev357+g74b5964f0",
+      "torch": "2.11.0+cu130",
+      "transformers": "5.10.2",
+      "cuda": "13.0.2"
+    }
+  },
+  "artifacts": [
+    {
+      "id": "dense12b_qat_q4_0_gguf",
+      "repo": "google/gemma-4-12B-it-qat-q4_0-gguf",
+      "revision": "f6e7774e6148da3b7f201e42ba37cf084c1db35f",
+      "path": "/opt/spark/models/hub/models--google--gemma-4-12B-it-qat-q4_0-gguf/snapshots/f6e7774e6148da3b7f201e42ba37cf084c1db35f/gemma-4-12b-it-qat-q4_0.gguf",
+      "bytes": 6975877728,
+      "sha256": "faff1a63667fac17ac5e777f47114688fcefea96e220e211aaa8d62c2c4561f1",
+      "format": "GGUF Q4_0 QAT",
+      "fucina": "supported",
+      "vllm": "not selected: no audited Gemma-4 GGUF launch in the pinned image; exact NVFP4 checkpoint is available instead"
+    },
+    {
+      "id": "dense12b_nvfp4",
+      "repo": "RedHatAI/gemma-4-12B-it-NVFP4",
+      "revision": "a1d2478a9b99cc444bc9f64839609d3a82ca9195",
+      "path": "/opt/spark/models/hub/models--RedHatAI--gemma-4-12B-it-NVFP4/snapshots/a1d2478a9b99cc444bc9f64839609d3a82ca9195",
+      "weight_bytes": 10264269928,
+      "weights_sha256": "2a47698057868018a97213e4504e37a7aacc22d13fd977af51965b1113afaf27",
+      "format": "compressed-tensors nvfp4-pack-quantized, group_size=16, FP8 scales",
+      "fucina": "LOAD FAILED on current source: NVFP4 shape mismatch L5 P1 (packed 983040 vs 7864320, scale 122880 vs 983040)",
+      "vllm": "candidate exact-artifact load via compressed-tensors; no head-to-head run because the fucina side failed first",
+      "comparability": "MISSING: exact-artifact dense cell stopped before performance, as required"
+    },
+    {
+      "id": "dense12b_bf16",
+      "repo": "google/gemma-4-12B-IT",
+      "revision": "5926caa4ec0cac5cbfadaf4077420520de1d5205",
+      "path": "/opt/spark/models/hub/models--google--gemma-4-12B-IT/snapshots/5926caa4ec0cac5cbfadaf4077420520de1d5205",
+      "weight_bytes": 23919549408,
+      "weights_sha256": "5a84cb313260ac447237b890387116dfa8682e49a6b44bc585ae8353abbff18d",
+      "format": "BF16 safetensors",
+      "fucina": "unsupported dense BF16 loader",
+      "vllm": "supported",
+      "comparability": "CAPABILITY_ONLY; not a head-to-head cell"
+    },
+    {
+      "id": "dense12b_assistant_q8_gguf",
+      "source": "GGUF of google/gemma-4-12B-it-assistant supplied locally",
+      "path": "/opt/spark/models/assistants/gemma-4-12B-it-qat-assistant-MTP-Q8_0.gguf",
+      "bytes": 465127040,
+      "sha256": "13331068b6af643c3dc75e619373b674c1f75a1958e7c82e2020d96a17c63809",
+      "format": "gemma4-assistant GGUF Q8_0",
+      "fucina": "supported",
+      "vllm": "unsupported assistant format; matching HF assistant safetensors not present",
+      "comparability": "FUCINA_WITHIN_ENGINE_MTP_ONLY; vLLM MTP cell MISSING"
+    },
+    {
+      "id": "e4b_bf16",
+      "repo": "google/gemma-4-E4B-it",
+      "revision": "fee6332c1abaafb77f6f9624236c63aa2f1d0187",
+      "path": "/opt/spark/models/hub/models--google--gemma-4-E4B-it/snapshots/fee6332c1abaafb77f6f9624236c63aa2f1d0187",
+      "weight_bytes": 15992595884,
+      "weights_sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+      "format": "BF16 safetensors, PLE, 18 KV-shared layers",
+      "fucina": "supported E4B runtime/server bridge but runtime transforms PLE to FP8 and decode weights to NVFP4/FP8 by default",
+      "vllm": "supported Gemma4 PLE/KV-sharing BF16 path",
+      "comparability": "SAME_SOURCE_ARTIFACT / DIFFERENT_RUNTIME_PRECISION; not kernel parity; server cell stopped because fucina E4B batch parity failed"
+    },
+    {
+      "id": "e4b_qat_q4_0_gguf",
+      "repo": "google/gemma-4-E4B-it-qat-q4_0-gguf",
+      "revision": "bb3b92e6f031fa438b409f898dd9f14f499a0cb0",
+      "path": "/opt/spark/models/hub/models--google--gemma-4-E4B-it-qat-q4_0-gguf/snapshots/bb3b92e6f031fa438b409f898dd9f14f499a0cb0/gemma-4-E4B_q4_0-it.gguf",
+      "bytes": 5154939136,
+      "sha256": "e8b6a059ba86947a44ace84d6e5679795bc41862c25c30513142588f0e9dba1d",
+      "format": "GGUF Q4_0 QAT",
+      "comparability": "FUCINA_CAPABILITY_ONLY unless a pinned vLLM GGUF path is demonstrated"
+    },
+    {
+      "id": "e4b_assistant_q4_gguf",
+      "repo": "unsloth/gemma-4-E4B-it-qat-GGUF",
+      "revision": "bbcd9d849c2541ecc2af7ef64b3c3c2c7aa14e96",
+      "path": "/opt/spark/models/hub/models--unsloth--gemma-4-E4B-it-qat-GGUF/snapshots/bbcd9d849c2541ecc2af7ef64b3c3c2c7aa14e96/MTP/gemma-4-E4B-it-Q4_0-MTP.gguf",
+      "bytes": 59676544,
+      "sha256": "b0005dc39d47ede950c3ec413cb20e832f15b216126eae368d9f572676153cb6",
+      "format": "gemma4-assistant GGUF Q4_0",
+      "fucina": "supported single-sequence E4B spec path",
+      "vllm": "unsupported assistant format; matching HF assistant absent"
+    }
+  ],
+  "planned_launch_commands": {
+    "fucina_dense_q4_plain_measured": "flock -w 1200 /tmp/fucina_gpu.lock -c 'GPU_CLOCK_MAX=2400 FUCINA_NO_BATCH_SPEC=1 FUCINA_PAGED_MAXSEQS=32 ./fucina -m <dense12b_q4_gguf> --ctx 16384 --parallel 32 --max-concurrent 64 --gpu-mem-util 0.90 --batch --spec=false --temp 0 --port 18080'",
+    "fucina_dense_q4_mtp_measured": "flock -w 1200 /tmp/fucina_gpu.lock -c 'GPU_CLOCK_MAX=2400 FUCINA_PAGED_MAXSEQS=32 ./fucina -m <dense12b_q4_gguf> --assistant <dense12b_assistant_q8_gguf> --ctx 16384 --parallel 32 --max-concurrent 64 --gpu-mem-util 0.90 --batch --temp 0 --port 18080'",
+    "vllm_dense_bf16_plain_measured": "GPU_CLOCK_MAX=2400 docker run --gpus all --ipc=host --network host -v /opt/spark/models:/opt/spark/models:ro <pinned-image> <dense12b_bf16> --language-model-only --host 127.0.0.1 --port 18081 --served-model-name gemma-4-12B-IT --max-model-len 16384 --max-num-seqs 32 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --enable-prefix-caching --kv-cache-dtype fp8 --attention-backend TRITON_ATTN",
+    "fucina_dense_nvfp4_plain": "STOPPED AT LOAD: flock -w 1200 /tmp/fucina_gpu.lock -c 'GPU_CLOCK_MAX=2400 FUCINA_NO_BATCH_SPEC=1 ./fucina -m <dense12b_nvfp4> --ctx 16384 --parallel 32 --max-concurrent 64 --gpu-mem-util 0.90 --batch --spec=false --temp 0 --port 18080'",
+    "fucina_dense_nvfp4_mtp": "flock -w 1200 /tmp/fucina_gpu.lock -c 'GPU_CLOCK_MAX=2400 ./fucina -m <dense12b_nvfp4> --assistant <dense12b_assistant_q8_gguf> --ctx 16384 --parallel 32 --max-concurrent 64 --gpu-mem-util 0.90 --batch --temp 0 --port 18080'",
+    "vllm_dense_nvfp4_plain": "GPU_CLOCK_MAX=2400 docker run --rm --gpus all --ipc=host --network host -v /opt/spark/models:/models:ro vllm/vllm-openai@sha256:9c719f... <dense12b_nvfp4> --language-model-only --host 127.0.0.1 --port 18081 --max-model-len 16384 --max-num-seqs 32 --gpu-memory-utilization 0.90 --enable-prefix-caching --attention-backend TRITON_ATTN --served-model-name gemma-nvfp4",
+    "fucina_e4b_bf16_plain": "flock -w 1200 /tmp/fucina_gpu.lock -c 'GPU_CLOCK_MAX=2400 ./fucina -m <e4b_bf16> --ctx 16384 --parallel 8 --max-concurrent 16 --batch --spec=false --temp 0 --port 18080'",
+    "vllm_e4b_bf16_plain": "GPU_CLOCK_MAX=2400 docker run ... <e4b_bf16> --language-model-only --kv-sharing-fast-prefill --max-model-len 16384 --max-num-seqs 8 ..."
+  },
+  "serialization": {
+    "fucina_lock": "/tmp/fucina_gpu.lock",
+    "vllm_lock_behavior": "vLLM ignores the lock; phases are manually serialized",
+    "quiescence_rule": "Before every start, nvidia-smi must show 0% compute and only Xorg/gnome-shell. Never overlap engines."
+  },
+  "pre_measurement_failures": [
+    {
+      "gate": "paged-kv-device-test",
+      "status": "FAIL",
+      "detail": "global nkv=1 hd=512 paged-vs-contiguous max error 0.0112 while paged-vs-host was 1.19e-07; sliding and recycled-sliding passed"
+    },
+    {
+      "gate": "dense batch self-test",
+      "status": "FAIL",
+      "detail": "FUCINA_BATCH_SELFTEST reported seq_add(batch) failed even with FUCINA_PAGED_MAXSEQS=4; make bench also failed its batch and sampling markers"
+    },
+    {
+      "gate": "dense exact NVFP4 load",
+      "status": "FAIL",
+      "detail": "NVFP4 shape mismatch L5 P1 (packed 983040 vs 7864320, scale 122880 vs 983040); server never became ready"
+    },
+    {
+      "gate": "E4B continuous-batch parity",
+      "status": "FAIL",
+      "detail": "2/8 token mismatches on the third divergent sequence; first two sequences matched independent decode"
+    },
+    {
+      "gate": "E4B HF forward/generation oracle",
+      "status": "MISSING",
+      "detail": "/tmp/e4b_ref.bin and /tmp/e4b_gen_ref.bin are absent and no repository producer script exists"
+    },
+    {
+      "gate": "E4B assistant Makefile targets",
+      "status": "BROKEN_TARGET_BUT_MANUAL_LINK_PASS",
+      "detail": "e4b-mtp-load-test/e4b-spec-test/e4b-spec-stream-test omit libdg.a and fail undefined dg_* symbols; unchanged tests manually linked with libdg.a pass load, 160-token lossless spec, and 160-token lossless stream"
+    }
+  ],
+  "missing_acquisition": [
+    {
+      "cell": "vLLM dense Gemma-4 MTP",
+      "status": "MISSING",
+      "request": "google/gemma-4-12B-it-assistant revision 364bd03c9952e5b7da73665ee30c9eccfc408345; model.safetensors 845719296 bytes, LFS SHA-256 3279c173daddd7186e79d652ad94022415736d3a1370625696c898429b06d6df, plus config/tokenizer metadata. It is semantically the same assistant family as local Q8_0 GGUF; because formats differ, any result remains FORMAT/SYSTEM unless an identical format is supported by both engines. Metadata came from the Hugging Face API with blobs=true; no weight download was performed."
+    },
+    {
+      "cell": "vLLM E4B MTP",
+      "status": "MISSING",
+      "request": "google/gemma-4-E4B-it-assistant revision 8d0031ea8c2109e2b1e86bb9368a4539b537f80a; model.safetensors 159138208 bytes, LFS SHA-256 12875062fc25c51e8fa9b62abd2de7ad48b7d63f8559d5d604fbd5a3d6bcff16, plus config/tokenizer metadata. Local assistant is GGUF Q4_0 only. Metadata came from the Hugging Face API with blobs=true; no weight download was performed."
+    }
+  ]
+}

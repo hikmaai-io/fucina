@@ -1,0 +1,64 @@
+BUILD_START 2026-07-19T18:43:53+02:00
+/usr/local/cuda-13/bin/nvcc -arch=sm_121a -O3 -lineinfo --use_fast_math -DBLACKWELL_NATIVE_FP4=1 -Xcompiler -O3 -Xcompiler -pthread --threads 8 -dc -o cuda/gemma4_kernels.o cuda/gemma4_kernels.cu
+cuda/qwen35_runtime.cuh(1177): warning #177-D: variable "KEYD" was declared but never referenced
+      const int KEYD=2048, VALD=c->ssm_inner_size;
+                ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+cuda/gemma4_kernels.cu(13887): warning #177-D: function "mtp_paged_graph_ensure" was declared but never referenced
+  static int mtp_paged_graph_ensure(gemma4_engine_t *eng)
+             ^
+
+cuda/qwen35_runtime.cuh(1177): warning #177-D: variable "KEYD" was declared but never referenced
+      const int KEYD=2048, VALD=c->ssm_inner_size;
+                ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+cuda/gemma4_kernels.cu(13887): warning #177-D: function "mtp_paged_graph_ensure" was declared but never referenced
+  static int mtp_paged_graph_ensure(gemma4_engine_t *eng)
+             ^
+
+/usr/local/cuda-13/bin/nvcc -arch=sm_121a -O3 -lineinfo --use_fast_math -DBLACKWELL_NATIVE_FP4=1 -Xcompiler -O3 -Xcompiler -pthread --threads 8 -std=c++17 -dc -o cuda/e4b_engine.o cuda/e4b_engine.cu
+/usr/local/cuda-13/bin/nvcc -arch=sm_121a -O3 -lineinfo --use_fast_math -DBLACKWELL_NATIVE_FP4=1 -Xcompiler -O3 -Xcompiler -pthread --threads 8 -dlink -o cuda/gemma4_kernels_link.o cuda/gemma4_kernels.o cuda/e4b_engine.o
+ar rcs cuda/libfucina.a cuda/gemma4_kernels.o cuda/e4b_engine.o cuda/gemma4_kernels_link.o
+libfucina.a cubin arch(es): sm_121a
+/usr/local/cuda-13/bin/nvcc -arch=sm_121a -O3 -lineinfo -Xcompiler -O3 -Xcompiler -pthread --threads 8 -dc -o cuda/diffusion_gemma_kernels.o cuda/diffusion_gemma_kernels.cu
+cuda/diffusion_gemma_kernels.cu(327): warning #550-D: variable "chosen" was set but never used
+      __attribute__((shared)) int chosen[64];
+                                  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+cuda/diffusion_gemma_kernels.cu(327): warning #550-D: variable "chosen" was set but never used
+      __attribute__((shared)) int chosen[64];
+                                  ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/usr/local/cuda-13/bin/nvcc -arch=sm_121a -O3 -lineinfo -Xcompiler -O3 -Xcompiler -pthread --threads 8 -dc -o cuda/diffusion_gemma_engine.o cuda/diffusion_gemma_engine.cu
+/usr/local/cuda-13/bin/nvcc -arch=sm_121a -std=c++17 -O3 -lineinfo --expt-relaxed-constexpr --expt-extended-lambda -DCUTLASS_ARCH_MMA_SM120_SUPPORTED=1 -I/home/mauromedda/.venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include -I/home/mauromedda/.venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -Xcompiler -O3 -Xcompiler -pthread -dc -o cuda/dg_fp4_moe.o cuda/dg_fp4_moe.cu
+ptxas info    : (C7504) Potential Performance Loss: 'setmaxnreg' ignored to maintain compatibility across compilation units.
+/usr/local/cuda-13/bin/nvcc -arch=sm_121a -O3 -lineinfo -Xcompiler -O3 -Xcompiler -pthread --threads 8 -dlink -o cuda/libdg_link.o cuda/diffusion_gemma_kernels.o cuda/diffusion_gemma_engine.o cuda/dg_fp4_moe.o
+ar rcs cuda/libdg.a cuda/diffusion_gemma_kernels.o cuda/diffusion_gemma_engine.o cuda/dg_fp4_moe.o cuda/libdg_link.o
+rm -f fucina
+CGO_CFLAGS="-I/usr/local/cuda-13/include" \
+CGO_LDFLAGS="-L/usr/local/cuda-13/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm" \
+/usr/local/go/bin/go build -a -ldflags="-s -w" -o fucina ./cmd/fucina/
+fucina: OK — device weight-upload path linked
+ok  	github.com/hikmaai-io/fucina/cmd/fucina	0.107s
+ok  	github.com/hikmaai-io/fucina/cmd/fucina-calibrate	0.095s
+ok  	github.com/hikmaai-io/fucina/internal/chat	0.014s
+ok  	github.com/hikmaai-io/fucina/internal/dist	0.010s
+?   	github.com/hikmaai-io/fucina/internal/engine/cuda	[no test files]
+?   	github.com/hikmaai-io/fucina/internal/engine/diffusion	[no test files]
+?   	github.com/hikmaai-io/fucina/internal/engine/e4b	[no test files]
+ok  	github.com/hikmaai-io/fucina/internal/grammar	0.010s
+ok  	github.com/hikmaai-io/fucina/internal/sampler	0.019s
+ok  	github.com/hikmaai-io/fucina/internal/server	0.054s
+ok  	github.com/hikmaai-io/fucina/internal/server/batch	0.067s
+ok  	github.com/hikmaai-io/fucina/internal/session	0.021s
+ok  	github.com/hikmaai-io/fucina/internal/tokenizer	3.127s
+BUILD_RC=0 2026-07-19T18:45:20+02:00
+exit

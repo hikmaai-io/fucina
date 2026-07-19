@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "requests_per_start": 105,
+  "http_failures": 0,
+  "fucina": {
+    "starts": 6,
+    "event_count_mismatches_per_start": [0, 0, 0, 0, 0, 0],
+    "interpretation": "one non-empty SSE content event per reported completion token"
+  },
+  "vllm": {
+    "starts": 3,
+    "event_count_mismatches_per_start": [83, 84, 36],
+    "concurrency_request_event_counts": "127 or 128 SSE content events for 128 reported completion tokens",
+    "interpretation": "vLLM may coalesce two tokens into one streamed content chunk; raw client intervals are SSE-chunk intervals, not guaranteed token-exact ITL",
+    "disposition": "aggregate completion throughput, usage counts, TTFT, wall time, failures and server Prometheus counters are valid; vLLM per-token ITL is MISSING and chunk-interval percentiles are diagnostic only"
+  },
+  "output_length": {
+    "standard_traffic_completion_tokens": 128,
+    "mixed_active_decode_streams": 4,
+    "mixed_active_decode_completion_tokens": 256,
+    "reason": "keep decode active when the arriving long prefill starts 50 ms later",
+    "disposition": "explicit mixed-workload protocol deviation; all concurrency, long, context, burst, prefix and arriving-prefill requests use 128"
+  }
+}

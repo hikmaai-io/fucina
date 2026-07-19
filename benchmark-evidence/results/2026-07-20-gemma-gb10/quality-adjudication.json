@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "corpus_cases": [
+    "arithmetic",
+    "code_python",
+    "multilingual",
+    "repetition",
+    "code_rust",
+    "reasoning",
+    "long_context_retrieval"
+  ],
+  "manual_semantic_result": {
+    "fucina-dense-q4-plain": "PASS all cases and starts",
+    "fucina-dense-q4-mtp": "PASS all cases and starts",
+    "vllm-dense-bf16-plain": "PASS all cases and starts"
+  },
+  "automated_rule_revision": {
+    "original_reasoning_rule": "required both 'contradiction' and 'even' inside a fixed 96-token answer",
+    "finding": "all preserved outputs correctly open the proof by contradiction, but the 96-token cap can occur before the parity step and word 'even'",
+    "corrected_rule": "requires the valid contradiction proof opening at this budget",
+    "raw_affected_runs": [
+      "fucina-dense-q4-plain-start2",
+      "fucina-dense-q4-plain-start3",
+      "vllm-dense-bf16-plain-start1"
+    ],
+    "disposition": "manual PASS; raw flags and outputs remain unchanged"
+  },
+  "same_target_plain_vs_mtp": {
+    "output_sha256_equal_all_seven_cases_all_three_starts": true,
+    "token_event_sha256_equal_all_seven_cases_starts_2_and_3": true,
+    "start_1_token_event_field": "MISSING in initial plain harness revision; decoded UTF-8 SHA-256 is equal for every case",
+    "claim": "served quality outputs are lossless for this fixed corpus; broader paged/batch GPU gates still fail"
+  },
+  "cross_format_equality": "NOT REQUIRED and not claimed: fucina Q4_0 and vLLM BF16 are different target arithmetic"
+}
