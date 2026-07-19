@@ -1,0 +1,8 @@
+# Qwen3.5 MoE batched-admission prefill microbench (prompt_len=15, reps=3)
+#    M  median_ms     p95_ms       ms/seq
+     1      54.60      55.11       54.600
+     2      72.47      73.14       36.234
+     4     100.20     100.88       25.051
+     8     151.47     153.29       18.934
+    16     243.40     244.82       15.212
+    32     449.23     451.88       14.039

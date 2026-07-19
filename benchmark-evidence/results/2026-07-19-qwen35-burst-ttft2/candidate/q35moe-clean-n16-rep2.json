@@ -1,0 +1,44 @@
+{
+  "N": 16,
+  "agg_decode_tps": 321.18590207576943,
+  "median_ttft_ms": 255.46892099373508,
+  "p95_ttft_ms": 296.7779249884188,
+  "ttfts_ms_raw": [
+    209.21,
+    210.17,
+    212.34,
+    252.67,
+    254.01,
+    255.07,
+    255.23,
+    255.4,
+    255.54,
+    256.3,
+    256.83,
+    257.0,
+    258.1,
+    259.06,
+    296.78,
+    298.77
+  ],
+  "median_per_stream_tps": 22.17997735562567,
+  "wall_s": 5.987186821002979,
+  "samples": [
+    {
+      "prompt": "Reply with one short sentence: what is the capital of France",
+      "text": " Paris is the capital of France.\n\nAnswer: Paris is the capital of France.\n\nAnswer: Paris is the capital of France.\n\nAnswer: Paris is the capital of Fr"
+    },
+    {
+      "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+      "text": "Photosynthesis is the process of the plants.\n\nPhotosynthesis is the process of the plants.\n\nPhotosynthesis is the process of the plants.\n\nPhotosynthes"
+    },
+    {
+      "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+      "text": "The prime numbers below 20 are 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20"
+    },
+    {
+      "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+      "text": "390\n\n137 + 265 = 390.\n\n137 + 265 = 390.\n\n137 + 265 = 390.\n\n137 + 265 = 390.\n\n137 + 265 = 390.\n\n137 + 265 = 390.\n\n137 + 265 = 390.\n\n137 + 265 = 390.\n\n1"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "N": 16,
+  "agg_decode_tps": 317.2676611166577,
+  "median_ttft_ms": 254.71630900574382,
+  "p95_ttft_ms": 295.03424098948017,
+  "ttfts_ms_raw": [
+    208.65,
+    209.28,
+    211.56,
+    251.27,
+    252.71,
+    252.78,
+    253.62,
+    254.12,
+    255.32,
+    255.86,
+    256.67,
+    257.12,
+    257.61,
+    257.72,
+    295.03,
+    297.39
+  ],
+  "median_per_stream_tps": 23.71771667973759,
+  "wall_s": 5.613556685013464,
+  "samples": [
+    {
+      "prompt": "Reply with one short sentence: what is the capital of France",
+      "text": " Paris.\n\nAnswer: Paris.\n\nAnswer: Paris.\n\nAnswer: Paris.\n\nAnswer: Paris.\n\nAnswer: Paris.\n\nAnswer: Paris.\n\nAnswer: Paris.\n\nAnswer: Paris.\n\nAnswer: Paris"
+    },
+    {
+      "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+      "text": "Photosynthesis is a process of the energy of the energy of the energy of the energy of the energy of the energy of the energy of the energy of the ene"
+    },
+    {
+      "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+      "text": "The prime numbers below 20 are 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20"
+    },
+    {
+      "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+      "text": "400\n\nAnswer: 400\n\nAnswer: 400\n\nAnswer: 400\n\nAnswer: 400\n\nAnswer: 400\n\nAnswer: 400\n\nAnswer: 400\n\nAnswer: 400\n\nAnswer: 400\n\nAnswer: 400\n\nAnswer: 400\n\nAn"
+    }
+  ]
+}

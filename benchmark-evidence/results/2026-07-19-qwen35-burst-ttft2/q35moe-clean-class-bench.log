@@ -1,0 +1,34 @@
+fucina: loaded /opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8 (directory)
+fucina: qwen35 geometry (runtime-derived) — NQ=16 NKV=2 NVH=32 INNER=4096 CONVD=8192 (M2 baked NQ16/NVH32/INNER4096)
+fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)
+fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine
+fucina: qwen35 tensor plan finalized: entries=900 core=0.88 GiB scales=0.01 MiB
+fucina: qwen35-Q4K mixer repacked in place (130 tensors → packed dp4a GEMV)
+fucina: qwen35 allocation decision: source=block-FP8 mixer=Q4_K experts=NVFP4 d_weights=0.88 GiB
+fucina: qwen35 allocation ledger: experts=16.88 core=0.88 scales=0.00 embed=3.35 head=1.45 moe-scratch=0.58 misc=0.00 total=23.13 GiB
+fucina: qwen35 free-memory trace: enter=40.92 after-experts=22.04 after-core=21.53 before-scratch=16.54 after-scratch=15.96 final=15.96 GiB
+fucina: qwen35 host-memory trace: free 40.92->15.96 available 110.94->85.97 cached 71.13->71.13 reclaimable 0.42->0.42 GiB
+fucina: qwen35 observed deltas: experts=+18.88 core=+0.52 embed/head=+4.99 moe-scratch=+0.58 fill-total=+24.97 ledger-residual=+1.83 GiB
+fucina: qwen35 Q4_K-MoE served via batched engine (40 layers, vocab 248320, H 2048, NKV 2, E-experts slabbed, 0.88 GiB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    41.09 GiB  (shared box: 78.61 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :    25.13 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 4096, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 4096)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :    25.13 GiB  (within budget by 82.59 GiB)
+fucina: engine initialized (0.88 GB model, 4096 ctx, Q8_0)
+fucina: 30 sliding + 10 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=4096 maxctx=4096 cuda-free=15.98 GiB available=86.00 GiB model-resident=23.13 GiB (ledger) workspace=1.39 GiB reserve/slot=0.11 GiB (max 0.11) physical-room=85.50 GiB budget-room=84.59 GiB chosen-room=84.59 GiB fit=755
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 5.23 GiB, cuda-free 14.57 GiB, available 84.59 GiB, physical=fit, budget=fit, reserved-before 4.91 GiB, room 84.59 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=4096 slotctx=4096 slots=32/32 workspace=1.39 GiB reserve/slot=0.11 GiB (recurrent 0.03 + KV 0.08; max-KV 0.08) committed=1.39 GiB reserved=10.15 GiB
+# Qwen3.5 MoE batched-admission prefill microbench (prompt_len=15, reps=7)
+#    M  median_ms     p95_ms       ms/seq
+    32     324.31     328.05       10.135
