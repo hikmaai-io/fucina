@@ -15,18 +15,21 @@ Status: **FUNCTIONAL** (on `main`). Enable for Gemma-4 with the `--batch` CLI fl
 `--paged-kv`), or the legacy `FUCINA_PAGED_KV=1 FUCINA_BATCH=1` env pair — both converge on the
 same path. Default path for Gemma-4 is unchanged (single-flight); Qwen3 is always on this path.
 Concurrent smoke: 4 parallel requests served concurrently (4.43s vs 5.56s sequential), correct
-outputs, no serialization. Remaining (Gemma-4 single-flight comparison): perf (split-K paged
-attention), per-seq MTP spec decode, CUDA graphs per batch size — the last two have since landed
-in part; see the scoreboard in [docs/qwen35-beat-vllm-plan.md](qwen35-beat-vllm-plan.md) for the
-current measured state on Qwen.
+outputs, no serialization. The current source also has Gemma-4 paged batched MTP and per-B CUDA
+graphs; the missing work is fresh served evidence and product-default calibration, not those
+kernels. See [docs/gemma-gb10-competitive.md](gemma-gb10-competitive.md) for the 2026-07 source and
+measurement audit, and the scoreboard in
+[docs/qwen35-beat-vllm-plan.md](qwen35-beat-vllm-plan.md) for Qwen.
 
-Why default-off for Gemma-4 (deliberate, not just caution): the batch path has **no MTP
-speculative decode** (the per-slot paged+batched drafter kernel for the Gemma-4 assistant head is
-unbuilt — see "Spec decode in the batch" below; Qwen never used the MTP head in the first place)
-and pays a **~10% split-K single-stream tax**, so for single-stream / low-concurrency Gemma-4
-traffic the single-flight path is faster. Turn `--batch` on for Gemma-4 only when you are actually
-serving concurrent clients, where flat TTFT and aggregate scaling dominate. Bench it both ways:
-`make tool-bench ARGS="--perf"` vs `make tool-bench BATCH=1 ARGS="--perf"`.
+Why default-off for Gemma-4: this is the **current product default**, not evidence that the batch
+path lacks MTP. With `--batch --assistant <head.gguf>`, `BatchAdapter.StepBatch` routes to the
+paged B-row MTP drafter and one lossless target verify; without an assistant, dense Gemma uses the
+model-agnostic prompt-lookup verifier unless `FUCINA_NO_BATCH_SPEC=1`. The default remains off
+because the fresh three-start Q4_0 matrix is shape-dependent: learned MTP is +99.6% at N=1 and
++37.0% at N=2, but −22.8% at N=4 and −23.2% at N=8 before tapering to plain at N≥16; separate
+paged/batch GPU gates also fail. Use `--batch` for concurrent Gemma only after checking the
+checkpoint and traffic shape you actually deploy. `--spec=false` controls the single-flight
+generator; use `FUCINA_NO_BATCH_SPEC=1` to obtain a genuinely plain continuous-batch baseline.
 
 How it works end to end:
 - `FUCINA_PAGED_KV` allocates the block pools (capacity-sized; `paged_cap = min(MAX_SEQS,
@@ -39,14 +42,17 @@ How it works end to end:
   samples one greedy token per row. Per-row admission: a slot that can't grow its KV is marked
   `-1` and excluded; the scheduler stops just that sequence (never the whole batch).
 
-Paged batched attention is now SPLIT-K and BIT-IDENTICAL to the contiguous split-K decode
-(`paged_sliding_attn_splitk_batched` / `paged_global_attn_splitk_batched` +
+Paged batched attention is implemented as SPLIT-K and is **intended** to be bit-identical to the
+contiguous split-K decode (`paged_sliding_attn_splitk_batched` /
+`paged_global_attn_splitk_batched` +
 `paged_flash_decode_combine_batched` in cuda/paged_kv_device.cuh): per (head,seq,split)
 online-softmax partials reading K/V through each row's block table, merged in the same
 split order — so the per-row n_splits/per/scan/combine all match the contiguous rows
-kernels, and only the K/V *address* (block-table lookup vs ring modulo) differs. The single-
-seq paged_read path uses the same kernels (B=1 view), so FUCINA_PAGED_E2E_SELFTEST now agrees
-on all 64/64 tokens (was "numerically equivalent", a few top-2 near-tie flips). Tradeoff: at
+kernels, and only the K/V *address* (block-table lookup vs ring modulo) differs. Historical runs
+reported 64/64 agreement. The fresh 2026-07-19 gate does **not** validate the unqualified claim:
+its global case differed from the contiguous oracle by 0.0112 (while paged-vs-host was 1.19e-07);
+sliding and recycled-sliding passed. Treat global bit-identity as unresolved until the oracle/path
+mismatch is root-caused. Tradeoff: at
 batch decode the attention is not the bottleneck (weight GEMV bandwidth is), so split-K's extra
 combine launch costs ~10% aggregate tok/s vs the old sequential kernel at short/medium contexts
 (measured 4×512 long-gen: 57.0 → ~51 tok/s on the GB10). Kept because bit-identity to the
@@ -61,14 +67,24 @@ at any position; attention launches at the full split grid (`GEMMA4_GLOBAL_MAX_S
 tail-returns past its own n_splits → bit-identical to the per-kernel split-K path). Logs
 "multiseq batch graph captured (B=%d)" once per distinct B. Temperature rows (any `temp>0`),
 capture failure, or `FUCINA_NO_BATCHED_GRAPH` fall back to the per-kernel body (which also runs
-the per-row sampler; the same env var also disables the spec-verify `batched_graph`). Verified: batch self-test 32/32 unchanged with B=1 and B=3 graphs exercised;
-4 concurrent greedy requests replay B=1/3/4 with correct deterministic output.
+the per-row sampler; the same env var also disables the spec-verify `batched_graph`). Historical
+runs reported a 32/32 batch self-test and correct B=1/3/4 replay. The fresh evidence run reported
+`seq_add(batch) failed`, so those historical results are not promoted to a current passing gate.
 
-Known limitations: no spec decode / TTFT metrics in the batch path. (Per-sequence sampling
-params are now honored; see the sampling-params phase note.) Batch prefill is token-by-token:
-`gemma4_engine_seq_add` loops one `decode_multiseq_forward` per prompt position, so admitting a
-long prompt costs one kernel launch per token. This is correct but slow for long prompts; Phase 4
-adds a cuBLASLt batched prefill that processes the whole prompt in one weight pass.
+Known limitations in current source:
+- Batched Gemma MTP self-drafting is greedy-only. Temperature rows are target-sampled losslessly
+  but are not eligible for the learned MTP draft round.
+- Verify scratch is capped at 32 total rows (`B + Σdrafts`); default depth is capped at 6 and
+  speculation auto-disables when fewer than 2 draft rows per slot fit. MTP therefore tapers out at
+  high concurrency by design.
+- `/metrics` has speculation and request/TTFT fields, but the fresh batched-MTP run left the
+  speculation counters and average TTFT at zero while MTP was active. It also lacks per-request
+  p95/p99 and accepted-length histograms. Batch speculation telemetry is therefore not usable for
+  a production SLO decision yet.
+- Fresh dense prompts that fit the supported tile use single-pass paged prefill; prefix/chunk
+  suffixes use batched chunks of up to 32 rows. Unsupported/long shapes retain a correct
+  token-by-token fallback, so long-prompt performance must be measured rather than inferred.
+- `response_format`/`json_schema` remains unavailable under continuous batching.
 
 ---
 Original plan (branch `perf/continuous-batching-paged-kv`).
@@ -150,7 +166,12 @@ type BatchEngine interface {
 ```
 On-device sampling both for prefill (returns first token) and each step (one token/slot).
 
-### Spec decode in the batch (decision #3) — interface landed, C kernel pending
+### Historical snapshot: spec decode interface before the CUDA kernel landed
+
+> **Historical, not current capability.** The text below records the intermediate branch state.
+> Current source resolves the listed CUDA gaps with per-slot recurrent state,
+> `mtp_forward_paged_batched` / `mtp_draft_paged_batched`, ragged paged target verification, and
+> lossless per-slot commit in `step_batch_spec_impl` (`cuda/gemma4_kernels.cu`).
 
 The scheduler interface now carries a token RUN per slot: `StepBatch(active, inputs) (out
 [][]int32, err error)`. The scheduler's `step` walks each row's run in order, calling `deliver`
@@ -161,7 +182,7 @@ run, so behavior is unchanged (batch self-test 32/32, regression byte-identical)
 cover multi-token runs (`TestSpeculativeRunsDeliverEveryToken`) and a stop landing mid-run
 (`TestSpeculativeRunStopsMidRun`).
 
-STILL PENDING (the hard CUDA half): the MTP drafter (`mtp_forward`) is structurally single-
+STILL PENDING **at that historical snapshot** (the hard CUDA half): the MTP drafter (`mtp_forward`) was structurally single-
 sequence — it reads K/V from the CONTIGUOUS single-seq cache at fixed layer offsets
 (`d_sliding_k + (MAX_LAYERS-2)*lstride`, `d_global_k + global_slot[MAX_LAYERS-1]`), its recurrent
 state `d_mtp_h` is one `[3840]` buffer, and its attention launches at a single-row grid. Per-slot

@@ -84,8 +84,10 @@ separate Qwen3.6 code path.
   **NVFP4 KV codec** (`FUCINA_KV_NVFP4=1`, native Blackwell FP4) trades a small accuracy cost for a
   1.78× smaller KV footprint — memory-only, opt-in (see [`docs/kv-quant-exploration.md`](docs/kv-quant-exploration.md)).
 - 🧵 **Continuous batching over a paged KV cache** — independent sequences decode in one batched
-  pass (vLLM-style block tables + free-list, split-K paged attention bit-identical to the contiguous
-  path, CUDA graph per batch size). **Opt-in for Gemma-4** (`--batch`, implies `--paged-kv`) — the
+  pass (vLLM-style block tables + free-list, split-K paged attention, CUDA graph per batch size).
+  The design targets bit-identity to contiguous attention, but the fresh 2026-07 global gate is
+  unresolved; see [`docs/gemma-gb10-competitive.md`](docs/gemma-gb10-competitive.md). **Opt-in for
+  Gemma-4** (`--batch`, implies `--paged-kv`) — the
   default single-flight path is unchanged there; **mandatory and auto-enabled for every Qwen3
   checkpoint** (Qwen has no single-flight path). See [`docs/continuous-batching.md`](docs/continuous-batching.md).
 - 🧑‍🤝‍🧑 **Multi-architecture, no model-select flag** — Gemma-4, Qwen3 dense, Qwen3 MoE, and the
@@ -543,8 +545,12 @@ hf download google/gemma-4-E4B-it-qat-q4_0-gguf \
 ```
 
 The E4B REPL shares the dense command surface (`/help`, `/thinking`, `/stats`, `/reset`, `/quit`)
-and `--thinking off|on|low|medium|high|xhigh`. Server mode and the MTP draft head are not wired for
-E4B yet.
+and `--thinking off|on|low|medium|high|xhigh`. Current source also wires E4B to the HTTP server,
+greedy continuous batching (`--parallel N`, engine-capped at eight total slots including the
+reserved single-sequence slot), and single-sequence greedy MTP with an E4B assistant. The E4B
+assistant is **not** used by the continuous-batch adapter, and batched E4B does not apply
+per-request sampling parameters; treat it as capability-stage until the separate E4B matrix and
+memory/concurrency gates pass.
 
 ### Native NVFP4 (safetensors) — Gemma 4
 
@@ -637,18 +643,24 @@ cache** (vLLM-style block table + free-list) instead of one lock held for the wh
 concurrent clients share each batched forward pass, and CUDA graphs are captured per active batch
 size.
 
-- **Gemma-4: opt-in.** Off by default (the default single-flight path is faster for one client at
-  a time and has MTP speculation, which the batch path lacks). Turn it on with `--batch` (implies
-  `--paged-kv`) — equivalent to the legacy `FUCINA_PAGED_KV=1 FUCINA_BATCH=1` env pair — when you
-  are actually serving concurrent clients.
+- **Gemma-4: opt-in.** Off by default. This is now a measured product choice, **not** a
+  missing-MTP limitation: current source runs the learned assistant through a paged B-row drafter
+  and lossless batched target verify, but the fresh three-start Q4_0 matrix finds MTP +99.6% at
+  N=1 and +37.0% at N=2 while regressing N=4–8 by ~23%. The broader paged/batch GPU gates are also
+  red. Turn batching on with `--batch` (implies `--paged-kv`)—equivalent to the legacy
+  `FUCINA_PAGED_KV=1 FUCINA_BATCH=1` env pair—only for a validated traffic shape; see
+  [`docs/gemma-gb10-competitive.md`](docs/gemma-gb10-competitive.md).
 - **Qwen3 / Qwen3.5 / Qwen3.6: mandatory, auto-enabled.** There is no single-flight path for Qwen
   (its prefill entry points decline), so fucina detects the architecture and turns batching on for
   you — `fucina -m <qwen-checkpoint>` just works, with or without `--batch`. If the paged-KV pool
   fails to allocate, startup fails fast with a message telling you to lower `--ctx` or raise
   `--gpu-mem-util`, rather than serving requests that would 500.
-- **Speculative decoding inside the batch path** is prompt-lookup only (n-gram, free) and applies
-  automatically to **dense** checkpoints (Gemma or Qwen); it's disabled for **MoE** checkpoints.
-  The Gemma-4 MTP draft head (`--assistant`) is not exercised in the batch path.
+- **Speculative decoding inside the batch path:** dense checkpoints use lossless prompt-lookup
+  verification by default; sparse/MoE checkpoints decline it. Dense Gemma with
+  `--assistant <head.gguf>` instead uses the learned **paged batched MTP** path. Its 32-row verify
+  budget makes draft depth taper with concurrency (default cap 6, auto-off below depth 2), and
+  learned MTP drafting is greedy-only. For a truly plain batch baseline set
+  `FUCINA_NO_BATCH_SPEC=1`; `--spec=false` alone controls the single-flight path.
 - **Burst-admission coalescing:** when the scheduler wakes from idle, it holds a short escalating
   window (a few ms, capped at 150 ms) so near-simultaneous requests land in the same batch instead
   of admitting one-by-one — unconditional scheduler behavior, no flag.
@@ -670,11 +682,11 @@ prefix — so accepted drafts cost far less than one decode each. Every verified
 from the **target model's own distribution**, so the output is **identical to plain decoding** at
 the same settings — drafting only changes speed, never the result.
 
-This section describes the Gemma-4 single-flight path, where both drafters below are available.
-Qwen checkpoints run through the continuous-batching path instead (see
-[Continuous batching & paged KV](#-continuous-batching--paged-kv)): prompt-lookup speculation
-applies automatically to **dense** Qwen checkpoints, is off for **MoE**, and the MTP draft head
-below (`--assistant`) does not apply to Qwen at all.
+Both drafters below are available on Gemma-4's single-flight path. They also have a current
+continuous-batch implementation: prompt lookup is driven by the Go scheduler and verified by the
+target, while `--assistant` selects the paged B-row MTP drafter/verify path for greedy rows. Qwen
+checkpoints run through continuous batching: prompt lookup applies to dense Qwen, is off for MoE,
+and the Gemma assistant does not apply to Qwen.
 
 Two drafters work together (Gemma-4):
 
@@ -695,8 +707,10 @@ fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 ```
 
 - **Works at any temperature** — correct for both greedy (`--temp 0`) and sampling (`--temp > 0`).
-- **Observe it live** — `/metrics` → `speculation` (`accept_rate`, `tokens_per_forward`); CLI runs
-  print `[mtp]` / `[lookup]` stats at the end.
+- **Observe it live (single-flight)** — `/metrics` → `speculation` (`accept_rate`,
+  `tokens_per_forward`); CLI runs print `[mtp]` / `[lookup]` stats at the end. Fresh batched-MTP
+  serving leaves those counters at zero despite active MTP, so batch acceptance telemetry is a
+  current product gap (see `docs/gemma-gb10-competitive.md`).
 - **Falls back** to per-token decode for requests with text `stop` strings (host-side trimming).
 - **Disable:** `--spec=false`. Graph escape hatches: `FUCINA_NO_DECODE_GRAPH=1`,
   `FUCINA_NO_BATCHED_GRAPH=1`. The draft head adds ~0.4 GB VRAM.
@@ -822,7 +836,7 @@ Reasoning/thinking works the same for both dialects: `"reasoning_effort": "low"|
 | `--top-p` | `0.95` | Top-P / nucleus sampling (gemma-4 default) |
 | `--thinking` | `off` | Default reasoning channel: `off`/`on`/`low`/`mid`/`high`/`xhigh` (Gemma and Qwen) |
 | `--assistant` | (none) | Gemma-4 MTP draft-head GGUF for speculation (Gemma-4 only; no effect on Qwen) |
-| `--spec` | `true` | Speculative decoding (prompt-lookup; MTP too when `--assistant` is set, Gemma-4 single-flight only) |
+| `--spec` | `true` | Single-flight speculative decoding. Continuous-batch speculation is separately default-on for dense models; set `FUCINA_NO_BATCH_SPEC=1` for a plain batch baseline. |
 | `--draft-k` | `6` | Max speculative draft length per step |
 | `--paged-kv` | `false` | Allocate the paged multi-sequence KV pools; auto-forced on for any Qwen3 checkpoint |
 | `--batch` | `false` | Continuous batching over the paged engine (implies `--paged-kv`); auto-forced on for any Qwen3 checkpoint, opt-in for Gemma-4 |
@@ -850,7 +864,7 @@ Reasoning/thinking works the same for both dialects: `"reasoning_effort": "low"|
 | `FUCINA_QWEN35_FP4=1` | Opt-in NVFP4 activations for the Qwen3.5/3.6 hybrid path (in addition to the default weight quant). |
 | `FUCINA_NO_BATCH_SPEC=1` | Disable prompt-lookup speculation inside the continuous-batching scheduler (Gemma or Qwen dense). |
 | `FUCINA_PAGED_MAXCTX=N` | Override the paged-KV pool sizing context (default 32768, clamped to `--ctx`). |
-| `FUCINA_PAGED_MAXSEQS=N` | Override the auto-computed max concurrent sequences the paged pool backs (auto range 1–64). |
+| `FUCINA_PAGED_MAXSEQS=N` | Override the auto-computed max concurrent sequences the paged pool backs (current compile-time ceiling: 32). |
 | `FUCINA_KV_NVFP4=1` | Quantize the KV cache to **NVFP4** precision (native Blackwell FP4 E2M1 + per-16 E4M3 block scale). Memory-only (~1.78× smaller KV), small accuracy cost; default OFF keeps flat FP8 byte-identical. |
 | `FUCINA_NO_WARMUP_PASS=1` | Skip the one-time startup warmup pass |
 | `FUCINA_DEBUG=1` | Dump request bodies + rendered prompts to `/tmp/fucina_debug.log` |
@@ -950,8 +964,9 @@ respective Qwen license terms on Hugging Face. fucina's own code is Apache-2.0.
   aggregate throughput at high concurrency (see [Performance](#-performance) and
   [`docs/qwen35-beat-vllm-plan.md`](docs/qwen35-beat-vllm-plan.md)); `response_format`/`json_schema`
   does not work under continuous batching, so it's unavailable for Qwen today. For Gemma, per-slot
-  spec decode inside the batch path is not yet built, and the NVFP4 KV codec / packed 4.5-bit KV
-  storage are verified but still opt-in behind a quality gate
+  paged MTP and lossless target verification exist in current source; the open work is fresh
+  served evidence, telemetry/default calibration, and a protection gate. The NVFP4 KV codec /
+  packed 4.5-bit KV storage are verified but still opt-in behind a quality gate
   ([`docs/kv-quant-exploration.md`](docs/kv-quant-exploration.md)). Also: harden the experimental
   DiffusionGemma path; an sm_120 (RTX 50-series) port to loosen the single-hardware constraint.
 
