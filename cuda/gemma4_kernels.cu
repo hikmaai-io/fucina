@@ -6629,11 +6629,15 @@ gemma4_engine_t* gemma4_engine_create(
         build_packed_q4k(eng);
     }
 
-    // GGUF Qwen descriptors are bound after all override conversion and in-place repacking. The
-    // safetensors loader binds the same fields in qwen35_fp8_fill_engine().
+    // Qwen descriptors are rebound after all override conversion and in-place repacking. For
+    // block-FP8 safetensors this pass must preserve each projection's separately allocated
+    // BF16 block-scale grid. Clearing `scale` here made the first source-FP8 prefill dequant kernel
+    // dereference NULL; Q4_K/NVFP4 happened to mask the bug because they do not use this field.
     if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
         auto bind_ref=[&](WeightRef &ref,uint64_t off,uint8_t fmt,int out_dim,int in_dim){
-            ref.data=weight_fp8(eng,off); ref.scale=nullptr; ref.global_scale=nullptr;
+            ref.data=weight_fp8(eng,off);
+            if(fmt!=FORMAT_FP8_BLOCK) ref.scale=nullptr; // FP8 scale was bound by safetensors loader
+            ref.global_scale=nullptr;
             ref.out_dim=out_dim; ref.in_dim=in_dim;
             ref.encoding=(fmt==FORMAT_Q4_K)?WeightEncoding::Q4_K:
                          (fmt==FORMAT_Q8_0)?WeightEncoding::Q8_0:

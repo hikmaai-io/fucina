@@ -2,7 +2,7 @@
 
 Date: 2026-07-25
 
-Scope: Qwen3/3.5/3.6 tool-call decoding over OpenAI-compatible streaming and non-streaming HTTP. No CUDA build, model load, or GPU test was run for this fix.
+Scope: Qwen3/3.5/3.6 tool-call decoding over OpenAI-compatible streaming and non-streaming HTTP, plus the Qwen3.6-35B-A3B source-FP8 admission failure found during GB10 qualification.
 
 ## Root cause
 
@@ -46,24 +46,42 @@ CPU-only command:
 go test ./internal/chat ./internal/tokenizer ./internal/server ./internal/server/batch -count=1
 ```
 
-## Hardware re-benchmark (run when the GPU is free)
+## GB10 hardware investigation and measured result
 
-Build once, then run the same complete 69-scenario suite against all three artifacts. These commands are intentionally serial and preserve separate reports:
+Hardware: GB10, CUDA 13, official `Qwen3.6-35B-A3B-FP8`, context 32768 (runtime cap 25280), port 8084. Every server run held `/tmp/fucina_gpu.lock`. The binary was rebuilt with `make fucina` before the final checks.
 
-```sh
-make fucina
+### Why source FP8 could not admit a sequence
 
-PORT=8081 MODEL=/opt/spark/models/hub/models--Qwen--Qwen3.6-27B-FP8 \
-  OUTPUT_DIR=./runs/qwen36-27b-fp8-parser-fix \
-  scripts/tool_eval_bench.sh 2>&1 | tee ./runs/qwen36-27b-fp8-parser-fix.log
+The failure was before paged-KV admission and before the grouped expert GEMM. The safetensors loader correctly bound every core FP8 `WeightRef.scale` to its separately allocated BF16 128x128 block-scale grid. Later, the generic post-repack descriptor pass in `gemma4_engine_create` rebound all Qwen references and unconditionally set `ref.scale=nullptr`. Q4_K and NVFP4 did not consume that field, masking the bug. Source FP8 did.
 
-PORT=8082 MODEL=/opt/spark/models/hub/models--Qwen--Qwen3.6-35B-A3B-FP8 \
-  OUTPUT_DIR=./runs/qwen36-35b-a3b-fp8-parser-fix \
-  scripts/tool_eval_bench.sh 2>&1 | tee ./runs/qwen36-35b-a3b-fp8-parser-fix.log
+With launch blocking and layer/phase synchronization, the first five-token warmup reached layer 0 and failed in `dequant_fp8_block_to_bf16_kernel` for `linear_attn.in_proj_qkv`: `fmt=FORMAT_FP8_BLOCK`, `in=2048`, `out=8192`, and `scale=NULL`. CUDA reported `an illegal memory access was encountered` before `moe_ffn` entry. The poisoned context then made multisequence admission and every serial fallback return `-1`; the slot and memory-plan messages were secondary symptoms. Expert-slab layout, FP8 expert scales, grouped expert dispatch, and paged KV had not run yet.
 
-PORT=8083 MODEL=/opt/spark/models/unsloth/Qwen3.6-35B-A3B-NVFP4 \
-  OUTPUT_DIR=./runs/qwen36-35b-a3b-nvfp4-parser-fix \
-  scripts/tool_eval_bench.sh 2>&1 | tee ./runs/qwen36-35b-a3b-nvfp4-parser-fix.log
+`cuda/gemma4_kernels.cu` now preserves the loader-owned scale pointer when the generic pass rebinds an FP8 descriptor, while still clearing scale for non-FP8 encodings.
+
+### Source-FP8 retest
+
+With `FUCINA_MOE_FP8=1` after that fix, startup reported:
+
+```text
+qwen35 allocation decision: source=block-FP8 mixer=FP8 experts=FP8 d_weights=31.41 GiB
+qwen35 memory plan ready: ... slots=4/32 ...
+qwen35 M4 batch graph captured ...
+batch decode graphs warmed (B=1..4)
 ```
 
-Acceptance checks: XML calls appear as OpenAI `tool_calls`, streaming and non-streaming results agree, TC-45 honors `required`, no malformed partial call is dispatched, and no unterminated span produces an empty response. Keep the existing dense, MoE, session, and Gemma protection gates unchanged.
+There were no `SeqAddMultiseq` or `AddSeq` errors. HTTP prefill and decode both ran: a plain deterministic request returned `content="Paris"`, `completion_tokens=1`, `finish_reason="stop"`; a forced weather-tool request returned 46 generated tokens at 29.8 tok/s instead of the former zero-token response. The latter was malformed model text, not a dispatchable call, so the hardened HTTP path exposed it as non-empty fallback content.
+
+This proves the admission crash precisely and repairs the opt-in source-FP8 data path, but it does **not** qualify source FP8 as the agentic default: its longer prose and tool syntax were still corrupt on this checkpoint.
+
+### Default and quality decision
+
+The engineering resolution is therefore **(b)**. The default remains the previously serving requantized path (`mixer=Q4_K experts=NVFP4`); source FP8 remains an explicit diagnostic mode. The final default run reported `d_weights=0.88 GiB`, `weights+scratch=25.46 GiB`, `slots=4/32`, warmed all batch graphs, and admitted real requests without fallback admission errors.
+
+Two real HTTP checks against that default on port 8084 produced:
+
+- plain deterministic check: `content="Paris"`, `completion_tokens=1`, `finish_reason="stop"`;
+- forced named weather tool: HTTP 200 with 128 completion tokens and non-empty malformed fallback content, rather than the previous empty zero-token turn.
+
+The 15-scenario `tool-eval-bench v2.0.4 --short` hardware quality check completed with **0/100 (0/15 passed)**; report: `runs/qwen36-35b-default-final/2026/07/2026-07-25T18-25-16.196987Z_0d1b6a6d.md`. This is a failed agentic-quality gate and is recorded rather than relabeled as success. The HTTP parser fix prevents dead/empty turns and safely parses valid XML or legacy JSON, but it cannot turn the malformed MoE token stream into valid calls. A complete 69-scenario claim is not made.
+
+The remaining quality defect is common to source-FP8, Q4_K-expert, and NVFP4-expert checks and therefore lies after admission in shared MoE forward/model compatibility, not in the fixed scale-pointer crash or the HTTP parser. Before any future default change, capture layer/router/shared-expert parity for this exact Qwen3.6 revision against `cuda/qwen35_moe_fp8_ref.py`; require coherent prose plus structured calls in the full suite. Never use a narrow eight-token oracle as the default gate.
