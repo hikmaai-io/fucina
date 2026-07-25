@@ -94,7 +94,7 @@ type Tokenizer struct {
 }
 
 // chatMLMarkers are the ChatML/Qwen control-token literals (Qwen3, Qwen3-MoE,
-// Qwen3.5). Registered for Encode's pre-split scan and mapped onto the
+// Qwen3.5/Qwen3.6). Registered for Encode's pre-split scan and mapped onto the
 // dialect-neutral marker fields by mapChatMLMarkers.
 var chatMLMarkers = []string{
 	"<|im_start|>", "<|im_end|>", "<|endoftext|>",

@@ -169,8 +169,8 @@ curl http://localhost:8080/v1/chat/completions -d '{
 }'
 ```
 Response carries standard `tool_calls` (`choices[0].message.tool_calls[].function.{name,arguments}`,
-`finish_reason: "tool_calls"`) even though Qwen internally emits Qwen3-Coder's XML
-`<tool_call><function=NAME>...</function></tool_call>` form — the server parses it for you.
+`finish_reason: "tool_calls"`). The server auto-detects Qwen3.6's XML-shaped
+`<tool_call><function=NAME>...</function></tool_call>` form and the legacy Qwen3/3.5 JSON body.
 Force a specific tool: `"tool_choice": {"type":"function","function":{"name":"get_weather"}}`.
 
 Reasoning/thinking: `"reasoning_effort": "low"|"medium"|"high"` or `"thinking": true/false` in the

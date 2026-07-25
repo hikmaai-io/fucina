@@ -163,6 +163,7 @@ type GenerationParams struct {
 	Thinking         bool     `json:"-"` // resolved per-request reasoning flag (dialect parsing needs it)
 	ParsePrefix      string   `json:"-"` // forced tool-call prefix appended to the prompt (tool_choice);
 	// prepended to raw output before parsing so the parser sees the complete call
+	ToolRequired bool `json:"-"` // tool_choice required/specific: absence of a parsed call is a protocol failure
 	// Constraint, when non-nil (response_format json_object/json_schema), masks the
 	// sampler each step so the output is always valid JSON. It forces the host-sampling
 	// path (the on-device batch sampler cannot take a host mask).
@@ -1001,10 +1002,15 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	// The forced prefix is re-prepended to raw output before parsing. Thinking is
 	// disabled for the turn (the forced call replaces the reasoning opener).
 	forcedPrefix := ""
+	toolRequired := false
 	if wantTools {
 		if name, forced := forcedToolChoice(req.ToolChoice); forced {
+			if name != "" && !toolNamed(req.Tools, name) {
+				http.Error(w, fmt.Sprintf("tool_choice selects unknown function %q", name), http.StatusBadRequest)
+				return
+			}
 			if pfx := s.dialect.ForcedCallPrefix(name); pfx != "" {
-				forcedPrefix = pfx
+				forcedPrefix, toolRequired = pfx, true
 				enableThinking = false
 			}
 		}
@@ -1071,6 +1077,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	params.Tools = req.Tools // for required-parameter validation of emitted calls
 	params.Thinking = enableThinking
 	params.ParsePrefix = forcedPrefix
+	params.ToolRequired = toolRequired
 	if req.Temperature != nil {
 		params.Temperature = *req.Temperature
 	}
@@ -1530,7 +1537,9 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 	chOpen, chEnd := s.tokenizer.ChannelOpen, s.tokenizer.ChannelEnd
 	openLit, closeLit := s.dialect.ToolCallLits()
 
-	// Same runaway bounds as streamResponse (the Req3 incident).
+	// Keep malformed generations bounded independently of the request budget.
+	// The finalization path below emits the complete buffered span as content,
+	// so hitting this backstop is visible rather than an empty assistant turn.
 	const maxToolToks = 2048
 	const maxToolCalls = 8
 
@@ -1588,15 +1597,11 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 		stopReason = reason
 		cancel()
 	}
-	// flushCall parses ONE closed tool-call span and streams it as a delta.
-	flushCall := func() {
-		raw := openLit + s.tokenizer.DecodeRaw(toolSpan) + closeLit
-		if forcedFirstSpan {
-			raw = params.ParsePrefix + s.tokenizer.DecodeRaw(toolSpan) + closeLit
-			forcedFirstSpan = false
-		}
-		toolSpan = nil
-		_, calls := s.parseToolCalls(raw, params.Tools)
+	// emitCallRaw parses one call span and streams every recovered structured
+	// call. It returns non-call text (including an unterminated/malformed span)
+	// for the caller to expose as plain content instead of silently dropping it.
+	emitCallRaw := func(raw string) string {
+		content, calls := s.parseToolCalls(raw, params.Tools)
 		calls, clar := validateToolCalls(calls, params.Tools)
 		if clar != "" && pendingClar == "" {
 			pendingClar = clar
@@ -1610,6 +1615,19 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 				}}}}},
 			})
 			callIdx++
+		}
+		return strings.TrimSpace(s.stripMarkers(content))
+	}
+	// flushCall handles a normally closed span.
+	flushCall := func() {
+		raw := openLit + s.tokenizer.DecodeRaw(toolSpan) + closeLit
+		if forcedFirstSpan {
+			raw = params.ParsePrefix + s.tokenizer.DecodeRaw(toolSpan) + closeLit
+			forcedFirstSpan = false
+		}
+		toolSpan = nil
+		if plain := emitCallRaw(raw); plain != "" {
+			emitContentDelta(plain)
 		}
 	}
 
@@ -1634,12 +1652,11 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 				}
 				return
 			}
+			toolSpan = append(toolSpan, t) // include the cap-triggering token in fallback
 			if toolToks > maxToolToks {
-				log.Printf("fucina: WARNING: unterminated tool call exceeded %d buffered tokens — cutting generation (runaway inside a tool-call span)", maxToolToks)
+				log.Printf("fucina: WARNING: unterminated tool call exceeded %d buffered tokens — cutting generation", maxToolToks)
 				selfStop("length")
-				return
 			}
-			toolSpan = append(toolSpan, t)
 			return
 		}
 
@@ -1720,11 +1737,36 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 	if callIdx > 0 && finish != "cancelled" {
 		finish = "tool_calls"
 	}
+	if inTool {
+		// Parse once more WITHOUT inventing a closing </tool_call>. The Qwen
+		// parser safely recovers a complete </function>, otherwise returns the
+		// buffered fragment as plain content. This keeps streaming and collected
+		// responses byte-equivalent at EOS/length boundaries.
+		raw := openLit + s.tokenizer.DecodeRaw(toolSpan)
+		if forcedFirstSpan {
+			raw = params.ParsePrefix + s.tokenizer.DecodeRaw(toolSpan)
+			forcedFirstSpan = false
+		}
+		before := callIdx
+		if s.dialect.Name() == "qwen" {
+			if plain := emitCallRaw(raw); plain != "" {
+				emitContentDelta(plain)
+			}
+		} else if plain := strings.TrimSpace(s.stripMarkers(raw)); plain != "" {
+			// Gemma's permissive legacy parser can recover partial dictionaries;
+			// never feed it an open span. Preserve its bytes as content instead.
+			emitContentDelta(plain)
+		}
+		if callIdx == before {
+			log.Printf("fucina: WARNING: generation ended inside an unterminated tool call (%d tokens buffered, finish=%s) — emitted buffered text fallback", toolToks, finish)
+		}
+	}
 	if callIdx == 0 && pendingClar != "" {
 		emitContentDelta(pendingClar) // every call was schema-invalid
 	}
-	if inTool && callIdx == 0 {
-		log.Printf("fucina: WARNING: generation ended inside an unterminated tool call (%d tokens buffered, finish=%s) — no tool_calls emitted", toolToks, finish)
+	if params.ToolRequired && callIdx == 0 && finish != "cancelled" {
+		// Never report a clean stop for a tool_choice contract violation.
+		finish = "length"
 	}
 	s.finishStream(sse, finish, 0, generated)
 }
@@ -1791,7 +1833,10 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 	reasoning, rest := s.splitReasoning(raw, params.Thinking)
 	msg.ReasoningContent = reasoning
 	if wantTools {
-		if finish == "length" || finish == "cancelled" {
+		// Qwen's parser safely recovers only complete XML/JSON calls and returns
+		// partial spans as content. Keep Gemma's historical truncation guard: its
+		// permissive legacy dictionary parser is intentionally unchanged.
+		if s.dialect.Name() != "qwen" && (finish == "length" || finish == "cancelled") {
 			o, c := s.dialect.ToolCallLits()
 			if i := strings.LastIndex(rest, o); i > strings.LastIndex(rest, c) {
 				rest = rest[:i]
@@ -1811,6 +1856,8 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 			if finish != "cancelled" {
 				finish = "tool_calls"
 			}
+		} else if params.ToolRequired && finish != "cancelled" {
+			finish = "length" // visible tool_choice contract failure, never a clean stop
 		}
 	} else {
 		msg.Content = strings.TrimSpace(s.stripMarkers(rest))
@@ -2291,10 +2338,10 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 	reasoning, rest := s.splitReasoning(params.ParsePrefix+s.tokenizer.DecodeRaw(toks), params.Thinking)
 	msg.ReasoningContent = reasoning
 	if wantTools {
-		if finish == "length" || finish == "cancelled" {
-			// Truncated turn: never dispatch a trailing UNTERMINATED call whose
-			// arguments were cut at an arbitrary token (mirror of the streaming
-			// path's guard); complete earlier calls still parse.
+		// Qwen's parser safely recovers only complete XML/JSON calls and returns
+		// partial spans as content. Keep Gemma's historical truncation guard: its
+		// permissive legacy dictionary parser is intentionally unchanged.
+		if s.dialect.Name() != "qwen" && (finish == "length" || finish == "cancelled") {
 			o, c := s.dialect.ToolCallLits()
 			if i := strings.LastIndex(rest, o); i > strings.LastIndex(rest, c) {
 				rest = rest[:i]
@@ -2319,6 +2366,8 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			if finish != "cancelled" {
 				finish = "tool_calls"
 			}
+		} else if params.ToolRequired && finish != "cancelled" {
+			finish = "length" // visible tool_choice contract failure, never a clean stop
 		}
 	} else {
 		// rest still carries control markers as literal strings (DecodeRaw); strip
@@ -2412,11 +2461,9 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	completedCalls := 0   // tool calls fully captured this turn (multi-call support)
 	toolToks := 0         // tokens buffered inside the CURRENT tool-call span
 
-	// Bounds for the tool-call buffer. The Req3 incident: a repetition loop
-	// INSIDE an unterminated tool call silently swallowed ~7950 of 8192 tokens —
-	// no wire output, no warning, a dead turn. The cap turns that failure mode
-	// into a visible, bounded one (the cycle detector in runSpec usually fires
-	// first; this is the backstop for non-cyclic runaways).
+	// Preserve the established safety backstops. Unlike the old behavior, the
+	// finalization path emits an unterminated buffer as content, so no bytes are
+	// silently lost when either bound fires.
 	const maxToolToks = 2048
 	const maxToolCalls = 8
 
@@ -2454,11 +2501,10 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 		// and buffer until the call closes — calls are emitted as structured
 		// tool_calls deltas after the loop. A closed call does NOT stop the turn:
 		// the model may emit further calls (multi/parallel tool calls); the turn
-		// ends at end-of-turn, on the first prose after a call, or at the caps.
+		// ends at end-of-turn or on the first prose after a call. The independent
+		// safety cap bounds malformed runaways; finalization exposes the entire
+		// captured fragment instead of turning that cutoff into an empty response.
 		if wantTools && tcOpen >= 0 && token == tcOpen && !inTool {
-			// !inTool: a re-emitted open marker inside an unterminated span must
-			// NOT reset the counter — that would defeat the maxToolToks backstop
-			// for exactly the runaway it exists to bound.
 			inTool = true
 			toolToks = 0
 		}
@@ -2470,7 +2516,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 				return completedCalls >= maxToolCalls
 			}
 			if toolToks > maxToolToks {
-				log.Printf("fucina: WARNING: unterminated tool call exceeded %d buffered tokens — cutting generation (runaway inside a tool-call span)", maxToolToks)
+				log.Printf("fucina: WARNING: unterminated tool call exceeded %d buffered tokens — cutting generation", maxToolToks)
 				finish = "length"
 				return true
 			}
@@ -2589,21 +2635,22 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	// Emit any captured tool call(s) as a structured delta before the final chunk.
 	if wantTools {
 		raw := params.ParsePrefix + s.tokenizer.DecodeRaw(rawToks)
-		if inTool && (finish == "length" || finish == "cancelled") {
-			// The turn was TRUNCATED inside an unterminated call: its arguments
-			// are arbitrarily-cut text (often the repetition cycle itself). The
-			// lenient recovery in parseToolCalls must not dispatch it — drop the
-			// trailing unterminated span; complete earlier calls still go out.
+		parseRaw := raw
+		if inTool && s.dialect.Name() != "qwen" {
+			// Preserve Gemma's existing no-partial-dispatch gate. Its parser is
+			// deliberately permissive for historical complete calls.
 			openLit, _ := s.dialect.ToolCallLits()
-			if i := strings.LastIndex(raw, openLit); i >= 0 {
-				raw = raw[:i]
+			if i := strings.LastIndex(parseRaw, openLit); i >= 0 {
+				parseRaw = parseRaw[:i]
 			}
 		}
-		if _, calls := s.parseToolCalls(raw, params.Tools); len(calls) > 0 {
+		emittedCall := false
+		if _, calls := s.parseToolCalls(parseRaw, params.Tools); len(calls) > 0 {
 			// Drop calls that violate their required-parameter schema; if every
 			// call is dropped, stream a clarification instead of a malformed call.
 			calls, clar := validateToolCalls(calls, params.Tools)
 			if len(calls) > 0 {
+				emittedCall = true
 				deltas := make([]DeltaToolCall, len(calls))
 				for i, c := range calls {
 					deltas[i] = DeltaToolCall{Index: i, ID: c.ID, Type: c.Type, Function: c.Function}
@@ -2622,10 +2669,24 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 				})
 			}
 		} else if inTool {
-			// The stream ended inside an unterminated tool-call span and nothing
-			// parseable was recovered: ~toolToks tokens of model output are being
-			// dropped. Without this line the turn dies silently (the Req3 mode).
-			log.Printf("fucina: WARNING: generation ended inside an unterminated tool call (%d tokens buffered, finish=%s) — no tool_calls emitted", toolToks, finish)
+			// Preserve only the trailing buffered span: any prose before its open
+			// marker was already streamed token-by-token and must not be duplicated.
+			fallbackRaw := raw
+			openLit, _ := s.dialect.ToolCallLits()
+			if i := strings.LastIndex(fallbackRaw, openLit); i >= 0 {
+				fallbackRaw = fallbackRaw[i:]
+			}
+			content := fallbackRaw
+			if s.dialect.Name() == "qwen" {
+				content, _ = s.parseToolCalls(fallbackRaw, params.Tools)
+			}
+			if plain := strings.TrimSpace(s.stripMarkers(content)); plain != "" {
+				emitContent(plain)
+			}
+			log.Printf("fucina: WARNING: generation ended inside an unterminated tool call (%d tokens buffered, finish=%s) — emitted buffered text fallback", toolToks, finish)
+		}
+		if params.ToolRequired && !emittedCall && finish != "cancelled" {
+			finish = "length"
 		}
 	}
 

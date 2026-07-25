@@ -757,9 +757,10 @@ curl http://localhost:8080/v1/chat/completions -d '{
 ```
 
 The response carries standard `choices[0].message.tool_calls[].function.{name,arguments}` and
-`finish_reason: "tool_calls"` regardless of dialect — for Qwen, the server parses the model's raw
-Qwen3-Coder XML output (`<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`)
-back into that same shape. Force a specific tool with
+`finish_reason: "tool_calls"` regardless of dialect. For Qwen, the server auto-detects Qwen3.6's
+XML-shaped output (`<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`)
+or the legacy Qwen3/3.5 JSON body inside `<tool_call>` and maps either to that same shape. Force a
+specific tool with
 `"tool_choice": {"type":"function","function":{"name":"get_weather"}}`.
 
 Reasoning/thinking works the same for both dialects: `"reasoning_effort": "low"|"medium"|"high"` or

@@ -114,10 +114,11 @@ convention this repo's own test fixtures and golden-generation scripts use, e.g.
 
 The dialect (`internal/chat`: `Gemma` vs `Qwen`) is chosen automatically from the loaded vocab —
 `<|im_start|>` present selects `Qwen`, no flag involved. The HTTP wire format is OpenAI-shaped for
-both: `tools`/`tool_choice` in the request, `tool_calls` in the response. Internally, Qwen tool
-calls are emitted by the model as Qwen3-Coder's XML form
-(`<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`) and parsed
-back into the standard `tool_calls` JSON shape — callers never see the XML.
+both: `tools`/`tool_choice` in the request, `tool_calls` in the response. Internally, the server
+auto-detects Qwen3.6's XML-shaped form
+(`<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`) and the legacy
+Qwen3/3.5 JSON body inside `<tool_call>`, then maps either to standard `tool_calls` — callers never
+need to select a parser dialect.
 
 One dialect-specific detail worth knowing if you inspect multi-turn message history: when a
 historical assistant turn is re-rendered into a new prompt, the Qwen dialect always injects an
