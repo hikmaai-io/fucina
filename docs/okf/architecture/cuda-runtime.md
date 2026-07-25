@@ -5,8 +5,8 @@ description: The GB10-specific model loading, quantization, execution, state, an
 tags: [cuda, kernels, quantization, graphs, state]
 status: draft
 stale_after: 2026-08-25
-generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T10:33:01+02:00 }
-snapshot_commit: 39a96dbd4856f394821021efa10ef31848ad2581
+generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T17:28:46+02:00 }
+snapshot_commit: 480f1b85722754d0e692321082890b6103fe56d8
 sources:
   - id: runtime
     resource: ../../../cuda/gemma4_kernels.cu
@@ -35,6 +35,7 @@ sources:
 * Grouped MoE routing and expert GEMM, including bounded SSD-backed expert slots.
 * Position-independent CUDA graphs for major decode paths, with eager fallbacks.
 * Per-slot snapshot, rollback, and state-cache primitives used by warm turns, sessions, and speculative experiments.
+* Experimental Qwen3.5 layer-range forwarding with host-fp32 frontiers, per-worker recurrent/KV state, and optional final norm/head for Phase E.
 
 # Structural risk
 

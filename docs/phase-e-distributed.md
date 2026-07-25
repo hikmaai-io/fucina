@@ -102,8 +102,8 @@ are recorded on the target topology:
   `11751 13 198 760 6511 314 9338 369` (8/8).
 - **Local TCP orchestration (passed 2026-07-25, not a multi-node gate):** two
   processes on one GB10, ranges `0:16` and `16:32`, full FP8 checkpoint loaded
-  by both, `FCNDIST1` over loopback. The five-token prompt prefetched at 15.5
-  tok/s and generated ` Paris.` at 30.8 tok/s. This proves CLI/TCP/cgo wiring,
+  by both, `FCNDIST1` over loopback. The five-token prompt prefilled at 21.7
+  tok/s and generated ` Paris.` at 31.9 tok/s. This proves CLI/TCP/cgo wiring,
   not distributed hardware, capacity, or speedup.
 - **Single-node regression:** `make gpu-gates` and the normal Go/cgo tests; no
   existing generated-token or state byte may change.

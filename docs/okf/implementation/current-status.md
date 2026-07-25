@@ -1,15 +1,15 @@
 ---
 type: Implementation Status
-title: Fucina implementation status at 39a96db
+title: Fucina implementation status at 480f1b8
 description: Dated repository and validation assessment for the current main branch.
 tags: [status, tests, git, maturity]
 status: draft
 stale_after: 2026-08-01
-generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T10:33:01+02:00 }
-snapshot_commit: 39a96dbd4856f394821021efa10ef31848ad2581
+generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T17:28:46+02:00 }
+snapshot_commit: 480f1b85722754d0e692321082890b6103fe56d8
 sources:
   - id: git
-    resource: https://github.com/hikmaai-io/fucina/commit/39a96dbd4856f394821021efa10ef31848ad2581
+    resource: https://github.com/hikmaai-io/fucina/commit/480f1b85722754d0e692321082890b6103fe56d8
     title: Inspected commit
   - id: makefile
     resource: ../../../Makefile
@@ -24,8 +24,7 @@ sources:
 
 # Repository state
 
-* The documented baseline is `main`/`origin/main` at `39a96db`.
-* The `feat/qwen-http-session` worktree adds Qwen HTTP slot persistence, its tests, and this previously prepared OKF bundle without discarding unrelated main-worktree content.
+* The implementation snapshot is local `main` at `480f1b8`, containing Qwen HTTP persistence and the integrated Phase-E CUDA/TCP boundary; `origin/main` remains at `39a96db`.
 * Build outputs and benchmark databases present in the worktree are ignored by Git as intended.
 
 # Validation executed on 2026-07-25
@@ -35,7 +34,9 @@ sources:
 | `go test ./internal/server/... ./internal/session/...` | **PASS** | HTTP, scheduler/batch, and session format |
 | `go test -race -count=1 ./internal/server/... ./internal/session/...` | **PASS** | Includes `internal/server/batch` |
 | `go vet ./internal/server/... ./internal/session/...` | **PASS** | Changed pure-Go packages |
-| Qwen HTTP restart GPU gate | **Pending** | `make qwen35-http-session-restart-test` |
+| Qwen HTTP restart GPU gate | **PASS** | Restored 11 cached tokens; prefilled only 7 new tokens |
+| Phase-E split-layer CUDA gate | **PASS** | 8/8 byte-identical frontiers and 8/8 FP8 oracle tokens on Qwen3.5-9B |
+| Phase-E separate-process TCP loopback | **PASS** | `[0,16)` coordinator plus `[16,32)` final worker generated ` Paris.` on one GB10 |
 | Broader GPU gates | **Not rerun** | Historical checked-in evidence only |
 
 # Race-gate finding resolved

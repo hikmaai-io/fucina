@@ -5,8 +5,8 @@ description: Recommended next work ordered by correctness, product coverage, and
 tags: [roadmap, quality, serving, distributed]
 status: draft
 stale_after: 2026-08-25
-generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T10:33:01+02:00 }
-snapshot_commit: 39a96dbd4856f394821021efa10ef31848ad2581
+generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T17:28:46+02:00 }
+snapshot_commit: 480f1b85722754d0e692321082890b6103fe56d8
 sources:
   - id: gaps
     resource: implementation/known-gaps.md
@@ -30,7 +30,7 @@ sources:
 4. **Close mandatory-batching feature gaps.** Add constrained `response_format`/`json_schema` support to batching, or provide a correctness-preserving constrained route for Qwen3.5/3.6.
 5. **Finish E4B per-sequence sampling.** Its batch adapter currently ignores request sampling parameters and remains greedy.
 6. **Continue tensor-management refactoring.** Finish canonical tensor metadata, transactional ownership, and typed scratch without changing hot-path arithmetic.
-7. **Decide whether Phase E is a product objective.** If yes, implement a real CUDA partial-forward shard runner, model-range loading, CLI orchestration, and two-node parity/performance gates before adding RDMA.
+7. **Productize Phase E.** Add range-filtered weight residency, true two-host parity/performance gates, then batched prefill and RDMA; the CUDA partial-forward runner and TCP CLI are now integrated.
 
 # Performance policy
 

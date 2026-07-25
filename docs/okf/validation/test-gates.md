@@ -5,8 +5,8 @@ description: Layered validation from pure-Go tests through real-model GB10 parit
 tags: [testing, ci, cuda, race, parity]
 status: draft
 stale_after: 2026-08-01
-generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T10:33:01+02:00 }
-snapshot_commit: 39a96dbd4856f394821021efa10ef31848ad2581
+generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T17:28:46+02:00 }
+snapshot_commit: 480f1b85722754d0e692321082890b6103fe56d8
 sources:
   - id: makefile
     resource: ../../../Makefile
@@ -27,13 +27,15 @@ sources:
 | Targeted race gate | `go test -race -count=1 ./internal/server/... ./internal/session/...` | CPU | Passed, including batch scheduler |
 | Host CUDA-adjacent tests | `make paged-kv-test`, detector/plan/allocation tests | C++ compiler; no model for some targets | Defined, not rerun in this inspection |
 | Build/smoke | `make all`, `make smoke` | CUDA 13 + GB10 + checkpoint | Not rerun |
-| Qwen HTTP persistence | `make qwen35-http-session-restart-test` | GB10 + official Qwen3.5-9B-FP8 | Pending current-worktree run |
+| Qwen HTTP persistence | `make qwen35-http-session-restart-test` | GB10 + official Qwen3.5-9B-FP8 | **PASS**: restart restored 11 cached tokens and prefilled only 7 new tokens |
+| Phase-E layer frontier | `make qwen35-shard-test` | GB10 + official Qwen3.5-9B-FP8 | PASS: 8/8 byte-identical frontier steps, 8/8 oracle tokens |
+| Phase-E TCP loopback | Separate coordinator/worker processes, ranges `0:16`/`16:32` | One shared GB10 | **PASS**: generated ` Paris.`; 21.7 tok/s prefill, 31.9 tok/s decode; not a two-host speed gate |
 | Qwen real-model correctness | `make gpu-gates` and specialized `qwen35-*` targets | GB10 + downloaded dense/MoE checkpoints | Historical pass evidence; not rerun |
 | Performance protection | `scripts/protection_gate.py`, benchmark protocol | Quiescent GB10 and comparison runtime | Historical evidence; not rerun |
 
 # Required interpretation
 
-A normal unit pass does not replace the race detector, and historical benchmark logs do not prove the current worktree was rebuilt from source. The prior test-fixture race is fixed and the targeted race command is green; Qwen HTTP persistence still requires the real-model restart target because CPU mocks cannot validate the CUDA slot-state ABI.
+A normal unit pass does not replace the race detector, and historical benchmark logs do not prove the current worktree was rebuilt from source. The prior test-fixture race is fixed and the targeted race command is green. Both the Phase-E CUDA layer frontier and Qwen HTTP process-restart path are validated on the official Qwen3.5 checkpoint.
 
 # CI discrepancy
 

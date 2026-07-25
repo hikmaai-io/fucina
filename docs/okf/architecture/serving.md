@@ -5,8 +5,8 @@ description: OpenAI-compatible HTTP routing, continuous batching, state reuse, a
 tags: [server, scheduler, batching, paged-kv, sessions]
 status: draft
 stale_after: 2026-08-25
-generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T10:33:01+02:00 }
-snapshot_commit: 39a96dbd4856f394821021efa10ef31848ad2581
+generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T17:28:46+02:00 }
+snapshot_commit: 480f1b85722754d0e692321082890b6103fe56d8
 sources:
   - id: server
     resource: ../../../internal/server/server.go

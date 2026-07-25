@@ -5,8 +5,8 @@ description: Prioritized correctness, coverage, feature, architecture, and docum
 tags: [risks, gaps, technical-debt, documentation]
 status: draft
 stale_after: 2026-08-01
-generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T10:33:01+02:00 }
-snapshot_commit: 39a96dbd4856f394821021efa10ef31848ad2581
+generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T17:28:46+02:00 }
+snapshot_commit: 480f1b85722754d0e692321082890b6103fe56d8
 sources:
   - id: ci
     resource: ../../../.github/workflows/ci.yml
@@ -31,7 +31,7 @@ sources:
 # P0 — quality gate
 
 1. **Local and hosted gates have drifted.** The Makefile race suite includes `internal/server/batch`; hosted CI's `PKGS` omits it. Hosted CI also omits pure-Go `internal/grammar`, `internal/session`, and `internal/dist`, even though these carry structured-output, persistence, and protocol logic.[^ci]
-2. **GPU evidence is not continuous CI.** Correctness depends on a GB10 and large local checkpoints. The Qwen HTTP restart target exists, but its current-worktree result must be recorded before merge; no automated public runner validates CUDA changes.
+2. **GPU evidence is not continuous CI.** Correctness depends on a GB10 and large local checkpoints. The Qwen HTTP restart and Phase-E frontier targets pass locally, but no automated public runner validates CUDA changes.
 
 [^ci]: Hosted CI workflow
 
@@ -47,7 +47,7 @@ sources:
 * Tensor metadata, alternate weight representations, ownership, and scratch remain partly implicit in a monolithic CUDA runtime; the canonical-plan migration is still in progress.[^tensor]
 * Phase B has a complete policy pipeline but no accepted sub-4-bit kernel or default policy that improves on the incumbent.
 * Phase C SSD expert streaming is a memory fallback with synchronous misses and advisory prefetch, not a default throughput path.
-* Phase E lacks the real CUDA shard runner, partial-forward ABI, range loading, orchestration, and multi-node evidence.[^dist]
+* Phase E now has a real CUDA shard runner, partial-forward ABI, CLI orchestration, and a same-engine split-layer parity gate. It still loads the full checkpoint on every process and lacks true two-host parity/throughput evidence, batched prefill, and RDMA.[^dist]
 
 [^tensor]: Tensor management refactor
 [^dist]: Distributed inference status
