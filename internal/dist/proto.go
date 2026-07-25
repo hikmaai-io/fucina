@@ -27,7 +27,7 @@ const (
 	// Magic identifies a fucina distributed-inference connection.
 	Magic = "FCNDIST1"
 	// Version is the current protocol version; Handshake rejects any other.
-	Version = 1
+	Version = 2
 
 	maxHelloBytes   = 1 << 16 // JSON handshake cap
 	maxPayloadBytes = 1 << 30 // 1 GiB ≫ any activation frame (hidden×tokens×4)
@@ -44,6 +44,10 @@ const (
 	// MsgPing/MsgPong are liveness probes.
 	MsgPing uint32 = 4
 	MsgPong uint32 = 5
+	// MsgAck confirms completion of a state-changing control message. SeqReset
+	// is not complete until its Ack arrives; this prevents sequence-id reuse
+	// racing stale KV/recurrent state on a worker.
+	MsgAck uint32 = 6
 )
 
 // Activation dtypes on the wire.
@@ -63,6 +67,7 @@ type Hello struct {
 	LayerHi    int    `json:"layer_hi"`
 	Hidden     int    `json:"hidden"` // residual width
 	DType      uint32 `json:"dtype"`  // activation dtype on the wire
+	Final      bool   `json:"final"`  // this range returns logits, not a residual
 }
 
 // ActivationHeader prefixes a MsgActivation / MsgLogits payload.
@@ -84,6 +89,9 @@ func fnv64(b []byte) uint64 {
 
 // WriteHello sends the magic and this end's Hello.
 func WriteHello(w io.Writer, h Hello) error {
+	if err := ValidateHello(h); err != nil {
+		return err
+	}
 	j, err := json.Marshal(h)
 	if err != nil {
 		return fmt.Errorf("dist: marshal hello: %w", err)
@@ -95,8 +103,7 @@ func WriteHello(w io.Writer, h Hello) error {
 	buf = append(buf, Magic...)
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(j)))
 	buf = append(buf, j...)
-	_, err = w.Write(buf)
-	return err
+	return writeFull(w, buf)
 }
 
 // ReadHello reads and validates the peer's magic + Hello.
@@ -123,16 +130,72 @@ func ReadHello(r io.Reader) (Hello, error) {
 	if err := json.Unmarshal(j, &h); err != nil {
 		return h, fmt.Errorf("dist: parse hello: %w", err)
 	}
-	if h.Version != Version {
-		return h, fmt.Errorf("dist: peer protocol version %d, want %d", h.Version, Version)
+	if err := ValidateHello(h); err != nil {
+		return h, err
 	}
 	return h, nil
+}
+
+// ValidateHello rejects nonsensical topology before an engine or connection is
+// allowed to enter the serving loop.
+func ValidateHello(h Hello) error {
+	if h.Version != Version {
+		return fmt.Errorf("dist: peer protocol version %d, want %d", h.Version, Version)
+	}
+	if h.ConfigHash == 0 {
+		return fmt.Errorf("dist: zero model config hash")
+	}
+	if h.LayerLo < 0 || h.LayerHi <= h.LayerLo {
+		return fmt.Errorf("dist: invalid layer range [%d,%d)", h.LayerLo, h.LayerHi)
+	}
+	if h.Hidden <= 0 {
+		return fmt.Errorf("dist: invalid hidden size %d", h.Hidden)
+	}
+	if h.DType != DTypeF32 && h.DType != DTypeBF16 {
+		return fmt.Errorf("dist: unsupported activation dtype %d", h.DType)
+	}
+	return nil
+}
+
+func dtypeBytes(dtype uint32) (uint64, error) {
+	switch dtype {
+	case DTypeF32:
+		return 4, nil
+	case DTypeBF16:
+		return 2, nil
+	default:
+		return 0, fmt.Errorf("dist: unsupported activation dtype %d", dtype)
+	}
+}
+
+// ValidateActivation checks identity and exact tensor geometry. Multiplication
+// is performed in uint64 so hostile token counts cannot overflow int.
+func ValidateActivation(h ActivationHeader, data []byte, hidden int, dtype uint32) error {
+	if h.NTokens == 0 {
+		return fmt.Errorf("dist: activation has zero tokens")
+	}
+	if h.DType != dtype {
+		return fmt.Errorf("dist: activation dtype %d, want %d", h.DType, dtype)
+	}
+	width, err := dtypeBytes(dtype)
+	if err != nil {
+		return err
+	}
+	want := uint64(h.NTokens) * uint64(hidden) * width
+	if want > maxPayloadBytes-actHeaderBytes || uint64(len(data)) != want {
+		return fmt.Errorf("dist: activation data length %d, want %d (%d tokens x hidden %d)",
+			len(data), want, h.NTokens, hidden)
+	}
+	return nil
 }
 
 // CheckPeer validates that a peer's Hello is compatible with ours for one
 // pipeline hop: same model, same hidden width, same dtype, and the peer's
 // layer range must begin where ours ends (contiguous pipeline).
 func CheckPeer(mine, peer Hello) error {
+	if mine.Final {
+		return fmt.Errorf("dist: final range [%d,%d) cannot have a downstream peer", mine.LayerLo, mine.LayerHi)
+	}
 	if peer.ConfigHash != mine.ConfigHash {
 		return fmt.Errorf("dist: peer model config hash %016x != ours %016x", peer.ConfigHash, mine.ConfigHash)
 	}
@@ -157,18 +220,17 @@ func WriteMsg(w io.Writer, typ uint32, payload []byte) error {
 	hdr := make([]byte, 8)
 	binary.LittleEndian.PutUint32(hdr[0:], typ)
 	binary.LittleEndian.PutUint32(hdr[4:], uint32(len(payload)))
-	if _, err := w.Write(hdr); err != nil {
+	if err := writeFull(w, hdr); err != nil {
 		return err
 	}
 	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
+		if err := writeFull(w, payload); err != nil {
 			return err
 		}
 	}
 	var sum [8]byte
 	binary.LittleEndian.PutUint64(sum[:], fnv64(payload))
-	_, err := w.Write(sum[:])
-	return err
+	return writeFull(w, sum[:])
 }
 
 // ReadMsg reads one framed message, verifying length bounds and checksum.
@@ -213,6 +275,20 @@ func EncodeActivation(h ActivationHeader, data []byte) ([]byte, error) {
 // DecodeActivation unpacks a MsgActivation/MsgLogits payload. The returned
 // data slice aliases payload (no copy) — callers must not retain it past the
 // payload's lifetime.
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if err != nil {
+			return err
+		}
+		if n <= 0 || n > len(p) {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
+}
+
 func DecodeActivation(payload []byte) (ActivationHeader, []byte, error) {
 	var h ActivationHeader
 	if len(payload) < actHeaderBytes {

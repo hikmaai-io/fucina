@@ -112,10 +112,10 @@ func (a *e4bServer) GenerateSpecContinue(history []int32, firstLogits []float32,
 	return a.GenerateSpecStream(history, firstLogits, maxNew, stops, draftK, temp, topK, topP, minP, repeatPenalty, seed, nil)
 }
 
-func (a *e4bServer) NTokens() int                                 { return a.eng.NPast() }
-func (a *e4bServer) Reset()                                       { a.eng.Reset() }
-func (a *e4bServer) Rewind(nKeep int) bool                        { return a.eng.Rewind(nKeep) }
-func (a *e4bServer) ContextSize() uint32                          { return a.eng.ContextSize() }
+func (a *e4bServer) NTokens() int                                         { return a.eng.NPast() }
+func (a *e4bServer) Reset()                                               { a.eng.Reset() }
+func (a *e4bServer) Rewind(nKeep int) bool                                { return a.eng.Rewind(nKeep) }
+func (a *e4bServer) ContextSize() uint32                                  { return a.eng.ContextSize() }
 func (a *e4bServer) SpecStats() (steps, drafted, accepted, emitted int64) { return a.eng.SpecStats() }
 
 func isStopToken(t int32, stops []int32) bool {

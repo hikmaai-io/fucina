@@ -68,6 +68,12 @@ type CLIArgs struct {
 	FlashAttn      string
 	ThreadsHTTP    int // alias of MaxConcurrent (llama --threads-http)
 
+	// Phase-E distributed inference (experimental, explicit opt-in).
+	DistListen  string // worker TCP listen address
+	DistWorkers string // coordinator's comma-separated worker addresses
+	DistLayers  string // this process's strict layer range, "lo:hi"
+	DistFinal   bool   // worker applies output norm + LM head
+
 	// System
 	System          string
 	Verbose         bool
@@ -200,6 +206,11 @@ func parseArgs(fs *flag.FlagSet, argv []string) (CLIArgs, testFlags, error) {
 	fs.BoolVar(&a.NoContBatching, "no-cont-batching", false, "Server: disable continuous batching / paged-KV multi-seq (single-flight; Gemma only — Qwen3 requires the batch path)")
 	fs.StringVar(&a.FlashAttn, "flash-attn", "", "Accepted for llama compatibility; fucina always uses flash/FP8 attention (no-op)")
 	fs.IntVar(&a.ThreadsHTTP, "threads-http", 0, "Server: max concurrent HTTP inference requests (alias of --max-concurrent)")
+	fs.StringVar(&a.DistListen, "dist-listen", "", "Phase-E worker TCP listen address (for example 0.0.0.0:9091)")
+	fs.StringVar(&a.DistListen, "worker-listen", "", "Alias of --dist-listen")
+	fs.StringVar(&a.DistWorkers, "dist-workers", "", "Phase-E coordinator worker addresses, comma-separated in layer order")
+	fs.StringVar(&a.DistLayers, "dist-layers", "", "Phase-E local layer range lo:hi")
+	fs.BoolVar(&a.DistFinal, "dist-final", false, "Phase-E worker is the final shard and returns logits")
 
 	fs.StringVar(&a.System, "s", "", "System prompt")
 	fs.StringVar(&a.System, "system", "", "System prompt")

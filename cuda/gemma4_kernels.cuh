@@ -317,8 +317,11 @@ void gemma4_engine_abort_prefill(gemma4_engine_t *eng);
 void gemma4_engine_print_info(const gemma4_engine_t *eng);
 void gemma4_engine_print_timing(const gemma4_engine_t *eng);
 int  gemma4_engine_get_n_layers(const gemma4_engine_t *eng);
+int  gemma4_engine_get_hidden_size(const gemma4_engine_t *eng);
+int  gemma4_engine_get_vocab_size(const gemma4_engine_t *eng);
 int  gemma4_engine_get_context_size(const gemma4_engine_t *eng);
 int  gemma4_engine_is_qwen3_family(const gemma4_engine_t *eng);  // 1 for Qwen3 / Qwen3-MoE
+int  gemma4_engine_supports_q35_shards(const gemma4_engine_t *eng); // 1 for Qwen3.5 hybrid only
 int  gemma4_engine_n_experts(const gemma4_engine_t *eng);        // >0 for sparse/MoE (spec gate)
 
 // Calibration-only sparse-MoE routing profiler. start allocates and zeros an
@@ -478,6 +481,20 @@ int  gemma4_engine_step_batch_fused(gemma4_engine_t *eng,
                                     int32_t *out_dec, int *out_dec_lens, int32_t *pf_first_out);
 void gemma4_engine_seq_remove(gemma4_engine_t *eng, int slot);
 int  gemma4_engine_seq_capacity(gemma4_engine_t *eng);
+
+// Phase-E Qwen3.5 layer-shard boundary. These intentionally expose only the
+// exact, token-sequential path first: ntokens must be 1. `embed` maps one token
+// to the fp32 residual stream. `forward_layers` advances the state owned by
+// [layer_lo,layer_hi) at exactly `pos`; input/output are host fp32. Set
+// final_head only when layer_hi==n_layers, in which case output is vocab logits
+// rather than a hidden row. A slot is obtained with seq_open and released with
+// seq_remove. Returns 0 or a negative validation/CUDA error; unsupported model
+// families return -2. The ordinary whole-model entry points do not call these.
+int gemma4_engine_q35_embed(gemma4_engine_t *eng, int32_t token, float *hidden_out);
+int gemma4_engine_q35_forward_layers(gemma4_engine_t *eng, int slot, int pos,
+                                     int ntokens, int layer_lo, int layer_hi,
+                                     const float *hidden_in, float *output,
+                                     int final_head);
 // Cross-request prefix cache (RadixAttention). set: enable/disable (effective only
 // on the full-attention single-pool geometry, n_layers_sliding==0; no-op for Gemma).
 // stats: observability counters (all zero when disabled).

@@ -15127,6 +15127,14 @@ int gemma4_engine_get_n_layers(const gemma4_engine_t *eng) {
     return eng ? eng->cfg.n_layers : 0;
 }
 
+int gemma4_engine_get_hidden_size(const gemma4_engine_t *eng) {
+    return eng ? eng->cfg.hidden_size : 0;
+}
+
+int gemma4_engine_get_vocab_size(const gemma4_engine_t *eng) {
+    return eng ? eng->cfg.vocab_size : 0;
+}
+
 // Detected expert count (0 = dense). The Go scheduler uses this to gate speculative
 // decoding OFF for sparse models: a K-token verify re-reads each drafted token's OWN
 // top-k experts (the dominant weight bytes do NOT amortize across draft rows, unlike a
@@ -15199,6 +15207,10 @@ int gemma4_engine_moe_profile_activation_snapshot(gemma4_engine_t *eng,
 // Detected architecture family. The Qwen3/Qwen3-MoE forward is served ONLY through
 // the paged multiseq + continuous-batching path (single-flight prefill declines),
 // so the Go server uses this to auto-enable the batch scheduler for those models.
+int gemma4_engine_supports_q35_shards(const gemma4_engine_t *eng) {
+    return (eng && eng->loaded && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) ? 1 : 0;
+}
+
 int gemma4_engine_is_qwen3_family(const gemma4_engine_t *eng) {
     // qwen35 is part of the Qwen3 family for SERVING-CONTROL purposes (the Go server uses
     // this to auto-enable continuous batching and to reject the single-flight path): it is
@@ -15665,6 +15677,72 @@ void gemma4_engine_abort_prefill(gemma4_engine_t *eng) {
 #include "qwen35_jspace.cuh"
 #include "qwen35_runtime.cuh"
 #include "qwen35_backend.cuh"
+
+// ─── Phase-E exact layer-range boundary ──────────────────────────────────────────────
+// Start with the token-sequential path because it has the strongest existing
+// Qwen3.5 parity oracle. A later distributed-prefill optimization may batch
+// prompt rows only after it has a cross-device frontier/state identity gate.
+extern "C" int gemma4_engine_q35_embed(gemma4_engine_t *eng, int32_t token,
+                                        float *hidden_out) {
+    if (!eng || !eng->loaded || !hidden_out) return -1;
+    if (eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -2;
+    if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
+    const int H = eng->cfg.hidden_size;
+    float *x = workspace_data<float>(eng->q35.decode_workspace[Q35_X]);
+    int32_t *d_tok = (int32_t *)eng->d_sb[0];
+    cudaMemcpyAsync(d_tok, &token, sizeof(token), cudaMemcpyHostToDevice, eng->stream);
+    embed_w(eng, x, eng->d_token_embd, d_tok, 1, H, eng->stream);
+    cudaMemcpyAsync(hidden_out, x, (size_t)H * sizeof(float),
+                    cudaMemcpyDeviceToHost, eng->stream);
+    cudaError_t e = cudaStreamSynchronize(eng->stream);
+    return (e == cudaSuccess && cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+extern "C" int gemma4_engine_q35_forward_layers(
+    gemma4_engine_t *eng, int slot, int pos, int ntokens,
+    int layer_lo, int layer_hi, const float *hidden_in, float *output,
+    int final_head) {
+    if (!eng || !eng->loaded || !hidden_in || !output) return -1;
+    if (eng->cfg.arch != GEMMA4_ARCH_QWEN3_5) return -2;
+    // Deliberately reject pseudo-batched prompt rows: the GDN recurrence and
+    // causal FULL attention require ordered state updates. Repeating this API
+    // with ntokens=1 is exact; silently treating N rows as independent is not.
+    if (ntokens != 1) return -3;
+    if (layer_lo < 0 || layer_hi <= layer_lo || layer_hi > eng->cfg.n_layers) return -4;
+    if (final_head && layer_hi != eng->cfg.n_layers) return -4;
+    if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
+    if (slot < 0 || slot >= eng->q35.capacity) return -5;
+    gemma4_seq *s = &eng->slots[slot];
+    // Position lifecycle is enforced by the Go ShardRunner/FCNDIST1 worker.
+    // Do not use s->n_tokens here: a hardware parity gate deliberately chains
+    // multiple disjoint ranges of the SAME frame through one engine/slot.
+    if (!s->used || pos < 0 || pos >= eng->q35.maxctx) return -5;
+    if (q35_slot_kv_reserve(eng, slot, pos + 1) != 0) return -1;
+
+    const int H = eng->cfg.hidden_size;
+    cudaStream_t st = eng->stream;
+    float *x = workspace_data<float>(eng->q35.decode_workspace[Q35_X]);
+    int h_slot = slot, h_pos = pos;
+    cudaMemcpyAsync(x, hidden_in, (size_t)H * sizeof(float), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(eng->d_ms_pos, &h_pos, sizeof(int), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(workspace_data<int>(eng->q35.routing_workspace), &h_slot,
+                    sizeof(int), cudaMemcpyHostToDevice, st);
+
+    qwen35_decode_layer_range_body(eng, 1, /*want_argmax=*/0, /*splice=*/0, st,
+                                    layer_lo, layer_hi, x, nullptr, final_head != 0);
+    const float *d_out = final_head ? eng->d_sb[11] : x;
+    const size_t nout = (size_t)(final_head ? eng->cfg.vocab_size : H);
+    cudaMemcpyAsync(output, d_out, nout * sizeof(float), cudaMemcpyDeviceToHost, st);
+    cudaError_t e = cudaStreamSynchronize(st);
+    if (e != cudaSuccess || cudaGetLastError() != cudaSuccess) return -1;
+
+    // State is now committed at `pos`; the caller advances its sequence cursor
+    // only after this return. A failed frame therefore cannot advance protocol
+    // lifecycle past its coordinator.
+    s->q35_state_is_clean = 0;
+    s->q35_conv_is_empty = 0;
+    return 0;
+}
 
 // ─── P0 (S1a) GDN rollback ABI ───────────────────────────────────────────────────────
 // Thin extern "C" wrappers around the q35_gdn_* statics, so the DFlash verify path (and the P0

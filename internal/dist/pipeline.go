@@ -8,6 +8,8 @@
 package dist
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -38,11 +40,23 @@ type Worker struct {
 
 // Serve handles one connection until EOF or error. EOF is a clean shutdown.
 func (w *Worker) Serve(conn io.ReadWriter) error {
+	if w == nil || w.Runner == nil {
+		return fmt.Errorf("dist: worker has no shard runner")
+	}
+	if w.Final != w.Hello.Final {
+		return fmt.Errorf("dist: worker final=%v disagrees with hello final=%v", w.Final, w.Hello.Final)
+	}
+	if err := ValidateHello(w.Hello); err != nil {
+		return fmt.Errorf("dist: worker hello: %w", err)
+	}
 	peer, err := ReadHello(conn)
 	if err != nil {
 		return err
 	}
 	// The upstream's range must end where ours begins, on the same model.
+	if peer.Final {
+		return fmt.Errorf("dist: worker: upstream range [%d,%d) is already final", peer.LayerLo, peer.LayerHi)
+	}
 	if peer.ConfigHash != w.Hello.ConfigHash {
 		return fmt.Errorf("dist: worker: peer config hash %016x != ours %016x", peer.ConfigHash, w.Hello.ConfigHash)
 	}
@@ -57,6 +71,14 @@ func (w *Worker) Serve(conn io.ReadWriter) error {
 	if err := WriteHello(conn, w.Hello); err != nil {
 		return err
 	}
+	// Sequence lifecycle is connection-scoped. A reconnect cannot inherit stale
+	// worker state: every still-live sequence is reset when this connection ends.
+	next := make(map[uint32]uint32)
+	defer func() {
+		for seq := range next {
+			_ = w.Runner.Reset(seq)
+		}
+	}()
 	for {
 		typ, payload, err := ReadMsg(conn)
 		if err != nil {
@@ -71,9 +93,30 @@ func (w *Worker) Serve(conn io.ReadWriter) error {
 			if err != nil {
 				return err
 			}
+			if err := ValidateActivation(h, data, w.Hello.Hidden, w.Hello.DType); err != nil {
+				return err
+			}
+			if h.NTokens > ^uint32(0)-h.Pos {
+				return fmt.Errorf("dist: worker sequence %d position overflow", h.SeqID)
+			}
+			want, exists := next[h.SeqID]
+			if !exists {
+				want = 0
+			}
+			if h.Pos != want {
+				return fmt.Errorf("dist: worker sequence %d position %d, want %d", h.SeqID, h.Pos, want)
+			}
 			out, err := w.Runner.Forward(h.SeqID, h.Pos, int(h.NTokens), data)
 			if err != nil {
 				return fmt.Errorf("dist: worker forward: %w", err)
+			}
+			next[h.SeqID] = h.Pos + h.NTokens
+			if !w.Final {
+				if err := ValidateActivation(h, out, w.Hello.Hidden, w.Hello.DType); err != nil {
+					return fmt.Errorf("dist: worker output: %w", err)
+				}
+			} else if len(out) == 0 || len(out)%4 != 0 {
+				return fmt.Errorf("dist: worker logits byte length %d is invalid", len(out))
 			}
 			reply, err := EncodeActivation(h, out)
 			if err != nil {
@@ -93,6 +136,10 @@ func (w *Worker) Serve(conn io.ReadWriter) error {
 			}
 			if err := w.Runner.Reset(h.SeqID); err != nil {
 				return fmt.Errorf("dist: worker reset: %w", err)
+			}
+			delete(next, h.SeqID)
+			if err := WriteMsg(conn, MsgAck, nil); err != nil {
+				return err
 			}
 		case MsgPing:
 			if err := WriteMsg(conn, MsgPong, nil); err != nil {
@@ -129,6 +176,8 @@ func errUnwrapIs(err, target error) bool {
 type Hop struct {
 	mu   sync.Mutex
 	conn io.ReadWriter
+	mine Hello
+	peer Hello
 }
 
 // Dial connects to a worker over conn: sends our Hello, validates the
@@ -144,7 +193,7 @@ func DialHop(conn io.ReadWriter, mine Hello) (*Hop, error) {
 	if err := CheckPeer(mine, peer); err != nil {
 		return nil, err
 	}
-	return &Hop{conn: conn}, nil
+	return &Hop{conn: conn, mine: mine, peer: peer}, nil
 }
 
 // Forward sends one activation frame and waits for the shard's reply.
@@ -166,14 +215,28 @@ func (h *Hop) Forward(hdr ActivationHeader, data []byte) ([]byte, bool, error) {
 	if typ != MsgActivation && typ != MsgLogits {
 		return nil, false, fmt.Errorf("dist: hop: unexpected reply type %d", typ)
 	}
-	_, out, err := DecodeActivation(reply)
+	if gotFinal := typ == MsgLogits; gotFinal != h.peer.Final {
+		return nil, false, fmt.Errorf("dist: hop: reply final=%v, handshake promised %v", gotFinal, h.peer.Final)
+	}
+	rh, out, err := DecodeActivation(reply)
 	if err != nil {
 		return nil, false, err
+	}
+	if rh != hdr {
+		return nil, false, fmt.Errorf("dist: hop: reply identity %+v != request %+v", rh, hdr)
+	}
+	final := typ == MsgLogits
+	if !final {
+		if err := ValidateActivation(rh, out, h.peer.Hidden, h.peer.DType); err != nil {
+			return nil, false, err
+		}
+	} else if len(out) == 0 || len(out)%4 != 0 {
+		return nil, false, fmt.Errorf("dist: hop: invalid logits byte length %d", len(out))
 	}
 	// Copy out of the frame buffer so callers may retain the result.
 	cp := make([]byte, len(out))
 	copy(cp, out)
-	return cp, typ == MsgLogits, nil
+	return cp, final, nil
 }
 
 // Reset tells the shard to drop a sequence's state.
@@ -184,7 +247,47 @@ func (h *Hop) Reset(seq uint32) error {
 	if err != nil {
 		return err
 	}
-	return WriteMsg(h.conn, MsgSeqReset, payload)
+	if err := WriteMsg(h.conn, MsgSeqReset, payload); err != nil {
+		return err
+	}
+	typ, body, err := ReadMsg(h.conn)
+	if err != nil {
+		return err
+	}
+	if typ != MsgAck || len(body) != 0 {
+		return fmt.Errorf("dist: hop: reset reply type=%d bytes=%d, want empty ack", typ, len(body))
+	}
+	return nil
+}
+
+// Ping performs a synchronous liveness round-trip.
+func (h *Hop) Ping() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := WriteMsg(h.conn, MsgPing, nil); err != nil {
+		return err
+	}
+	typ, body, err := ReadMsg(h.conn)
+	if err != nil {
+		return err
+	}
+	if typ != MsgPong || len(body) != 0 {
+		return fmt.Errorf("dist: hop: ping reply type=%d bytes=%d", typ, len(body))
+	}
+	return nil
+}
+
+// Peer returns the immutable worker handshake.
+func (h *Hop) Peer() Hello { return h.peer }
+
+// Close closes the transport when it supports io.Closer.
+func (h *Hop) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if c, ok := h.conn.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 // Pipeline chains hops in layer order. The coordinator runs its own local
@@ -206,9 +309,13 @@ func (p *Pipeline) Forward(seq, pos uint32, ntokens int, act []byte) ([]byte, er
 		}
 	}
 	for i, hop := range p.Hops {
-		out, _, err := hop.Forward(ActivationHeader{SeqID: seq, Pos: pos, NTokens: uint32(ntokens), DType: DTypeF32}, cur)
+		out, final, err := hop.Forward(ActivationHeader{SeqID: seq, Pos: pos, NTokens: uint32(ntokens), DType: hop.mine.DType}, cur)
 		if err != nil {
 			return nil, fmt.Errorf("dist: hop %d: %w", i, err)
+		}
+		last := i == len(p.Hops)-1
+		if final != last {
+			return nil, fmt.Errorf("dist: hop %d final=%v, want %v", i, final, last)
 		}
 		cur = out
 	}
@@ -217,38 +324,72 @@ func (p *Pipeline) Forward(seq, pos uint32, ntokens int, act []byte) ([]byte, er
 
 // Reset fans a sequence reset out to the local shard and every hop.
 func (p *Pipeline) Reset(seq uint32) error {
+	var errs []error
 	if p.Local != nil {
 		if err := p.Local.Reset(seq); err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("dist: local reset: %w", err))
 		}
 	}
+	// Reset every hop even when an earlier one failed: retaining state on the
+	// remaining workers would make sequence-id reuse unsafe.
 	for i, hop := range p.Hops {
 		if err := hop.Reset(seq); err != nil {
-			return fmt.Errorf("dist: hop %d reset: %w", i, err)
+			errs = append(errs, fmt.Errorf("dist: hop %d reset: %w", i, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ListenAndServe runs a worker on a TCP listener, one connection at a time
 // (a shard serves exactly one coordinator).
 func ListenAndServe(addr string, w *Worker) error {
+	return ListenAndServeContext(context.Background(), addr, w)
+}
+
+// ListenAndServeContext runs a single-coordinator worker until cancellation.
+func ListenAndServeContext(ctx context.Context, addr string, w *Worker) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return ctx.Err()
+			}
 			return err
 		}
 		if tc, ok := conn.(*net.TCPConn); ok {
-			tc.SetNoDelay(true) // decode is latency-bound: never Nagle a token
+			_ = tc.SetNoDelay(true) // decode is latency-bound: never Nagle a token
+			_ = tc.SetKeepAlive(true)
 		}
 		if err := w.Serve(conn); err != nil {
 			log.Printf("dist: worker connection ended: %v", err)
 		}
-		conn.Close()
+		_ = conn.Close()
 	}
+}
+
+// DialTCP establishes a persistent low-latency hop and performs the handshake.
+func DialTCP(ctx context.Context, addr string, mine Hello) (*Hop, error) {
+	d := net.Dialer{KeepAlive: 30 * 1e9}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	hop, err := DialHop(conn, mine)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return hop, nil
 }

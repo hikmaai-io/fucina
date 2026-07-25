@@ -74,6 +74,14 @@ Server options:
                              serving. Auto-forced ON for every Qwen3/3.5/3.6
                              checkpoint (no single-flight path exists for Qwen).
 
+Experimental Phase-E options (Qwen3.5, one-shot token-sequential only):
+  --dist-listen ADDR         Run a headless worker on ADDR.
+  --dist-workers A,B         Coordinator worker addresses in contiguous layer order.
+  --dist-layers LO:HI        Strict layer range owned by this process.
+  --dist-final               Worker owns the final range and returns logits.
+                             Not yet range-filtered residency or HTTP serving; see
+                             docs/phase-e-distributed.md for exact hardware gates.
+
 Other options:
   --cuda-device N            CUDA device ID (default: 0)
   --gpu-mem-util F           Fraction of total GPU memory the engine may use

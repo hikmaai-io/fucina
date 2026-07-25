@@ -662,6 +662,20 @@ record.
 
 ---
 
+## 🔗 Experimental Phase-E layer sharding
+
+Qwen3.5 has an exact fp32 residual-stream boundary for layer ranges and a persistent
+`FCNDIST1` TCP coordinator/worker path. The current CLI supports **one-shot,
+token-sequential** inference only; it rejects multi-token frames rather than violating GDN
+recurrence order. See [`docs/phase-e-distributed.md`](docs/phase-e-distributed.md) for commands,
+protocol/lifecycle guarantees, and the hardware gates.
+
+This is **not yet a multi-node capacity claim**: every process still loads the full checkpoint,
+the HTTP scheduler is not distributed, and physical two-GB10 correctness/performance gates have
+not run. Range-filtered weight residency is the blocker for models that cannot fit one node.
+
+---
+
 ## 🎯 Speculative decoding
 
 Speculative decoding is **on by default** (`--spec`). Each step *drafts* candidate tokens cheaply,
@@ -832,6 +846,10 @@ The next request must render a strict extension of the saved token history. See
 | `--draft-k` | `6` | Max speculative draft length per step |
 | `--paged-kv` | `false` | Allocate the paged multi-sequence KV pools; auto-forced on for any Qwen3 checkpoint |
 | `--batch` | `false` | Continuous batching over the paged engine (implies `--paged-kv`); auto-forced on for any Qwen3 checkpoint, opt-in for Gemma-4 |
+| `--dist-listen` | (none) | Experimental Phase-E headless worker listen address; requires `--dist-layers` |
+| `--dist-workers` | (none) | Experimental one-shot coordinator: comma-separated worker addresses in layer order |
+| `--dist-layers` | (none) | This process's strict `lo:hi` Qwen3.5 layer range |
+| `--dist-final` | `false` | Mark a worker as the final range; applies output norm/head and returns logits |
 | `--gpu-mem-util` | `0.90` | Fraction of total GPU memory the engine may use; caps `--ctx`/paged-pool sizing to fit |
 | `--host` | `127.0.0.1` | Server listen address |
 | `--port` | `8080` | Server port |

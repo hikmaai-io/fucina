@@ -118,6 +118,15 @@ func main() {
 	runtime.LockOSThread() // CUDA requires thread affinity
 
 	args := parseFlags()
+	if args.DistListen != "" && args.DistWorkers != "" {
+		log.Fatal("fucina: --dist-listen and --dist-workers are mutually exclusive")
+	}
+	if (args.DistListen != "" || args.DistWorkers != "") && args.DistLayers == "" {
+		log.Fatal("fucina: distributed mode requires --dist-layers lo:hi")
+	}
+	if args.DistFinal && args.DistListen == "" {
+		log.Fatal("fucina: --dist-final is valid only with --dist-listen")
+	}
 	if args.JSpace {
 		if args.JLENSPath == "" {
 			log.Fatal("fucina: --jspace requires --j-lens <lens.fjls> (convert with scripts/convert_jlens.py)")
@@ -172,7 +181,7 @@ func main() {
 	// Paged multi-sequence KV pools are gated inside the C engine on the FUCINA_PAGED_KV
 	// env var, read at engine init. Promote the --paged-kv/--batch flags to that env var
 	// BEFORE NewEngine so the flag and the legacy env path converge on one code path.
-	if args.PagedKV && os.Getenv("FUCINA_PAGED_KV") == "" {
+	if (args.PagedKV || args.DistListen != "" || args.DistWorkers != "") && os.Getenv("FUCINA_PAGED_KV") == "" {
 		os.Setenv("FUCINA_PAGED_KV", "1")
 	}
 	// --timings includes the opt-in, synchronizing Qwen MoE prefill phase breakdown. The
@@ -217,6 +226,13 @@ func main() {
 	}
 	defer eng.Close()
 
+	// A worker is headless: it owns only its layer-state execution boundary and
+	// never loads a tokenizer or starts the HTTP server.
+	if args.DistListen != "" {
+		runDistributedWorker(eng, args)
+		return
+	}
+
 	if args.JSpace {
 		if err := eng.LoadJSpace(args.JLENSPath, args.JSpaceTopK); err != nil {
 			log.Fatalf("fucina: J-space initialization failed: %v", err)
@@ -254,6 +270,11 @@ func main() {
 
 	if args.Verbose {
 		log.Printf("fucina: tokenizer loaded (%d tokens)", tok.NumTokens())
+	}
+
+	if args.DistWorkers != "" {
+		runDistributedOneShot(eng, tok, args)
+		return
 	}
 
 	// Determine mode: server, interactive REPL, or one-shot

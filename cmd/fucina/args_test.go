@@ -202,6 +202,29 @@ func TestParseArgsBatchImpliesPagedKV(t *testing.T) {
 	}
 }
 
+func TestParseArgsDistributed(t *testing.T) {
+	a, _ := mustParse(t, []string{"--dist-listen", "0.0.0.0:9091", "--dist-layers", "20:40", "--dist-final"})
+	if a.DistListen != "0.0.0.0:9091" || a.DistLayers != "20:40" || !a.DistFinal {
+		t.Fatalf("worker flags not parsed: %+v", a)
+	}
+	a, _ = mustParse(t, []string{"--dist-workers", "node1:9091,node2:9091", "--dist-layers", "0:20"})
+	if a.DistWorkers != "node1:9091,node2:9091" || a.DistLayers != "0:20" || a.DistFinal {
+		t.Fatalf("coordinator flags not parsed: %+v", a)
+	}
+}
+
+func TestParseLayerRange(t *testing.T) {
+	lo, hi, err := parseLayerRange(" 0:20 ")
+	if err != nil || lo != 0 || hi != 20 {
+		t.Fatalf("parse range = [%d,%d), %v", lo, hi, err)
+	}
+	for _, in := range []string{"", "1", "2:2", "-1:2", "x:2", "1:2:3"} {
+		if _, _, err := parseLayerRange(in); err == nil {
+			t.Errorf("parseLayerRange(%q) unexpectedly succeeded", in)
+		}
+	}
+}
+
 func TestParseThinkingLevel(t *testing.T) {
 	falseInputs := []string{"off", "none", "false"}
 	for _, in := range falseInputs {

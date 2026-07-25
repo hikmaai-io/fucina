@@ -30,7 +30,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
         e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test \
-        gpu-gates qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-meta-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test \
+        gpu-gates qwen35-state-test qwen35-shard-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-meta-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test \
         qwen35-http-session-restart-test \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
         qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen36-ssd-stream-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
@@ -122,8 +122,8 @@ test: fucina go-test go-test-cgo paged-kv-test
 # none was a prerequisite of `test`, so all could be silently forgotten. This
 # umbrella chains them so a regression in any cannot pass unnoticed. Requires
 # the Qwen3.5 FP8/NVFP4 checkpoints and a GPU; run each under the shared GPU flock.
-gpu-gates: qwen35-parity-test qwen35-batch-test qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test
-	@echo "gpu-gates: all Qwen3.5 dense+MoE parity/batch/state/chunk/multiseq-prefill/clean-GDN/MoE-engine gates passed"
+gpu-gates: qwen35-parity-test qwen35-batch-test qwen35-state-test qwen35-shard-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test
+	@echo "gpu-gates: all Qwen3.5 dense+MoE parity/batch/state/shard/chunk/multiseq-prefill/clean-GDN/MoE-engine gates passed"
 
 
 # ─── Paged-KV allocator unit test (host-only, no GPU) ───────────────────
@@ -239,6 +239,15 @@ qwen35-state-test: lib libdg
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_state \
 		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
 	flock -w 1200 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_state $(QWEN35_MODEL)"
+
+# Phase-E integrated layer-cut gate. Runs two independent slots through [0,L)
+# and [0,L/2)+[L/2,L), crossing the frontier through host fp32 bytes, and
+# requires every final-logit byte plus the 8-token greedy stream to match.
+qwen35-shard-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_shard.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_shard \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_shard $(QWEN35_FP8_MODEL)"
 
 # ─── S1a P0: lossless GDN snapshot/rewind/commit gate (GPU) ───
 # The DFlash (1+K) verification prerequisite. Asserts that for every accepted length j in 0..K,
@@ -522,7 +531,7 @@ profile: fucina
 # cuda/libfucina.a, so `go test`/`go vet` there fails to build/link unless the
 # CUDA archive has been compiled with nvcc on a GB10 box. The server,
 # tokenizer, sampler and chat packages are pure Go and run anywhere.
-GO_TEST_PKGS := ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+GO_TEST_PKGS := ./internal/dist/ ./internal/session/ ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 
 # cgo-dependent Go tests (cmd/fucina: CLI parsing tests). Requires
 # cuda/libfucina.a to link, hence the `lib` prerequisite.

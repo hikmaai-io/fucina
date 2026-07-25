@@ -351,12 +351,15 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
 // Kernel-launch-only B-row hybrid forward (all per-step inputs DEVICE-resident → graph-safe).
 // Advances each row's per-slot GDN state / conv ring / FULL-layer K/V; leaves B logit rows in
 // d_sb[11]; when want_argmax, appends the per-row greedy argmax into d_ms_outtok.
-static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_argmax,
-                                        int splice, cudaStream_t st) {
+static void qwen35_decode_layer_range_body(gemma4_engine_t *eng, int B, int want_argmax,
+                                            int splice, cudaStream_t st,
+                                            int layer_lo, int layer_hi,
+                                            const float *hidden_in, float *hidden_out,
+                                            int apply_head) {
     const gemma4_model_config_t *c = &eng->cfg;
     const int H=c->hidden_size, HD=M2_HEAD, NQ=c->n_heads, NKV=c->n_kv_global;
     const int INNER=c->ssm_inner_size, CONVD=(2*M2_KEYD+c->ssm_inner_size), NKH=M2_NKH, NVH=(c->ssm_inner_size/M2_SD), SD=M2_SD, TSR=c->ssm_time_step_rank, ROT=M2_ROT;
-    const int I = c->intermediate, VOC = c->vocab_size, L = c->n_layers;
+    const int I = c->intermediate, VOC = c->vocab_size;
     const int maxctx = eng->q35.maxctx;
     const float eps = 1e-6f;
     const size_t smGDN = ((size_t)SD * SD + 3 * SD) * sizeof(float);
@@ -387,9 +390,19 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
         qwen35_splice_inputs_kernel<<<grid1d((size_t)B),256,0,st>>>(
             d_tok, d_pos, eng->q35.d_slot_tok, eng->q35.d_slot_pos, d_slot, B);
 
-    embed_w(eng, x, eng->d_token_embd, d_tok, B, H, st);
+    // A full forward embeds token ids exactly as before. A distributed shard starts
+    // from the fp32 residual stream produced by the preceding shard; D2D copying
+    // preserves every bit at the layer cut. hidden_in may alias x (the C boundary
+    // stages host input there), in which case no copy is needed.
+    if (hidden_in) {
+        if (hidden_in != x)
+            cudaMemcpyAsync(x, hidden_in, (size_t)B * H * sizeof(float),
+                            cudaMemcpyDeviceToDevice, st);
+    } else {
+        embed_w(eng, x, eng->d_token_embd, d_tok, B, H, st);
+    }
 
-    for (int l = 0; l < L; l++) {
+    for (int l = layer_lo; l < layer_hi; l++) {
         const auto &T = eng->tensors.layers[l];
         rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(T.attn_norm), H, B, eps);
         moe_profile_activation(eng, l, 0, xn, (size_t)B*H, st);
@@ -459,6 +472,13 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
         q35_jspace_after_layer(eng, x, B, l, st);
     }
 
+    if (hidden_out) {
+        if (hidden_out != x)
+            cudaMemcpyAsync(hidden_out, x, (size_t)B * H * sizeof(float),
+                            cudaMemcpyDeviceToDevice, st);
+    }
+    if (!apply_head) return;
+
     rms_norm_rows_kernel<<<B,256,32*sizeof(float),st>>>(xn, x, Wf(eng->tensors.output_norm), H, B, eps);
     if (eng->format == FORMAT_FP8_BLOCK && want_argmax && B == 1 && eng->d_lmhead_q8) {
         // EXACT two-pass greedy head at B=1: Q8_0 approx scan (0.53 GB, half the BF16 read) →
@@ -495,6 +515,15 @@ static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_ar
     if (splice && want_argmax)
         qwen35_writeback_slot_state_kernel<<<grid1d((size_t)B),256,0,st>>>(
             eng->q35.d_slot_tok, eng->q35.d_slot_pos, eng->d_ms_outtok, d_slot, B);
+}
+
+// The production single-node path remains a whole-model specialization. Keeping
+// this wrapper means its call sites, graph capture, launch order, and arithmetic
+// are unchanged; only the distributed ABI below supplies strict sub-ranges.
+static void qwen35_decode_multiseq_body(gemma4_engine_t *eng, int B, int want_argmax,
+                                        int splice, cudaStream_t st) {
+    qwen35_decode_layer_range_body(eng, B, want_argmax, splice, st,
+                                   0, eng->cfg.n_layers, nullptr, nullptr, 1);
 }
 
 // ── S2b: keyed CUDA-graph cache ────────────────────────────────────────────────────────

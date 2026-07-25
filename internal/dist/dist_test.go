@@ -37,11 +37,7 @@ func TestHelloRejectsBadMagic(t *testing.T) {
 }
 
 func TestHelloRejectsWrongVersion(t *testing.T) {
-	var buf bytes.Buffer
-	if err := WriteHello(&buf, Hello{Version: 99}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ReadHello(&buf); err == nil || !strings.Contains(err.Error(), "version") {
+	if err := WriteHello(io.Discard, Hello{Version: 99, ConfigHash: 1, LayerHi: 1, Hidden: 1, DType: DTypeF32}); err == nil || !strings.Contains(err.Error(), "version") {
 		t.Fatalf("want version error, got %v", err)
 	}
 }
@@ -127,6 +123,48 @@ func TestDecodeActivationRejectsShortPayload(t *testing.T) {
 	}
 }
 
+func TestValidateActivationGeometry(t *testing.T) {
+	h := ActivationHeader{NTokens: 2, DType: DTypeF32}
+	if err := ValidateActivation(h, make([]byte, 2*3*4), 3, DTypeF32); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		h    ActivationHeader
+		data []byte
+	}{
+		{"zero tokens", ActivationHeader{DType: DTypeF32}, nil},
+		{"wrong dtype", ActivationHeader{NTokens: 1, DType: DTypeBF16}, make([]byte, 12)},
+		{"wrong bytes", ActivationHeader{NTokens: 2, DType: DTypeF32}, make([]byte, 23)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateActivation(tc.h, tc.data, 3, DTypeF32); err == nil {
+				t.Fatal("want geometry error")
+			}
+		})
+	}
+}
+
+type shortWriter struct{ bytes.Buffer }
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > 2 {
+		p = p[:2]
+	}
+	return w.Buffer.Write(p)
+}
+
+func TestWriteMsgHandlesShortWrites(t *testing.T) {
+	var w shortWriter
+	if err := WriteMsg(&w, MsgActivation, []byte("short-write-payload")); err != nil {
+		t.Fatal(err)
+	}
+	typ, payload, err := ReadMsg(&w.Buffer)
+	if err != nil || typ != MsgActivation || string(payload) != "short-write-payload" {
+		t.Fatalf("roundtrip type=%d payload=%q err=%v", typ, payload, err)
+	}
+}
+
 // --- handshake gating ---
 
 func TestCheckPeerGates(t *testing.T) {
@@ -196,6 +234,7 @@ func f32bytes(vals ...float32) []byte {
 func startWorker(t *testing.T, hello Hello, r ShardRunner, final, wantServeOK bool) io.ReadWriteCloser {
 	t.Helper()
 	c1, c2 := net.Pipe()
+	hello.Final = final
 	w := &Worker{Hello: hello, Runner: r, Final: final}
 	go func() {
 		err := w.Serve(c2)
@@ -238,11 +277,7 @@ func TestTwoShardPipeline(t *testing.T) {
 	if len(local.resets) != 1 || local.resets[0] != 1 {
 		t.Fatalf("local resets %v", local.resets)
 	}
-	// The worker handles the reset asynchronously to the write; force a sync
-	// point by pushing another forward through.
-	if _, err := p.Forward(2, 0, 1, f32bytes(1, 1)); err != nil {
-		t.Fatal(err)
-	}
+	// Reset is ACKed only after worker state has been dropped.
 	if len(wr.resets) != 1 || wr.resets[0] != 1 {
 		t.Fatalf("worker resets %v", wr.resets)
 	}
@@ -253,6 +288,18 @@ func TestDialHopRejectsWrongModel(t *testing.T) {
 	_, err := DialHop(conn, Hello{Version: Version, ConfigHash: 1, LayerLo: 0, LayerHi: 20, Hidden: 2, DType: DTypeF32})
 	if err == nil {
 		t.Fatal("want handshake rejection for wrong model")
+	}
+}
+
+func TestWorkerRejectsStalePosition(t *testing.T) {
+	const hash = 1
+	conn := startWorker(t, Hello{Version: Version, ConfigHash: hash, LayerLo: 1, LayerHi: 2, Hidden: 2, DType: DTypeF32}, &addRunner{}, true, false)
+	hop, err := DialHop(conn, Hello{Version: Version, ConfigHash: hash, LayerLo: 0, LayerHi: 1, Hidden: 2, DType: DTypeF32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := hop.Forward(ActivationHeader{SeqID: 9, Pos: 1, NTokens: 1, DType: DTypeF32}, f32bytes(1, 2)); err == nil {
+		t.Fatal("want stale-position rejection")
 	}
 }
 
