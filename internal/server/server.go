@@ -709,8 +709,8 @@ func (s *Server) SetModelName(name string) {
 // Per-request reasoning_effort / thinking / enable_thinking overrides it.
 func (s *Server) SetThinkingDefault(on bool) { s.thinkingDefault = on }
 
-// SetDebug enables verbose request logging: each chat request's full body and the
-// rendered gemma-4 prompt are appended to debugDumpPath (and the per-request
+// SetDebug enables verbose request logging: each chat request's full body, rendered
+// prompt, and exact engine token IDs are appended to debugDumpPath (and the per-request
 // summary is logged). Use to inspect exactly what a client like pi sends.
 func (s *Server) SetDebug(on bool) { s.debug = on }
 
@@ -1057,8 +1057,8 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 
 	// Per-request summary so the client's real footprint is visible (system-prompt
 	// size, tool count, thinking, streaming). FUCINA_DEBUG=1 also dumps the full
-	// request body + rendered prompt to /tmp for inspecting exactly what a client
-	// (e.g. pi) sends.
+	// request body, rendered prompt, and exact engine token IDs to /tmp for inspecting
+	// exactly what a client (e.g. pi) sends.
 	sysChars := 0
 	if len(req.Messages) > 0 && req.Messages[0].Role == "system" {
 		sysChars = len(req.Messages[0].Content)
@@ -1067,9 +1067,9 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		len(req.Messages), len(req.Tools), sysChars, len(tokens), enableThinking, req.Stream)
 	if s.debug || os.Getenv("FUCINA_DEBUG") == "1" {
 		dump := fmt.Sprintf("\n========== %s  %d msgs / %d tools / %d tok / thinking=%v / stream=%v ==========\n"+
-			"--- REQUEST BODY ---\n%s\n--- RENDERED PROMPT ---\n%s\n",
+			"--- REQUEST BODY ---\n%s\n--- RENDERED PROMPT ---\n%s\n--- TOKEN IDS (EXACT ENGINE INPUT) ---\n%v\n",
 			time.Now().Format("15:04:05"), len(req.Messages), len(req.Tools), len(tokens),
-			enableThinking, req.Stream, string(body), prompt)
+			enableThinking, req.Stream, string(body), prompt, tokens)
 		s.writeDebugDump(dump)
 	}
 

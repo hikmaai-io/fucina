@@ -84,6 +84,31 @@ Two real HTTP checks against that default on port 8084 produced:
 
 The 15-scenario `tool-eval-bench v2.0.4 --short` hardware quality check completed with **0/100 (0/15 passed)**; report: `runs/qwen36-35b-default-final/2026/07/2026-07-25T18-25-16.196987Z_0d1b6a6d.md`. This is a failed agentic-quality gate and is recorded rather than relabeled as success. The HTTP parser fix prevents dead/empty turns and safely parses valid XML or legacy JSON, but it cannot turn the malformed MoE token stream into valid calls. A complete 69-scenario claim is not made.
 
+## Shared-path audit
+
+The minimal failing chat request was compared directly with the official Qwen3.6 tokenizer, not inferred from decoded text. `AutoTokenizer.apply_chat_template(..., add_generation_prompt=True, enable_thinking=False)` and fucina render the same bytes:
+
+```text
+<|im_start|>user
+Write one short sentence about the sea.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+```
+
+Both produce the same 20 IDs:
+
+```text
+[248045, 846, 198, 7734, 799, 2716, 11316, 883, 279, 9117,
+ 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]
+```
+
+The HF tokenizer reports a base vocabulary of 248,044 plus 33 added tokens; the model deliberately pads its embedding/head space to 248,320. Every ID above is valid. Fucina uses each ID directly as the row index into the checkpoint's `[248320, hidden]` BF16 embedding table; there is no BOS insertion, ID remap, or off-by-one. `TestQwen36_SeaPromptHFParity` locks the rendered bytes and IDs. Debug request dumps now include `TOKEN IDS (EXACT ENGINE INPUT)` after the rendered prompt.
+
+The model config was also checked rather than interpreting the generic startup labels: the 40-layer MoE pattern is exactly 30 `linear_attention` layers and 10 `full_attention` layers at indices 3, 7, …, 39. The “30 sliding + 10 global” startup line is generic accounting terminology; Qwen's 30 entries dispatch through GDN and do not use sliding softmax attention. Qwen's 10 FULL layers use their own per-slot absolute-position fp16 K/V arrays, not the generic paged sliding/global pool. RoPE uses the runtime position with head_dim 256, partial rotary width 64, and theta 10,000,000. GDN decode derives the runtime MoE geometry (`NQ=16`, `NKV=2`, `NVH=32`, `INNER=4096`, `CONVD=8192`); the graph-on/off row gate exercises the same recurrent and FULL-KV state over 24 accumulating steps.
+
 ## MoE graph-router numerical corruption and resolution
 
 A follow-up GB10 investigation treated the failed batched self-test as a hard correctness gate rather than tolerating the narrow eight-token oracle. The historical result in `benchmark-evidence/results/2026-07-19-qwen35-burst-ttft2/qwen-gates.log` was reproduced before the fix:
