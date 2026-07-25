@@ -30,7 +30,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
         e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test \
-        gpu-gates qwen35-state-test qwen35-shard-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-meta-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test \
+        gpu-gates qwen35-state-test qwen35-shard-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-meta-test qwen35-clean-gdn-test qwen35-head-policy-test qwen35-head-rows-test qwen35-moe-fp8-engine-test \
         qwen35-http-session-restart-test \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
         qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen36-ssd-stream-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
@@ -58,7 +58,7 @@ cuda/gemma4_kernels.o: cuda/gemma4_kernels.cu cuda/gemma4_kernels.cuh cuda/gemma
                        cuda/tensor_types.h cuda/model_plan.h cuda/gemma4_detect.h cuda/paged_kv.h cuda/paged_kv_device.cuh \
                        cuda/paged_prefix.h cuda/safetensors.h cuda/nvfp4.h \
                        cuda/nvfp4_loader.h cuda/nvfp4_gemv.cuh cuda/fp8_block.cuh \
-                       cuda/qwen35_fp8_loader.h cuda/qwen35_state.cuh cuda/qwen35_kernels.cuh \
+                       cuda/qwen35_fp8_loader.h cuda/qwen35_state.cuh cuda/qwen35_head_policy.h cuda/qwen35_kernels.cuh \
                        cuda/qwen35_jspace.cuh cuda/qwen35_runtime.cuh cuda/qwen35_backend.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -dc -o $@ cuda/gemma4_kernels.cu
 
@@ -122,8 +122,8 @@ test: fucina go-test go-test-cgo paged-kv-test
 # none was a prerequisite of `test`, so all could be silently forgotten. This
 # umbrella chains them so a regression in any cannot pass unnoticed. Requires
 # the Qwen3.5 FP8/NVFP4 checkpoints and a GPU; run each under the shared GPU flock.
-gpu-gates: qwen35-parity-test qwen35-batch-test qwen35-state-test qwen35-shard-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test
-	@echo "gpu-gates: all Qwen3.5 dense+MoE parity/batch/state/shard/chunk/multiseq-prefill/clean-GDN/MoE-engine gates passed"
+gpu-gates: qwen35-parity-test qwen35-batch-test qwen35-state-test qwen35-shard-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-test qwen35-head-rows-test qwen35-moe-fp8-engine-test
+	@echo "gpu-gates: all Qwen3.5 dense+MoE parity/batch/state/shard/chunk/multiseq-prefill/clean-GDN/head/MoE-engine gates passed"
 
 
 # ─── Paged-KV allocator unit test (host-only, no GPU) ───────────────────
@@ -360,6 +360,17 @@ qwen35-clean-gdn-meta-test:
 	$(CXX) -O2 -std=c++17 -Icuda cuda/test_qwen35_clean_gdn_meta.cc -o /tmp/fucina_qwen35_clean_gdn_meta
 	/tmp/fucina_qwen35_clean_gdn_meta
 
+qwen35-head-policy-test:
+	$(CXX) -O2 -std=c++17 -Icuda cuda/test_qwen35_head_policy.cc -o /tmp/fucina_qwen35_head_policy
+	/tmp/fucina_qwen35_head_policy
+
+# Production-graph A/B: incumbent one-row and GB10 four-row Q8 scans must emit the same stream.
+qwen35-head-rows-test: qwen35-head-policy-test lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_head_rows.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_head_rows \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "/tmp/fucina_qwen35_head_rows $(QWEN35_MOE_FP8_MODEL)"
+
 qwen35-clean-gdn-test: qwen35-clean-gdn-meta-test lib libdg
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_clean_gdn.cu \
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_clean_gdn \
@@ -542,7 +553,7 @@ go-test-cgo: lib libdg
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	$(GO) test $(GO_TEST_CGO_PKGS) -count=1
 
-go-test: qwen35-clean-gdn-meta-test
+go-test: qwen35-clean-gdn-meta-test qwen35-head-policy-test
 	$(GO) test $(GO_TEST_PKGS) -count=1
 
 phase-b-test:
