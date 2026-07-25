@@ -37,8 +37,10 @@ sources:
 
 # P1 — user-visible feature gaps
 
-* `response_format` and `json_schema` return HTTP 501 under continuous batching; all supported Qwen3.5/3.6 serving uses that path.
-* E4B continuous batching is greedy and ignores per-request temperature/top-k/top-p/min-p/seed parameters.
+* `response_format` and `json_schema` return HTTP 501 under continuous batching; all supported Qwen3.5/3.6 serving uses that path. This loses five current tool-eval scenarios (TC-64/65/66/67/69).
+* TC-60 cross-turn sleeper injection remains a safety-critical model-level failure in the final Qwen3.6 MoE qualification.
+* Qwen base>0 continuation prefill uses the exact scalar attention path. The faster tensor-core candidate is quarantined after correct router replay exposed only 2/25 continuation agreement versus scalar/one-shot 25/25.
+* E4B continuous batching is greedy and ignores per-request temperature/top-k/top-p/min-p/seed parameters; its hardware batch parity gate also retains the historical 2/8 mismatch in one sequence. Its HF forward/generation gates require `/tmp/e4b_ref.bin` and `/tmp/e4b_gen_ref.bin`, but no pinned producer or artifacts are in the repository.
 * Gemma's MTP assistant is not implemented per slot in the continuous-batch path.
 * Embeddings remain a stub that returns an empty data list.
 

@@ -23,19 +23,25 @@ sources:
 
 | Layer | Representative command | Environment | Current inspection result |
 |---|---|---|---|
-| Go unit/integration | `go test ./internal/server/... ./internal/session/...` | CPU | Passed 2026-07-25 |
-| Targeted race gate | `go test -race -count=1 ./internal/server/... ./internal/session/...` | CPU | Passed, including batch scheduler |
-| Host CUDA-adjacent tests | `make paged-kv-test`, detector/plan/allocation tests | C++ compiler; no model for some targets | Defined, not rerun in this inspection |
-| Build/smoke | `make all`, `make smoke` | CUDA 13 + GB10 + checkpoint | Not rerun |
+| Go unit/integration | `go test ./... -count=1` | CPU + cgo link | **PASS** 2026-07-25 |
+| Targeted race gate | `make check` | CPU | **PASS**, including batch scheduler; local `golangci-lint` unavailable and explicitly skipped |
+| Host CUDA-adjacent tests | `make paged-kv-test`, metadata helpers | C++ compiler | PASS through `make test` |
+| Build/smoke | clean `make fucina`, `make test` | CUDA 13 + GB10 | PASS; note `--test-parser`/`--test-cuda` still print placeholder messages |
 | Qwen HTTP persistence | `make qwen35-http-session-restart-test` | GB10 + official Qwen3.5-9B-FP8 | **PASS**: restart restored 11 cached tokens and prefilled only 7 new tokens |
-| Phase-E layer frontier | `make qwen35-shard-test` | GB10 + official Qwen3.5-9B-FP8 | PASS: 8/8 byte-identical frontier steps, 8/8 oracle tokens |
-| Phase-E TCP loopback | Separate coordinator/worker processes, ranges `0:16`/`16:32` | One shared GB10 | **PASS**: generated ` Paris.`; 21.7 tok/s prefill, 31.9 tok/s decode; not a two-host speed gate |
-| Qwen real-model correctness | `make gpu-gates` and specialized `qwen35-*` targets | GB10 + downloaded dense/MoE checkpoints | Historical pass evidence; not rerun |
-| Performance protection | `scripts/protection_gate.py`, benchmark protocol | Quiescent GB10 and comparison runtime | Historical evidence; not rerun |
+| Phase-E layer frontier | `make qwen35-shard-test` | GB10 + official Qwen3.5-9B-FP8 | **PASS**: 8/8 byte-identical frontier steps, 8/8 oracle tokens |
+| Qwen real-model correctness | `make gpu-gates` | GB10 + dense/MoE checkpoints | **PASS** on final branch, including exact continuation 25/25 |
+| MoE engine + standalone oracle | `make qwen35-moe-fp8-engine-test qwen35-moe-fp8-test` | GB10 + official Qwen3.5-35B-A3B-FP8 | **PASS**: engine self-test PASS, both oracle paths 8/8 |
+| MoE graph replay | engine self-test, three ragged rows | GB10 | **PASS**: B=3 vs B=1 and graph-on vs graph-off are 24/24 for every row; self-chain PASS |
+| Gemma dense paged parity | `make paged-kv-device-test` | GB10 | **PASS**; global max error 0.000968, sliding exact |
+| Gemma legacy bench | `make bench MODEL=gemma-4-12b-it-qat-q4_0.gguf` | GB10 | **Known historical FAIL unchanged**: self-test marker checks fail, while plain-vs-batch output remains byte-identical |
+| E4B foundation/load/NVFP4 | targeted `e4b-*` gates | GB10 + E4B checkpoints | PASS except **known historical `e4b-batch-test` FAIL**, same 2/8 mismatch in sequence 2 |
+| E4B MTP | `e4b-mtp-load-test`, `e4b-spec-test`, `e4b-spec-stream-test` | GB10 + Q4_0 target/assistant | **PASS** after fixing Make target linkage; 160/160 byte-identical spec and stream |
+| E4B HF oracle artifacts | `e4b-fwd-test`, `e4b-gen-test` | GB10 + BF16 checkpoint + `/tmp` refs | **Unavailable**: repository has no producer/artifacts for `e4b_ref.bin` and `e4b_gen_ref.bin` |
+| Performance protection | 3×128-step Qwen3.6 MoE decode microbench | Quiescent GB10 under flock | B=1 **59.0 tok/s median**, above 46–53 tok/s baseline |
 
 # Required interpretation
 
-A normal unit pass does not replace the race detector, and historical benchmark logs do not prove the current worktree was rebuilt from source. The prior test-fixture race is fixed and the targeted race command is green. Both the Phase-E CUDA layer frontier and Qwen HTTP process-restart path are validated on the official Qwen3.5 checkpoint.
+A normal unit pass does not replace the race detector, and historical benchmark logs do not prove the current worktree was rebuilt from source. This inspection used a clean CUDA rebuild and reran both. The historical MoE line `qwen-gates.log:417` (`oracle 8/8, self-test FAIL`, with 6/24 row/graph agreement) is **resolved** on the final branch: all three rows are 24/24, graph-on/off is 24/24, self-chain passes, and both oracle gates are 8/8. The retained Gemma/E4B failures predate this Qwen fix and reproduced with the same signatures; they are known gaps, not newly green gates.
 
 # CI discrepancy
 

@@ -37,7 +37,11 @@ sources:
 | Qwen HTTP restart GPU gate | **PASS** | Restored 11 cached tokens; prefilled only 7 new tokens |
 | Phase-E split-layer CUDA gate | **PASS** | 8/8 byte-identical frontiers and 8/8 FP8 oracle tokens on Qwen3.5-9B |
 | Phase-E separate-process TCP loopback | **PASS** | `[0,16)` coordinator plus `[16,32)` final worker generated ` Paris.` on one GB10 |
-| Broader GPU gates | **Not rerun** | Historical checked-in evidence only |
+| Full Qwen GPU umbrella | **PASS** | Dense+MoE parity, state, shard, chunk, multiseq prefill, clean GDN, head, and MoE engine |
+| MoE graph self-test | **PASS** | Every ragged row B=3 vs B=1 and graph-on/off 24/24; self-chain PASS; engine + standalone oracle 8/8 |
+| Qwen3.6 MoE quality/performance | **80/100 router-only; 78/100 final** | 12/100 before; final decode median 59.0 tok/s, no loss versus 46–53 baseline |
+| Gemma regression set | **No new signature** | paged device PASS; legacy dense bench and E4B batch retain their documented historical failures |
+| Full Go and race gates | **PASS** | `go test ./... -count=1` and `make check`; local lint tool unavailable and skipped |
 
 # Race-gate finding resolved
 
@@ -47,4 +51,4 @@ The unlocked `mockEngine` counter reads in `TestBatchedAdmissionCancellation` no
 
 # Overall verdict
 
-Fucina is far beyond a prototype in core Qwen/Gemma inference and GB10 optimization, but it remains an experimental lab engine rather than a release-clean product. Core functionality and historical GPU gates are strong; cross-path feature completeness, test-gate hygiene, documentation consistency, and hardware-independent CI are the main readiness constraints.
+Fucina is far beyond a prototype in core Qwen/Gemma inference and GB10 optimization, but it remains an experimental lab engine rather than a release-clean product. The historical Qwen MoE self-test failure is now resolved on hardware and the router correctness fix retains decode performance. Release constraints remain: structured output is HTTP 501 for batched/Qwen serving, TC-60 fails, known Gemma/E4B gates remain red, local lint was unavailable, and GPU validation is not continuous CI.

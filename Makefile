@@ -292,9 +292,9 @@ qwen35-longctx-test: lib libdg
 # ─── Qwen3.5 chunked-prefill CONTINUATION (base>0) parity + timing gate (GPU) ───
 # One-shot seq_add vs seq_open + seq_prefill_chunk(1024, rest) on a 2400-token natural-text
 # prompt (first ids of qwen35_longctx_4k.ids), 24 greedy continuation tokens each — run with
-# BOTH the scalar continuation attention (g_fucina_q35_scalar_cont_attn=1) and the default
-# tensor-core one. Asserts the TC continuation tracks one-shot at least as well as the scalar
-# path (first token + 25-token agreement) and prints the continuation-chunk wall time of both.
+# BOTH the production scalar continuation attention (g_fucina_q35_scalar_cont_attn=1) and the
+# diagnostic tensor-core candidate. Requires the shipping scalar path to match one-shot 25/25;
+# prints the non-shipping TC candidate's agreement and continuation-chunk wall time separately.
 qwen35-chunk-parity-test: lib libdg
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_qwen35_chunk_parity.cu \
 		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_qwen35_chunk_parity \
@@ -755,22 +755,22 @@ e4b-batch-test:
 
 # E4B MTP increment 1: load the gemma4-assistant draft head + verify residency/dims (no
 # drafter forward yet). GGUF=<e4b base q4_0 gguf> MTP=<assistant gguf>. See docs/e4b-mtp-plan.md.
-e4b-mtp-load-test: lib
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_mtp_load.cu cuda/libfucina.a -o /tmp/e4b_mtp_load -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_mtp_load $(GGUF) $(MTP)
+e4b-mtp-load-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_mtp_load.cu cuda/libfucina.a cuda/libdg.a -o /tmp/e4b_mtp_load -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_mtp_load $(GGUF) $(MTP)
 
 # E4B MTP increments 3+4: greedy speculative decode via the draft head. DECISIVE GATE —
 # compares e4b_engine_generate_greedy (baseline) vs e4b_engine_generate_spec_greedy (assistant
 # loaded) for the same prompt and asserts BYTE-IDENTICAL token ids (greedy spec is lossless).
 # GGUF=<e4b base q4_0 gguf> MTP=<assistant gguf>. See docs/e4b-mtp-plan.md.
-e4b-spec-test: lib
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_spec.cu cuda/libfucina.a -o /tmp/e4b_spec -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_spec $(GGUF) $(MTP)
+e4b-spec-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_spec.cu cuda/libfucina.a cuda/libdg.a -o /tmp/e4b_spec -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_spec $(GGUF) $(MTP)
 
 # E4B MTP increment 5: the SERVER continue/streaming spec path. Prefills then drives
 # e4b_engine_spec_stream (continue from live KV, h0 re-derived from the last history token,
 # per-token emit callback) and asserts BYTE-IDENTICAL to plain greedy + that the callback saw
 # exactly the returned tokens in order. GGUF=<base> MTP=<assistant>. See docs/e4b-mtp-plan.md.
-e4b-spec-stream-test: lib
-	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_spec_stream.cu cuda/libfucina.a -o /tmp/e4b_spec_stream -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_spec_stream $(GGUF) $(MTP)
+e4b-spec-stream-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_e4b_spec_stream.cu cuda/libfucina.a cuda/libdg.a -o /tmp/e4b_spec_stream -lcudart -lcublas -lcublasLt -lcuda -lstdc++ -lm && /tmp/e4b_spec_stream $(GGUF) $(MTP)
 
 # E4B NVFP4 weight-path foundation: quantizer + tuned decode GEMV, validated vs the
 # host dequant oracle (kernel correctness) and full precision (FP4 SNR), with bandwidth.

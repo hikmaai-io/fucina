@@ -92,6 +92,14 @@ First public release as `github.com/hikmaai-io/fucina` (formerly the internal `g
   oracle, and name-mapping, plus GPU correctness for the decode/verify kernels.
 
 ### Fixed
+- **MoE graph-decode correctness**: decode-sized router logits are now computed by an explicit-
+  stream GEMV inside CUDA graph capture instead of a cuBLAS SGEMM accidentally issued on the
+  engine stream. Graph replay no longer reuses capture-time expert routes; Qwen3.5 MoE row and
+  graph parity improved from 6/24 to 24/24, and the self-chain gate now passes. The exact scalar
+  continuation-prefill attention is also the production default after correct routing exposed that
+  the approximate tensor-core candidate no longer met its 25-token parity gate.
+- **E4B assistant gate linkage**: the MTP load, lossless spec, and streaming-spec Make targets now
+  link `libdg.a`, matching the shared CUDA symbols already required by `libfucina.a`.
 - **Repeat-penalty silently disabled**: both the non-spec CLI loop and the one-shot
   path passed `pastTokens=nil` to the host sampler, making repeat-penalty a no-op.
   Now passes `kv.CurrentTokens()` so the penalty is applied.
