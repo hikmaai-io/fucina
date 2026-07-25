@@ -16,7 +16,7 @@ binary.
 [Features](#-features) · [Quick start](#-quick-start) · [Model support](#-models) ·
 [Performance](#-performance) · [Continuous batching](#-continuous-batching--paged-kv) ·
 [Speculative decoding](#-speculative-decoding) · [HTTP API](#-http-api) ·
-[DiffusionGemma](#-diffusiongemma)
+[DiffusionGemma](#-diffusiongemma) · [OKF knowledge bundle](docs/okf/)
 
 ![Platform](https://img.shields.io/badge/platform-DGX%20Spark%20GB10-76B900?logo=nvidia&logoColor=white)
 ![Arch](https://img.shields.io/badge/arch-sm__121a%20(Blackwell)-76B900)

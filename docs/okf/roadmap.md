@@ -1,0 +1,43 @@
+---
+type: Roadmap
+title: Evidence-ranked fucina roadmap
+description: Recommended next work ordered by correctness, product coverage, and implementation dependency.
+tags: [roadmap, quality, serving, distributed]
+status: draft
+stale_after: 2026-08-25
+generated: { by: openai-codex/gpt-5.6-sol, at: 2026-07-25T10:33:01+02:00 }
+snapshot_commit: 39a96dbd4856f394821021efa10ef31848ad2581
+sources:
+  - id: gaps
+    resource: implementation/known-gaps.md
+    title: Known implementation gaps
+  - id: mission
+    resource: ../sota-gb10-qwen3-mission-plan.md
+    title: Concluded Qwen3.5 GB10 mission
+  - id: tensor-plan
+    resource: ../tensor-management-refactor-plan.md
+    title: Tensor management refactor plan
+  - id: phase-e
+    resource: ../phase-e-distributed.md
+    title: Distributed inference plan
+---
+
+# Priority order
+
+1. **Restore a green correctness gate.** Fix the race in the batch scheduler test fixture, rerun `make check`, and make local/CI package lists identical. A red race gate takes precedence over performance work.
+2. **Reconcile public documentation with code.** Remove legacy Qwen3/Qwen3MoE support claims, mark superseded plans, and reconcile the `v0.1.0` tag with the changelog's “unreleased” heading.
+3. **Close mandatory-batching feature gaps.** Add constrained `response_format`/`json_schema` support to batching, or provide a correctness-preserving constrained route for Qwen3.5/3.6.
+4. **Finish E4B per-sequence sampling.** Its batch adapter currently ignores request sampling parameters and remains greedy.
+5. **Complete disk sessions for the Qwen server path.** Qwen state snapshots work in the paged REPL, but the HTTP session field is wired only to the single-flight cache.
+6. **Continue tensor-management refactoring.** Finish canonical tensor metadata, transactional ownership, and typed scratch without changing hot-path arithmetic.
+7. **Decide whether Phase E is a product objective.** If yes, implement a real CUDA partial-forward shard runner, model-range loading, CLI orchestration, and two-node parity/performance gates before adding RDMA.
+
+# Performance policy
+
+The single-node Qwen throughput mission is concluded with an explicit determinism trade-off.[^mission] New optimization work should begin only from fresh profiler evidence and must retain the byte-identity/protection gates unless introduced as an explicit, default-off mode.
+
+[^mission]: Concluded Qwen3.5 GB10 mission
+
+# Dependencies
+
+The detailed evidence behind these priorities is in [known gaps](implementation/known-gaps.md), [DS4 pillars](capabilities/ds4-pillars.md), and [test gates](validation/test-gates.md).
