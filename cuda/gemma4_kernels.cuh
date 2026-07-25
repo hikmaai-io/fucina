@@ -452,6 +452,8 @@ int  gemma4_engine_seq_add_multiseq(gemma4_engine_t *eng, const int32_t *tokens_
 // DEBUG (test-only): copy just-computed first-token logits (nrows==1: d_logits; nrows>1: d_sb[11]).
 int  gemma4_engine_debug_logits(gemma4_engine_t *eng, float *out, int nrows);
 int  gemma4_engine_debug_set_q35_clean_gdn(gemma4_engine_t *eng, int enabled);
+// DEBUG (test-only): force exact Q8 greedy-head rows/warp (1,2,4) and invalidate Qwen graphs.
+int  gemma4_engine_debug_set_q35_head_rows(gemma4_engine_t *eng, int rows);
 int  gemma4_engine_step_batch(gemma4_engine_t *eng, const int *slots,
                               const int32_t *in_tokens, int B, int32_t *out_tokens);
 // MTP speculative batched step: per-slot draft + one batched verify. out_tokens is

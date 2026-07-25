@@ -82,6 +82,14 @@ static int ensure_q35_scratch(gemma4_engine_t *eng) {
     const int H=c->hidden_size, HD=M2_HEAD, NQ=c->n_heads, NKV=c->n_kv_global, INNER=c->ssm_inner_size, CONVD=(2*M2_KEYD+c->ssm_inner_size);
     const int KEYD=M2_KEYD, VALD=c->ssm_inner_size, NVH=(c->ssm_inner_size/M2_SD), SD=M2_SD, TSR=c->ssm_time_step_rank, CK=M2_CK;
     const int I = c->intermediate;
+    // Exact greedy-head ILP policy is fixed before any decode graph capture. Optimized row counts
+    // remain opt-in until the GB10 A/B passes; `=1` is both the default and immediate rollback.
+    if (eng->q35.q8_head_rows == 0) {
+        const char *head_rows_env=getenv("FUCINA_QWEN35_Q8_HEAD_ROWS");
+        eng->q35.q8_head_rows=q35_q8_head_rows_policy(head_rows_env);
+        fprintf(stderr,"fucina: qwen35 exact Q8 LM-head rows/warp=%d (%s)\n",
+                eng->q35.q8_head_rows, head_rows_env ? "env" : "safe default");
+    }
     // baked geometry must match the M2/M3 #defines (the mixer kernels bake head/GDN dims);
     // H and NKV are runtime (9B: 4096/4, 35B-A3B MoE: 2048/2).
     if (c->head_dim != HD || c->n_heads != NQ ||
@@ -484,8 +492,8 @@ static void qwen35_decode_layer_range_body(gemma4_engine_t *eng, int B, int want
         // EXACT two-pass greedy head at B=1: Q8_0 approx scan (0.53 GB, half the BF16 read) →
         // collect candidates within Q8HEAD_MARGIN of the approx max → exact BF16 rescore of
         // ≤Q8HEAD_MAXCAND rows → argmax. Bit-identical tokens (oracle + self-test gated).
-        q8_head_gemv_kernel<<<(unsigned)((VOC + 7) / 8), 8 * 32, 0, st>>>(
-            eng->d_sb[11], eng->d_lmhead_q8, xn, H, VOC);
+        q8_head_gemv_launch(eng->d_sb[11], eng->d_lmhead_q8, xn, H, VOC,
+                            eng->q35.q8_head_rows, st);
         q8_head_candidates_kernel<<<1, 1024, 0, st>>>(eng->d_sb[11], VOC,
             eng->d_head_cand, eng->d_head_cnt);
         q8_head_rescore_argmax_kernel<<<1, 256, 0, st>>>(eng->d_lmhead_bf16, xn,

@@ -94,7 +94,15 @@ convention this repo's own test fixtures and golden-generation scripts use, e.g.
 - **Speculative decoding inside the batch scheduler** is prompt-lookup only, and gated on
   `NExperts() == 0` — it runs automatically for dense Qwen checkpoints, is off for MoE. The Gemma-4
   MTP draft head (`--assistant`) is never exercised for Qwen (Qwen has no single-flight path to run
-  it on).
+  it on). The one-layer `mtp.*` head present in official FP8 Qwen is implemented only by the
+  standalone parity/oracle path, not production continuous batching; sparse verify rows multiply
+  routed-expert bytes and lossless GDN commit requires rollback/replay. See
+  [`qwen36-moe-single-stream.md`](qwen36-moe-single-stream.md).
+- **B=1 exact greedy LM head:** the incumbent one-output-row Q8 approximate scan remains the safe
+  default. On GB10, `FUCINA_QWEN35_Q8_HEAD_ROWS=2` or `4` opts into a register-blocked experiment;
+  `1` is immediate rollback. Candidate selection and exact BF16 rescore are unchanged. The
+  four-row candidate is staged behind exactness and speed gates and has no published gain until
+  the hardware A/B in [`qwen36-moe-single-stream.md`](qwen36-moe-single-stream.md) passes.
 - **Burst-admission coalescing** in the scheduler holds a short escalating window (few ms, capped
   at 150 ms) when it wakes from idle, so near-simultaneous requests land in the same batch instead
   of admitting one at a time. Unconditional, no flag.

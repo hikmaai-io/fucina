@@ -520,6 +520,7 @@ static inline void bf16_head_gemv_launch(
 #define Q8HEAD_MAXCAND 64
 
 // Approx logits from the Q8_0 head (34 B / 32-elem block: fp16 scale + 32 int8), float acts.
+// Keep the incumbent kernel byte-for-byte as the default/rollback and the rows=1 A/B reference.
 __global__ void q8_head_gemv_kernel(
     float *__restrict__ y, const unsigned char *__restrict__ w, const float *__restrict__ x,
     int in_dim, int out_dim)
@@ -544,6 +545,69 @@ __global__ void q8_head_gemv_kernel(
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, o);
     if (lane == 0) y[row] = acc;
+}
+
+// ROWS output rows share each activation load. Every individual row deliberately retains the
+// incumbent b/j accumulation and shuffle order, so this changes ILP only — not approximation,
+// candidate membership, exact BF16 rescore, or greedy output.
+template<int ROWS>
+__global__ void q8_head_gemv_rows_kernel(
+    float *__restrict__ y, const unsigned char *__restrict__ w, const float *__restrict__ x,
+    int in_dim, int out_dim)
+{
+    int nwarps = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row0 = (blockIdx.x * nwarps + warp) * ROWS;
+    if (row0 >= out_dim) return;
+    int nrow = min(ROWS, out_dim - row0), nb = in_dim >> 5;
+    float acc[ROWS];
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) acc[r] = 0.f;
+    for (int b = lane; b < nb; b += 32) {
+        const float *xb = x + b * 32;
+        float p[ROWS], d[ROWS];
+        const int8_t *q[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            p[r] = 0.f; d[r] = 0.f; q[r] = nullptr;
+            if (r < nrow) {
+                const unsigned char *blk = w + ((size_t)(row0 + r) * nb + b) * 34;
+                __half_raw hs; hs.x = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+                d[r] = __half2float(__half(hs));
+                q[r] = (const int8_t *)(blk + 2);
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            float xj = xb[j];
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) if (r < nrow) p[r] += (float)q[r][j] * xj;
+        }
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) if (r < nrow) acc[r] += d[r] * p[r];
+    }
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        float a = acc[r];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xFFFFFFFFu, a, o);
+        if (lane == 0 && r < nrow) y[row0 + r] = a;
+    }
+}
+static inline void q8_head_gemv_launch(
+    float *y, const unsigned char *w, const float *x, int in_dim, int out_dim,
+    int rows, cudaStream_t stream)
+{
+    const int nwarps = 8, threads = nwarps * 32;
+    if (rows == 4) {
+        unsigned blocks = (unsigned)((out_dim + nwarps * 4 - 1) / (nwarps * 4));
+        q8_head_gemv_rows_kernel<4><<<blocks,threads,0,stream>>>(y,w,x,in_dim,out_dim);
+    } else if (rows == 2) {
+        unsigned blocks = (unsigned)((out_dim + nwarps * 2 - 1) / (nwarps * 2));
+        q8_head_gemv_rows_kernel<2><<<blocks,threads,0,stream>>>(y,w,x,in_dim,out_dim);
+    } else {
+        unsigned blocks = (unsigned)((out_dim + nwarps - 1) / nwarps);
+        q8_head_gemv_kernel<<<blocks,threads,0,stream>>>(y,w,x,in_dim,out_dim);
+    }
 }
 
 // Pass 1b: per row, find the approx max then collect indices > max - margin (capped).
@@ -5182,6 +5246,7 @@ gemma4_engine_t* gemma4_engine_create(
     // qwen35 M4 batched-decode arenas (lazy; allocated on first qwen35 seq_add).
     eng->q35.ready = 0; eng->q35.capacity = requested_seq_capacity();
     eng->q35.maxctx = 0; eng->q35.reserved_context = 0; eng->q35.graph_enabled = 1;
+    eng->q35.q8_head_rows = 0; // selected after model detection, before the first Qwen graph capture
     // S2a GPU input-splicing default-on; FUCINA_QWEN35_NO_GPU_SPLICE=1 forces the host-copy path.
     eng->q35.gpu_splice_enabled = getenv("FUCINA_QWEN35_NO_GPU_SPLICE") ? 0 : 1;
     // S1a DFlash feature gate (default OFF). Parsed via the shared planner mapping so runtime and
@@ -12345,6 +12410,20 @@ extern "C" int gemma4_engine_debug_logits(gemma4_engine_t *eng, float *out, int 
 extern "C" int gemma4_engine_debug_set_q35_clean_gdn(gemma4_engine_t *eng, int enabled) {
     if(!eng || !eng->loaded || eng->cfg.arch!=GEMMA4_ARCH_QWEN3_5) return -1;
     eng->q35.clean_gdn=enabled?1:0;
+    return 0;
+}
+
+extern "C" int gemma4_engine_debug_set_q35_head_rows(gemma4_engine_t *eng, int rows) {
+    if(!eng || !eng->loaded || eng->cfg.arch!=GEMMA4_ARCH_QWEN3_5) return -1;
+    if(rows!=1 && rows!=2 && rows!=4) return -1;
+    if(cudaStreamSynchronize(eng->stream)!=cudaSuccess) return -1;
+    for(int i=0;i<eng->q35.graph_count;i++) {
+        if(eng->q35.graph_cache[i].exec) cudaGraphExecDestroy(eng->q35.graph_cache[i].exec);
+        eng->q35.graph_cache[i].exec=NULL;
+        eng->q35.graph_cache[i].key=q35_graph_key{0,0,0};
+    }
+    eng->q35.graph_count=0; eng->q35.graph_failed=0; eng->q35.graph_logged=0;
+    eng->q35.q8_head_rows=rows;
     return 0;
 }
 

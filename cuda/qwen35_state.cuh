@@ -1,5 +1,7 @@
 #pragma once
 
+#include "qwen35_head_policy.h"
+
 // Linux GB10 exposes CUDA unified memory through system RAM. cudaMemGetInfo reports raw free
 // pages, while MemAvailable includes reclaimable file cache. Keep both visible so admission can
 // distinguish actual allocations from safetensors mmap cache growth.
@@ -45,6 +47,7 @@ struct qwen35_runtime_state {
     int reserved_context;
     int graph_enabled;
     int gpu_splice_enabled;   // S2a: derive next-step input_ids/positions on-GPU from slot state
+    int q8_head_rows;         // exact B=1 Q8 search: rows/warp (1=default/rollback; 2/4=A/B only)
 
     // S2a — persistent per-slot decode state (device). d_slot_tok[slot] holds the last
     // sampled/accepted token id (== the next step's input_id for that slot); d_slot_pos[slot]
