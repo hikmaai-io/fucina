@@ -17,9 +17,10 @@ First public release as `github.com/hikmaai-io/fucina` (formerly the internal `g
 - **Continuous batching is now mandatory (auto-enabled) for every Qwen3 checkpoint** — there is no
   single-flight path for Qwen; `fucina -m <qwen-checkpoint>` detects the architecture and turns
   batching on automatically. Still opt-in for Gemma-4 (`--batch`/`FUCINA_BATCH`).
-- **Qwen ChatML chat dialect + Qwen3-Coder XML tool calling**: the server auto-selects the Gemma-4
-  or Qwen dialect from the loaded vocab (no flag) and parses Qwen's `<tool_call>` XML output back
-  into standard OpenAI `tool_calls` JSON on the wire.
+- **Qwen ChatML chat dialect + dual tool-call parsing**: the server auto-selects the Gemma-4 or
+  Qwen dialect from the loaded vocab (no flag), then auto-detects Qwen3.6's XML-shaped
+  `<function>/<parameter>` body or the legacy Qwen3/3.5 JSON body inside each `<tool_call>`.
+  Unterminated spans remain visible as content, and both forms map to OpenAI `tool_calls`.
 - **`response_format`/`json_schema` structured output** (host-side constrained JSON decoding,
   `internal/grammar`) for the Gemma-4 single-flight path; route-guarded off (HTTP 501) under
   continuous batching, so not currently available for any Qwen checkpoint.

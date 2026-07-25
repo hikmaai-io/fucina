@@ -1,7 +1,7 @@
 package chat
 
-// Qwen3.5 / Qwen3 ChatML dialect. The wire format is taken from the
-// chat_template.jinja shipped inside the Qwen3.5-35B-A3B checkpoint (which is
+// Qwen3.5 / Qwen3.6 ChatML dialect. The wire format is taken from the
+// chat_template.jinja shipped inside the Qwen3.5/3.6 dense and MoE checkpoints (which is
 // the authority — NOT classic Hermes JSON calls):
 //
 //	<|im_start|>system
@@ -39,13 +39,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"strconv"
 	"strings"
 )
 
 type qwenDialect struct{}
 
-// Qwen is the ChatML dialect used by the Qwen3 / Qwen3.5 families.
+// Qwen is the ChatML dialect used by the Qwen3 / Qwen3.5 / Qwen3.6 families.
 var Qwen Dialect = qwenDialect{}
 
 func (qwenDialect) Name() string { return "qwen" }
@@ -344,31 +346,88 @@ func (qwenDialect) ParseToolCalls(raw string, tools []Tool) (string, []ToolCall)
 	var calls []ToolCall
 	var contentB strings.Builder
 	for {
-		o := strings.Index(raw, "<tool_call>")
-		if o < 0 {
+		open, bodyStart := findQwenOpenTag(raw, 0, "tool_call")
+		if open < 0 {
 			contentB.WriteString(raw)
 			break
 		}
-		contentB.WriteString(raw[:o])
-		body := raw[o+len("<tool_call>"):]
-		if e := strings.Index(body, "</tool_call>"); e >= 0 {
-			raw = body[e+len("</tool_call>"):]
-			body = body[:e]
-		} else {
-			// Unterminated final block: recover only a complete inner
-			// <function=…></function>; else the text is a truncated call
-			// and must not be dispatched or leak into content.
-			raw = ""
-			if !strings.Contains(body, "</function>") {
-				break
-			}
+		contentB.WriteString(raw[:open])
+
+		close, afterClose := findQwenCloseTag(raw, bodyStart, "tool_call")
+		bodyEnd := len(raw)
+		closed := close >= 0
+		if closed {
+			bodyEnd = close
 		}
-		if tc, ok := parseQwenCall(body, schemas); ok {
+		body := raw[bodyStart:bodyEnd]
+		tc, ok := parseQwenCall(body, schemas)
+		if ok {
 			tc.ID = fmt.Sprintf("call_%s_%d", tc.Function.Name, len(calls))
 			calls = append(calls, tc)
+		} else {
+			// Parsing failures are output, not absence of output. Preserve the
+			// complete original span so the HTTP layer can expose it as content;
+			// exact control markers are stripped there, while the useful body is
+			// retained. Incomplete calls are never dispatched.
+			end := len(raw)
+			if closed {
+				end = afterClose
+			}
+			contentB.WriteString(raw[open:end])
 		}
+		if !closed {
+			break
+		}
+		raw = raw[afterClose:]
 	}
 	return strings.TrimSpace(contentB.String()), calls
+}
+
+// findQwenOpenTag finds an XML-ish bare opening tag. Qwen emits exact tags, but
+// accepting horizontal/newline whitespace before '>' makes parsing resilient to
+// harmless formatting variants without treating arbitrary attributes as valid.
+func findQwenOpenTag(s string, from int, element string) (start, after int) {
+	needle := "<" + element
+	for from <= len(s)-len(needle) {
+		i := strings.Index(s[from:], needle)
+		if i < 0 {
+			break
+		}
+		i += from
+		j := i + len(needle)
+		for j < len(s) && isQwenSpace(s[j]) {
+			j++
+		}
+		if j < len(s) && s[j] == '>' {
+			return i, j + 1
+		}
+		from = i + 1
+	}
+	return -1, -1
+}
+
+func findQwenCloseTag(s string, from int, element string) (start, after int) {
+	needle := "</" + element
+	for from <= len(s)-len(needle) {
+		i := strings.Index(s[from:], needle)
+		if i < 0 {
+			break
+		}
+		i += from
+		j := i + len(needle)
+		for j < len(s) && isQwenSpace(s[j]) {
+			j++
+		}
+		if j < len(s) && s[j] == '>' {
+			return i, j + 1
+		}
+		from = i + 1
+	}
+	return -1, -1
+}
+
+func isQwenSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
 // qwenParamSchemas maps function name → parameter name → declared JSON-Schema
@@ -396,58 +455,125 @@ func qwenParamSchemas(tools []Tool) map[string]map[string]string {
 	return m
 }
 
-// parseQwenCall parses one <tool_call> body: <function=NAME> then repeated
-// <parameter=KEY>\nVALUE\n</parameter>, closed by </function>.
+// parseQwenCall auto-detects the two Qwen dialects inside <tool_call>:
+//
+//	XML (Qwen3.6 template): <function=NAME><parameter=KEY>VALUE...</parameter></function>
+//	JSON (legacy Qwen3/3.5): {"name":"NAME","arguments":{...}}
+//
+// Dialect selection comes only from emitted bytes; there is no model/quant flag.
 func parseQwenCall(body string, schemas map[string]map[string]string) (ToolCall, bool) {
-	f := strings.Index(body, "<function=")
-	if f < 0 {
+	if strings.HasPrefix(strings.TrimSpace(body), "{") {
+		return parseQwenJSONCall(body)
+	}
+	return parseQwenXMLCall(body, schemas)
+}
+
+func parseQwenJSONCall(body string) (ToolCall, bool) {
+	type jsonFunction struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	var wire struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+		Function  *jsonFunction   `json:"function"`
+	}
+	dec := json.NewDecoder(strings.NewReader(body))
+	if err := dec.Decode(&wire); err != nil {
 		return ToolCall{}, false
 	}
-	rest := body[f+len("<function="):]
-	nameEnd := strings.IndexAny(rest, ">\n")
-	if nameEnd < 0 {
+	// Reject a valid object followed by model garbage inside the call span.
+	var extra interface{}
+	if dec.Decode(&extra) != io.EOF {
 		return ToolCall{}, false
 	}
-	name := strings.TrimSpace(rest[:nameEnd])
+	name, arguments := wire.Name, wire.Arguments
+	if wire.Function != nil {
+		name, arguments = wire.Function.Name, wire.Function.Arguments
+	}
+	name = strings.TrimSpace(name)
 	if name == "" {
 		return ToolCall{}, false
 	}
-	rest = rest[nameEnd:]
-	if rest != "" && rest[0] == '>' {
-		rest = rest[1:]
+	args, ok := compactQwenJSONArguments(arguments)
+	if !ok {
+		return ToolCall{}, false
 	}
-	if fe := strings.LastIndex(rest, "</function>"); fe >= 0 {
-		rest = rest[:fe]
+	return ToolCall{
+		ID:       "call_" + name,
+		Type:     "function",
+		Function: ToolCallFunction{Name: name, Arguments: args},
+	}, true
+}
+
+func compactQwenJSONArguments(raw json.RawMessage) (string, bool) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return "{}", true
+	}
+	// Some OpenAI-compatible emitters encode arguments as a JSON string rather
+	// than an object. Accept that legacy variant when the string itself is JSON.
+	if bytes.HasPrefix(bytes.TrimSpace(raw), []byte{'"'}) {
+		var encoded string
+		if json.Unmarshal(raw, &encoded) != nil {
+			return "", false
+		}
+		raw = json.RawMessage(encoded)
+	}
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 || t[0] != '{' || !json.Valid(t) {
+		return "", false
+	}
+	var compact bytes.Buffer
+	if json.Compact(&compact, t) != nil {
+		return "", false
+	}
+	return compact.String(), true
+}
+
+// parseQwenXMLCall parses one complete function block. Values are delimited only
+// by the exact closing parameter tag, so ordinary comparisons, HTML, paths, and
+// JSON containing '<' or '>' remain data rather than confusing the scanner.
+func parseQwenXMLCall(body string, schemas map[string]map[string]string) (ToolCall, bool) {
+	fnStart, name, fnBodyStart, ok := findQwenAttributeTag(body, 0, "function")
+	if !ok || strings.TrimSpace(body[:fnStart]) != "" {
+		return ToolCall{}, false
+	}
+	fnClose, fnAfter := findQwenCloseTag(body, fnBodyStart, "function")
+	if fnClose < 0 || strings.TrimSpace(body[fnAfter:]) != "" {
+		return ToolCall{}, false
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ToolCall{}, false
 	}
 
-	// Arguments JSON is built by hand to preserve parameter ORDER (a re-render
-	// of this call must token-match the model's emission).
+	rest := body[fnBodyStart:fnClose]
+	// Build JSON by hand to preserve parameter order. Re-rendering assistant
+	// calls in a later turn must retain the model's original argument ordering.
 	var args bytes.Buffer
 	args.WriteByte('{')
 	n := 0
+	pos := 0
 	for {
-		p := strings.Index(rest, "<parameter=")
-		if p < 0 {
+		p, key, valueStart, found := findQwenAttributeTag(rest, pos, "parameter")
+		if !found {
+			if strings.TrimSpace(rest[pos:]) != "" {
+				return ToolCall{}, false
+			}
 			break
 		}
-		rest = rest[p+len("<parameter="):]
-		ke := strings.Index(rest, ">")
-		if ke < 0 {
-			break
+		if strings.TrimSpace(rest[pos:p]) != "" {
+			return ToolCall{}, false
 		}
-		key := strings.TrimSpace(rest[:ke])
-		rest = rest[ke+1:]
-		var val string
-		if ve := strings.Index(rest, "</parameter>"); ve >= 0 {
-			val = rest[:ve]
-			rest = rest[ve+len("</parameter>"):]
-		} else {
-			val = rest // truncated last parameter: take what's there
-			rest = ""
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return ToolCall{}, false
 		}
-		// The template wraps values in single newlines: <parameter=k>\nVALUE\n</parameter>.
-		val = strings.TrimPrefix(val, "\n")
-		val = strings.TrimSuffix(val, "\n")
+		valueEnd, afterValue := findQwenCloseTag(rest, valueStart, "parameter")
+		if valueEnd < 0 { // never dispatch a truncated parameter
+			return ToolCall{}, false
+		}
+		val := trimQwenStructuralNewline(rest[valueStart:valueEnd])
 		if n > 0 {
 			args.WriteByte(',')
 		}
@@ -456,69 +582,127 @@ func parseQwenCall(body string, schemas map[string]map[string]string) (ToolCall,
 		args.Write(keyJSON)
 		args.WriteByte(':')
 		args.WriteString(qwenCoerceArg(val, schemas[name][key]))
+		pos = afterValue
 	}
 	args.WriteByte('}')
 	return ToolCall{
-		ID:   "call_" + name,
-		Type: "function",
-		Function: ToolCallFunction{
-			Name:      name,
-			Arguments: args.String(),
-		},
+		ID:       "call_" + name,
+		Type:     "function",
+		Function: ToolCallFunction{Name: name, Arguments: args.String()},
 	}, true
 }
 
-// qwenCoerceArg converts a raw <parameter> body into a JSON value using the
-// declared schema type; without a schema entry it falls back to a conservative
-// guess (object/array/bool/null literals, else string).
+// findQwenAttributeTag accepts <element=value> plus whitespace around '='. It
+// intentionally does not decode XML entities: this protocol is XML-shaped, not
+// general XML, and model values are raw text.
+func findQwenAttributeTag(s string, from int, element string) (start int, value string, after int, ok bool) {
+	needle := "<" + element
+	for from <= len(s)-len(needle) {
+		i := strings.Index(s[from:], needle)
+		if i < 0 {
+			break
+		}
+		i += from
+		j := i + len(needle)
+		for j < len(s) && isQwenSpace(s[j]) {
+			j++
+		}
+		if j >= len(s) || s[j] != '=' {
+			from = i + 1
+			continue
+		}
+		j++
+		for j < len(s) && isQwenSpace(s[j]) {
+			j++
+		}
+		valueStart := j
+		for j < len(s) && s[j] != '>' {
+			j++
+		}
+		if j >= len(s) {
+			return -1, "", -1, false
+		}
+		return i, s[valueStart:j], j + 1, true
+	}
+	return -1, "", -1, false
+}
+
+func trimQwenStructuralNewline(s string) string {
+	if strings.HasPrefix(s, "\r\n") {
+		s = s[2:]
+	} else if strings.HasPrefix(s, "\n") || strings.HasPrefix(s, "\r") {
+		s = s[1:]
+	}
+	if strings.HasSuffix(s, "\r\n") {
+		s = s[:len(s)-2]
+	} else if strings.HasSuffix(s, "\n") || strings.HasSuffix(s, "\r") {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// qwenCoerceArg converts a raw <parameter> body into valid JSON. A declared
+// schema wins; otherwise unambiguous JSON numbers, booleans, null, objects, and
+// arrays retain their types, while every other value remains a string.
 func qwenCoerceArg(val, typ string) string {
 	jsonStr := func() string {
 		var buf bytes.Buffer
 		enc := json.NewEncoder(&buf)
 		enc.SetEscapeHTML(false)
-		enc.Encode(val)
+		_ = enc.Encode(val)
 		return strings.TrimSuffix(buf.String(), "\n")
+	}
+	t := strings.TrimSpace(val)
+	compactStructured := func(expected byte) (string, bool) {
+		if len(t) == 0 || t[0] != expected || !json.Valid([]byte(t)) {
+			return "", false
+		}
+		var buf bytes.Buffer
+		if json.Compact(&buf, []byte(t)) != nil {
+			return "", false
+		}
+		return buf.String(), true
 	}
 	switch typ {
 	case "string":
 		return jsonStr()
 	case "integer":
-		if _, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64); err == nil {
-			return strings.TrimSpace(val)
+		if _, err := strconv.ParseInt(t, 10, 64); err == nil && json.Valid([]byte(t)) {
+			return t
 		}
-		if f, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil {
-			return strconv.FormatInt(int64(f), 10)
+		if f, err := strconv.ParseFloat(t, 64); err == nil && !math.IsInf(f, 0) && !math.IsNaN(f) && f == math.Trunc(f) {
+			return strconv.FormatFloat(f, 'f', 0, 64)
 		}
 		return jsonStr()
 	case "number":
-		if _, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil {
-			return strings.TrimSpace(val)
+		if len(t) > 0 && json.Valid([]byte(t)) && (t[0] == '-' || t[0] >= '0' && t[0] <= '9') {
+			return t
 		}
 		return jsonStr()
 	case "boolean":
-		switch strings.ToLower(strings.TrimSpace(val)) {
+		switch strings.ToLower(t) {
 		case "true":
 			return "true"
 		case "false":
 			return "false"
 		}
 		return jsonStr()
-	case "object", "array":
-		if json.Valid([]byte(val)) {
-			var buf bytes.Buffer
-			if json.Compact(&buf, []byte(val)) == nil {
-				return buf.String()
-			}
+	case "object":
+		if compact, ok := compactStructured('{'); ok {
+			return compact
+		}
+		return jsonStr()
+	case "array":
+		if compact, ok := compactStructured('['); ok {
+			return compact
 		}
 		return jsonStr()
 	}
-	// No schema: accept structured literals, keep everything else as string.
-	t := strings.TrimSpace(val)
-	if len(t) > 0 && (t[0] == '{' || t[0] == '[') && json.Valid([]byte(t)) {
-		var buf bytes.Buffer
-		if json.Compact(&buf, []byte(t)) == nil {
-			return buf.String()
-		}
+	if compact, ok := compactStructured('{'); ok {
+		return compact
+	}
+	if compact, ok := compactStructured('['); ok {
+		return compact
 	}
 	switch strings.ToLower(t) {
 	case "true":
@@ -527,6 +711,9 @@ func qwenCoerceArg(val, typ string) string {
 		return "false"
 	case "null", "none":
 		return "null"
+	}
+	if len(t) > 0 && json.Valid([]byte(t)) && (t[0] == '-' || t[0] >= '0' && t[0] <= '9') {
+		return t
 	}
 	return jsonStr()
 }

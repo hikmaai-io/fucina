@@ -35,6 +35,8 @@ var qwenVocabWords = []string{
 	" world",                     // 18
 	"\n\n",                       // 19
 	"The answer is 42.",          // 20
+	"get_weather>",               // 21 (completion after tool_choice:"required" prefix)
+	`{"name":"get_weather","arguments":{"city":"Paris"}}`, // 22 legacy Qwen JSON body
 }
 
 // newQwenTokenizer builds a ChatML tokenizer from a synthetic HF
@@ -338,6 +340,52 @@ func TestQwenDialect_Batch_StreamToolCall(t *testing.T) {
 	}
 }
 
+func TestQwenDialect_Batch_StreamMixedContentAndXMLCall(t *testing.T) {
+	call := qwenToolCallScript[3 : len(qwenToolCallScript)-1]
+	script := append([]int32{17, 18, 19}, call...)
+	script = append(script, qImEnd)
+	srv := newQwenBatchServer(t, script)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages": []map[string]string{{"role": "user", "content": "say and check"}},
+		"tools":    []interface{}{qwenWeatherTool}, "stream": true, "max_tokens": 64,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	var content string
+	var calls []DeltaToolCall
+	for _, ev := range sseEvents(t, rec.Body.String()) {
+		for _, ch := range ev.Choices {
+			content += ch.Delta.Content
+			calls = append(calls, ch.Delta.ToolCalls...)
+		}
+	}
+	if content != "Hello world\n\n" {
+		t.Errorf("mixed streamed content=%q", content)
+	}
+	if len(calls) != 1 || calls[0].Function.Arguments != `{"city":"Paris"}` {
+		t.Fatalf("mixed streamed calls=%+v", calls)
+	}
+}
+
+func TestQwenDialect_Batch_StreamLegacyJSONCall(t *testing.T) {
+	srv := newQwenBatchServer(t, []int32{qTCOpen, 22, qTCEnd, qImEnd})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages": []map[string]string{{"role": "user", "content": "weather"}},
+		"tools":    []interface{}{qwenWeatherTool}, "stream": true, "max_tokens": 16,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	var calls []DeltaToolCall
+	for _, ev := range sseEvents(t, rec.Body.String()) {
+		for _, ch := range ev.Choices {
+			calls = append(calls, ch.Delta.ToolCalls...)
+		}
+	}
+	if len(calls) != 1 || calls[0].Function.Arguments != `{"city":"Paris"}` {
+		t.Fatalf("legacy JSON stream calls=%+v", calls)
+	}
+}
+
 func TestQwenDialect_Batch_StreamPlain(t *testing.T) {
 	// Thinking off: prompt pre-closes the think block; output is prose only.
 	srv := newQwenBatchServer(t, []int32{17, 18, qImEnd})
@@ -361,6 +409,187 @@ func TestQwenDialect_Batch_StreamPlain(t *testing.T) {
 	}
 	if reasoning != "" {
 		t.Errorf("unexpected reasoning: %q", reasoning)
+	}
+}
+
+func TestQwenDialect_Batch_StreamMultipleToolCalls(t *testing.T) {
+	one := qwenToolCallScript[3 : len(qwenToolCallScript)-1] // open...close, no reasoning/EOS
+	script := append(append([]int32{}, one...), one...)
+	script = append(script, qImEnd)
+	srv := newQwenBatchServer(t, script)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages": []map[string]string{{"role": "user", "content": "weather twice"}},
+		"tools":    []interface{}{qwenWeatherTool}, "stream": true, "max_tokens": 64,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	var calls []DeltaToolCall
+	for _, ev := range sseEvents(t, rec.Body.String()) {
+		for _, ch := range ev.Choices {
+			calls = append(calls, ch.Delta.ToolCalls...)
+		}
+	}
+	if len(calls) != 2 {
+		t.Fatalf("streamed tool_calls = %+v, want 2", calls)
+	}
+	if calls[0].Index != 0 || calls[1].Index != 1 || calls[0].ID == calls[1].ID {
+		t.Errorf("bad streaming call indexes/IDs: %+v", calls)
+	}
+}
+
+func TestQwenDialect_Batch_UnterminatedFallback(t *testing.T) {
+	// EOS arrives after a partial function. The fragment must not dispatch, but
+	// unlike the old dead-turn behavior it must be emitted as content.
+	script := []int32{qTCOpen, 11, 12, 11, 13, 11, 14, qImEnd}
+	srv := newQwenBatchServer(t, script)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages": []map[string]string{{"role": "user", "content": "weather"}},
+		"tools":    []interface{}{qwenWeatherTool}, "stream": true, "max_tokens": 32,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	var content string
+	var calls []DeltaToolCall
+	for _, ev := range sseEvents(t, rec.Body.String()) {
+		for _, ch := range ev.Choices {
+			content += ch.Delta.Content
+			calls = append(calls, ch.Delta.ToolCalls...)
+		}
+	}
+	if len(calls) != 0 {
+		t.Fatalf("partial call dispatched: %+v", calls)
+	}
+	if !strings.Contains(content, "<function=get_weather>") || !strings.Contains(content, "Paris") {
+		t.Errorf("buffered fallback missing from content: %q", content)
+	}
+}
+
+func TestQwenDialect_Batch_CollectUnterminatedFallback(t *testing.T) {
+	script := []int32{qTCOpen, 11, 12, 11, 13, 11, 14, qImEnd}
+	srv := newQwenBatchServer(t, script)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages": []map[string]string{{"role": "user", "content": "weather"}},
+		"tools":    []interface{}{qwenWeatherTool}, "max_tokens": 32,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	var resp ChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	msg := resp.Choices[0].Message
+	if len(msg.ToolCalls) != 0 || !strings.Contains(msg.Content, "<function=get_weather>") ||
+		!strings.Contains(msg.Content, "Paris") {
+		t.Fatalf("unterminated collected response=%+v", resp.Choices[0])
+	}
+}
+
+func TestQwenDialect_Batch_StreamCapFallback(t *testing.T) {
+	script := []int32{qTCOpen}
+	for i := 0; i < 2050; i++ {
+		script = append(script, 14) // Paris
+	}
+	script = append(script, qImEnd)
+	srv := newQwenBatchServer(t, script)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages": []map[string]string{{"role": "user", "content": "weather"}},
+		"tools":    []interface{}{qwenWeatherTool}, "stream": true, "max_tokens": 4096,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	var content, finish string
+	var calls []DeltaToolCall
+	for _, ev := range sseEvents(t, rec.Body.String()) {
+		for _, ch := range ev.Choices {
+			content += ch.Delta.Content
+			calls = append(calls, ch.Delta.ToolCalls...)
+			if ch.FinishReason != "" {
+				finish = ch.FinishReason
+			}
+		}
+	}
+	if len(calls) != 0 || finish != "length" {
+		t.Fatalf("cap fallback calls=%+v finish=%q", calls, finish)
+	}
+	if got := strings.Count(content, "Paris"); got != 2049 {
+		t.Fatalf("cap fallback preserved %d/2049 buffered values", got)
+	}
+}
+
+func TestQwenDialect_Batch_UnterminatedOuterRecoversCall(t *testing.T) {
+	// Qwen occasionally emits EOS after </function> without </tool_call>. The
+	// complete inner call is safe and should still become structured output.
+	script := []int32{qTCOpen, 11, 12, 11, 13, 11, 14, 11, 15, 11, 16, qImEnd}
+	srv := newQwenBatchServer(t, script)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages": []map[string]string{{"role": "user", "content": "weather"}},
+		"tools":    []interface{}{qwenWeatherTool}, "stream": true, "max_tokens": 32,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	var calls []DeltaToolCall
+	for _, ev := range sseEvents(t, rec.Body.String()) {
+		for _, ch := range ev.Choices {
+			calls = append(calls, ch.Delta.ToolCalls...)
+		}
+	}
+	if len(calls) != 1 || calls[0].Function.Arguments != `{"city":"Paris"}` {
+		t.Fatalf("unterminated outer call not recovered: %+v", calls)
+	}
+}
+
+func TestQwenDialect_RequiredAnyToolChoice(t *testing.T) {
+	// "required" opens <function= in the prompt; generation starts with the
+	// selected function name and completes the body.
+	script := []int32{21, 11, 13, 11, 14, 11, 15, 11, 16, 11, qTCEnd, qImEnd}
+	srv := newQwenBatchServer(t, script)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages": []map[string]string{{"role": "user", "content": "7 times 8"}},
+		"tools":    []interface{}{qwenWeatherTool}, "tool_choice": "required", "max_tokens": 64,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	var resp ChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 1 || resp.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("required tool call not enforced: %+v", resp.Choices[0])
+	}
+}
+
+func TestQwenDialect_RequiredMalformedIsNotCleanStop(t *testing.T) {
+	srv := newQwenBatchServer(t, []int32{21, qImEnd})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages": []map[string]string{{"role": "user", "content": "weather"}},
+		"tools":    []interface{}{qwenWeatherTool}, "tool_choice": "required", "max_tokens": 16,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	var resp ChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	choice := resp.Choices[0]
+	if choice.FinishReason == "stop" || len(choice.Message.ToolCalls) != 0 {
+		t.Fatalf("malformed required call reported as success: %+v", choice)
+	}
+	if choice.Message.Content == "" {
+		t.Fatalf("malformed required call discarded its buffered fallback: %+v", choice)
+	}
+}
+
+func TestQwenDialect_UnknownForcedToolRejected(t *testing.T) {
+	srv := newQwenBatchServer(t, qwenToolCallScript)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages":    []map[string]string{{"role": "user", "content": "weather"}},
+		"tools":       []interface{}{qwenWeatherTool},
+		"tool_choice": map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "not_a_tool"}},
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "unknown function") {
+		t.Fatalf("unknown forced tool: status=%d body=%q", rec.Code, rec.Body.String())
 	}
 }
 

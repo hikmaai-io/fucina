@@ -16,6 +16,15 @@ type (
 
 func isToolChoiceNone(tc interface{}) bool { return chat.IsToolChoiceNone(tc) }
 
+func toolNamed(tools []Tool, name string) bool {
+	for _, tool := range tools {
+		if tool.Function.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // forcedToolChoice interprets the OpenAI tool_choice forms that FORCE a call:
 // "required" (any function) and {"type":"function","function":{"name":X}}.
 // Returns the forced function name ("" for "required") and whether forcing is

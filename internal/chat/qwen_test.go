@@ -113,7 +113,7 @@ var qwenTestTools = []Tool{{
 	Function: ToolFunction{
 		Name: "get_weather",
 		Parameters: json.RawMessage(`{"type":"object","properties":{
-			"city":{"type":"string"},"days":{"type":"integer"},
+			"city":{"type":"string"},"unit":{"type":"string"},"days":{"type":"integer"},
 			"metric":{"type":"boolean"},"coords":{"type":"object"},
 			"tags":{"type":"array"}},"required":["city"]}`),
 	},
@@ -137,6 +137,74 @@ func TestQwenParseToolCalls(t *testing.T) {
 	want := `{"city":"Paris","days":3,"metric":true}`
 	if calls[0].Function.Arguments != want {
 		t.Errorf("args = %s, want %s", calls[0].Function.Arguments, want)
+	}
+}
+
+// Captured from the Qwen3.6-35B-A3B TC-01 tool-routing incident. The model
+// followed tokenizer_config.json's XML instruction; the old JSON-only serving
+// parser returned an empty assistant message for this wire shape.
+const capturedQwen36XML = `<tool_call>
+<function=get_weather>
+<parameter=city>
+Berlin
+</parameter>
+<parameter=unit>
+celsius
+</parameter>
+</function>
+</tool_call>`
+
+func TestQwenParseCapturedQwen36XML(t *testing.T) {
+	content, calls := Qwen.ParseToolCalls(capturedQwen36XML, qwenTestTools)
+	if content != "" || len(calls) != 1 {
+		t.Fatalf("content=%q calls=%+v", content, calls)
+	}
+	if calls[0].Function.Name != "get_weather" ||
+		calls[0].Function.Arguments != `{"city":"Berlin","unit":"celsius"}` {
+		t.Fatalf("captured call parsed as %+v", calls[0])
+	}
+}
+
+func TestQwenParseWhitespaceCRLFAndAngleValues(t *testing.T) {
+	raw := "<tool_call >\r\n\t<function = get_weather >\r\n" +
+		"<parameter = city>\r\nx < 3 && y > 1\r\n<div>Berlin</div>\r\n</parameter >\r\n" +
+		"<parameter = days> 7 </parameter >\r\n</function >\r\n</tool_call >"
+	_, calls := Qwen.ParseToolCalls(raw, qwenTestTools)
+	if len(calls) != 1 {
+		t.Fatalf("calls=%+v", calls)
+	}
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args["city"] != "x < 3 && y > 1\r\n<div>Berlin</div>" || args["days"] != float64(7) {
+		t.Fatalf("arguments=%#v", args)
+	}
+}
+
+func TestQwenParseLegacyJSONAndMixedDialects(t *testing.T) {
+	legacy := `<tool_call>{"name":"get_weather","arguments":{"city":"Paris","days":2}}</tool_call>`
+	xml := strings.Replace(capturedQwen36XML, "Berlin", "Rome", 1)
+	raw := "I'll compare both.\n" + legacy + "\nthen\n" + xml + "\nDone."
+	content, calls := Qwen.ParseToolCalls(raw, qwenTestTools)
+	if len(calls) != 2 {
+		t.Fatalf("calls=%+v", calls)
+	}
+	if calls[0].Function.Arguments != `{"city":"Paris","days":2}` ||
+		!strings.Contains(calls[1].Function.Arguments, `"Rome"`) {
+		t.Fatalf("mixed arguments=%+v", calls)
+	}
+	if !strings.Contains(content, "I'll compare both.") || !strings.Contains(content, "then") ||
+		!strings.Contains(content, "Done.") {
+		t.Fatalf("mixed content=%q", content)
+	}
+}
+
+func TestQwenParseLegacyJSONStringArguments(t *testing.T) {
+	raw := `<tool_call>{"type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Oslo\"}"}}</tool_call>`
+	_, calls := Qwen.ParseToolCalls(raw, qwenTestTools)
+	if len(calls) != 1 || calls[0].Function.Arguments != `{"city":"Oslo"}` {
+		t.Fatalf("calls=%+v", calls)
 	}
 }
 
@@ -175,16 +243,33 @@ func TestQwenParseStructuredArgs(t *testing.T) {
 	}
 }
 
+func TestQwenParseMalformedClosedCallFallsBack(t *testing.T) {
+	raw := "before <tool_call><function=get_weather><parameter=city>Paris</function></tool_call> after"
+	content, calls := Qwen.ParseToolCalls(raw, qwenTestTools)
+	if len(calls) != 0 {
+		t.Fatalf("malformed call dispatched: %+v", calls)
+	}
+	if content != raw {
+		t.Fatalf("fallback content=%q, want %q", content, raw)
+	}
+
+	raw = `<tool_call>{"name":"get_weather","arguments":not-json}</tool_call>`
+	content, calls = Qwen.ParseToolCalls(raw, qwenTestTools)
+	if len(calls) != 0 || content != raw {
+		t.Fatalf("malformed JSON content=%q calls=%+v", content, calls)
+	}
+}
+
 func TestQwenParseTruncatedCall(t *testing.T) {
-	// Unterminated call with no complete inner function: dropped, and its
-	// fragment must not leak into content.
+	// Unterminated call with no complete inner function is never dispatched,
+	// but remains visible as plain/fallback content for the HTTP layer.
 	raw := "text before<tool_call>\n<function=get_weather>\n<parameter=city>\nPar"
 	content, calls := Qwen.ParseToolCalls(raw, qwenTestTools)
 	if len(calls) != 0 {
-		t.Errorf("truncated call must be dropped, got %d", len(calls))
+		t.Errorf("truncated call must not dispatch, got %d", len(calls))
 	}
-	if content != "text before" {
-		t.Errorf("content = %q", content)
+	if content != raw {
+		t.Errorf("fallback content = %q, want %q", content, raw)
 	}
 
 	// Unterminated <tool_call> whose inner function IS complete: recovered.
@@ -202,8 +287,8 @@ func TestQwenParseNoSchema(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("calls = %d", len(calls))
 	}
-	// Without a schema, numeric-looking strings stay strings; bool literals coerce.
-	want := `{"version":"3.10","flag":true}`
+	// Without a schema, an unquoted valid JSON number and bool are unambiguous.
+	want := `{"version":3.10,"flag":true}`
 	if calls[0].Function.Arguments != want {
 		t.Errorf("args = %s, want %s", calls[0].Function.Arguments, want)
 	}

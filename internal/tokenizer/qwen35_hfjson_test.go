@@ -3,6 +3,8 @@ package tokenizer
 import (
 	"os"
 	"testing"
+
+	"github.com/hikmaai-io/fucina/internal/chat"
 )
 
 // qwen35JSONPath returns the Qwen3.5 HF tokenizer.json the safetensors serving
@@ -77,6 +79,42 @@ func TestQwen35_HFJSONServedTokenizer(t *testing.T) {
 	}
 	if ids3 := tk.Encode("a\n\n\nb", false, false); len(ids3) != 3 || ids3[1] != 1358 {
 		t.Errorf("triple-newline encode = %v, want [a 1358 b]", ids3)
+	}
+}
+
+// TestQwen36_SeaPromptHFParity locks the shortest production quality repro all the way from
+// Qwen chat rendering through the tokenizer. wantIDs came from AutoTokenizer.apply_chat_template
+// on the official Qwen3.6-35B-A3B-FP8 snapshot with add_generation_prompt=true and
+// enable_thinking=false. The Qwen3.5 and Qwen3.6 checkpoints share this tokenizer/template.
+func TestQwen36_SeaPromptHFParity(t *testing.T) {
+	path := qwen35JSONPath()
+	if path == "" {
+		t.Skip("no Qwen3.5/3.6 tokenizer.json available (set FUCINA_QWEN35_TOKENIZER)")
+	}
+	tk, err := NewFromHFJSON(path)
+	if err != nil {
+		t.Fatalf("NewFromHFJSON: %v", err)
+	}
+
+	prompt := chat.Qwen.Render([]chat.RichMessage{{
+		Role: "user", Content: "Write one short sentence about the sea.",
+	}}, nil, false)
+	const wantPrompt = "<|im_start|>user\nWrite one short sentence about the sea.<|im_end|>\n" +
+		"<|im_start|>assistant\n<think>\n\n</think>\n\n"
+	if prompt != wantPrompt {
+		t.Fatalf("rendered prompt:\n got %q\nwant %q", prompt, wantPrompt)
+	}
+
+	got := tk.Encode(prompt, true, false)
+	want := []int32{248045, 846, 198, 7734, 799, 2716, 11316, 883, 279, 9117,
+		13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271}
+	if len(got) != len(want) {
+		t.Fatalf("engine token IDs = %v (%d), HF wants %v (%d)", got, len(got), want, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("engine token IDs diverge at %d: got %v, HF wants %v", i, got, want)
+		}
 	}
 }
 

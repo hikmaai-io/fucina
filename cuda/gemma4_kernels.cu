@@ -6629,11 +6629,15 @@ gemma4_engine_t* gemma4_engine_create(
         build_packed_q4k(eng);
     }
 
-    // GGUF Qwen descriptors are bound after all override conversion and in-place repacking. The
-    // safetensors loader binds the same fields in qwen35_fp8_fill_engine().
+    // Qwen descriptors are rebound after all override conversion and in-place repacking. For
+    // block-FP8 safetensors this pass must preserve each projection's separately allocated
+    // BF16 block-scale grid. Clearing `scale` here made the first source-FP8 prefill dequant kernel
+    // dereference NULL; Q4_K/NVFP4 happened to mask the bug because they do not use this field.
     if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5) {
         auto bind_ref=[&](WeightRef &ref,uint64_t off,uint8_t fmt,int out_dim,int in_dim){
-            ref.data=weight_fp8(eng,off); ref.scale=nullptr; ref.global_scale=nullptr;
+            ref.data=weight_fp8(eng,off);
+            if(fmt!=FORMAT_FP8_BLOCK) ref.scale=nullptr; // FP8 scale was bound by safetensors loader
+            ref.global_scale=nullptr;
             ref.out_dim=out_dim; ref.in_dim=in_dim;
             ref.encoding=(fmt==FORMAT_Q4_K)?WeightEncoding::Q4_K:
                          (fmt==FORMAT_Q8_0)?WeightEncoding::Q8_0:
@@ -9555,10 +9559,18 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         float *out = out_f32 + (size_t)t0 * H;
         int total = cn * U;
         // Router → softmax-E → top-U → renorm-to-sum-1 → counting-sort route (pes = ones[E]).
-        // Wide (prefill) calls ride a cublas SGEMM — the block-per-(expert,token) GEMV re-walks
+        // Wide prefill calls ride a cuBLAS SGEMM — the block-per-(expert,token) GEMV re-walks
         // the router per token and measured 314 ms per 2.9k-token pass (11.6% of prefill).
-        if (moe_unify || cn > 2 * FP8_MAXB) {
+        // Decode-sized calls MUST use the explicit-stream kernel. In particular, the decode body
+        // is captured on a temporary stream while the shared cuBLAS handle is normally bound to
+        // eng->stream. The old `moe_unify ||` condition issued router SGEMM on that other stream,
+        // outside capture; graph replay then reused stale router logits from capture time. The
+        // prefill-produced first tokens were coherent, but subsequent graph-decoded tokens routed
+        // to the wrong experts. It also explains graph-on/off and self-chain failures across FP8,
+        // Q4_K and NVFP4 experts: the corruption happened before every expert GEMM variant.
+        if (cn > 2 * FP8_MAXB) {
             const float alf = 1.0f, bet = 0.0f;
+            cublasSetStream(eng->cublas, stream);
             cublasSgemm(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, E, cn, H,
                         &alf, router_w, H, h, H, &bet, eng->d_moe_rlogits, E);
         } else
