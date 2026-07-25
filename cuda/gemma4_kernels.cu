@@ -9559,10 +9559,18 @@ static void moe_ffn(gemma4_engine_t *eng, int l, const float *h_f32, float *out_
         float *out = out_f32 + (size_t)t0 * H;
         int total = cn * U;
         // Router → softmax-E → top-U → renorm-to-sum-1 → counting-sort route (pes = ones[E]).
-        // Wide (prefill) calls ride a cublas SGEMM — the block-per-(expert,token) GEMV re-walks
+        // Wide prefill calls ride a cuBLAS SGEMM — the block-per-(expert,token) GEMV re-walks
         // the router per token and measured 314 ms per 2.9k-token pass (11.6% of prefill).
-        if (moe_unify || cn > 2 * FP8_MAXB) {
+        // Decode-sized calls MUST use the explicit-stream kernel. In particular, the decode body
+        // is captured on a temporary stream while the shared cuBLAS handle is normally bound to
+        // eng->stream. The old `moe_unify ||` condition issued router SGEMM on that other stream,
+        // outside capture; graph replay then reused stale router logits from capture time. The
+        // prefill-produced first tokens were coherent, but subsequent graph-decoded tokens routed
+        // to the wrong experts. It also explains graph-on/off and self-chain failures across FP8,
+        // Q4_K and NVFP4 experts: the corruption happened before every expert GEMM variant.
+        if (cn > 2 * FP8_MAXB) {
             const float alf = 1.0f, bet = 0.0f;
+            cublasSetStream(eng->cublas, stream);
             cublasSgemm(eng->cublas, CUBLAS_OP_T, CUBLAS_OP_N, E, cn, H,
                         &alf, router_w, H, h, H, &bet, eng->d_moe_rlogits, E);
         } else

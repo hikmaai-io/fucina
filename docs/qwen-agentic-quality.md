@@ -84,4 +84,43 @@ Two real HTTP checks against that default on port 8084 produced:
 
 The 15-scenario `tool-eval-bench v2.0.4 --short` hardware quality check completed with **0/100 (0/15 passed)**; report: `runs/qwen36-35b-default-final/2026/07/2026-07-25T18-25-16.196987Z_0d1b6a6d.md`. This is a failed agentic-quality gate and is recorded rather than relabeled as success. The HTTP parser fix prevents dead/empty turns and safely parses valid XML or legacy JSON, but it cannot turn the malformed MoE token stream into valid calls. A complete 69-scenario claim is not made.
 
-The remaining quality defect is common to source-FP8, Q4_K-expert, and NVFP4-expert checks and therefore lies after admission in shared MoE forward/model compatibility, not in the fixed scale-pointer crash or the HTTP parser. Before any future default change, capture layer/router/shared-expert parity for this exact Qwen3.6 revision against `cuda/qwen35_moe_fp8_ref.py`; require coherent prose plus structured calls in the full suite. Never use a narrow eight-token oracle as the default gate.
+## MoE graph-router numerical corruption and resolution
+
+A follow-up GB10 investigation treated the failed batched self-test as a hard correctness gate rather than tolerating the narrow eight-token oracle. The historical result in `benchmark-evidence/results/2026-07-19-qwen35-burst-ttft2/qwen-gates.log` was reproduced before the fix:
+
+```text
+MoE FP8 engine oracle-parity: 8/8
+qwen35 M4 seq 0: B=3 vs B=1 6/24; graph-on vs graph-off 6/24
+qwen35 M4 self-chain: FAIL
+FAIL — ... (oracle 8/8, self-test FAIL)
+```
+
+The defect was in router execution before expert arithmetic, not in tool parsing, the NVFP4 requantizer, grouped-GEMM indexing/scales, top-k normalization, shared-expert accumulation, KV, or GDN state. The component isolation was:
+
+- Default `mixer=Q4_K experts=NVFP4`, `FUCINA_MOE_Q4K=1`, and source `FUCINA_MOE_FP8=1` all failed the same graph/self-chain test. Changing the routed-expert storage and GEMM therefore did not remove the corruption.
+- `FUCINA_NO_UNIFY=1` passed all 24 decode steps for all three ragged rows, graph-on/off, sampling, self-chain, and the 8/8 oracle while leaving the default NVFP4 expert conversion/GEMMs and shared expert intact. This isolated the difference to the unified router branch.
+- The prompt's first tokens came from non-graph prefill and were coherent; corruption began on subsequent graph decode. That ruled out a pure load-time requantization error and matched stale per-step scratch rather than accumulating KV/GDN drift.
+
+The exact bug was the short-decode router's `cublasSgemm`. CUDA graphs capture the decode body on a temporary stream, but the shared cuBLAS handle remained bound to the engine stream. The router SGEMM consequently executed outside capture. Replays updated the hidden state but reused router logits produced at capture time, selecting and weighting the wrong experts on every later token. This explains why kernels remained fast, why all expert formats failed, why graph-off could produce valid text, and why an eight-token oracle generated partly during prefill could pass.
+
+`cuda/gemma4_kernels.cu` now always uses the explicit-stream router GEMV for decode-sized calls. Wide prefill retains SGEMM and explicitly binds the cuBLAS handle to the caller's stream. Router softmax/top-k/renormalization, grouped expert GEMMs, shared-expert addition, and NVFP4 weight conversion are unchanged.
+
+### Measured after the router fix
+
+Both required gates passed on GB10 with the official Qwen3.5-35B-A3B-FP8 oracle artifact:
+
+```text
+make qwen35-moe-fp8-engine-test
+# row-independence PASS; graph-on==off PASS; M3 parity PASS (8/8);
+# sampling PASS; self-chain PASS; final PASS
+
+make qwen35-moe-fp8-test
+# PASS — 8/8 greedy parity vs torch FP8 oracle
+```
+
+The official Qwen3.6-35B-A3B-FP8 was then rebuilt and served under `/tmp/fucina_gpu.lock` on port 8086 with the default `mixer=Q4_K experts=NVFP4`. Its internal 24-step ragged-row checks were 24/24 for B=3 versus B=1 and graph-on versus graph-off, and self-chain passed. (The test binary's Qwen3.5-specific pinned continuation is not a Qwen3.6 cross-version oracle.) Real HTTP checks produced:
+
+- exact requested plain prompt, greedy, `max_tokens=60`: **“The sea whispers ancient secrets to the shore.”** — 9 completion tokens, `finish_reason="stop"`, 38.8 generated tok/s including request timing;
+- forced `get_weather` tool request: `finish_reason="tool_calls"`, name `get_weather`, arguments `{"city":"Paris"}` — 17 completion tokens, 25.4 generated tok/s including the 270-token tool-schema prefill.
+
+This changes the earlier qualification result: the parser fix and source-FP8 admission fix were valid, but the remaining malformed output was caused by the graph-capture router arithmetic defect. Greedy prose and structured calls are coherent after fixing that defect; the eight-token oracle remains a regression gate, not the sole quality criterion.
