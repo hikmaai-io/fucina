@@ -42,9 +42,9 @@ See [model support](capabilities/model-support.md) for the code-verified support
 |---|---|
 | Qwen3.5/3.6 core inference | Mature experimental implementation with extensive real-model gates and strong GB10 benchmark evidence. |
 | Gemma 4 core inference | Mature experimental implementation; single-flight remains the richest path. |
-| Continuous serving | Functional and performance-oriented; constrained output and some persistence/spec features do not span every batch path. |
-| DS4-inspired single-node features | Phases A-C substantially implemented; Phase D is split by serving path; Phase E is a protocol scaffold. |
-| Release engineering | Not release-clean today: the normal unit suite passes, but the documented race gate fails and CI coverage differs from the Makefile gate. |
+| Continuous serving | Functional and performance-oriented; Qwen HTTP slot persistence is implemented, while constrained output and some speculation features do not span every batch path. |
+| DS4-inspired single-node features | Phases A-D substantially implemented (Qwen HTTP hardware gate pending); Phase E is a protocol scaffold. |
+| Release engineering | Not release-clean today: targeted unit/race gates pass, but CI coverage differs from the Makefile gate and the Qwen HTTP restart GPU gate remains to be recorded. |
 | Portability | Intentionally absent; other GPUs and CUDA toolchains are unsupported. |
 
 # Trust boundary

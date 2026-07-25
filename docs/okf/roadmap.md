@@ -24,11 +24,11 @@ sources:
 
 # Priority order
 
-1. **Restore a green correctness gate.** Fix the race in the batch scheduler test fixture, rerun `make check`, and make local/CI package lists identical. A red race gate takes precedence over performance work.
-2. **Reconcile public documentation with code.** Remove legacy Qwen3/Qwen3MoE support claims, mark superseded plans, and reconcile the `v0.1.0` tag with the changelog's “unreleased” heading.
-3. **Close mandatory-batching feature gaps.** Add constrained `response_format`/`json_schema` support to batching, or provide a correctness-preserving constrained route for Qwen3.5/3.6.
-4. **Finish E4B per-sequence sampling.** Its batch adapter currently ignores request sampling parameters and remains greedy.
-5. **Complete disk sessions for the Qwen server path.** Qwen state snapshots work in the paged REPL, but the HTTP session field is wired only to the single-flight cache.
+1. **Close the Qwen HTTP-session hardware gate.** Run `make qwen35-http-session-restart-test` on the GB10 with the official 9B FP8 checkpoint and retain the exact restore/suffix evidence.
+2. **Unify local and hosted pure-Go gates.** Include scheduler, grammar, session, and distributed packages from one shared package list so CI cannot silently omit them.
+3. **Reconcile public documentation with code.** Remove legacy Qwen3/Qwen3MoE support claims, mark superseded plans, and reconcile the `v0.1.0` tag with the changelog's “unreleased” heading.
+4. **Close mandatory-batching feature gaps.** Add constrained `response_format`/`json_schema` support to batching, or provide a correctness-preserving constrained route for Qwen3.5/3.6.
+5. **Finish E4B per-sequence sampling.** Its batch adapter currently ignores request sampling parameters and remains greedy.
 6. **Continue tensor-management refactoring.** Finish canonical tensor metadata, transactional ownership, and typed scratch without changing hot-path arithmetic.
 7. **Decide whether Phase E is a product objective.** If yes, implement a real CUDA partial-forward shard runner, model-range loading, CLI orchestration, and two-node parity/performance gates before adding RDMA.
 

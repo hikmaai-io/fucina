@@ -49,23 +49,41 @@ of the saved state; the "zero prefill" guarantee is for the saved prefix.
 ## Server
 
 Start with `--session-dir DIR`. A request carrying `"session": "NAME"` (a
-validated name, never a path) loads `DIR/NAME.fcsess` before prefill — seeding
-it into the KVCache snapshot pool, so a matching prompt restores instead of
-prefilling — and saves the updated conversation back after generation.
-Corrupt, truncated, or wrong-model session files are a 400 with the precise
-reason. Missing files are created on first save. Resume effectiveness is
-observable in `/metrics` (`kv_cache.reused_tokens`) and the per-request prefill
-log line (`N cached, M new`).
+validated name, never a path) loads `DIR/NAME.fcsess` before prefill and saves
+the updated conversation back after generation. Missing files create a new
+session. Corrupt, truncated, wrong-model, wrong-geometry, divergent, and
+symbolic-link files are rejected with HTTP 400 before inference. Two concurrent
+requests for the same name have no merge semantics, so the second receives
+HTTP 409 while other session names continue independently.
 
-Scope: the session field rides the single-flight KVCache path. The
-continuous-batching path keeps its in-memory per-conversation state cache
-(BatchAdapter); wiring disk sessions into the scheduler is future work — use
-the REPL commands for Qwen hybrid models meanwhile.
+Both serving paths are supported:
+
+- **Gemma single-flight (`flat-kv`)** seeds the snapshot pool, then normal
+  longest-prefix prefill restores the saved KV state.
+- **Qwen3.5/3.6 mandatory batching (`q35-slot`)** restores the named snapshot
+  into a fresh scheduler slot and chunk-prefills only the strict prompt suffix.
+  The scheduler exports the updated slot before freeing it; the HTTP goroutine
+  performs the atomic fsync/rename so filesystem I/O never blocks shared decode.
+
+Qwen persistence uses one-token decode steps while any persistent row is active.
+This preserves an exact stop/length frontier: speculative decoding can commit a
+tail beyond the token where the scheduler stops, and such hidden state could not
+be represented by the next rendered prompt. Unnamed traffic retains the normal
+speculative path. The saved token history is the engine's authoritative committed
+frontier, which can be one sampled token behind the response; that token is
+simply part of the next request's suffix.
+
+Resume effectiveness is observable in `/metrics` (`kv_cache.reused_tokens`),
+the scheduler log (`disk session restored (N cached, M new prompt tokens)`), and
+the session-save log. A loaded Qwen history must be a **strict** token prefix of
+the newly rendered prompt because snapshots contain no logits for an exact-match
+continuation and recurrent state cannot be rewound.
 
 ## Gates
 
 ```bash
-go test ./internal/session/ ./internal/server/   # format, corruption, resume
-make session-restart-test                        # GPU: save → restart → /load →
-                                                 # continue with zero re-prefill
+go test ./internal/server/... ./internal/session/...
+go test -race ./internal/server/... ./internal/session/...
+make session-restart-test                 # GPU REPL restart gate
+make qwen35-http-session-restart-test     # GPU HTTP scheduler restart gate
 ```

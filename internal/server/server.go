@@ -75,8 +75,13 @@ type Server struct {
 	metrics      Metrics
 	httpServer   *http.Server
 	// Disk session persistence (see session.go). Empty sessionDir = disabled.
-	sessionDir   string
-	sessionIdent session.Identity
+	sessionDir       string
+	sessionIdent     session.Identity
+	sessionKind      string
+	sessionStateBase int64 // Q35 snapshot bytes at zero tokens (derived at startup)
+	sessionStateStep int64 // Q35 bytes added by each committed token
+	sessionMu        sync.Mutex
+	sessionActive    map[string]struct{} // one in-flight writer per named session
 
 	// jsonPieces caches the decoded UTF-8 bytes of every token id (control tokens →
 	// nil), built once and reused by every response_format request's grammar constraint.
@@ -575,6 +580,25 @@ func (s *Server) SetBatchEngine(eng BatchEngine) bool {
 	if eng == nil || !eng.Supported() {
 		return false
 	}
+	// Gemma disk sessions use the one physical flat KV sequence. A scheduler
+	// would own the engine concurrently and cannot restore that state into a
+	// paged slot, so keep session-enabled Gemma on its proven single-flight path.
+	// Q35 sessions use SessionStateEngine below and require batching.
+	if s.sessionDir != "" {
+		switch s.sessionKind {
+		case session.KindFlatKV:
+			return false
+		case session.KindQ35Slot:
+			// Fail closed at startup rather than accepting a named request and
+			// discovering after generation that its slot cannot be exported.
+			if _, ok := eng.(batch.SessionStateEngine); !ok {
+				return false
+			}
+			if _, ok := eng.(batch.ChunkPrefillEngine); !ok {
+				return false
+			}
+		}
+	}
 	// Queue depth mirrors the single-flight admission channel: waiting requests
 	// not yet admitted to a slot. The scheduler admits up to engine Capacity()
 	// concurrently and queues the rest (surfacing ErrQueueFull as a 503).
@@ -1013,6 +1037,16 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// Two concurrent writers to one named conversation have no valid merge
+		// semantics and would race atomic renames (last writer wins). Reject the
+		// second request rather than lose a turn or restore stale state.
+		if !s.claimSession(req.Session) {
+			writeJSON(w, http.StatusConflict, map[string]interface{}{
+				"error": map[string]string{"message": "session is already in use by another request", "type": "session_conflict"},
+			})
+			return
+		}
+		defer s.releaseSession(req.Session)
 	}
 
 	// Per-request summary so the client's real footprint is visible (system-prompt
@@ -1154,7 +1188,19 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			})
 			return
 		}
-		s.serveBatch(w, r, params, tokens, wantTools, legacy)
+		var diskState *batch.StateSnapshot
+		if sessionPath != "" {
+			if s.sessionKind != session.KindQ35Slot {
+				http.Error(w, "disk sessions on the batch path require a Qwen3.5/3.6 slot-state engine", http.StatusBadRequest)
+				return
+			}
+			diskState, err = s.loadBatchSession(sessionPath, tokens)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("session %s: %v", req.Session, err), http.StatusBadRequest)
+				return
+			}
+		}
+		s.serveBatch(w, r, params, tokens, wantTools, legacy, sessionPath, diskState)
 		return
 	}
 
@@ -1343,7 +1389,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 // Sampling note: the current batched C ABI samples greedily on-device regardless
 // of SeqParams. The params are still forwarded so the contract is stable for when
 // the kernels grow temperature/top-k support.
-func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params GenerationParams, tokens []int32, wantTools, legacy bool) {
+func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params GenerationParams, tokens []int32, wantTools, legacy bool, sessionPath string, diskState *batch.StateSnapshot) {
 	stops := s.tokenizer.StopIDs()
 
 	seed := uint64(params.Seed)
@@ -1374,11 +1420,13 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 	defer cancel()
 
 	req := batch.Request{
-		Tokens: tokens,
-		Params: sp,
-		Stops:  stops,
-		MaxNew: params.MaxTokens,
-		Ctx:    ctx,
+		Tokens:         tokens,
+		Params:         sp,
+		Stops:          stops,
+		MaxNew:         params.MaxTokens,
+		Ctx:            ctx,
+		SessionState:   diskState,
+		PersistSession: sessionPath != "",
 		Emit: func(t int32) bool {
 			select {
 			case tokCh <- t:
@@ -1401,9 +1449,9 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 	}
 
 	if params.Stream {
-		s.streamBatch(w, r, cancel, tokCh, done, params, wantTools, legacy)
+		s.streamBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, sessionPath)
 	} else {
-		s.collectBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, len(tokens))
+		s.collectBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, len(tokens), sessionPath)
 	}
 }
 
@@ -1469,7 +1517,7 @@ func drainTokensBurst(tokCh <-chan int32, done <-chan batch.Result, onTok func(i
 // response. Text decodes incrementally (whole-slice decode, emit the new
 // suffix) so multi-byte UTF-8 pieces are never split mid-character.
 func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc,
-	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool) {
+	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool, sessionPath string) {
 
 	sse, ok := newSSEWriter(w, legacy, s.modelName)
 	if !ok {
@@ -1655,6 +1703,15 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 		}
 	}, sse.flush)
 
+	if sessionPath != "" && (res.Reason == batch.FinishError || res.Reason == batch.FinishShutdown) {
+		msg := "session generation failed"
+		if res.Err != nil {
+			msg += ": " + res.Err.Error()
+		}
+		sse.errorEvent(msg)
+		return
+	}
+	s.saveBatchSessionResult(sessionPath, res)
 	s.logGenSpeed(genStart, generated)
 	finish := batchFinish(res, r.Context())
 	if stopped && r.Context().Err() == nil {
@@ -1678,7 +1735,7 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 // the sequence — the calls are complete and anything further is the model
 // hallucinating the tool response (same cutoff as the streaming paths).
 func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc,
-	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool, promptTokens int) {
+	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool, promptTokens int, sessionPath string) {
 
 	var ids []int32
 	genStart := time.Now()
@@ -1710,6 +1767,15 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 			}
 		}
 	})
+	if sessionPath != "" && (res.Reason == batch.FinishError || res.Reason == batch.FinishShutdown) {
+		msg := "session generation failed"
+		if res.Err != nil {
+			msg += ": " + res.Err.Error()
+		}
+		http.Error(w, msg, http.StatusInternalServerError)
+		return
+	}
+	s.saveBatchSessionResult(sessionPath, res)
 	if stopped && lastCallEnd >= 0 {
 		ids = ids[:lastCallEnd+1] // drop the hallucination that triggered the cutoff
 	}

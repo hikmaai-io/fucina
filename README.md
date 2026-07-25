@@ -752,6 +752,12 @@ Reasoning/thinking works the same for both dialects: `"reasoning_effort": "low"|
 `"thinking": true/false` in the request; the model's reasoning appears in
 `choices[0].message.reasoning_content`.
 
+For restart-safe conversations, start with `--session-dir DIR` and include
+`"session": "NAME"` in chat or legacy completion requests. Gemma saves flat KV;
+Qwen3.5/3.6 saves each batch slot's full-attention KV plus GDN recurrent/conv state.
+The next request must render a strict extension of the saved token history. See
+[`docs/session-persistence.md`](docs/session-persistence.md) for format and safety details.
+
 > [!IMPORTANT]
 > `response_format`/`json_schema` (constrained JSON decoding) is implemented but is route-guarded
 > off the continuous-batching path with HTTP `501 unsupported_under_batching` — since every Qwen
@@ -832,6 +838,7 @@ Reasoning/thinking works the same for both dialects: `"reasoning_effort": "low"|
 | `--api-key` | (none) | Bearer token required on `/v1/*` (constant-time; reads `FUCINA_API_KEY` if unset). Empty = auth off (localhost dev) |
 | `--max-concurrent` | `4` | Admission-queue depth (in-flight + waiting); excess requests get `503` |
 | `--max-output-tokens` | `0` | Absolute per-request output-token ceiling (independent of context window); `0` = no extra cap |
+| `--session-dir` | (none) | Directory for named disk sessions supplied as `"session": "NAME"`; supports Gemma single-flight and Qwen3.5/3.6 batching |
 
 </details>
 

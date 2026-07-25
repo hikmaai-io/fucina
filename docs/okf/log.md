@@ -5,3 +5,4 @@
 * **Creation**: Added the initial OKF v0.2 bundle covering architecture, model support, DS4 implementation phases, test gates, performance evidence, known gaps, and roadmap.
 * **Validation**: Recorded `go test ./...` as passing and `make check` as failing under the race detector in `TestBatchedAdmissionCancellation`.
 * **Documentation**: Identified legacy Qwen3 claims and stale plan documents that no longer match the Qwen3.5-only detector on `main`.
+* **Qwen HTTP sessions**: Documented scheduler-owned `q35-slot` restore/export, exact commit frontiers, strict-prefix and concurrent-writer safety, CPU/race coverage, and the dedicated residual GB10 restart gate.

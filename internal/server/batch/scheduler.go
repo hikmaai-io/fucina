@@ -227,6 +227,28 @@ type StateSaverEngine interface {
 	SaveState(slot int, tokens []int32)
 }
 
+// StateSnapshot is an opaque, exact-position engine snapshot paired with the
+// committed token history that produced it. The scheduler never interprets
+// State; hybrid engines use it for full-layer K/V plus recurrent state.
+type StateSnapshot struct {
+	Tokens []int32
+	State  []byte
+}
+
+// SessionStateEngine is the disk-session boundary for hybrid batched engines.
+// RestoreSession opens a fresh slot, restores snap, and returns the number of
+// prompt tokens already committed; the scheduler then prefills only the suffix.
+// ExportSession snapshots the slot at its authoritative committed position.
+// StepBatchExact must commit at most one input token per row: persistent
+// sequences cannot use a speculative run whose already-committed tail may lie
+// past a stop/budget boundary and therefore cannot be represented by the next
+// rendered prompt.
+type SessionStateEngine interface {
+	RestoreSession(prompt []int32, params SeqParams, snap StateSnapshot) (slot int, nShared int, err error)
+	ExportSession(slot int, tokens []int32) (*StateSnapshot, error)
+	StepBatchExact(active []int32, inputs []int32) (out []int32, err error)
+}
+
 // defaultPrefillChunk is the prompt-token budget committed per scheduler pass for a
 // chunked (interleaved) prefill. Each pass commits at most one chunk for ONE prefilling
 // sequence AND runs one decode step, so decode of the active sequences keeps flowing
@@ -288,6 +310,13 @@ type Request struct {
 	// emit sink). A typical implementation does a non-blocking send to a
 	// buffered per-sequence channel and returns false when that channel is full.
 	Emit func(token int32) bool
+	// SessionState, when non-nil, is restored during admission before any
+	// prompt suffix is prefilled. PersistSession asks the scheduler to export
+	// the updated state before freeing the slot; the snapshot is returned in
+	// Result for the HTTP goroutine to write atomically without blocking the
+	// shared scheduler on filesystem I/O.
+	SessionState   *StateSnapshot
+	PersistSession bool
 	// Done receives the terminal Result exactly once when the sequence is
 	// evicted, for any reason. It MUST be buffered (cap >= 1) so the scheduler
 	// never blocks delivering it. A nil Done is allowed (fire-and-forget).
@@ -316,8 +345,16 @@ type Result struct {
 	Reason FinishReason
 	// Generated is the number of tokens emitted for this sequence.
 	Generated int
+	// ReusedTokens is the restored disk-session prefix length (zero on a cold
+	// admission). It is also surfaced through the engine prefix-cache metrics.
+	ReusedTokens int
 	// Err is the underlying engine error when Reason is FinishError, else nil.
 	Err error
+	// SessionState is the updated snapshot requested by PersistSession.
+	// SessionErr reports export failure without changing an otherwise-correct
+	// generation result.
+	SessionState *StateSnapshot
+	SessionErr   error
 }
 
 // ─── Errors ────────────────────────────────────────────────────────
@@ -358,6 +395,8 @@ type seq struct {
 	// regBlocks is how many full 256-token blocks of hist have been registered with
 	// the prefix cache; used to call PrefixCommit only when a new block completes.
 	regBlocks int
+	// reused is the exact disk-session prefix restored at admission.
+	reused int
 }
 
 // stopHit reports whether t is one of this sequence's stop tokens.
@@ -437,8 +476,11 @@ type Scheduler struct {
 	prefixCommit PrefixCommitEngine
 
 	// stateSaver, when non-nil, snapshots a finishing sequence's slot state
-	// keyed by its token history (hybrid engines' conversation cache).
+	// keyed by its token history (hybrid engines' in-memory conversation cache).
 	stateSaver StateSaverEngine
+	// sessionState is the explicit disk-session restore/export path. Unlike the
+	// opportunistic in-memory cache, restore failures are fatal to that request.
+	sessionState SessionStateEngine
 
 	// Per-pass phase telemetry (owner-goroutine only, no locks): where does a
 	// scheduler pass spend its time — the engine step (cgo forward), token
@@ -577,6 +619,9 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	}
 	if ss, ok := engine.(StateSaverEngine); ok {
 		s.stateSaver = ss
+	}
+	if se, ok := engine.(SessionStateEngine); ok {
+		s.sessionState = se
 	}
 	return s
 }
@@ -964,6 +1009,50 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			continue
 		}
 
+		// Reject persistence before touching the engine when it cannot export a
+		// slot snapshot. A new session has no SessionState yet, so checking only
+		// the restore branch below would otherwise run the request and fail late.
+		if req.PersistSession && s.sessionState == nil {
+			err := errors.New("batch: engine does not support hybrid session persistence")
+			reply(req, Result{Reason: FinishError, Err: err})
+			w = w[1:]
+			continue
+		}
+
+		// Explicit disk session: restore it into a fresh slot during admission,
+		// then put the sequence in the normal chunked-prefill backlog starting at
+		// nShared. Restore errors are request-fatal — silently cold-prefilling and
+		// overwriting a named session would hide corruption or a model mismatch.
+		if req.SessionState != nil {
+			if s.sessionState == nil || s.chunk == nil {
+				err := errors.New("batch: engine does not support hybrid session restore")
+				reply(req, Result{Reason: FinishError, Err: err})
+				w = w[1:]
+				continue
+			}
+			slot, nShared, err := s.sessionState.RestoreSession(req.Tokens, req.Params, *req.SessionState)
+			if err != nil {
+				reply(req, Result{Reason: FinishError, Err: fmt.Errorf("session restore: %w", err)})
+				w = w[1:]
+				continue
+			}
+			if nShared <= 0 || nShared >= len(req.Tokens) {
+				_ = s.engine.RemoveSeq(slot)
+				err := fmt.Errorf("session restore covered %d of %d prompt tokens; a strict saved prefix is required", nShared, len(req.Tokens))
+				reply(req, Result{Reason: FinishError, Err: err})
+				w = w[1:]
+				continue
+			}
+			sq := s.newSeq(req, slot)
+			sq.prefillPos = nShared
+			sq.reused = nShared
+			*prefill = append(*prefill, sq)
+			log.Printf("batch: disk session restored (%d cached, %d new prompt tokens)", nShared, len(req.Tokens)-nShared)
+			w = w[1:]
+			admitted = true
+			continue
+		}
+
 		// Chunked path: a prompt on a chunk-capable engine is opened now (adopting any
 		// cached prefix) and prefilled in pieces interleaved with decode, so it never
 		// blocks the batch. Opening is cheap (no prefill), so it is NOT subject to the
@@ -1055,6 +1144,9 @@ func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma Mul
 		if req.Ctx != nil && req.Ctx.Err() != nil {
 			break // let the serial loop reply-cancel this one
 		}
+		if req.PersistSession {
+			break // persistent state must use serial restore/export admission
+		}
 		if s.chunk != nil && len(req.Tokens) > s.chunkMin {
 			break // long prompt → chunked interleave path, not one-shot
 		}
@@ -1143,7 +1235,7 @@ func (s *Scheduler) newSeq(req Request, slot int) *seq {
 	// registration, and/or eviction-time state snapshots. The prompt's full
 	// blocks are already registered by AddSeq, so start regBlocks past them —
 	// PrefixCommit only fires for generated blocks.
-	if s.spec != nil || s.prefixCommit != nil || s.stateSaver != nil {
+	if s.spec != nil || s.prefixCommit != nil || s.stateSaver != nil || req.PersistSession {
 		sq.hist = append(make([]int32, 0, len(req.Tokens)+req.MaxNew), req.Tokens...)
 		sq.regBlocks = len(req.Tokens) / 256
 	}
@@ -1390,10 +1482,60 @@ func (s *Scheduler) step(active map[int]*seq) bool {
 	if len(active) == 0 {
 		return true
 	}
+	// A persistent sequence needs an exact stop frontier. Speculative engines
+	// may commit an entire accepted run before the scheduler observes a stop in
+	// its middle; that tail cannot be represented by the rendered conversation.
+	// Use the engine's one-token ABI for the whole shared step whenever any row
+	// will be exported. Ordinary traffic keeps the speculative fast path.
+	for _, sq := range active {
+		if sq.req.PersistSession && s.sessionState != nil {
+			return s.stepSessionExact(active)
+		}
+	}
 	if s.spec != nil {
 		return s.stepSpec(active)
 	}
 	return s.stepPlain(active)
+}
+
+// stepSessionExact is the persistent-session analogue of stepPlain. The
+// SessionStateEngine guarantees exactly one newly sampled token per row.
+func (s *Scheduler) stepSessionExact(active map[int]*seq) bool {
+	slots := make([]int32, 0, len(active))
+	inputs := make([]int32, 0, len(active))
+	for slot, sq := range active {
+		slots = append(slots, int32(slot))
+		inputs = append(inputs, sq.next)
+	}
+	t0 := time.Now()
+	out, err := s.sessionState.StepBatchExact(slots, inputs)
+	engineDur := time.Since(t0)
+	s.telEngine += engineDur
+	s.logFirstDecode(active, engineDur)
+	s.telSteps++
+	s.telBatch += int64(len(slots))
+	if err == nil && len(out) != len(slots) {
+		err = fmt.Errorf("StepBatchExact returned %d tokens for %d slots", len(out), len(slots))
+	}
+	if err != nil {
+		log.Printf("batch: StepBatchExact failed (%d active): %v", len(active), err)
+		for _, slot := range slots {
+			if sq := active[int(slot)]; sq != nil {
+				s.evict(active, sq, Result{Reason: FinishError, Generated: sq.generated, Err: err})
+			}
+		}
+		return false
+	}
+	t1 := time.Now()
+	ev0 := s.telEvict
+	for i, slot := range slots {
+		if sq := active[int(slot)]; sq != nil {
+			s.telTokens++
+			s.deliver(active, sq, out[i])
+		}
+	}
+	s.telDeliver += time.Since(t1) - (s.telEvict - ev0)
+	return true
 }
 
 // logFirstDecode attributes the first post-admission decode call by admission group.
@@ -1634,7 +1776,13 @@ const specCorpusCap = 1 << 16 // tokens kept in the cross-request suffix-decodin
 
 func (s *Scheduler) evict(active map[int]*seq, sq *seq, res Result) {
 	delete(active, sq.slot)
-	reply(sq.req, res)
+	res.ReusedTokens = sq.reused
+	// Ordinary requests retain the low-latency behavior: reply before expensive
+	// teardown. A persistent request must wait for ExportSession while the slot
+	// is still live, so its Result is delivered by flushEvictions instead.
+	if !sq.req.PersistSession {
+		reply(sq.req, res)
+	}
 	s.pendingFin = append(s.pendingFin, pendingFin{sq: sq, res: res})
 }
 
@@ -1655,12 +1803,18 @@ func (s *Scheduler) flushEvictions() {
 	for _, p := range s.pendingFin {
 		sq, res := p.sq, p.res
 		// Snapshot a cleanly finished conversation's slot state BEFORE the slot
-		// is freed, so a later request extending this conversation restores it
-		// instead of re-prefilling. Error/shutdown evictions never snapshot
-		// (state suspect).
-		if s.stateSaver != nil && len(sq.hist) > 0 {
-			switch res.Reason {
-			case FinishStop, FinishLength, FinishCancelled:
+		// is freed. Named disk sessions export into Result; unnamed traffic keeps
+		// using the adapter's opportunistic in-memory conversation cache. Error /
+		// shutdown evictions never snapshot because their state may be suspect.
+		clean := res.Reason == FinishStop || res.Reason == FinishLength || res.Reason == FinishCancelled
+		if clean && len(sq.hist) > 0 {
+			if sq.req.PersistSession {
+				if s.sessionState == nil {
+					res.SessionErr = errors.New("batch: engine does not support hybrid session export")
+				} else {
+					res.SessionState, res.SessionErr = s.sessionState.ExportSession(sq.slot, sq.hist)
+				}
+			} else if s.stateSaver != nil {
 				s.stateSaver.SaveState(sq.slot, sq.hist)
 			}
 		}
@@ -1669,6 +1823,9 @@ func (s *Scheduler) flushEvictions() {
 		}
 		// Feed the finished sequence's tokens to the cross-request drafter corpus (spec
 		// engines only). Trim from the FRONT so the ring keeps the most recent traffic.
+		if sq.req.PersistSession {
+			reply(sq.req, res)
+		}
 		if s.spec != nil && len(sq.hist) > 0 {
 			s.corpus = append(s.corpus, sq.hist...)
 			if over := len(s.corpus) - specCorpusCap; over > 0 {

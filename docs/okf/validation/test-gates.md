@@ -23,16 +23,17 @@ sources:
 
 | Layer | Representative command | Environment | Current inspection result |
 |---|---|---|---|
-| Go unit/integration | `go test ./...` | CPU plus existing cgo link artifacts | Passed 2026-07-25 |
-| Static/race gate | `make check` | CPU; local lint tool optional | Failed on batch test-fixture race |
+| Go unit/integration | `go test ./internal/server/... ./internal/session/...` | CPU | Passed 2026-07-25 |
+| Targeted race gate | `go test -race -count=1 ./internal/server/... ./internal/session/...` | CPU | Passed, including batch scheduler |
 | Host CUDA-adjacent tests | `make paged-kv-test`, detector/plan/allocation tests | C++ compiler; no model for some targets | Defined, not rerun in this inspection |
 | Build/smoke | `make all`, `make smoke` | CUDA 13 + GB10 + checkpoint | Not rerun |
+| Qwen HTTP persistence | `make qwen35-http-session-restart-test` | GB10 + official Qwen3.5-9B-FP8 | Pending current-worktree run |
 | Qwen real-model correctness | `make gpu-gates` and specialized `qwen35-*` targets | GB10 + downloaded dense/MoE checkpoints | Historical pass evidence; not rerun |
 | Performance protection | `scripts/protection_gate.py`, benchmark protocol | Quiescent GB10 and comparison runtime | Historical evidence; not rerun |
 
 # Required interpretation
 
-A normal `go test ./...` pass does not replace the race detector, and historical benchmark logs do not prove the current worktree was rebuilt from source. Conversely, the current race report points to a test fixture and does not by itself demonstrate a production data race.
+A normal unit pass does not replace the race detector, and historical benchmark logs do not prove the current worktree was rebuilt from source. The prior test-fixture race is fixed and the targeted race command is green; Qwen HTTP persistence still requires the real-model restart target because CPU mocks cannot validate the CUDA slot-state ABI.
 
 # CI discrepancy
 

@@ -200,6 +200,12 @@ func (m *mockEngine) counts() (add, remove int) {
 	return m.addCalls, m.removeCalls
 }
 
+func (m *mockEngine) multiseqCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.multiseqCalls
+}
+
 // ─── Test helpers ──────────────────────────────────────────────────
 
 // collector drains a sequence's emitted tokens into a slice via a buffered
@@ -380,11 +386,12 @@ func TestBatchedAdmissionCancellation(t *testing.T) {
 			t.Errorf("seq %d: reason = %q, want %q", i, res.Reason, FinishLength)
 		}
 	}
-	if eng.multiseqCalls == 0 {
+	if eng.multiseqCount() == 0 {
 		t.Error("batched admission (SeqAddMultiseq) never fired for the burst")
 	}
-	if eng.addCalls != eng.removeCalls {
-		t.Errorf("slot leak: %d admitted (add), %d freed (remove)", eng.addCalls, eng.removeCalls)
+	add, remove := eng.counts()
+	if add != remove {
+		t.Errorf("slot leak: %d admitted (add), %d freed (remove)", add, remove)
 	}
 }
 
@@ -481,6 +488,9 @@ func TestContextCancelEvicts(t *testing.T) {
 	if res.Reason != FinishCancelled {
 		t.Errorf("reason = %q want %q", res.Reason, FinishCancelled)
 	}
+	// Non-persistent results intentionally arrive before deferred teardown;
+	// shutdown joins the owner goroutine before asserting the engine is empty.
+	sched.Shutdown()
 	if live := eng.liveCount(); live != 0 {
 		t.Errorf("live slots after cancel = %d want 0", live)
 	}

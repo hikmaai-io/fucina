@@ -31,6 +31,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test \
         gpu-gates qwen35-state-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-meta-test qwen35-clean-gdn-test qwen35-moe-fp8-engine-test \
+        qwen35-http-session-restart-test \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
         qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen36-ssd-stream-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
         paged-kv-device-test packed-kv-test kv-quant-explore bench tool-bench phase-b-test \
@@ -319,6 +320,11 @@ qwen35-fp8-test: lib libdg
 # including the GDN recurrent state — costs zero prefill tokens).
 session-restart-test: fucina
 	flock -w 1800 /tmp/fucina_gpu.lock -c "scripts/test_session_restart.sh $(QWEN35_FP8_MODEL)"
+
+# Saves a named session through Qwen's mandatory HTTP batch path, restarts the
+# server, extends the exact prompt, and asserts only the suffix is prefilled.
+qwen35-http-session-restart-test: fucina
+	flock -w 1800 /tmp/fucina_gpu.lock -c "scripts/test_qwen_http_session_restart.sh $(QWEN35_FP8_MODEL)"
 
 # ─── Qwen3.5 FP8-9B served through the REAL batched engine (not the B=1 oracle) (GPU) ───
 # Loads the official Qwen3.5-9B FP8 checkpoint via gemma4_engine_create (FORMAT_FP8_BLOCK loader:

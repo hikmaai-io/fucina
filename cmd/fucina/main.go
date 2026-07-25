@@ -280,7 +280,7 @@ func main() {
 		srv.SetThinkBudget(args.ThinkBudget)
 		srv.SetKVSnapshotBudget(int64(args.KVSnapshotGB * (1 << 30)))
 		// Disk session persistence: requests naming a "session" resume from and
-		// save back to <session-dir>/<name>.fcsess (single-flight KVCache path).
+		// save back to <session-dir>/<name>.fcsess (Gemma flat KV or Qwen slot state).
 		if args.SessionDir != "" {
 			if err := srv.SetSessionDir(args.SessionDir, args.ModelPath); err != nil {
 				log.Printf("fucina: session persistence DISABLED: %v", err)

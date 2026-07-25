@@ -24,23 +24,23 @@ sources:
 
 # Repository state
 
-* Branch `main` matches `origin/main` at `39a96db`.
-* No tracked modifications existed before this OKF bundle was added.
-* Pre-existing untracked content: `qwen35-fucina-plan.md` and `scratchpad/` (about 2.2 MiB). The plan is an early roadmap and no longer represents current implementation maturity.
+* The documented baseline is `main`/`origin/main` at `39a96db`.
+* The `feat/qwen-http-session` worktree adds Qwen HTTP slot persistence, its tests, and this previously prepared OKF bundle without discarding unrelated main-worktree content.
 * Build outputs and benchmark databases present in the worktree are ignored by Git as intended.
 
 # Validation executed on 2026-07-25
 
 | Check | Result | Scope |
 |---|---|---|
-| `go test ./...` | **PASS** | All Go packages; no race detector |
-| `make check` | **FAIL** | Vet passed; local lint skipped because `golangci-lint` is absent; race test failed in `internal/server/batch` |
-| GPU gates | **Not rerun** | Historical checked-in evidence only |
-| Full CUDA rebuild | **Not rerun** | Existing artifacts were inspected, not rebuilt |
+| `go test ./internal/server/... ./internal/session/...` | **PASS** | HTTP, scheduler/batch, and session format |
+| `go test -race -count=1 ./internal/server/... ./internal/session/...` | **PASS** | Includes `internal/server/batch` |
+| `go vet ./internal/server/... ./internal/session/...` | **PASS** | Changed pure-Go packages |
+| Qwen HTTP restart GPU gate | **Pending** | `make qwen35-http-session-restart-test` |
+| Broader GPU gates | **Not rerun** | Historical checked-in evidence only |
 
-# Race-gate finding
+# Race-gate finding resolved
 
-`TestBatchedAdmissionCancellation` reads mock counters directly while the scheduler goroutine updates them under `mockEngine.mu`. The race detector reports the unsynchronized read/write pair. This currently proves a race in the test fixture, not a production scheduler race; nevertheless the repository's advertised `make check` gate is red and cannot certify the branch.[^test]
+The unlocked `mockEngine` counter reads in `TestBatchedAdmissionCancellation` now use locked accessors. The cancellation test also joins deferred scheduler teardown before asserting no live slots. The targeted race suite, including `internal/server/batch`, is green.[^test]
 
 [^test]: Batch scheduler tests
 

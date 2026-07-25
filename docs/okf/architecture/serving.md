@@ -34,6 +34,7 @@ sources:
 Gemma single-flight uses a physical KV cache plus snapshots and prefix matching. Qwen hybrid batching uses independent slots containing full-attention KV plus Gated-DeltaNet recurrent and convolution state. Burst coalescing and chunked admission are optimized for shared decode progress rather than one request holding the engine for its full lifetime.[^batching-doc]
 
 [^batching-doc]: Continuous batching design
+[^sessions]: Session persistence design
 
 # Feature asymmetry
 
@@ -42,9 +43,13 @@ Gemma single-flight uses a physical KV cache plus snapshots and prefix matching.
 | Concurrent independent sequences | No | Yes | Yes |
 | Per-request sampling parameters | Yes | Yes for main CUDA adapter | No; greedy only |
 | JSON constrained decoding | Yes | No; HTTP 501 | No batch integration |
-| Disk session through HTTP | Yes | No | No |
+| Disk session through HTTP | Yes (`flat-kv`) | Qwen3.5/3.6 (`q35-slot`) | No |
 | Prompt-lookup speculation | Yes | Dense batch rows only | Separate E4B paths |
 | Gemma MTP assistant | Yes | Not implemented per slot | E4B-specific MTP path exists |
+
+# Persistent Qwen sessions
+
+With `--session-dir`, the HTTP handler validates a named `q35-slot` file and strict token-prefix match before admission. The scheduler restores the slot, prefills only the suffix, uses one-token decode while persistent rows are active, exports the exact committed frontier before eviction, and returns bytes to the HTTP goroutine for atomic disk write. Concurrent writers to one name receive HTTP 409; malformed, mismatched, divergent, or symlink files fail before CUDA admission.[^sessions]
 
 # API safety
 

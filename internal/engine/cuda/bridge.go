@@ -1517,6 +1517,65 @@ func (a *BatchAdapter) Supported() bool { return a.eng.SeqFreeCapacity() > 0 }
 // success it records the slot so Capacity() stays accurate. On hybrid engines
 // a prompt extending a saved conversation restores that snapshot and prefills
 // only the suffix (one-shot), instead of the whole prompt.
+// RestoreSession implements batch.SessionStateEngine. Unlike the opportunistic
+// in-memory cache, an explicit disk snapshot is never allowed to fall back
+// cold: token/state mismatches or restore failures are surfaced to the request
+// so a named session cannot be silently overwritten from corrupt state.
+func (a *BatchAdapter) RestoreSession(prompt []int32, params batch.SeqParams, snap batch.StateSnapshot) (slot int, nShared int, err error) {
+	if !a.snapOn() {
+		return 0, 0, fmt.Errorf("fucina: hybrid per-slot snapshots are unsupported")
+	}
+	n := len(snap.Tokens)
+	if n <= 0 || n >= len(prompt) || !isTokenPrefix(snap.Tokens, prompt) {
+		return 0, 0, fmt.Errorf("fucina: saved tokens are not a strict prefix of the request prompt")
+	}
+	want := a.eng.SeqStateSize(n)
+	if want <= 0 || int64(len(snap.State)) != want {
+		return 0, 0, fmt.Errorf("fucina: session state is %d B but the engine lays out %d tokens as %d B", len(snap.State), n, want)
+	}
+	a.scLookups++
+	slot, err = a.eng.SeqOpen(params)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err = a.eng.SeqStateRestore(slot, snap.State, n); err != nil {
+		a.eng.SeqRemove(slot) // a failed restore may leave the slot state undefined
+		return 0, 0, err
+	}
+	a.active++
+	a.scHitTokens += int64(n)
+	return slot, n, nil
+}
+
+// ExportSession implements batch.SessionStateEngine. SeqNTokens is the
+// authoritative frontier: sampled output runs one token ahead of engine state,
+// so only tokens[:n] are paired with the snapshot.
+func (a *BatchAdapter) ExportSession(slot int, tokens []int32) (*batch.StateSnapshot, error) {
+	if !a.snapOn() {
+		return nil, fmt.Errorf("fucina: hybrid per-slot snapshots are unsupported")
+	}
+	n := a.eng.SeqNTokens(slot)
+	if n <= 0 || n > len(tokens) {
+		return nil, fmt.Errorf("fucina: slot %d reports %d committed tokens for history length %d", slot, n, len(tokens))
+	}
+	sz := a.eng.SeqStateSize(n)
+	if sz <= 0 {
+		return nil, fmt.Errorf("fucina: engine reports no session state for %d tokens", n)
+	}
+	state := make([]byte, int(sz))
+	if err := a.eng.SeqStateSave(slot, state, n); err != nil {
+		return nil, err
+	}
+	return &batch.StateSnapshot{Tokens: append([]int32(nil), tokens[:n]...), State: state}, nil
+}
+
+// StepBatchExact bypasses the adapter's optional MTP multi-token path. Disk
+// sessions need a one-token commit frontier so a stop/budget in the returned
+// run cannot leave hidden committed state beyond the persisted token history.
+func (a *BatchAdapter) StepBatchExact(active []int32, inputs []int32) ([]int32, error) {
+	return a.eng.StepBatch(active, inputs)
+}
+
 func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int32, error) {
 	if a.snapOn() {
 		a.scLookups++

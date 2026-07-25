@@ -30,9 +30,8 @@ sources:
 
 # P0 — quality gate
 
-1. **`make check` is red.** The batch cancellation test performs unlocked reads of locked mock counters. Fix the fixture and rerun the race suite.
-2. **Local and hosted gates have drifted.** The Makefile race suite includes `internal/server/batch`; hosted CI's `PKGS` omits it. Hosted CI also omits pure-Go `internal/grammar`, `internal/session`, and `internal/dist`, even though these carry structured-output, persistence, and protocol logic.[^ci]
-3. **GPU evidence is not continuous CI.** Correctness depends on a GB10 and large local checkpoints. Historical gates are extensive, but no automated public runner validates current CUDA changes.
+1. **Local and hosted gates have drifted.** The Makefile race suite includes `internal/server/batch`; hosted CI's `PKGS` omits it. Hosted CI also omits pure-Go `internal/grammar`, `internal/session`, and `internal/dist`, even though these carry structured-output, persistence, and protocol logic.[^ci]
+2. **GPU evidence is not continuous CI.** Correctness depends on a GB10 and large local checkpoints. The Qwen HTTP restart target exists, but its current-worktree result must be recorded before merge; no automated public runner validates CUDA changes.
 
 [^ci]: Hosted CI workflow
 
@@ -40,7 +39,6 @@ sources:
 
 * `response_format` and `json_schema` return HTTP 501 under continuous batching; all supported Qwen3.5/3.6 serving uses that path.
 * E4B continuous batching is greedy and ignores per-request temperature/top-k/top-p/min-p/seed parameters.
-* HTTP disk sessions are single-flight only. Qwen hybrid persistence works in the paged REPL but is not threaded through the server scheduler.
 * Gemma's MTP assistant is not implemented per slot in the continuous-batch path.
 * Embeddings remain a stub that returns an empty data list.
 
