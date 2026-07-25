@@ -23,4 +23,4 @@ This directory is the OKF v0.2 knowledge bundle for fucina. It is a dated, sourc
 * Concept documents use YAML frontmatter and standard Markdown links.
 * `generated` records when this snapshot was produced; no `verified` field is present until a human or independent process confirms a concept.
 * Time-sensitive concepts are `draft` and expire through `stale_after`.
-* The implementation snapshot is local commit `480f1b85722754d0e692321082890b6103fe56d8`, validated on 2026-07-25; `origin/main` remains at `39a96db`.
+* The bundle was refreshed on 2026-07-25 for the merge candidate based on local `main` `69bdacb`, including final GB10 Qwen/Gemma gate reruns and Qwen3.6 agentic/decode measurements. Individual concept frontmatter retains its original generation snapshot for provenance.

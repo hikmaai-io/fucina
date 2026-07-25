@@ -4,15 +4,14 @@
 // chunk runs FULL-layer attention over the whole fp16 K/V cache. This harness pins the
 // token-level contract of that continuation path against the one-shot prefill:
 //   (A) one-shot   : seq_add(prompt)                          -> first + 24 greedy tokens
-//   (B) chunked/sc : seq_open + prefill_chunk(1024, rest) with g_fucina_q35_scalar_cont_attn=1
-//                    (the scalar qwen35_b_attn_kernel continuation)   -> first + 24 tokens
-//   (C) chunked/tc : same split with the default tensor-core continuation -> first + 24 tokens
+//   (B) chunked/sc : seq_open + prefill_chunk(1024, rest) with the production scalar
+//                    qwen35_b_attn_kernel continuation              -> first + 24 tokens
+//   (C) chunked/tc : same split with the diagnostic tensor-core candidate -> first + 24 tokens
 // It prints the first token of each run, the 25-token agreement of B and C against A (the
 // chunked-vs-one-shot bar) and of C against B (TC-vs-scalar), plus the wall time of the
-// continuation chunk under both paths. Gate (see docs in the TC-continuation commit):
-// C's agreement with A must be >= B's, and C's first token must match A's whenever B's does.
-// NOTE: chunked-vs-one-shot was NEVER bitwise for qwen35 (chunk 1 is TC, continuation was
-// scalar), so the bar is token-level agreement, exactly like the TC base==0 precedent.
+// continuation chunk under both paths. The shipping scalar path must agree 25/25 with one-shot.
+// The approximate TC candidate remains measured but non-shipping after correct graph-router replay
+// exposed a 2/25 trajectory; it must not silently become production without restoring parity.
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -136,8 +135,10 @@ int main(int argc, char **argv) {
     printf("PARITY first: oneshot=%d scalar=%d tc=%d\n", A[0], B[0], C[0]);
     printf("PARITY agree/%d: scalar-vs-oneshot=%d tc-vs-oneshot=%d tc-vs-scalar=%d\n",
            NTOK, ba, ca, cb);
-    // Gate: the TC continuation must track one-shot at least as well as the scalar one.
-    int pass = (ca >= ba) && (C[0] == A[0] || B[0] != A[0]);
-    printf("CHUNK-PARITY %s\n", pass ? "PASS" : "FAIL");
+    // Gate the shipping continuation path at the strongest observed contract: exact token parity.
+    // TC remains diagnostic until it independently reaches the same bar.
+    int pass = (ba == NTOK) && (B[0] == A[0]);
+    printf("CHUNK-PARITY %s (production scalar %d/%d; diagnostic tc %d/%d)\n",
+           pass ? "PASS" : "FAIL", ba, NTOK, ca, NTOK);
     return pass ? 0 : 1;
 }

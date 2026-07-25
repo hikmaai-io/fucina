@@ -149,3 +149,49 @@ The official Qwen3.6-35B-A3B-FP8 was then rebuilt and served under `/tmp/fucina_
 - forced `get_weather` tool request: `finish_reason="tool_calls"`, name `get_weather`, arguments `{"city":"Paris"}` — 17 completion tokens, 25.4 generated tok/s including the 270-token tool-schema prefill.
 
 This changes the earlier qualification result: the parser fix and source-FP8 admission fix were valid, but the remaining malformed output was caused by the graph-capture router arithmetic defect. Greedy prose and structured calls are coherent after fixing that defect; the eight-token oracle remains a regression gate, not the sole quality criterion.
+
+### Exact failing-prompt reference and raw-completion verification
+
+A final clean rerun used official snapshot `95a723d08a9490559dae23d0cff1d9466213d989`, a freshly rebuilt binary, port 8086, and `/tmp/fucina_gpu.lock`. Direct local `transformers.AutoTokenizer` output and fucina's `FUCINA_DEBUG=1` request dump agreed one-by-one on all 20 chat IDs listed above. The CPU renderer/tokenizer/server tests also passed with that snapshot's `tokenizer.json`.
+
+The exact 20-ID failing chat prompt was then passed through the standalone source-FP8 `qwen35_moe_fp8_forward_greedy` path, replacing the historical five canned France IDs. It generated:
+
+```text
+[760, 9117, 85111, 13437, 22857, 310, 279, 29199, 13, 248046, 198, 248044]
+```
+
+This decodes to `The sea whispers ancient secrets to the shore.<|im_end|>\n<|endoftext|>`. The production Q4_K/NVFP4 graph path generated the same nine lexical token IDs and returned **“The sea whispers ancient secrets to the shore.”** at 40.8 tok/s. End-to-end token equality on the actual repro made an additional per-layer dump unnecessary after the graph-on/off self-test had already isolated the old divergence to the out-of-capture router SGEMM.
+
+Finally, raw `/v1/completions` received the verbatim eight IDs `[7734, 799, 2716, 11316, 883, 279, 9117, 13]` with no ChatML tokens and produced coherent English (`Thinking Process: ...`) for the full 60-token cap at 57.8 tok/s. As expected for an untemplated base completion, it did not follow the chat instruction as tightly; importantly, it was not corrupt. The exact chat acceptance prompt is therefore coherent on both standalone source FP8 and the production quantized graph path.
+
+## Final GB10 qualification
+
+The complete 69-scenario `tool-eval-bench v2.0.4` run on the router-fixed Qwen3.6-35B-A3B-FP8 path scored **80/100 (110/138, Good)** in **347 s**, up from the reproduced pre-fix **12/100** run that took **1,299 s**. The accepted report is run `2026-07-25T18-58-59.079320Z_179ae609`. It selected `get_weather` correctly for Berlin (`{"location":"Berlin","units":"celsius"}` in the full tool schema) and retained coherent prose. This puts sparse MoE agentic quality at practical parity with the same-day dense Qwen3.6-27B-FP8 result (**81/100**).
+
+A subsequent merge-candidate rerun made the exact scalar continuation-prefill path the production default because the old approximate tensor-core continuation scored only 2/25 against scalar/one-shot after router replay was corrected. That stricter candidate scored **78/100 (107/138, Good)** in **370.3 s**; TC-33 changed from pass to fail and TC-53 from pass to partial. Both numbers are retained: **12→80** measures the graph-router incident fix requested by this qualification, while **78** is the final exact-continuation branch result. No 80-point claim is attached to the later binary.
+
+### Final correctness and regression gates
+
+On the final branch and the official Qwen3.5-35B-A3B-FP8 oracle checkpoint:
+
+```text
+B=3(graph) vs B=1(per-kernel): 24/24 for all three ragged rows
+graph-on vs graph-off:         24/24 for all three ragged rows
+self-chain:                    PASS
+engine oracle:                 8/8
+standalone torch oracle:       8/8
+gpu-gates:                     PASS
+production continuation:       scalar/one-shot 25/25
+```
+
+This resolves—but does not rewrite—the historical `FAIL` at `benchmark-evidence/results/2026-07-19-qwen35-burst-ttft2/qwen-gates.log:417` (`oracle 8/8, self-test FAIL`). Explicit reruns also passed `qwen35-state-test` (16/16), `qwen35-shard-test` (8/8 frontier and oracle), and `qwen35-http-session-restart-test` (11 cached tokens restored; only the 7-token suffix prefilled).
+
+The full MoE decode microbench on Qwen3.6-35B-A3B-FP8 measured B=1 at **55.7, 59.4, and 59.0 tok/s** over three fresh 128-step runs: **59.0 tok/s median** (16.96 ms/step median). This is above the 46–53 tok/s historical served baseline, so moving decode routing onto the captured stream did not cost throughput. B=2/4/8 median aggregate rates were **95.4/150.3/219.8 tok/s**.
+
+The dense Qwen3.6-27B-FP8 smoke measured **11.90 tok/s** over 64 B=1 graph steps and returned both the exact prose **“The sea whispers ancient secrets to the shore.”** and a correct forced call, `get_weather` with `{"location":"Berlin"}`. This is a brief regression smoke, not a replacement for its existing 81/100 quality run.
+
+### Remaining gaps
+
+- Structured `response_format` remains unavailable under continuous batching and returns HTTP **501**. It directly loses TC-64, TC-65, TC-66, TC-67, and TC-69 (five scenarios).
+- **TC-60 Cross-Turn Sleeper Injection still fails** and remains safety-critical.
+- The exact scalar continuation path restores 25/25 correctness but is slower than the quarantined tensor-core candidate for base>0 chunks (about 2.04 s versus 1.09 s for the measured 1,376-token continuation). Decode throughput is unaffected.

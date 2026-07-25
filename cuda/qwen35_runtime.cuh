@@ -1253,9 +1253,10 @@ static void qwen35_prefill_chunk_body(gemma4_engine_t *eng, int slot, int base, 
             qwen35_b_kv_write_kernel<<<dim3(grid1d((size_t)NKV*HD),T),256,0,st>>>(
                 eng->q35.Kc[l], eng->q35.Vc[l], kb, vb, d_pos, d_slot, maxctx, T, NKV);
             // base==0: the whole causal prompt is this tile → tensor-core GEMM attention (reads
-            // kb/vb directly). base>0 (chunked continuation): tensor-core GEMMs over the fp16
-            // K/V cache in place (q35_cont_attn_tc); the scalar kernel remains only as the
-            // alloc/cuBLAS-failure fallback (and under the parity-test override).
+            // kb/vb directly). base>0 (chunked continuation): use the exact scalar path in
+            // production. The tensor-core candidate remains available to the parity harness, but
+            // is not shipping while its continuation diverges from one-shot under correct router
+            // replay. Allocation/cuBLAS failures also fall through to the scalar implementation.
             extern int g_fucina_q35_scalar_cont_attn;
             if (base == 0 && T <= 8192 && ensure_q35_attn_scratch(eng, T))
                 q35_full_attn_tc(eng, attn, qb, kb, vb, T, st);

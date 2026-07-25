@@ -9207,9 +9207,12 @@ int gemma4_engine_prefill_batched(
 // (skips paged_prefill_batched). Used ONLY by the dual-path determinism self-test.
 int g_fucina_force_slow_prefill = 0;
 
-// Test override: when set, the qwen35 base>0 chunked-prefill continuation forces the scalar
-// qwen35_b_attn_kernel instead of the tensor-core path. Used ONLY by test_qwen35_chunk_parity.
-int g_fucina_q35_scalar_cont_attn = 0;
+// Production correctness policy for qwen35 base>0 chunked-prefill continuation. The tensor-core
+// approximation used to be the default, but after graph decode's router was made current per replay
+// it no longer met its own token-parity gate (2/25 vs scalar/one-shot 25/25). Keep the exact scalar
+// path as the shipping default; the parity harness temporarily clears this flag to measure the
+// tensor-core candidate without letting an approximate prefill path silently change served output.
+int g_fucina_q35_scalar_cont_attn = 1;
 
 // ── Qwen3-MoE sparse FFN ────────────────────────────────────────────────────────────────────────
 // The dense SiLU-GLU FFN is replaced by a 128-expert top-8 mixture. The router is a PLAIN GEMV

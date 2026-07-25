@@ -44,7 +44,7 @@ See [model support](capabilities/model-support.md) for the code-verified support
 | Gemma 4 core inference | Mature experimental implementation; single-flight remains the richest path. |
 | Continuous serving | Functional and performance-oriented; Qwen HTTP slot persistence is implemented, while constrained output and some speculation features do not span every batch path. |
 | DS4-inspired features | Phases A-D substantially implemented with the Qwen HTTP restart gate passing; Phase E has an integrated CUDA/TCP execution boundary with range-residency and two-host gates still pending. |
-| Release engineering | Not release-clean today: targeted unit/race gates pass, but CI coverage differs from the Makefile gate and the Qwen HTTP restart GPU gate remains to be recorded. |
+| Release engineering | Not release-clean today: full unit/race and Qwen GPU gates pass locally, including HTTP restart, but hosted CI coverage differs from the Makefile and known Gemma/E4B gates remain red. |
 | Portability | Intentionally absent; other GPUs and CUDA toolchains are unsupported. |
 
 # Trust boundary
