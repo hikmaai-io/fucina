@@ -40,7 +40,7 @@ sources:
 | Full Qwen GPU umbrella | **PASS** | Dense+MoE parity, state, shard, chunk, multiseq prefill, clean GDN, head, and MoE engine |
 | MoE graph self-test | **PASS** | Every ragged row B=3 vs B=1 and graph-on/off 24/24; self-chain PASS; engine + standalone oracle 8/8 |
 | Qwen3.6 MoE quality/performance | **80/100 router-only; 78/100 final** | 12/100 before; final decode median 59.0 tok/s, no loss versus 46–53 baseline |
-| Gemma regression set | **No new signature** | paged device PASS; legacy dense bench and E4B batch retain their documented historical failures |
+| Gemma regression set | **E4B batch resolved** | paged device PASS; E4B ragged lengths 1..5 match independent decode for 8/8 tokens per row; legacy dense bench retains its documented historical failure |
 | Full Go and race gates | **PASS** | `go test ./... -count=1` and `make check`; local lint tool unavailable and skipped |
 
 # Race-gate finding resolved
@@ -51,4 +51,4 @@ The unlocked `mockEngine` counter reads in `TestBatchedAdmissionCancellation` no
 
 # Overall verdict
 
-Fucina is far beyond a prototype in core Qwen/Gemma inference and GB10 optimization, but it remains an experimental lab engine rather than a release-clean product. The historical Qwen MoE self-test failure is now resolved on hardware and the router correctness fix retains decode performance. Release constraints remain: TC-60 fails, known Gemma/E4B gates remain red, and GPU validation is not continuous CI. Batched/Qwen structured output was closed on 2026-07-26 with 5/5 schema-valid Qwen3.6 FP8 hardware requests.
+Fucina is far beyond a prototype in core Qwen/Gemma inference and GB10 optimization, but it remains an experimental lab engine rather than a release-clean product. The historical Qwen MoE self-test and E4B batch-parity failures are now resolved on hardware. Release constraints remain: TC-60 fails, the legacy dense Gemma gate remains red, E4B HF oracle artifacts are unavailable, and GPU validation is not continuous CI. Batched/Qwen structured output was closed on 2026-07-26 with 5/5 schema-valid Qwen3.6 FP8 hardware requests.

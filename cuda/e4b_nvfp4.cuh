@@ -110,6 +110,92 @@ static inline void e4b_gemv_launch(float* y, const uint8_t* wpacked, const uint8
     e4b_gemv_kernel<<<blocks, 32 * E4B_GEMV_WARPS, 0, stream>>>(y, wpacked, wscale, gs, x, in_dim, out_dim);
 }
 
+// Batched decode counterpart. Each weight group is decoded once and applied to NK
+// independent activation rows. For every (row, output) accumulator the g traversal,
+// expression order and warp reduction are identical to e4b_gemv_kernel, so batching
+// changes memory reuse only—not the numerical result.
+template<int NK>
+static __global__ void e4b_gemv_batched_kernel(
+    float* __restrict__ y, const uint8_t* __restrict__ wpacked,
+    const uint8_t* __restrict__ wscale, const float* __restrict__ gs,
+    const float* __restrict__ x, int in_dim, int out_dim) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x * E4B_GEMV_WARPS + warp) * E4B_GEMV_ROWS;
+    if (row0 >= out_dim) return;
+    const int nrow = min(E4B_GEMV_ROWS, out_dim - row0);
+    const size_t wrowb = (size_t)(in_dim / 2);
+    const size_t srowb = (size_t)(in_dim / 16);
+    const int ngrp = in_dim / 32;
+
+    const float lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    auto dec = [&lut](uint32_t nib) -> float { float v=lut[nib&7u]; return (nib&8u)?-v:v; };
+    auto mac8 = [&](uint32_t u, const float* xb, float bs) {
+        float a=0.f;
+        #pragma unroll
+        for (int b=0;b<4;b++) { uint32_t v=(u>>(8*b))&0xFFu;
+            a += dec(v&0xF)*xb[2*b]; a += dec(v>>4)*xb[2*b+1]; }
+        return a*bs;
+    };
+
+    float acc[NK][E4B_GEMV_ROWS];
+    #pragma unroll
+    for (int n=0;n<NK;n++) {
+        #pragma unroll
+        for (int r=0;r<E4B_GEMV_ROWS;r++) acc[n][r]=0.f;
+    }
+    for (int g=lane;g<ngrp;g+=32) {
+        #pragma unroll
+        for (int r=0;r<E4B_GEMV_ROWS;r++) {
+            if (r>=nrow) break;
+            const uint8_t* wrow=wpacked+(size_t)(row0+r)*wrowb;
+            const uint8_t* srow=wscale +(size_t)(row0+r)*srowb;
+            uint4 packed=*reinterpret_cast<const uint4*>(wrow+(size_t)g*16);
+            float bs0=e4m3_dev(srow[(size_t)g*2]);
+            float bs1=e4m3_dev(srow[(size_t)g*2+1]);
+            #pragma unroll
+            for (int n=0;n<NK;n++) {
+                const float* xb=x+(size_t)n*in_dim+(size_t)g*32;
+                acc[n][r] += mac8(packed.x,xb+0,bs0);
+                acc[n][r] += mac8(packed.y,xb+8,bs0);
+                acc[n][r] += mac8(packed.z,xb+16,bs1);
+                acc[n][r] += mac8(packed.w,xb+24,bs1);
+            }
+        }
+    }
+    const float g_scale=*gs;
+    #pragma unroll
+    for (int n=0;n<NK;n++) {
+        #pragma unroll
+        for (int r=0;r<E4B_GEMV_ROWS;r++) {
+            float a=acc[n][r];
+            #pragma unroll
+            for (int o=16;o>0;o>>=1) a += __shfl_xor_sync(0xffffffffu,a,o);
+            if (lane==0 && r<nrow) y[(size_t)n*out_dim+row0+r]=a*g_scale;
+        }
+    }
+}
+
+static inline void e4b_gemv_batched_launch(
+    float* y, const uint8_t* wpacked, const uint8_t* wscale, const float* gs,
+    const float* x, int in_dim, int out_dim, int B, cudaStream_t stream) {
+    const int per=E4B_GEMV_WARPS*E4B_GEMV_ROWS;
+    dim3 blocks((out_dim+per-1)/per);
+    #define E4B_NV_B(N) e4b_gemv_batched_kernel<N><<<blocks,32*E4B_GEMV_WARPS,0,stream>>>( \
+        y,wpacked,wscale,gs,x,in_dim,out_dim)
+    switch (B) {
+        case 1:E4B_NV_B(1);break; case 2:E4B_NV_B(2);break;
+        case 3:E4B_NV_B(3);break; case 4:E4B_NV_B(4);break;
+        case 5:E4B_NV_B(5);break; case 6:E4B_NV_B(6);break;
+        case 7:E4B_NV_B(7);break; case 8:E4B_NV_B(8);break;
+        default:
+            for (int off=0;off<B;off+=8) { int n=min(8,B-off);
+                e4b_gemv_batched_launch(y+(size_t)off*out_dim,wpacked,wscale,gs,
+                    x+(size_t)off*in_dim,in_dim,out_dim,n,stream); }
+    }
+    #undef E4B_NV_B
+}
+
 // A quantized NVFP4 weight, device-resident. Layout matches nvfp4.h exactly:
 //   packed : U8 [out_dim][in_dim/2]   two E2M1 nibbles/byte (low=even k, high=odd k)
 //   scale  : E4M3 [out_dim][in_dim/16] LINEAR block scales
@@ -254,6 +340,14 @@ inline void e4b_nvfp4_gemv_bf16(__nv_bfloat16* y, const Weight& w, const __nv_bf
     to_bf16<<<(w.out_dim + 255) / 256, 256, 0, stream>>>(yf, y, w.out_dim);
 }
 
+inline void e4b_nvfp4_gemv_bf16_batched(
+    __nv_bfloat16* y, const Weight& w, const __nv_bfloat16* x,
+    float* xf, float* yf, int B, cudaStream_t stream) {
+    to_f32<<<((size_t)B*w.in_dim+255)/256,256,0,stream>>>(x,xf,B*w.in_dim);
+    e4b_gemv_batched_launch(yf,w.packed,w.scale,w.gs,xf,w.in_dim,w.out_dim,B,stream);
+    to_bf16<<<((size_t)B*w.out_dim+255)/256,256,0,stream>>>(yf,y,B*w.out_dim);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // FP8 (E4M3) per-row-scaled weight — the HIGHER-PRECISION quant for the routing/
 // decision projections (attention Q/K "index"; the output LM head). 8-bit weight =
@@ -336,6 +430,71 @@ static __global__ void e4b_fp8_gemv_kernel(
     }
 }
 
+// FP8 batched kernel with the same per-output arithmetic invariant as the NVFP4
+// variant above. Weight bytes are loaded once and reused across up to eight rows.
+template<int NK>
+static __global__ void e4b_fp8_gemv_batched_kernel(
+    float* __restrict__ y, const __nv_fp8_storage_t* __restrict__ q,
+    const float* __restrict__ rs, const float* __restrict__ x,
+    int in_dim, int out_dim) {
+    const int warp=threadIdx.x>>5, lane=threadIdx.x&31;
+    const int row0=(blockIdx.x*E4B_GEMV_WARPS+warp)*E4B_GEMV_ROWS;
+    if (row0>=out_dim) return;
+    const int nrow=min(E4B_GEMV_ROWS,out_dim-row0), ngrp=in_dim/16;
+    float acc[NK][E4B_GEMV_ROWS];
+    #pragma unroll
+    for (int n=0;n<NK;n++) {
+        #pragma unroll
+        for (int r=0;r<E4B_GEMV_ROWS;r++) acc[n][r]=0.f;
+    }
+    for (int g=lane;g<ngrp;g+=32) {
+        #pragma unroll
+        for (int r=0;r<E4B_GEMV_ROWS;r++) {
+            if (r>=nrow) break;
+            const __nv_fp8_storage_t* qr=q+(size_t)(row0+r)*in_dim;
+            uint4 w4=*reinterpret_cast<const uint4*>(qr+(size_t)g*16);
+            const uint8_t* wb=reinterpret_cast<const uint8_t*>(&w4);
+            #pragma unroll
+            for (int n=0;n<NK;n++) {
+                const float* xb=x+(size_t)n*in_dim+(size_t)g*16;
+                float a=0.f;
+                #pragma unroll
+                for (int j=0;j<16;j++) a += e4m3_dev(wb[j])*xb[j];
+                acc[n][r] += a;
+            }
+        }
+    }
+    #pragma unroll
+    for (int n=0;n<NK;n++) {
+        #pragma unroll
+        for (int r=0;r<E4B_GEMV_ROWS;r++) {
+            float a=acc[n][r];
+            #pragma unroll
+            for (int o=16;o>0;o>>=1) a += __shfl_xor_sync(0xffffffffu,a,o);
+            if (lane==0 && r<nrow) y[(size_t)n*out_dim+row0+r]=a*rs[row0+r];
+        }
+    }
+}
+
+static inline void e4b_fp8_gemv_batched_launch(
+    float* y, const Fp8Weight& w, const float* x, int B, cudaStream_t stream) {
+    const int per=E4B_GEMV_WARPS*E4B_GEMV_ROWS;
+    dim3 blocks((w.out_dim+per-1)/per);
+    #define E4B_FP8_B(N) e4b_fp8_gemv_batched_kernel<N><<<blocks,32*E4B_GEMV_WARPS,0,stream>>>( \
+        y,w.q,w.rs,x,w.in_dim,w.out_dim)
+    switch (B) {
+        case 1:E4B_FP8_B(1);break; case 2:E4B_FP8_B(2);break;
+        case 3:E4B_FP8_B(3);break; case 4:E4B_FP8_B(4);break;
+        case 5:E4B_FP8_B(5);break; case 6:E4B_FP8_B(6);break;
+        case 7:E4B_FP8_B(7);break; case 8:E4B_FP8_B(8);break;
+        default:
+            for (int off=0;off<B;off+=8) { int n=min(8,B-off);
+                e4b_fp8_gemv_batched_launch(y+(size_t)off*w.out_dim,w,
+                    x+(size_t)off*w.in_dim,n,stream); }
+    }
+    #undef E4B_FP8_B
+}
+
 inline bool e4b_fp8_quantize(const __nv_bfloat16* d_W, int out_dim, int in_dim, Fp8Weight* w) {
     if (!w || in_dim <= 0 || out_dim <= 0 || (in_dim & 15)) return false;
     w->in_dim = in_dim; w->out_dim = out_dim;
@@ -361,6 +520,20 @@ inline void e4b_fp8_gemv_bf16(__nv_bfloat16* y, const Fp8Weight& w, const __nv_b
                               float* xf, float* yf, cudaStream_t stream) {
     e4b_fp8_gemv_f32(yf, w, x, xf, stream);
     to_bf16<<<(w.out_dim + 255) / 256, 256, 0, stream>>>(yf, y, w.out_dim);
+}
+
+inline void e4b_fp8_gemv_f32_batched(
+    float* y, const Fp8Weight& w, const __nv_bfloat16* x,
+    float* xf, int B, cudaStream_t stream) {
+    to_f32<<<((size_t)B*w.in_dim+255)/256,256,0,stream>>>(x,xf,B*w.in_dim);
+    e4b_fp8_gemv_batched_launch(y,w,xf,B,stream);
+}
+
+inline void e4b_fp8_gemv_bf16_batched(
+    __nv_bfloat16* y, const Fp8Weight& w, const __nv_bfloat16* x,
+    float* xf, float* yf, int B, cudaStream_t stream) {
+    e4b_fp8_gemv_f32_batched(yf,w,x,xf,B,stream);
+    to_bf16<<<((size_t)B*w.out_dim+255)/256,256,0,stream>>>(yf,y,B*w.out_dim);
 }
 
 } // namespace e4bfp4
