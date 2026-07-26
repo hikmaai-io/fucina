@@ -123,6 +123,62 @@ func newQwenSingleFlightServer(t *testing.T, script []int32) *Server {
 	return srv
 }
 
+func TestQwenRoleFidelitySurvivesPrefixCacheHit(t *testing.T) {
+	srv := newQwenSingleFlightServer(t, nil)
+	payload := `{"kind":"weather","text":"UNTRUSTED_PAYLOAD"}`
+	messages := []ChatMessage{
+		{Role: "system", Content: "trusted policy"},
+		{Role: "user", Content: "check weather"},
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			Type: "function", Function: ToolCallFunction{Name: "get_weather", Arguments: `{"city":"Paris"}`},
+		}}},
+		{Role: "tool", Content: payload},
+	}
+	tools := []Tool{{Type: "function", Function: ToolFunction{
+		Name: "get_weather", Parameters: json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`),
+	}}}
+	prompt := srv.renderChatTemplate(messages, tools, false)
+	ids := srv.tokenizer.Encode(prompt, true, false)
+	if len(ids) < 3 {
+		t.Fatalf("rendered prompt encoded to only %d tokens", len(ids))
+	}
+
+	first := prefillReal(t, srv.kv, ids)
+	if first.ReusedTokens != 0 {
+		t.Fatalf("cold request reused %d tokens", first.ReusedTokens)
+	}
+	second := prefillReal(t, srv.kv, ids)
+	if second.ReusedTokens != len(ids)-1 || second.NewTokens != 1 {
+		t.Fatalf("prefix hit reused/new = %d/%d, want %d/1", second.ReusedTokens, second.NewTokens, len(ids)-1)
+	}
+
+	toolOpen, toolClose := srv.tokenizer.ToolRespOpen, srv.tokenizer.ToolRespEnd
+	openAt, closeAt := -1, -1
+	for i, id := range ids {
+		if id == toolOpen && openAt < 0 {
+			openAt = i
+		}
+		if id == toolClose && openAt >= 0 {
+			closeAt = i
+			break
+		}
+	}
+	if openAt < 0 || closeAt <= openAt {
+		t.Fatalf("tool response markers lost before cache: open=%d close=%d", openAt, closeAt)
+	}
+	srv.kv.Lock()
+	cached := srv.kv.CurrentTokens()
+	srv.kv.Unlock()
+	if len(cached) != len(ids) {
+		t.Fatalf("cache holds %d tokens, want exact %d-token rendered prompt", len(cached), len(ids))
+	}
+	for i := range ids {
+		if cached[i] != ids[i] {
+			t.Fatalf("cache changed rendered token %d: got %d want %d", i, cached[i], ids[i])
+		}
+	}
+}
+
 func TestQwenDialect_SingleFlight_ToolCall(t *testing.T) {
 	srv := newQwenSingleFlightServer(t, qwenToolCallScript)
 	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
