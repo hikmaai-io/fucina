@@ -16,11 +16,15 @@ int main(int argc, char** argv){
     e4b_engine_t* eng=e4b_engine_create(dir,4096,8,0);
     if(!eng){ fprintf(stderr,"FAIL create\n"); return 1; }
 
-    // three prompts of different lengths (valid token-id subsequences)
+    // Valid token-id prefixes spanning the short-context boundary explicitly.
+    // Length 2 historically exposed deterministic drift while 1 and 3 matched;
+    // keep 1..5 together to cover both neighboring lengths and ragged composition.
     std::vector<std::vector<int32_t>> prompts = {
-        {818,5279,529,7001,563},   // "The capital of France is"
-        {818,5279,529},            // "The capital of"
-        {818,5279},                // "The capital"
+        {818},                     // length 1
+        {818,5279},                // length 2
+        {818,5279,529},            // length 3
+        {818,5279,529,7001},       // length 4
+        {818,5279,529,7001,563},   // length 5
     };
     const int B=(int)prompts.size(), NGEN=8;
 

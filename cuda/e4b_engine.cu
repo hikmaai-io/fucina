@@ -722,9 +722,12 @@ extern "C" e4b_engine_t *e4b_engine_create(const char *model_path, uint32_t cont
         }
         // decision → FP8 E4M3: the tied LM head [V,H], read once per token for logits.
         ok &= e4bfp4::e4b_fp8_quantize(eng->d_embed, V_, H_, &eng->fp8_head);
-        // f32 GEMV scratch: max projection dim is FF (the FFN); head writes its own per-call buffer.
-        ok &= (cudaMalloc(&eng->d_fp4_xf, (size_t)FF*sizeof(float))==cudaSuccess);
-        ok &= (cudaMalloc(&eng->d_fp4_yf, (size_t)FF*sizeof(float))==cudaSuccess);
+        // f32 GEMV scratch for up to 32 continuous-batch rows. The single-row decode
+        // uses row zero; batched NVFP4/FP8 projections reuse quantized weights while
+        // retaining the exact per-row GEMV arithmetic.
+        constexpr int S=32;
+        ok &= (cudaMalloc(&eng->d_fp4_xf, (size_t)S*FF*sizeof(float))==cudaSuccess);
+        ok &= (cudaMalloc(&eng->d_fp4_yf, (size_t)S*FF*sizeof(float))==cudaSuccess);
         if (cudaDeviceSynchronize()!=cudaSuccess || !ok) {
             fprintf(stderr,"e4b: hybrid quant failed — falling back to BF16 decode\n");
         } else {
@@ -734,7 +737,7 @@ extern "C" e4b_engine_t *e4b_engine_create(const char *model_path, uint32_t cont
                 fp4b += L.fp4_gate.bytes+L.fp4_up.bytes+L.fp4_down.bytes+L.fp4_wv.bytes+L.fp4_wo.bytes;
                 fp8b += L.fp8_wq.bytes+L.fp8_wk.bytes;
             }
-            eng->dev_bytes += fp4b + fp8b + 2*(uint64_t)FF*sizeof(float);
+            eng->dev_bytes += fp4b + fp8b + 2*32ull*(uint64_t)FF*sizeof(float);
             fprintf(stderr,"e4b: hybrid decode quant ON (+%.2f GB: content@NVFP4 FFN+V/O %.2f GB, "
                     "index@FP8 Q/K+head %.2f GB; BF16 kept for prefill)\n",
                     (fp4b+fp8b)/1e9, fp4b/1e9, fp8b/1e9);
@@ -1576,34 +1579,6 @@ __global__ void kv_store_batch_kernel(const bf16* __restrict__ src, bf16* const*
     int b=i/row, e=i%row;
     caches[b][(size_t)(pos[b] % cap)*row + e] = src[i];
 }
-// Batched GQA attention: sequence b's single query (at pos[b]) attends ITS cache
-// [0..pos[b]] (sliding window if window>0). One block per (head, sequence).
-__global__ void attn_batch_kernel(const bf16* __restrict__ q, bf16* const* __restrict__ kcaches,
-                                  bf16* const* __restrict__ vcaches, const int* __restrict__ pos,
-                                  bf16* __restrict__ out, int B, int n_heads, int n_kv, int hd,
-                                  float scaling, int window, int cap){
-    int h = blockIdx.x, b = blockIdx.y; if (h>=n_heads || b>=B) return;
-    int P = pos[b]; int group=n_heads/n_kv, kvh=h/group;
-    const bf16* qv = q + ((size_t)b*n_heads + h)*hd;
-    const bf16* kc = kcaches[b]; const bf16* vc = vcaches[b];
-    extern __shared__ float scores[];
-    int lo = (window>0)?(P-window+1):0; if(lo<0) lo=0; int len=P-lo+1;
-    for (int j=threadIdx.x;j<len;j+=blockDim.x){
-        const bf16* kv=kc+((size_t)((lo+j)%cap)*n_kv+kvh)*hd;
-        float dot=0.f; for(int d=0;d<hd;d++) dot+=b2f(qv[d])*b2f(kv[d]);
-        scores[j]=dot*scaling;
-    }
-    __syncthreads(); __shared__ float ssum;
-    if (threadIdx.x==0){ float m=-1e30f; for(int j=0;j<len;j++) m=fmaxf(m,scores[j]);
-        float sm=0.f; for(int j=0;j<len;j++){ float e=expf(scores[j]-m); scores[j]=e; sm+=e; } ssum=sm; }
-    __syncthreads(); float inv=1.f/ssum;
-    bf16* ov = out + ((size_t)b*n_heads + h)*hd;
-    for (int d=threadIdx.x;d<hd;d+=blockDim.x){
-        float acc=0.f; for(int j=0;j<len;j++){ const bf16* vv=vc+((size_t)((lo+j)%cap)*n_kv+kvh)*hd; acc+=scores[j]*b2f(vv[d]); }
-        ov[d]=f2b(acc*inv);
-    }
-}
-
 // Build per-layer-input from FP8 PLE lookup (×16) + context projection, combined.
 // ple_lookup_raw:[T,ple_width] (dequant, unscaled)  context:[T,ple_width] (already
 // projected, scaled by 1/sqrt(H), and per-256-block RMSNormed on host side? no —
@@ -2839,9 +2814,10 @@ extern "C" int e4b_engine_generate_greedy(e4b_engine_t *eng, const int32_t *prom
 // Continuous batching — multiple sequences decoded in ONE weight pass.
 //
 // Prefill (seq_add) is per-sequence (e4b_step on the slot). Decode is batched:
-// step_batch feeds B slots one token each, runs all the projection/FFN/PLE GEMMs
-// over [B] rows (weights read once for B tokens — the throughput win), and does
-// attention per-sequence against each slot's own KV cache. Greedy sampling for now.
+// step_batch feeds B slots one token each and reuses the dominant quantized
+// projection/FFN weights across rows. Small BF16 PLE GEMMs and attention execute
+// independently per row to preserve exact one-row arithmetic and slot-local KV.
+// Greedy sampling for now.
 // ════════════════════════════════════════════════════════════════════════════
 static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int32_t* in_tokens,
                                  int B, int32_t* out_tokens){
@@ -2851,12 +2827,22 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
     const float eps=c.rms_eps;
     cudaSetDevice(eng->device_id);
     auto GRID=[&](int n){ return (n+255)/256; };
+    // cuBLAS is allowed to choose a different reduction tiling when its row count
+    // changes. PLE and the explicit BF16 fallback therefore run as B independent
+    // one-row GEMMs, matching e4b_step's T==1 arithmetic exactly. The large decode
+    // projections retain weight reuse through the row-invariant quantized kernels.
+    auto linear_rows = [&](const bf16* Wt, const bf16* x, bf16* y, int out, int in){
+        bool ok=true;
+        for (int b=0;b<B;b++) ok &= linear(eng->cublas,Wt,x+(size_t)b*in,y+(size_t)b*out,1,out,in);
+        return ok;
+    };
 
-    // per-sequence positions + a max for shared-mem sizing
-    std::vector<int> hpos(B); int maxP=0;
+    // Per-sequence absolute positions. Every row owns its KV cache and position;
+    // batch order must never influence either one.
+    std::vector<int> hpos(B);
     for (int i=0;i<B;i++){ Slot& s=eng->slots[slot_ids[i]];
         if (s.n_past+1>eng->max_ctx){ fprintf(stderr,"e4b: slot %d ctx overflow\n",slot_ids[i]); return -1; }
-        hpos[i]=s.n_past; if(s.n_past>maxP) maxP=s.n_past; }
+        hpos[i]=s.n_past; }
 
     float* d_invf_s = make_inv_freq_sliding(c.head_dim, c.rope_theta_sliding);
     float* d_invf_f = make_inv_freq_proportional(c.global_head_dim, c.rope_theta_full, c.rope_partial_full);
@@ -2865,6 +2851,10 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
     const int QMAX=c.n_heads*c.global_head_dim, KVMAX=c.n_kv_heads*c.global_head_dim;
     int32_t* d_ids; bf16 *d_hidden,*d_norm,*d_tmpH,*d_q,*d_k,*d_v,*d_attn,*d_gate,*d_up,*d_act,*d_pleg;
     float *d_ple_lookup,*d_ple_ctx,*d_pli;
+    // Batched rows use the same split-K attention arithmetic as independent decode.
+    // The partials are reused serially per row; attention cannot share weights, and
+    // serial row launches keep each result independent of batch composition.
+    float *d_fa_m, *d_fa_l, *d_fa_acc;
     int* d_pos; bf16 **d_kptr, **d_vptr;
     cudaMalloc(&d_ids,B*sizeof(int32_t)); cudaMalloc(&d_pos,B*sizeof(int));
     cudaMalloc(&d_kptr,B*sizeof(bf16*)); cudaMalloc(&d_vptr,B*sizeof(bf16*));
@@ -2873,13 +2863,16 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
     cudaMalloc(&d_attn,(size_t)B*QMAX*2); cudaMalloc(&d_gate,(size_t)B*FF*2); cudaMalloc(&d_up,(size_t)B*FF*2);
     cudaMalloc(&d_act,(size_t)B*FF*2); cudaMalloc(&d_pleg,(size_t)B*PD*2);
     cudaMalloc(&d_ple_lookup,(size_t)B*W*4); cudaMalloc(&d_ple_ctx,(size_t)B*W*4); cudaMalloc(&d_pli,(size_t)B*W*4);
+    cudaMalloc(&d_fa_m,(size_t)c.n_heads*E4B_FA_SPLITS*4);
+    cudaMalloc(&d_fa_l,(size_t)c.n_heads*E4B_FA_SPLITS*4);
+    cudaMalloc(&d_fa_acc,(size_t)c.n_heads*E4B_FA_SPLITS*E4B_FA_HDMAX*4);
     cudaMemcpy(d_ids,in_tokens,B*sizeof(int32_t),cudaMemcpyHostToDevice);
     cudaMemcpy(d_pos,hpos.data(),B*sizeof(int),cudaMemcpyHostToDevice);
 
     embed_kernel<<<B,256>>>(eng->d_embed,d_ids,d_hidden,B,H,sqrtf((float)H));
     e4b_ple_lookup_launch(eng->d_ple_fp8, eng->d_ple_scale, d_ids, d_ple_lookup, B, W);
     { bf16* d_ctx_bf; cudaMalloc(&d_ctx_bf,(size_t)B*W*2);
-      linear(eng->cublas, eng->d_plm_proj, d_hidden, d_ctx_bf, B, W, H);
+      linear_rows(eng->d_plm_proj,d_hidden,d_ctx_bf,W,H);
       to_f32_kernel<<<GRID(B*W),256>>>(d_ctx_bf,d_ple_ctx,B*W); cudaFree(d_ctx_bf);
       rmsnorm_f32_grouped<<<B*c.n_layers,256>>>(d_ple_ctx, eng->d_ple_proj_norm, B*c.n_layers, PD, eps); }
     ple_combine_kernel<<<GRID(B*W),256>>>(d_ple_lookup, d_ple_ctx, d_pli, B*W);
@@ -2892,17 +2885,25 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
         const bool shared=c.layer_shares_kv(li); const int window=full?0:c.sliding_window;
         const int cap = full ? eng->max_ctx : eng->sliding_cap;  // ring capacity (full ⇒ no wrap)
         float* d_invf=full?d_invf_f:d_invf_s;
-        // Projection over B rows. Under use_q40 the BF16 weights were freed, so dequant the
-        // Q4_0 nibbles → scratch then GEMM (weights still read once for the B-token batch).
-        auto bproj = [&](bf16* y, __nv_bfloat16* Wbf, const uint8_t* wb40, const bf16* x, int out, int in){
+        // Projection over B rows. Both quantized formats reuse each weight read across
+        // rows while preserving the single-row accumulator/reduction order. This is
+        // essential for safetensors: independent decode uses hybrid FP8/NVFP4, so the
+        // historical BF16 batch projection was a different model, not merely a batching
+        // implementation of the same model.
+        auto bproj = [&](bf16* y, __nv_bfloat16* Wbf, const uint8_t* wb40,
+                         const e4bfp4::Weight* w4, const e4bfp4::Fp8Weight* w8,
+                         const bf16* x, int out, int in){
             if (eng->use_q40){
-                // Batched MMVQ: each weight ROW is read once and dp4a'd against all B tokens
-                // (token-major qx/dx/sx). Per-token math is identical to mmvq_launch, so batched
-                // == single-seq decode bit-for-bit — the continuous-batching weight-reuse win.
-                quantize_q8_1_bf16_kernel<<<(B*in)/32,32,0,0>>>(x, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, B*in);
-                mmvq_batched_launch(eng->d_fp4_yf, wb40, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, in, out, B, 2, 0);
-                e4bfp4::to_bf16<<<(unsigned)(((size_t)B*out+255)/256),256,0,0>>>(eng->d_fp4_yf, y, B*out);
-            } else linear(eng->cublas, Wbf, x, y, B, out, in);
+                quantize_q8_1_bf16_kernel<<<(B*in)/32,32,0,0>>>(x,eng->d_q40_qa,eng->d_q40_da,eng->d_q40_sa,B*in);
+                mmvq_batched_launch(eng->d_fp4_yf,wb40,eng->d_q40_qa,eng->d_q40_da,eng->d_q40_sa,in,out,B,2,0);
+                e4bfp4::to_bf16<<<(unsigned)(((size_t)B*out+255)/256),256>>>(eng->d_fp4_yf,y,B*out);
+            } else if (eng->use_fp4 && w8) {
+                e4bfp4::e4b_fp8_gemv_bf16_batched(y,*w8,x,eng->d_fp4_xf,eng->d_fp4_yf,B,0);
+            } else if (eng->use_fp4 && w4) {
+                e4bfp4::e4b_nvfp4_gemv_bf16_batched(y,*w4,x,eng->d_fp4_xf,eng->d_fp4_yf,B,0);
+            } else {
+                linear_rows(Wbf,x,y,out,in);
+            }
         };
         // gather this layer's per-slot cache pointers
         for (int b=0;b<B;b++){ Slot& s=eng->slots[slot_ids[b]]; hk[b]=s.kc[li]; hv[b]=s.vc[li]; }
@@ -2911,41 +2912,51 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
 
         cudaMemcpy(d_tmpH,d_hidden,(size_t)B*H*2,cudaMemcpyDeviceToDevice);
         rmsnorm_kernel<<<B,1024>>>(d_hidden,L.input_ln,d_norm,B,H,eps);
-        bproj(d_q,L.wq,L.q40_wq,d_norm,qd,H);
+        bproj(d_q,L.wq,L.q40_wq,nullptr,&L.fp8_wq,d_norm,qd,H);
         head_rmsnorm_kernel<<<B*c.n_heads,256>>>(d_q,L.q_norm,B,c.n_heads,hd,eps);
         rope_batch_kernel<<<B*c.n_heads,256>>>(d_q,d_invf,B,c.n_heads,hd,d_pos);
         if (!shared){
-            bproj(d_k,L.wk,L.q40_wk,d_norm,kvd,H);
-            bproj(d_v,L.wv,L.q40_wv,d_norm,kvd,H);
+            bproj(d_k,L.wk,L.q40_wk,nullptr,&L.fp8_wk,d_norm,kvd,H);
+            bproj(d_v,L.wv,L.q40_wv,&L.fp4_wv,nullptr,d_norm,kvd,H);
             head_rmsnorm_kernel<<<B*c.n_kv_heads,256>>>(d_k,L.k_norm,B,c.n_kv_heads,hd,eps);
             rope_batch_kernel<<<B*c.n_kv_heads,256>>>(d_k,d_invf,B,c.n_kv_heads,hd,d_pos);
             head_rmsnorm_kernel<<<B*c.n_kv_heads,256>>>(d_v,nullptr,B,c.n_kv_heads,hd,eps);
             kv_store_batch_kernel<<<GRID(B*kvd),256>>>(d_k,d_kptr,d_pos,B,kvd,cap);
             kv_store_batch_kernel<<<GRID(B*kvd),256>>>(d_v,d_vptr,d_pos,B,kvd,cap);
         }
-        dim3 ag(c.n_heads,B);
-        const int span = (window>0 && window<(maxP+1)) ? window : (maxP+1);
-        size_t sh=(size_t)span*sizeof(float);
-        attn_batch_kernel<<<ag,256,sh>>>(d_q,d_kptr,d_vptr,d_pos,d_attn,B,c.n_heads,c.n_kv_heads,hd,1.0f,window,cap);
-        bproj(d_norm,L.wo,L.q40_wo,d_attn,H,qd);
+        // Match the independent T==1 decode exactly: same contiguous split partition,
+        // warp reduction order, online softmax and split combine. The old serial-dot
+        // attention was not the source of the recorded two-token mismatch, but retaining
+        // a second reduction path would leave parity dependent on future argmax margins.
+        constexpr int NW = 4;
+        const int smemS = NW * hd * (int)sizeof(float);
+        dim3 sg(c.n_heads, E4B_FA_SPLITS);
+        for (int b=0; b<B; ++b) {
+            attn_flash_decode_split_kernel<NW><<<sg,NW*32,smemS>>>(
+                d_q+(size_t)b*qd,hk[b],hv[b],d_fa_m,d_fa_l,d_fa_acc,d_pos+b,
+                c.n_heads,c.n_kv_heads,hd,1.0f,window,cap,E4B_FA_SPLITS);
+            attn_flash_combine_kernel<<<c.n_heads,256>>>(
+                d_fa_m,d_fa_l,d_fa_acc,d_attn+(size_t)b*qd,c.n_heads,hd,E4B_FA_SPLITS);
+        }
+        bproj(d_norm,L.wo,L.q40_wo,&L.fp4_wo,nullptr,d_attn,H,qd);
         rmsnorm_kernel<<<B,1024>>>(d_norm,L.post_attn_ln,d_norm,B,H,eps);
         add_kernel<<<GRID(B*H),256>>>(d_tmpH,d_norm,B*H);
         cudaMemcpy(d_hidden,d_tmpH,(size_t)B*H*2,cudaMemcpyDeviceToDevice);
 
         cudaMemcpy(d_tmpH,d_hidden,(size_t)B*H*2,cudaMemcpyDeviceToDevice);
         rmsnorm_kernel<<<B,1024>>>(d_hidden,L.pre_ff_ln,d_norm,B,H,eps);
-        bproj(d_gate,L.w_gate,L.q40_gate,d_norm,FF,H);
-        bproj(d_up,L.w_up,L.q40_up,d_norm,FF,H);
+        bproj(d_gate,L.w_gate,L.q40_gate,&L.fp4_gate,nullptr,d_norm,FF,H);
+        bproj(d_up,L.w_up,L.q40_up,&L.fp4_up,nullptr,d_norm,FF,H);
         geglu_kernel<<<GRID(B*FF),256>>>(d_gate,d_up,d_act,B*FF);
-        bproj(d_norm,L.w_down,L.q40_down,d_act,H,FF);
+        bproj(d_norm,L.w_down,L.q40_down,&L.fp4_down,nullptr,d_act,H,FF);
         rmsnorm_kernel<<<B,1024>>>(d_norm,L.post_ff_ln,d_norm,B,H,eps);
         add_kernel<<<GRID(B*H),256>>>(d_tmpH,d_norm,B*H);
         cudaMemcpy(d_hidden,d_tmpH,(size_t)B*H*2,cudaMemcpyDeviceToDevice);
 
         cudaMemcpy(d_tmpH,d_hidden,(size_t)B*H*2,cudaMemcpyDeviceToDevice);
-        linear(eng->cublas,L.ple_in_gate,d_hidden,d_pleg,B,PD,H);
+        linear_rows(L.ple_in_gate,d_hidden,d_pleg,PD,H);
         ple_gate_strided<<<GRID(B*PD),256>>>(d_pleg,d_pli,B,PD,W,li);
-        linear(eng->cublas,L.ple_proj,d_pleg,d_norm,B,H,PD);
+        linear_rows(L.ple_proj,d_pleg,d_norm,H,PD);
         rmsnorm_kernel<<<B,1024>>>(d_norm,L.post_ple_ln,d_norm,B,H,eps);
         add_kernel<<<GRID(B*H),256>>>(d_tmpH,d_norm,B*H);
         scale_kernel<<<GRID(B*H),256>>>(d_tmpH,L.layer_scalar,B*H);
@@ -2955,12 +2966,15 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
     // logits for all B rows → argmax each. use_q40 → native Q6_K head per row (same kernel as
     // single-seq, so batched == independent); else cuBLAS over the BF16 tied embedding.
     float* d_logits_f; cudaMalloc(&d_logits_f,(size_t)B*V*4);
-    if (eng->use_q40){   // native Q6_K head, batched over B rows (read once); bit-matches single-seq
-        quantize_q8_1_bf16_kernel<<<(B*H)/32,32,0,0>>>(d_norm, eng->d_q40_qa, eng->d_q40_da, eng->d_q40_sa, B*H);
-        mmvq_q6_k_batched_launch(d_logits_f, eng->d_q6k_head, eng->d_q40_qa, eng->d_q40_da, H, V, B, 0);
+    if (eng->use_q40){   // native Q6_K head, row-invariant batched MMVQ
+        quantize_q8_1_bf16_kernel<<<(B*H)/32,32>>>(d_norm,eng->d_q40_qa,eng->d_q40_da,eng->d_q40_sa,B*H);
+        mmvq_q6_k_batched_launch(d_logits_f,eng->d_q6k_head,eng->d_q40_qa,eng->d_q40_da,H,V,B,0);
+    } else if (eng->use_fp4) {
+        // Independent safetensors decode uses this FP8 decision head; batching must too.
+        e4bfp4::e4b_fp8_gemv_f32_batched(d_logits_f,eng->fp8_head,d_norm,eng->d_fp4_xf,B,0);
     } else {
         bf16* d_logits_bf; cudaMalloc(&d_logits_bf,(size_t)B*V*2);
-        linear(eng->cublas, eng->d_embed, d_norm, d_logits_bf, B, V, H);
+        linear_rows(eng->d_embed,d_norm,d_logits_bf,V,H);
         to_f32_kernel<<<GRID(B*V),256>>>(d_logits_bf,d_logits_f,B*V);
         cudaFree(d_logits_bf);
     }
@@ -2974,6 +2988,7 @@ static int e4b_step_batch_decode(e4b_engine* eng, const int* slot_ids, const int
     cudaFree(d_ids);cudaFree(d_pos);cudaFree(d_kptr);cudaFree(d_vptr);cudaFree(d_hidden);cudaFree(d_norm);
     cudaFree(d_tmpH);cudaFree(d_q);cudaFree(d_k);cudaFree(d_v);cudaFree(d_attn);cudaFree(d_gate);cudaFree(d_up);
     cudaFree(d_act);cudaFree(d_pleg);cudaFree(d_ple_lookup);cudaFree(d_ple_ctx);cudaFree(d_pli);
+    cudaFree(d_fa_m);cudaFree(d_fa_l);cudaFree(d_fa_acc);
     cudaFree(d_logits_f);cudaFree(d_invf_s);cudaFree(d_invf_f);
     return err==cudaSuccess?0:-1;
 }

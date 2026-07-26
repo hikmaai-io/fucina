@@ -34,14 +34,14 @@ sources:
 | MoE graph replay | engine self-test, three ragged rows | GB10 | **PASS**: B=3 vs B=1 and graph-on vs graph-off are 24/24 for every row; self-chain PASS |
 | Gemma dense paged parity | `make paged-kv-device-test` | GB10 | **PASS**; global max error 0.000968, sliding exact |
 | Gemma legacy bench | `make bench MODEL=gemma-4-12b-it-qat-q4_0.gguf` | GB10 | **Known historical FAIL unchanged**: self-test marker checks fail, while plain-vs-batch output remains byte-identical |
-| E4B foundation/load/NVFP4 | targeted `e4b-*` gates | GB10 + E4B checkpoints | PASS except **known historical `e4b-batch-test` FAIL**, same 2/8 mismatch in sequence 2 |
+| E4B foundation/load/NVFP4 | targeted `e4b-*` gates | GB10 + E4B checkpoints | **PASS**, including ragged batch-vs-independent parity for lengths 1..5 (8/8 tokens per row) |
 | E4B MTP | `e4b-mtp-load-test`, `e4b-spec-test`, `e4b-spec-stream-test` | GB10 + Q4_0 target/assistant | **PASS** after fixing Make target linkage; 160/160 byte-identical spec and stream |
 | E4B HF oracle artifacts | `e4b-fwd-test`, `e4b-gen-test` | GB10 + BF16 checkpoint + `/tmp` refs | **Unavailable**: repository has no producer/artifacts for `e4b_ref.bin` and `e4b_gen_ref.bin` |
 | Performance protection | 3×128-step Qwen3.6 MoE decode microbench | Quiescent GB10 under flock | B=1 **59.0 tok/s median**, above 46–53 tok/s baseline |
 
 # Required interpretation
 
-A normal unit pass does not replace the race detector, and historical benchmark logs do not prove the current worktree was rebuilt from source. This inspection used a clean CUDA rebuild and reran both. The historical MoE line `qwen-gates.log:417` (`oracle 8/8, self-test FAIL`, with 6/24 row/graph agreement) is **resolved** on the final branch: all three rows are 24/24, graph-on/off is 24/24, self-chain passes, and both oracle gates are 8/8. The retained Gemma/E4B failures predate this Qwen fix and reproduced with the same signatures; they are known gaps, not newly green gates.
+A normal unit pass does not replace the race detector, and historical benchmark logs do not prove the current worktree was rebuilt from source. This inspection used a clean CUDA rebuild and reran both. The historical MoE line `qwen-gates.log:417` (`oracle 8/8, self-test FAIL`, with 6/24 row/graph agreement) is **resolved** on the final branch: all three rows are 24/24, graph-on/off is 24/24, self-chain passes, and both oracle gates are 8/8. The retained legacy dense Gemma failure predates this Qwen fix and remains a known gap. The separate E4B batch mismatch has since been resolved by making the batched numerical path identical to independent decode.
 
 # CI discrepancy
 
