@@ -2,6 +2,7 @@ package batch
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"testing"
@@ -53,6 +54,9 @@ type mockEngine struct {
 
 	// multiseqCalls counts batched-admission (SeqAddMultiseq) calls.
 	multiseqCalls int
+	// multiseqErr fails only the optional burst-admission call; AddSeq remains
+	// available so tests can prove the failure is a transient serial fallback.
+	multiseqErr error
 }
 
 func newMockEngine(capacity int) *mockEngine {
@@ -96,6 +100,10 @@ func (m *mockEngine) AddSeq(prompt []int32, _ SeqParams) (int, int32, error) {
 func (m *mockEngine) SeqAddMultiseq(prompts [][]int32, _ []SeqParams) ([]int, []int32, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.multiseqErr != nil {
+		m.multiseqCalls++
+		return nil, nil, m.multiseqErr
+	}
 	if m.addErr != nil {
 		return nil, nil, m.addErr
 	}
@@ -338,6 +346,48 @@ func TestIdleBurstAdmitsInOnePass(t *testing.T) {
 	}
 	if got := len(steps[0]); got != n {
 		t.Errorf("first StepBatch advanced %d slots, want %d (burst was not admitted in one pass)", got, n)
+	}
+}
+
+// TestBatchedAdmissionFailureFallsBackWithoutSerializingDecode proves a transient
+// failure in the optional prefill optimization changes admission cost only; all
+// rows still enter the first shared decode step.
+func TestBatchedAdmissionFailureFallsBackWithoutSerializingDecode(t *testing.T) {
+	const n = 4
+	eng := newMockEngine(n)
+	eng.multiseqErr = errors.New("transient multiseq prefill failure")
+	sched := New(eng, 16)
+
+	dones := make([]chan Result, n)
+	for i := 0; i < n; i++ {
+		dones[i] = make(chan Result, 1)
+		if err := sched.Submit(Request{
+			Tokens: []int32{int32(i + 1)}, MaxNew: 5, Ctx: context.Background(),
+			Emit: (&collector{}).emit, Done: dones[i],
+		}); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	// Queue the whole burst before Start so the optional multiseq call sees all
+	// rows. Its forced error must fall through to serial PREFILL admission in the
+	// same pass, after which decode itself is still one B=4 engine step.
+	sched.Start()
+	defer sched.Shutdown()
+	for i := range dones {
+		if res := waitResult(t, dones[i]); res.Reason != FinishLength {
+			t.Fatalf("seq %d: %+v", i, res)
+		}
+	}
+	steps := eng.steps()
+	got := 0
+	if len(steps) > 0 {
+		got = len(steps[0])
+	}
+	if got != n {
+		t.Fatalf("first decode occupancy = %d, want %d after serial admission fallback (steps=%v)", got, n, steps)
+	}
+	if eng.multiseqCount() != 1 {
+		t.Fatalf("multiseq calls = %d, want 1", eng.multiseqCount())
 	}
 }
 

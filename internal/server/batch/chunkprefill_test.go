@@ -2,6 +2,7 @@ package batch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -30,8 +31,11 @@ type chunkMock struct {
 	acc      map[int]int32 // per-slot prefilled-token accumulator
 
 	// ops records the engine-call timeline for interleave assertions: "P" for each
-	// PrefillChunk, "S" for each StepBatch (in call order).
-	ops []string
+	// PrefillChunk, "S" for each StepBatch (in call order). stepWidths records
+	// decode occupancy so concurrent-admission tests can distinguish real batching
+	// from four independent B=1 calls.
+	ops        []string
+	stepWidths []int
 
 	openCalls, chunkCalls, addCalls, stepCalls, removeCalls int
 
@@ -39,9 +43,10 @@ type chunkMock struct {
 	// (exercises the prefill-error eviction path).
 	failPrefillSlot int
 
-	// prefillDelay, when > 0, is slept (outside the lock) per PrefillChunk so a
-	// GPU-free prefill takes long enough for a test to cancel it mid-flight.
+	// prefillDelay/addDelay are slept outside the lock so tests can submit or
+	// cancel while an engine admission call is in flight.
 	prefillDelay time.Duration
+	addDelay     time.Duration
 }
 
 func newChunkMock(capacity int) *chunkMock {
@@ -77,12 +82,16 @@ func sumTokens(t []int32) int32 {
 
 func (m *chunkMock) AddSeq(prompt []int32, _ SeqParams) (int, int32, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.addCalls++
 	slot := m.allocSlot()
 	m.live[slot] = true
 	m.acc[slot] = sumTokens(prompt)
-	return slot, m.acc[slot] + 1, nil
+	first, delay := m.acc[slot]+1, m.addDelay
+	m.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	return slot, first, nil
 }
 
 func (m *chunkMock) OpenSeq(_ []int32, _ SeqParams) (int, int, error) {
@@ -125,6 +134,7 @@ func (m *chunkMock) StepBatch(active []int32, inputs []int32) ([][]int32, error)
 	defer m.mu.Unlock()
 	m.stepCalls++
 	m.ops = append(m.ops, "S")
+	m.stepWidths = append(m.stepWidths, len(active))
 	out := make([][]int32, len(active))
 	for i, slot := range active {
 		if !m.live[int(slot)] {
@@ -160,6 +170,53 @@ func (m *chunkMock) callCounts() (open, chunk, add, step int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.openCalls, m.chunkCalls, m.addCalls, m.stepCalls
+}
+
+func (m *chunkMock) maxStepWidth() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	max := 0
+	for _, width := range m.stepWidths {
+		if width > max {
+			max = width
+		}
+	}
+	return max
+}
+
+// unsupportedFusedChunkMock deliberately advertises an optimistic fused row
+// budget and then returns the optional unsupported signal without committing
+// either half. It models the Qwen3.5/3.6 capability mismatch that used to evict
+// every long request arriving alongside decode and pin observed occupancy at 1.
+type unsupportedFusedChunkMock struct {
+	*chunkMock
+	fusedCalls int
+}
+
+func (m *unsupportedFusedChunkMock) MaxFusedRows() int { return 32 }
+
+func (m *unsupportedFusedChunkMock) StepBatchFused(_ []int32, _ []int32, _ int, _ []int32, _ bool) ([]int32, int32, error) {
+	m.mu.Lock()
+	m.fusedCalls++
+	m.mu.Unlock()
+	return nil, 0, ErrFusedPrefillUnsupported
+}
+
+func (m *unsupportedFusedChunkMock) fusedCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.fusedCalls
+}
+
+// adaptiveAdmissionMock models the Qwen hybrid adapter: long prompts are
+// normally chunked only while decode is busy, and burst admission first tries
+// the optional multisequence prefill. The forced transient error exercises the
+// exact serial fallback that previously misclassified request #2+ as busy.
+type adaptiveAdmissionMock struct{ *chunkMock }
+
+func (m *adaptiveAdmissionMock) PrefillChunkHint() (int, int) { return 5, 4 }
+func (m *adaptiveAdmissionMock) SeqAddMultiseq(_ [][]int32, _ []SeqParams) ([]int, []int32, error) {
+	return nil, nil, errors.New("transient multiseq failure")
 }
 
 // iota1 builds a prompt of n tokens [1,2,...,n].
@@ -357,6 +414,148 @@ func TestPrefillDecodeInterleave(t *testing.T) {
 	}
 }
 
+// TestIdleLongBurstFallbackStartsAtFullOccupancy verifies admission policy at the
+// boundary that matters for HTTP: a coalesced long-prompt burst begins idle, the
+// optimized multiseq prefill fails transiently, and every serial fallback prefill
+// still completes before decode. Newly admitted peers must not be mistaken for a
+// pre-existing busy batch and diverted into chunked prefill.
+func TestIdleLongBurstFallbackStartsAtFullOccupancy(t *testing.T) {
+	const n = 4
+	base := newChunkMock(n)
+	eng := &adaptiveAdmissionMock{chunkMock: base}
+	sched := New(eng, 8)
+
+	dones := make([]chan Result, n)
+	for i := 0; i < n; i++ {
+		dones[i] = make(chan Result, 1)
+		if err := sched.Submit(Request{
+			Tokens: iota1(25), MaxNew: 6, Ctx: context.Background(),
+			Emit: (&collector{}).emit, Done: dones[i],
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sched.Start()
+	defer sched.Shutdown()
+	for i := range dones {
+		if res := waitResult(t, dones[i]); res.Reason != FinishLength {
+			t.Fatalf("seq %d: %+v", i, res)
+		}
+	}
+	open, _, add, _ := base.callCounts()
+	if open != 0 || add != n {
+		t.Errorf("OpenSeq/AddSeq = %d/%d, want 0/%d: idle peers were diverted to chunked prefill", open, add, n)
+	}
+	if got := base.maxStepWidth(); got != n {
+		t.Errorf("max decode occupancy = %d, want %d", got, n)
+	}
+}
+
+// TestArrivalsDuringFirstPrefillJoinInitialDecodeBatch covers the real HTTP timing:
+// client goroutines are not all in the submit channel within the 3 ms idle probe,
+// but request B arrives while request A's long one-shot prefill blocks the scheduler.
+// The scheduler must re-drain admission before its first decode step, preserving B=2.
+func TestArrivalsDuringFirstPrefillJoinInitialDecodeBatch(t *testing.T) {
+	base := newChunkMock(2)
+	base.addDelay = 30 * time.Millisecond
+	eng := &adaptiveAdmissionMock{chunkMock: base}
+	sched := New(eng, 4)
+	sched.coalesceWindow = 0
+	sched.Start()
+	defer sched.Shutdown()
+
+	dones := []chan Result{make(chan Result, 1), make(chan Result, 1)}
+	if err := sched.Submit(Request{
+		Tokens: iota1(25), MaxNew: 6, Ctx: context.Background(),
+		Emit: (&collector{}).emit, Done: dones[0],
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		_, _, adds, _ := base.callCounts()
+		if adds == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("first blocking admission never started")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if err := sched.Submit(Request{
+		Tokens: iota1(25), MaxNew: 6, Ctx: context.Background(),
+		Emit: (&collector{}).emit, Done: dones[1],
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range dones {
+		if res := waitResult(t, dones[i]); res.Reason != FinishLength {
+			t.Fatalf("seq %d: %+v", i, res)
+		}
+	}
+	if got := base.maxStepWidth(); got != 2 {
+		t.Errorf("max decode occupancy = %d want 2", got)
+	}
+	open, _, _, _ := base.callCounts()
+	if open != 0 {
+		t.Errorf("OpenSeq calls = %d want 0; request B was misclassified as busy", open)
+	}
+}
+
+// TestUnsupportedFusionFallsBackAndReachesBatchOccupancy proves an optional fused-ABI
+// mismatch is a capability fallback, not a request failure. The long arrival remains
+// admitted, finishes through PrefillChunk interleaving, and eventually decodes in the
+// same B=2 step as the already-active stream.
+func TestUnsupportedFusionFallsBackAndReachesBatchOccupancy(t *testing.T) {
+	base := newChunkMock(2)
+	eng := &unsupportedFusedChunkMock{chunkMock: base}
+	sched := New(eng, 4)
+	sched.chunkMin = 4
+	sched.chunkSize = 5
+	sched.Start()
+	defer sched.Shutdown()
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	doneA := make(chan Result, 1)
+	if err := sched.Submit(Request{
+		Tokens: []int32{1}, MaxNew: 100000, Ctx: ctxA,
+		Emit: (&collector{}).emit, Done: doneA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(2 * time.Second)
+	for base.maxStepWidth() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("first sequence never became active")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	doneB := make(chan Result, 1)
+	if err := sched.Submit(Request{
+		Tokens: iota1(25), MaxNew: 8, Ctx: context.Background(),
+		Emit: (&collector{}).emit, Done: doneB,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if res := waitResult(t, doneB); res.Reason != FinishLength || res.Generated != 8 {
+		t.Fatalf("long request = %+v, want length/8", res)
+	}
+	cancelA()
+	waitResult(t, doneA)
+
+	if got := eng.fusedCount(); got != 1 {
+		t.Errorf("fused probes = %d, want exactly 1 before capability is disabled", got)
+	}
+	if got := base.maxStepWidth(); got != 2 {
+		t.Errorf("max decode occupancy = %d, want 2; long admission was not co-scheduled", got)
+	}
+}
+
 // TestPrefillSlotCountsAgainstCapacity asserts a prefilling sequence holds a slot:
 // with capacity 1, a queued short request cannot be admitted until the chunk-prefilling
 // long request has fully finished (prefill + generation + eviction).
@@ -497,8 +696,11 @@ func TestChunkedPrefillConcurrentLossless(t *testing.T) {
 	cols := make([]*collector, n)
 	dones := make([]chan Result, n)
 	for i := 0; i < n; i++ {
-		// Distinct prompt lengths → distinct sums → distinct token streams.
-		prompts[i] = iota1(200 + 37*i)
+		// Equal prompt lengths keep concurrent admissions in lockstep long enough
+		// to require a full-width decode step; perturb one token so each expected
+		// stream remains independently attributable.
+		prompts[i] = iota1(200)
+		prompts[i][0] += int32(100 * i)
 		cols[i] = &collector{}
 		dones[i] = make(chan Result, 1)
 		if err := sched.Submit(Request{
@@ -525,5 +727,8 @@ func TestChunkedPrefillConcurrentLossless(t *testing.T) {
 	}
 	if eng.liveCount() != 0 {
 		t.Errorf("live slots at end = %d want 0", eng.liveCount())
+	}
+	if got := eng.maxStepWidth(); got != n {
+		t.Errorf("max decode occupancy = %d want %d (concurrent chunked admissions never co-scheduled)", got, n)
 	}
 }
