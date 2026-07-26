@@ -12620,6 +12620,17 @@ extern "C" int gemma4_engine_step_batch(
 // captured for this M — that's fine, decode_multiseq_forward falls to the per-kernel body
 // (correctness first). When a graph for size M does exist (e.g. a prior plain step_batch of the
 // same width) it is reused and is bit-identical (both graph paths use the fixed max split count).
+extern "C" int gemma4_engine_fused_prefill_max_rows(const gemma4_engine_t *eng)
+{
+    // The legacy full-attention Qwen3 fused body was removed. Qwen3.5/3.6 uses
+    // hybrid recurrent state and its current prefill body cannot mix another
+    // slot's decode rows in the same forward. Family detection is therefore
+    // NOT a capability test: advertise zero until an architecture implements
+    // the exact fused ABI below.
+    (void)eng;
+    return 0;
+}
+
 extern "C" int gemma4_engine_step_batch_fused(
     gemma4_engine_t *eng,
     const int *dec_slots, const int32_t *dec_toks, int B_dec,

@@ -477,6 +477,9 @@ int  gemma4_engine_step_batch_spec_ext(gemma4_engine_t *eng, const int *slots,
 // perturbs the other (distinct block tables, NULL rng_off). pf_slot advances by pf_len; when
 // pf_is_final != 0 the prompt's FIRST generated token is written to *pf_first_out. B_dec + pf_len
 // must be <= GEMMA4_MAX_SEQS. Returns 0 / -1 (hard error or KV exhaustion) / -2 (arch unsupported).
+// The capability query is authoritative: zero means callers must use separate
+// chunk-prefill/decode interleaving and must not probe the fused call by model family.
+int  gemma4_engine_fused_prefill_max_rows(const gemma4_engine_t *eng);
 int  gemma4_engine_step_batch_fused(gemma4_engine_t *eng,
                                     const int *dec_slots, const int32_t *dec_toks, int B_dec,
                                     int pf_slot, const int32_t *pf_chunk, int pf_len, int pf_is_final,

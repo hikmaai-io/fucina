@@ -367,10 +367,23 @@ var ErrShutdown = errors.New("batch: scheduler shut down")
 // server's inflight admission channel does today.
 var ErrQueueFull = errors.New("batch: submit queue full")
 
+// ErrFusedPrefillUnsupported is returned by an optional FusedPrefillEngine when
+// the loaded architecture does not implement the fused CUDA ABI. Capability is
+// normally rejected by MaxFusedRows at construction, but keeping this runtime
+// signal makes a stale/optimistic capability probe harmless: the scheduler
+// disables fusion and continues through the lossless PrefillChunk + StepBatch
+// interleave path instead of evicting the arriving sequence.
+var ErrFusedPrefillUnsupported = errors.New("batch: fused prefill unsupported")
+
 // ─── Per-sequence scheduler state ──────────────────────────────────
 
 // seq is the scheduler's private bookkeeping for one admitted sequence. It is
 // touched only by the scheduler goroutine, so it needs no synchronization.
+type admissionFirst struct {
+	sq    *seq
+	first int32
+}
+
 type seq struct {
 	req                Request
 	slot               int // engine slot id (valid once admitted)
@@ -771,8 +784,13 @@ func (s *Scheduler) run() {
 		//    prompt finished prefilling is promoted to active in either path.
 		fusedThisPass := false
 		if s.fused != nil && len(prefill) > 0 && len(active) > 0 {
-			s.stepFused(active, &prefill)
-			fusedThisPass = true
+			fusedThisPass = s.stepFused(active, &prefill)
+			if !fusedThisPass {
+				// The engine declined the optional fused ABI without committing
+				// work. Keep this sequence and use the documented lossless
+				// interleave path for this and all subsequent passes.
+				s.advancePrefill(active, &prefill)
+			}
 		} else {
 			s.advancePrefill(active, &prefill)
 		}
@@ -962,6 +980,21 @@ func retryTimer(haveWaiters bool) <-chan time.Time {
 func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Request) bool {
 	admitted := false
 	oneShotAdmits := 0 // blocking AddSeq admissions this pass (capped to interleave decode)
+	// First tokens sampled by an idle burst are held until the entire capacity
+	// wave is prefilled. Emitting row 0 before rows 1..N are admitted starts its
+	// client-side generation clock while the GPU is still doing peer prefills,
+	// making true B=N decode look like B=1 aggregate throughput.
+	var initialFirst []admissionFirst
+	// Capture idleness at ENTRY. Admissions performed below must not make later
+	// members of the same coalesced burst look like arrivals to a busy decode
+	// batch. That mistake sent request #2+ through chunked prefill, interleaving
+	// seconds of prefill into generation and holding aggregate tg near B=1.
+	idleAtEntry := len(active) == 0 && len(*prefill) == 0 && len(s.pendingFin) == 0
+	// A prefilling or not-yet-emitted sequence also holds a slot, as does a
+	// finished sequence whose deferred teardown has not run yet.
+	held := func() int {
+		return len(active) + len(*prefill) + len(initialFirst) + len(s.pendingFin)
+	}
 	// BURST admission: when the batch is fully idle there is no decode to starve, so a
 	// coalesced burst of short prompts is admitted in ONE pass instead of one-per-pass.
 	// Beyond removing (N-1) scheduler round-trips from the ramp, this starts every burst
@@ -970,14 +1003,24 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 	// allows (identical/shared-prefix bursts route convergently: measured 600 vs 372
 	// tok/s aggregate at B=16 on the 35B MoE).
 	oneShotCap := maxOneShotAdmitsPerPass
-	if len(active) == 0 && len(*prefill) == 0 {
+	if idleAtEntry {
 		oneShotCap = s.engine.Capacity()
-		// P1: batched multi-seq admission. The burst above still admits one-per-loop-iteration
-		// with a BLOCKING single-seq SeqAdd each (measured 32x~52 ms serial). When the engine
-		// supports it, prefill the leading run of short prompts in ONE forward instead.
+		// P1: consume an idle synchronized burst in as many bounded groups as
+		// necessary. Only prompts already eligible for the established multiseq
+		// path participate; long prompts retain serial one-shot prefill so this
+		// scheduler fix cannot change their numerical path. A transient failure
+		// breaks to serial fallback in this SAME idle pass.
 		if ma, ok := s.engine.(MultiseqAdmitEngine); ok {
-			if s.admitBatched(active, waiting, ma, s.engine.Capacity()) {
+			for {
+				free := s.engine.Capacity() - held()
+				if free < 2 || !s.admitBatched(active, waiting, ma, free, &initialFirst) {
+					break
+				}
 				admitted = true
+				// The batched prefill is a blocking engine call. Requests that
+				// arrived while it ran belong to the same not-yet-decoded burst;
+				// fold them in before deciding the first step's occupancy.
+				s.drainSubmit(waiting)
 			}
 		}
 	} else if ma, ok := s.engine.(MultiseqAdmitEngine); ok && len(*waiting) >= 2 {
@@ -988,16 +1031,13 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		// drained). ONE batched prefill of the free-slot-bounded straggler run is a SINGLE
 		// blocking forward (same decode-stall budget as the one serial AddSeq the cap already
 		// permits), but admits them all at once. Bounded to free capacity so it never overfills.
-		free := s.engine.Capacity() - (len(active) + len(*prefill) + len(s.pendingFin))
-		if free >= 2 && s.admitBatched(active, waiting, ma, free) {
+		free := s.engine.Capacity() - held()
+		if free >= 2 && s.admitBatched(active, waiting, ma, free, nil) {
 			admitted = true
 			oneShotAdmits++ // the batched forward counts as this pass's ONE blocking admit
 		}
 	}
 	w := *waiting
-	// A prefilling sequence also holds a slot, so it counts against capacity —
-	// as does a finished sequence whose deferred teardown hasn't run yet.
-	held := func() int { return len(active) + len(*prefill) + len(s.pendingFin) }
 	for len(w) > 0 && held() < s.engine.Capacity() {
 		req := w[0]
 
@@ -1062,7 +1102,7 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		// is nothing to block, and the one-shot prefill is strictly faster (each chunk
 		// re-pays per-pass fixed costs: MoE expert-slab dequants, GDN chunk-scan restarts,
 		// scalar attention for base>0 tiles). Busy batch → chunk; idle → one-shot TTFT.
-		if s.chunk != nil && len(req.Tokens) > s.chunkMin && (!s.chunkAdaptive || held() > 0) {
+		if s.chunk != nil && len(req.Tokens) > s.chunkMin && (!s.chunkAdaptive || !idleAtEntry) {
 			slot, nShared, err := s.chunk.OpenSeq(req.Tokens, req.Params)
 			if err != nil {
 				log.Printf("batch: OpenSeq failed: %v", err)
@@ -1110,26 +1150,40 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		admitted = true // a slot was consumed (progress), even if it self-evicts below
 		oneShotAdmits++
 
-		// Deliver the first (prefill-sampled) token immediately and apply the
-		// same stop/budget bookkeeping a decode step would, so a one-token
-		// sequence (prompt that immediately samples a stop) is evicted here
-		// rather than entering the step loop.
-		if s.deliver(active, sq, first) {
+		// A one-shot prefill can take seconds. If this pass began idle, concurrent
+		// HTTP requests submitted during that call are peers in the same admission
+		// burst, not later arrivals to an established decode batch. Pull them into
+		// this local queue now so they are admitted before the first StepBatch.
+		if idleAtEntry {
+			*waiting = w
+			s.drainSubmit(waiting)
+			w = *waiting
+		}
+
+		// Idle bursts publish all first tokens together after admission; busy
+		// one-shot admission still delivers immediately to minimize TTFT.
+		if idleAtEntry {
+			initialFirst = append(initialFirst, admissionFirst{sq: sq, first: first})
+		} else if s.deliver(active, sq, first) {
 			active[slot] = sq
 		}
 	}
 	*waiting = w
+	for _, p := range initialFirst {
+		if s.deliver(active, p.sq, p.first) {
+			active[p.sq.slot] = p.sq
+		}
+	}
 	return admitted
 }
 
-// admitBatched prefills the leading run of waiting SHORT prompts in ONE forward (P1). It only
-// fires from the idle-batch burst path (no decode to starve). It collects consecutive one-shot
-// prompts (short enough to skip the chunked path, not cancelled) up to capacity and a token
-// budget, prefills them together, and delivers each first token. Returns true if it admitted
-// anything. Any unsupported/failed batch falls back to the serial loop (returns false), so this
-// is purely additive. Chunked (long) prompts and the turn-2 snapshot cache stay on the serial path.
-func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma MultiseqAdmitEngine, maxAdmit int) bool {
-	const maxBatchTokens = 4096 // stay well under the engine's prefill tile
+// admitBatched prefills the leading established-eligible run of waiting prompts in ONE forward
+// (P1). It retains the existing conservative token/chunk bounds so this scheduler change cannot
+// alter which numerical prefill path a request uses. Idle admission may invoke it repeatedly to
+// fill a capacity wave. Any unsupported/failed call falls back to serial admission in the same
+// pass, so a transient SeqAddMultiseq failure never becomes a permanent serial decode path.
+func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma MultiseqAdmitEngine, maxAdmit int, deferred *[]admissionFirst) bool {
+	const maxBatchTokens = 4096 // established bound: stay well under the engine prefill tile
 	w := *waiting
 	capacity := s.engine.Capacity()
 	if maxAdmit < capacity {
@@ -1148,7 +1202,7 @@ func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma Mul
 			break // persistent state must use serial restore/export admission
 		}
 		if s.chunk != nil && len(req.Tokens) > s.chunkMin {
-			break // long prompt → chunked interleave path, not one-shot
+			break // long prompts preserve their one-shot/chunked numerical path
 		}
 		if len(req.Tokens) == 0 {
 			break
@@ -1181,7 +1235,6 @@ func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma Mul
 	if slots == nil {
 		return false // engine declined (unsupported) → serial path
 	}
-	*waiting = w[len(reqs):]
 	var admissionID int64
 	var admittedAt time.Time
 	if s.phaseTiming {
@@ -1189,12 +1242,25 @@ func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma Mul
 		admissionID = s.admissionID
 		admittedAt = time.Now()
 	}
+	if len(slots) != len(reqs) || len(firsts) != len(reqs) {
+		// A malformed optional result cannot be mapped safely. Free any slots the
+		// engine did report and leave the requests queued for serial admission.
+		for _, slot := range slots {
+			_ = s.engine.RemoveSeq(slot)
+		}
+		log.Printf("batch: SeqAddMultiseq returned %d slots/%d firsts for %d requests — serial fallback",
+			len(slots), len(firsts), len(reqs))
+		return false
+	}
+	*waiting = w[len(reqs):]
 	for i, req := range reqs {
 		sq := s.newSeq(req, slots[i])
 		if s.phaseTiming {
 			sq.admissionID, sq.admittedAt, sq.firstDecodePending = admissionID, admittedAt, true
 		}
-		if s.deliver(active, sq, firsts[i]) {
+		if deferred != nil {
+			*deferred = append(*deferred, admissionFirst{sq: sq, first: firsts[i]})
+		} else if s.deliver(active, sq, firsts[i]) {
 			active[slots[i]] = sq
 		}
 	}
@@ -1307,7 +1373,7 @@ func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
 // and prefill rows, leaving no room for the extra draft/verify rows speculation needs — and prefill is
 // a transient state, so decode returns to the spec path automatically once the prompt is fully
 // prefilled. Both paths are lossless w.r.t. greedy decode, so this changes only throughput, never tokens.
-func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) {
+func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) bool {
 	p := *prefill
 	pfSq := p[0]
 	toks := pfSq.req.Tokens
@@ -1320,7 +1386,7 @@ func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) {
 	room := s.fusedRows - len(active)
 	if room < 1 {
 		s.step(active)
-		return
+		return true
 	}
 	hi := lo + room
 	if hi > len(toks) {
@@ -1337,17 +1403,26 @@ func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) {
 	}
 
 	decOut, pfFirst, err := s.fused.StepBatchFused(slots, inputs, pfSq.slot, toks[lo:hi], last)
+	if errors.Is(err, ErrFusedPrefillUnsupported) {
+		// Optional capability mismatch: no rows were committed. Disable it once
+		// and let run() execute PrefillChunk followed by the shared decode step.
+		// Treating -2 as a request error used to evict every concurrent long
+		// admission, leaving only the first stream and avgB=1 indefinitely.
+		log.Printf("batch: fused prefill unavailable — using chunked prefill/decode interleave")
+		s.fused, s.fusedRows = nil, 0
+		return false
+	}
 	if err != nil {
-		// A fused step failed. The engine ensures the prefill blocks FIRST and returns before
-		// committing ANY decode row on error, so the decode rows are uncommitted: evict just the
-		// prefilling sequence (the common cause is its KV exhausting) and run a plain decode this
+		// A supported fused step failed. The engine ensures the prefill blocks FIRST and returns
+		// before committing ANY decode row on error, so the decode rows are uncommitted: evict just
+		// the prefilling sequence (the common cause is its KV exhausting) and run a plain decode this
 		// pass so the active sequences still progress. A genuine decode-forward failure then surfaces
 		// in s.step (which evicts the whole batch), matching stepPlain's behavior.
 		log.Printf("batch: StepBatchFused failed (slot %d, %d active): %v", pfSq.slot, len(active), err)
 		*prefill = p[1:]
 		s.evict(active, pfSq, Result{Reason: FinishError, Generated: pfSq.generated, Err: err})
 		s.step(active)
-		return
+		return true
 	}
 
 	// Decode commit: scatter one token per slot (deliver handles stop/budget/cancel and the
@@ -1371,7 +1446,7 @@ func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) {
 		p = p[1:]
 		p = append(p, pfSq)
 		*prefill = p
-		return
+		return true
 	}
 	// Prompt fully prefilled: leave the backlog, register its blocks, deliver the first token,
 	// and join active if it survives — exactly the one-shot/advancePrefill completion path.
@@ -1382,6 +1457,7 @@ func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) {
 	if s.deliver(active, pfSq, pfFirst) {
 		active[pfSq.slot] = pfSq
 	}
+	return true
 }
 
 // sweepCancelledPrefill evicts every backlog sequence whose context has been

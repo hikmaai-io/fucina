@@ -1048,6 +1048,9 @@ func (e *Engine) StepBatchFused(decSlots []int32, decInputs []int32, pfSlot int,
 		C.int(pfSlot), (*C.int32_t)(unsafe.Pointer(&pfChunk[0])), C.int(len(pfChunk)), doFinal,
 		outPtr, lensPtr, &pfFirst,
 	)
+	if int(ret) == -2 {
+		return nil, 0, batch.ErrFusedPrefillUnsupported
+	}
 	if ret != 0 {
 		return nil, 0, fmt.Errorf("fucina: step_batch_fused failed (ret %d)", int(ret))
 	}
@@ -1750,13 +1753,18 @@ func (a *BatchAdapter) StepBatchFused(decSlots []int32, decInputs []int32, pfSlo
 }
 
 // MaxFusedRows is the hard per-pass row budget (decode rows + prefill rows) for a fused step.
-// It returns 0 for non-Qwen3 archs (Gemma) so the scheduler keeps Gemma on its byte-identical
-// non-fused chunked path, and 0 when FUCINA_NO_FUSED_PREFILL is set (the pre-fusion baseline).
+// The CUDA capability query, not broad Qwen family detection, is authoritative: Qwen3.5/3.6
+// requires continuous batching but its hybrid prefill currently cannot share one forward with
+// another slot's decode. Advertising it as fused made every concurrent long admission hit -2
+// and get evicted, pinning HTTP serving at avgB=1. Zero keeps the exact separate
+// PrefillChunk+StepBatch interleave path; Gemma and distributed behavior are unchanged.
 func (a *BatchAdapter) MaxFusedRows() int {
-	if !a.eng.IsQwen3Family() || os.Getenv("FUCINA_NO_FUSED_PREFILL") != "" {
+	if os.Getenv("FUCINA_NO_FUSED_PREFILL") != "" {
 		return 0
 	}
-	return maxBatchSeqs
+	a.eng.mu.Lock()
+	defer a.eng.mu.Unlock()
+	return int(C.gemma4_engine_fused_prefill_max_rows(a.eng.ptr))
 }
 
 // RemoveSeq frees a slot and updates the live-slot count.
