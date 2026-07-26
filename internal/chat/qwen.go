@@ -90,9 +90,10 @@ func qwenSanitize(s string) string {
 	return s
 }
 
-// qwenToolJSON serializes one tool declaration the way the HF template's
-// `tool | tojson` does: compact JSON, no HTML escaping. The client's
-// parameters schema is embedded verbatim (compacted), preserving key order.
+// qwenToolJSON serializes one tool declaration the way Transformers' Jinja
+// `tool | tojson` filter does: one space after JSON commas and colons, no HTML
+// escaping, and insertion order preserved. encoding/json emits compact JSON,
+// so qwenJSONSpaces adds the two structural spaces without touching strings.
 func qwenToolJSON(t Tool) string {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -100,7 +101,32 @@ func qwenToolJSON(t Tool) string {
 	if err := enc.Encode(t); err != nil {
 		return "{}"
 	}
-	return strings.TrimSuffix(buf.String(), "\n")
+	return qwenJSONSpaces(strings.TrimSuffix(buf.String(), "\n"))
+}
+
+func qwenJSONSpaces(compact string) string {
+	var sb strings.Builder
+	sb.Grow(len(compact) + len(compact)/8)
+	inString, escaped := false, false
+	for _, r := range compact {
+		sb.WriteRune(r)
+		if inString {
+			if escaped {
+				escaped = false
+			} else if r == '\\' {
+				escaped = true
+			} else if r == '"' {
+				inString = false
+			}
+			continue
+		}
+		if r == '"' {
+			inString = true
+		} else if r == ',' || r == ':' {
+			sb.WriteByte(' ')
+		}
+	}
+	return sb.String()
 }
 
 func (qwenDialect) Render(msgs []RichMessage, tools []Tool, enableThinking bool) string {
@@ -195,19 +221,11 @@ func (qwenDialect) Render(msgs []RichMessage, tools []Tool, enableThinking bool)
 				sb.WriteString("\n</think>\n\n")
 				sb.WriteString(content)
 			} else {
-				// DELIBERATE deviation from the checkpoint template (which
-				// renders old assistant turns bare): keep the EMPTY think
-				// block. A thinking-off generation committed exactly
-				// "<think>\n\n</think>\n\n"+content to the KV (the pre-closed
-				// opener was part of its prompt), so this re-render stays
-				// byte-identical to the committed sequence and the per-
-				// conversation state/prefix cache keeps matching across
-				// turns. Thinking-ON old turns still break the prefix when
-				// their reasoning is dropped — unavoidable (and identical to
-				// the official template's behavior). The empty block is
-				// distribution-neutral: it is precisely what the model sees
-				// in every non-thinking exchange.
-				sb.WriteString("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+				// The checkpoint template drops reasoning blocks from assistant
+				// turns at or before the latest real user query. This can shorten
+				// a cache hit when the prior generation used thinking-off's empty
+				// block, but retaining it changes the model-authoritative prompt.
+				sb.WriteString("<|im_start|>assistant\n")
 				sb.WriteString(content)
 			}
 			for j, tc := range msg.ToolCalls {
@@ -255,11 +273,9 @@ type argKV struct {
 }
 
 // orderedArgs decodes a JSON arguments object PRESERVING key order (Go maps
-// randomize it; the re-rendered prompt must token-match what the model
-// emitted) and renders each value the way the template does: objects/arrays
-// as compact JSON, strings verbatim, numbers as their literal text, booleans
-// and null in Python string form ("True"/"False"/"None" — the template runs
-// `value | string` through jinja, and that is what the model was trained on).
+// randomize it; the re-rendered prompt must retain the client's ordering) and
+// renders each value the way the template does: strings verbatim; every other
+// value through Jinja's `tojson` formatting.
 func orderedArgs(rawArgs string) []argKV {
 	dec := json.NewDecoder(strings.NewReader(rawArgs))
 	dec.UseNumber()
@@ -299,19 +315,11 @@ func qwenArgText(raw json.RawMessage) string {
 	case '{', '[':
 		var buf bytes.Buffer
 		if json.Compact(&buf, raw) == nil {
-			return buf.String()
+			return qwenJSONSpaces(buf.String())
 		}
 		return s
 	}
-	switch s {
-	case "true":
-		return "True"
-	case "false":
-		return "False"
-	case "null":
-		return "None"
-	}
-	return s // number: keep the literal text ("3" stays "3", not "3.0")
+	return s // number/bool/null: JSON literal text is already the tojson form
 }
 
 func (qwenDialect) ForcedCallPrefix(fnName string) string {

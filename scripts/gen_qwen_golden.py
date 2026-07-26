@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""Render Qwen3.5 chat-template goldens with the checkpoint's own jinja.
+"""Render Qwen3.6 chat-template goldens with the checkpoint's own Jinja.
 
-tojson is overridden to compact json.dumps (ensure_ascii=False) to match Go's
-json.Encoder with SetEscapeHTML(false) — HF's runtime uses json.dumps too
-(no HTML escaping), so this is faithful for the checkpoint.
+The tojson override mirrors Transformers' chat-template environment: Python's
+single-line json.dumps spacing, insertion order, Unicode retained, and no HTML
+escaping. The checkpoint template itself is used without substitutions.
 """
 import json, sys
 import jinja2
 
-SNAP = "/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/0b2752837483aa34b3db6e83e151b150c0e00e49"
+SNAP = "/opt/spark/models/hub/models--Qwen--Qwen3.6-35B-A3B-FP8/snapshots/95a723d08a9490559dae23d0cff1d9466213d989"
 template_src = json.load(open(f"{SNAP}/tokenizer_config.json"))["chat_template"]
 
-template_src = template_src.replace(
-    "{{- '<|im_start|>' + message.role + '\\n' + content }}",
-    "{{- '<|im_start|>' + message.role + '\\n<think>\\n\\n</think>\\n\\n' + content }}")
-
 env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
-env.filters["tojson"] = lambda v: json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+env.filters["tojson"] = lambda v: json.dumps(v, ensure_ascii=False)
 env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(Exception(msg))
 tmpl = env.from_string(template_src)
 

@@ -469,6 +469,96 @@ func TestQ35HTTPSessionPersistsAcrossSchedulerRestart(t *testing.T) {
 	srv2.scheduler.Shutdown()
 }
 
+func TestQwenChatRoleFidelitySurvivesSessionRestore(t *testing.T) {
+	modelDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modelDir, "config.json"), []byte(`{"arch":"qwen3_6"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionDir := t.TempDir()
+	tk := newQwenTokenizer(t)
+	base := &fakeQ35SessionServerEngine{fakeServerEngine: fakeServerEngine{
+		ctxSize: 8192, vocab: tk.NumTokens(), eos: tk.EOS,
+	}}
+	srv := New(base, tk)
+	srv.SetLogLevel("warn")
+	if err := srv.SetSessionDir(sessionDir, modelDir); err != nil {
+		t.Fatal(err)
+	}
+	eng := newQ35HTTPBatchEngine(2)
+	if !srv.SetBatchEngine(eng) {
+		t.Fatal("SetBatchEngine refused Qwen session engine")
+	}
+	defer srv.scheduler.Shutdown()
+	eng.mu.Lock()
+	eng.prefill = nil
+	eng.restores = 0
+	eng.exports = 0
+	eng.mu.Unlock()
+
+	payload := `{"kind":"weather","text":"UNTRUSTED_PAYLOAD"}`
+	messages := []ChatMessage{
+		{Role: "system", Content: "trusted policy"},
+		{Role: "user", Content: "check weather"},
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: "call_weather_0", Type: "function",
+			Function: ToolCallFunction{Name: "get_weather", Arguments: `{"city":"Paris"}`},
+		}}},
+		{Role: "tool", ToolCallID: "call_weather_0", Content: payload},
+	}
+	tools := []Tool{{Type: "function", Function: ToolFunction{
+		Name: "get_weather", Parameters: json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`),
+	}}}
+	prompt := srv.renderChatTemplate(messages, tools, false)
+	full := srv.tokenizer.Encode(prompt, true, false)
+	if len(full) < 8 {
+		t.Fatalf("rendered prompt encoded to only %d tokens", len(full))
+	}
+	saved := append([]int32(nil), full[:len(full)-4]...)
+	meta := session.Meta{
+		CreatedAt: time.Now().UTC(), NTokens: len(saved), EngineKind: session.KindQ35Slot,
+		Model: srv.sessionIdent,
+	}
+	if err := session.WriteFile(filepath.Join(sessionDir, "roles.fcsess"), meta, saved, q35FakeState(saved)); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := json.Marshal(map[string]interface{}{
+		"model": "qwen", "messages": messages, "tools": tools,
+		"session": "roles", "max_tokens": 1, "temperature": 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := postJSON(t, srv, "/v1/chat/completions", string(body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resume status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	eng.mu.Lock()
+	restores := eng.restores
+	prefilled := append([]int32(nil), eng.prefill...)
+	eng.mu.Unlock()
+	if restores != 1 {
+		t.Fatalf("session restores=%d, want 1", restores)
+	}
+	wantSuffix := full[len(saved):]
+	if len(prefilled) != len(wantSuffix) {
+		t.Fatalf("session prefilled %d tokens, want exact %d-token suffix", len(prefilled), len(wantSuffix))
+	}
+	for i := range wantSuffix {
+		if prefilled[i] != wantSuffix[i] {
+			t.Fatalf("session changed rendered suffix token %d: got %d want %d", i, prefilled[i], wantSuffix[i])
+		}
+	}
+
+	start := strings.Index(prompt, "<tool_response>\n")
+	end := strings.Index(prompt, "\n</tool_response>")
+	systemEnd := strings.Index(prompt, "<|im_end|>\n")
+	if start < 0 || end <= start || systemEnd < 0 || start <= systemEnd ||
+		prompt[start+len("<tool_response>\n"):end] != payload {
+		t.Fatalf("rendered role boundary changed before session restore:\n%s", prompt)
+	}
+}
+
 func TestQ35HTTPRestoreFailureIsVisible(t *testing.T) {
 	modelDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(modelDir, "config.json"), []byte(`{"arch":"qwen3_5"}`), 0o644); err != nil {
