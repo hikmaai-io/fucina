@@ -1,0 +1,61 @@
+2026/07/26 19:10:28 fucina: loading model /opt/spark/models/hub/models--Qwen--Qwen3.6-35B-A3B-FP8 (ctx=8192, device=0)...
+fucina: loaded /opt/spark/models/hub/models--Qwen--Qwen3.6-35B-A3B-FP8 (directory)
+fucina: qwen35 geometry (runtime-derived) — NQ=16 NKV=2 NVH=32 INNER=4096 CONVD=8192 (M2 baked NQ16/NVH32/INNER4096)
+fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)
+fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine
+fucina: qwen35 tensor plan finalized: entries=900 core=0.88 GiB scales=0.01 MiB
+fucina: qwen35-Q4K mixer repacked in place (130 tensors → packed dp4a GEMV)
+fucina: qwen35 allocation decision: source=block-FP8 mixer=Q4_K experts=NVFP4 d_weights=0.88 GiB
+fucina: qwen35 allocation ledger: experts=16.88 core=0.88 scales=0.00 embed=3.35 head=1.45 moe-scratch=0.58 misc=0.00 total=23.13 GiB
+fucina: qwen35 free-memory trace: enter=79.26 after-experts=29.86 after-core=30.35 before-scratch=23.84 after-scratch=23.23 final=23.23 GiB
+fucina: qwen35 host-memory trace: free 79.26->23.23 available 113.10->82.83 cached 33.31->58.77 reclaimable 2.45->2.63 GiB
+fucina: qwen35 observed deltas: experts=+49.40 core=-0.49 embed/head=+6.51 moe-scratch=+0.61 fill-total=+56.03 ledger-residual=+32.89 GiB
+fucina: qwen35 Q4_K-MoE served via batched engine (40 layers, vocab 248320, H 2048, NKV 2, E-experts slabbed, 0.88 GiB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    79.48 GiB  (shared box: 40.22 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :    56.25 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 8192, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 8192)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :    56.25 GiB  (within budget by 51.48 GiB)
+fucina: engine initialized (0.88 GB model, 8192 ctx, Q8_0)
+fucina: 30 sliding + 10 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 exact Q8 LM-head rows/warp=1 (safe default)
+fucina: qwen35 memory-plan inputs: requested=2 slotctx=8192 maxctx=8192 cuda-free=25.53 GiB available=85.13 GiB model-resident=23.13 GiB (ledger) workspace=2.16 GiB reserve/slot=0.19 GiB (max 0.19) physical-room=84.63 GiB budget-room=84.59 GiB chosen-room=84.59 GiB fit=437
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 5.23 GiB, cuda-free 23.35 GiB, available 82.95 GiB, physical=fit, budget=fit, reserved-before 2.54 GiB, room 84.59 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=8192 slotctx=8192 slots=2/32 workspace=2.16 GiB reserve/slot=0.19 GiB (recurrent 0.03 + KV 0.16; max-KV 0.16) committed=2.16 GiB reserved=7.77 GiB
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+2026/07/26 19:12:42 fucina: prefill scratch warmed in 0.36s
+2026/07/26 19:12:42 fucina: ChatML vocab detected — using the Qwen chat dialect (template + tool calls)
+2026/07/26 19:12:42 fucina: hybrid state-snapshot conversation cache enabled (budget 8192 MiB)
+2026/07/26 19:12:42 fucina: batch decode graphs warmed (B=1..2) in 0.1s
+2026/07/26 19:12:42 fucina: continuous batching ENABLED (paged KV multi-sequence)
+2026/07/26 19:12:42 fucina: debug logging ON — request dumps -> /tmp/fucina_debug.log
+2026/07/26 19:12:42 fucina: server starting on 127.0.0.1:8094
+2026/07/26 19:12:42 fucina: model=/opt/spark/models/hub/models--Qwen--Qwen3.6-35B-A3B-FP8 ctx=8192
+2026/07/26 19:12:42 fucina: server listening on 127.0.0.1:8094
+2026/07/26 19:12:43 fucina: [46a7a7922fd8d771] GET /readyz -> 200 (0ms)
+2026/07/26 19:12:43 fucina: [92a5a490359c4e6e] GET /v1/models -> 200 (0ms)
+2026/07/26 19:12:43 fucina: [4a2e03ad28405a7c] GET /v1/version -> 404 (0ms)
+2026/07/26 19:12:43 fucina: chat: 2 msgs, 12 tools, sys=455ch, 1439 prompt-tok, thinking=false, stream=true
+2026/07/26 19:12:45 fucina: generated 38 tokens in 1.78s (21.4 tok/s)
+2026/07/26 19:12:45 fucina: [753dea80aa475f19] POST /v1/chat/completions -> 200 (1778ms)
+2026/07/26 19:12:45 fucina: chat: 4 msgs, 12 tools, sys=455ch, 1730 prompt-tok, thinking=false, stream=false
+2026/07/26 19:12:46 fucina: generated 80 tokens in 1.83s (43.8 tok/s)
+2026/07/26 19:12:46 fucina: [1dd3e4b8b9d4721f] POST /v1/chat/completions -> 200 (1847ms)
+2026/07/26 19:12:46 fucina: chat: 6 msgs, 12 tools, sys=455ch, 1836 prompt-tok, thinking=false, stream=false
+2026/07/26 19:12:46 fucina: state-snap MISS: prompt 1836 toks vs closest snap 1810 toks, lcp=1435; snap[lcp:]=[248068 271 248069 271 248058 198 27 1628] prompt[lcp:]=[248058 198 27 1628 27362 67017 29 198]
+2026/07/26 19:12:48 batch: telemetry: 120 steps / 5.3s — avgB 1.0, engine 17.54 ms/step, deliver 0.002, evict 0.433 (n=4), admit 23.029 (eng 22.251), pass 40.57 — 120 tok (23 tok/s)
+2026/07/26 19:12:49 fucina: generated 81 tokens in 2.60s (31.1 tok/s)
+2026/07/26 19:12:49 fucina: [74d5c62210a12e26] POST /v1/chat/completions -> 200 (2603ms)
+2026/07/26 19:12:49 fucina: chat: 8 msgs, 12 tools, sys=455ch, 2078 prompt-tok, thinking=false, stream=false
+2026/07/26 19:12:50 fucina: generated 18 tokens in 0.68s (26.6 tok/s)
+2026/07/26 19:12:50 fucina: [e9988281bfc97e66] POST /v1/chat/completions -> 200 (680ms)
+2026/07/26 19:12:50 fucina: shutting down...

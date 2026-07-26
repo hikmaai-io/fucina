@@ -38,7 +38,7 @@ sources:
 # P1 — user-visible feature gaps
 
 * **Closed 2026-07-26:** `response_format` and `json_schema` now use independent per-slot grammars under continuous batching; TC-64/65/66/67/69-style Qwen3.6 FP8 hardware requests passed 5/5 schema validation. See [`../../batched-structured-output.md`](../../batched-structured-output.md).
-* TC-60 cross-turn sleeper injection remains a safety-critical model-level failure in the final Qwen3.6 MoE qualification.
+* TC-60 cross-turn sleeper injection remains a safety-critical model-level failure after byte-exact official-template, role-boundary, prefix-cache, and session-restore verification; see [`../../tc60-cross-turn-injection.md`](../../tc60-cross-turn-injection.md).
 * Qwen base>0 continuation prefill uses the exact scalar attention path. The faster tensor-core candidate is quarantined after correct router replay exposed only 2/25 continuation agreement versus scalar/one-shot 25/25.
 * E4B continuous batching is greedy and ignores per-request temperature/top-k/top-p/min-p/seed parameters; its hardware batch parity gate also retains the historical 2/8 mismatch in one sequence. Its HF forward/generation gates require `/tmp/e4b_ref.bin` and `/tmp/e4b_gen_ref.bin`, but no pinned producer or artifacts are in the repository.
 * Gemma's MTP assistant is not implemented per slot in the continuous-batch path.
