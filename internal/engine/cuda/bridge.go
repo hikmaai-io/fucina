@@ -1099,6 +1099,36 @@ func (e *Engine) StepBatch(slots []int32, inputs []int32) ([]int32, error) {
 	return out, nil
 }
 
+// StepBatchExact is the one-token host-input decode used by constrained rows and
+// persisted sessions. On Qwen it bypasses GPU self-splice: a grammar may replace
+// the device's sampled token, so the caller's accepted input is authoritative.
+func (e *Engine) StepBatchExact(slots []int32, inputs []int32) ([]int32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(slots) != len(inputs) {
+		return nil, fmt.Errorf("fucina: step_batch_exact: %d slots vs %d inputs", len(slots), len(inputs))
+	}
+	b := len(slots)
+	if b == 0 {
+		return nil, nil
+	}
+	if b > maxBatchSeqs {
+		return nil, fmt.Errorf("fucina: step_batch_exact: batch %d exceeds max %d", b, maxBatchSeqs)
+	}
+	cslots := make([]C.int, b)
+	for i, slot := range slots {
+		cslots[i] = C.int(slot)
+	}
+	out := make([]int32, b)
+	ret := C.gemma4_engine_step_batch_exact(e.ptr, &cslots[0],
+		(*C.int32_t)(unsafe.Pointer(&inputs[0])), C.int(b),
+		(*C.int32_t)(unsafe.Pointer(&out[0])))
+	if ret != 0 {
+		return nil, fmt.Errorf("fucina: step_batch_exact failed")
+	}
+	return out, nil
+}
+
 // StepBatchSpec is the MTP-speculative batched step: it drafts per slot and verifies
 // all slots in one batched target forward, returning a token RUN per slot (the accepted
 // drafts plus the bonus/resampled token). Output is byte-identical to StepBatch; the
@@ -1268,6 +1298,9 @@ type BatchAdapter struct {
 	scLookups    int64
 	scHitTokens  int64
 	scEvictions  int64
+	// Reused host buffer for constrained batch logits (up to rows*runtime vocab).
+	// Scheduler ownership is single-threaded, so no adapter lock is needed.
+	constraintLogits []float32
 }
 
 // seqStateSnap is one saved conversation: the exact token sequence committed
@@ -1576,7 +1609,39 @@ func (a *BatchAdapter) ExportSession(slot int, tokens []int32) (*batch.StateSnap
 // sessions need a one-token commit frontier so a stop/budget in the returned
 // run cannot leave hidden committed state beyond the persisted token history.
 func (a *BatchAdapter) StepBatchExact(active []int32, inputs []int32) ([]int32, error) {
-	return a.eng.StepBatch(active, inputs)
+	return a.eng.StepBatchExact(active, inputs)
+}
+
+// CopyLogits implements batch.ConstraintLogitsEngine. It is called immediately
+// after SeqAdd/SeqPrefillChunk (batch=false) or StepBatchExact (batch=true),
+// before any other engine call can overwrite the resident head output.
+func (a *BatchAdapter) CopyLogits(rows int, batched bool) ([]float32, int, error) {
+	if rows < 1 {
+		return nil, 0, fmt.Errorf("fucina: copy logits: invalid row count %d", rows)
+	}
+	a.eng.mu.Lock()
+	defer a.eng.mu.Unlock()
+	vocab := int(C.gemma4_engine_get_vocab_size(a.eng.ptr))
+	need := rows * vocab
+	if vocab <= 0 || need <= 0 {
+		return nil, 0, fmt.Errorf("fucina: copy logits: invalid vocab %d", vocab)
+	}
+	if cap(a.constraintLogits) < need {
+		a.constraintLogits = make([]float32, need)
+	} else {
+		a.constraintLogits = a.constraintLogits[:need]
+	}
+	batchFlag := C.int(0)
+	if batched {
+		batchFlag = 1
+	}
+	rc := C.gemma4_engine_copy_logits(a.eng.ptr,
+		(*C.float)(unsafe.Pointer(&a.constraintLogits[0])), C.int(rows), batchFlag)
+	if int(rc) != vocab {
+		return nil, 0, fmt.Errorf("fucina: copy logits failed (rows=%d batch=%v rc=%d vocab=%d)",
+			rows, batched, int(rc), vocab)
+	}
+	return a.constraintLogits, vocab, nil
 }
 
 func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int32, error) {

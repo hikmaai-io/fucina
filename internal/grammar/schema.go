@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 )
 
 // JSON type bits (a node may allow several, e.g. ["string","null"]).
@@ -103,6 +104,11 @@ func parseSchema(raw json.RawMessage) (*schemaNode, error) {
 			return nil, fmt.Errorf("schema: object has %d properties (max %d)", len(rs.Properties), maxProps)
 		}
 		for name, sub := range rs.Properties {
+			// Key matching is deliberately literal-byte (fast bitmask candidates),
+			// so names requiring JSON escapes cannot be represented losslessly.
+			if strings.IndexAny(name, "\\\"") >= 0 || strings.IndexFunc(name, func(r rune) bool { return r < 0x20 }) >= 0 {
+				return nil, fmt.Errorf("schema: property name %q requires JSON escaping", name)
+			}
 			child, err := parseSchema(sub)
 			if err != nil {
 				return nil, err
@@ -199,14 +205,26 @@ type sframe struct {
 	keyPos  int    // key string: bytes matched so far
 	curProp int    // object: property index selected for the pending value
 
-	esc      bool // string: previous byte was a backslash
-	numIsInt bool // number: integer-only (no '.'/'e')
-	numSeen  bool // number: at least one digit consumed
+	esc      bool  // string: previous byte was a backslash
+	unicode  uint8 // string: hex digits remaining after a \\u escape
+	numIsInt bool  // number: integer-only (no '.'/'e')
+	numPhase uint8 // strict JSON-number phase (no leading zero / dangling dot/exponent)
 
 	lits    []string // literal/enum: candidate serializations (shared, read-only)
 	litMask uint64   // literal/enum: candidates still matching
 	litPos  int      // literal/enum: bytes matched so far
 }
+
+const (
+	npSign = iota
+	npZero
+	npInt
+	npDot
+	npFrac
+	npExp
+	npExpSign
+	npExpDigits
+)
 
 var (
 	litsTrue  = []string{"true"}
@@ -247,9 +265,20 @@ func (s *schemaState) step(b byte) bool {
 		top := &s.stack[len(s.stack)-1]
 		switch top.mode {
 		case smStr:
+			if top.unicode > 0 {
+				if !isHex(b) {
+					return false
+				}
+				top.unicode--
+				return true
+			}
 			if top.esc {
 				top.esc = false
-				return true
+				if b == 'u' {
+					top.unicode = 4
+					return true
+				}
+				return strings.ContainsRune(`"\\/bfnrt`, rune(b))
 			}
 			if b == '\\' {
 				top.esc = true
@@ -273,21 +302,13 @@ func (s *schemaState) step(b byte) bool {
 			}
 			return s.narrowKey(top, b)
 		case smNum:
-			if top.numIsInt {
-				if isDigit(b) {
-					top.numSeen = true
-					return true
-				}
-			} else if numCont(b) {
-				if isDigit(b) {
-					top.numSeen = true
-				}
+			if top.stepNumber(b) {
 				return true
 			}
-			if !top.numSeen { // a bare '-' is not a number
+			if !top.numberComplete() {
 				return false
 			}
-			s.pop() // number ends on this non-continuation byte; re-process it in the parent
+			s.pop() // number ends on this delimiter; re-process it in the parent
 			continue
 		case smLit:
 			done, ok := s.stepLit(top, b)
@@ -376,6 +397,75 @@ func (s *schemaState) step(b byte) bool {
 
 func (f *sframe) reqSatisfied() bool { return f.used&f.node.reqMask == f.node.reqMask }
 
+func (f *sframe) numberComplete() bool {
+	return f.numPhase == npZero || f.numPhase == npInt || f.numPhase == npFrac || f.numPhase == npExpDigits
+}
+
+func (f *sframe) stepNumber(b byte) bool {
+	switch f.numPhase {
+	case npSign:
+		if b == '0' {
+			f.numPhase = npZero
+			return true
+		}
+		if b >= '1' && b <= '9' {
+			f.numPhase = npInt
+			return true
+		}
+	case npZero:
+		if !f.numIsInt && b == '.' {
+			f.numPhase = npDot
+			return true
+		}
+		if !f.numIsInt && (b == 'e' || b == 'E') {
+			f.numPhase = npExp
+			return true
+		}
+	case npInt:
+		if isDigit(b) {
+			return true
+		}
+		if !f.numIsInt && b == '.' {
+			f.numPhase = npDot
+			return true
+		}
+		if !f.numIsInt && (b == 'e' || b == 'E') {
+			f.numPhase = npExp
+			return true
+		}
+	case npDot:
+		if isDigit(b) {
+			f.numPhase = npFrac
+			return true
+		}
+	case npFrac:
+		if isDigit(b) {
+			return true
+		}
+		if b == 'e' || b == 'E' {
+			f.numPhase = npExp
+			return true
+		}
+	case npExp:
+		if b == '+' || b == '-' {
+			f.numPhase = npExpSign
+			return true
+		}
+		if isDigit(b) {
+			f.numPhase = npExpDigits
+			return true
+		}
+	case npExpSign:
+		if isDigit(b) {
+			f.numPhase = npExpDigits
+			return true
+		}
+	case npExpDigits:
+		return isDigit(b)
+	}
+	return false
+}
+
 // fullMask is the bitmask of all declared properties (additionalProperties:false ⇒ the
 // legal key set). hasUnused reports whether any declared property is not yet consumed.
 func (f *sframe) fullMask() uint64 {
@@ -455,7 +545,14 @@ func (s *schemaState) beginValue(f *sframe, b byte) bool {
 	case (b == '-' || isDigit(b)) && (n.has(tNumber) || n.has(tInteger)):
 		f.mode = smNum
 		f.numIsInt = n.has(tInteger) && !n.has(tNumber)
-		f.numSeen = isDigit(b)
+		switch {
+		case b == '-':
+			f.numPhase = npSign
+		case b == '0':
+			f.numPhase = npZero
+		default:
+			f.numPhase = npInt
+		}
 		return true
 	case b == 't' && n.has(tBoolean):
 		return s.enterLit(f, litsTrue, b)
@@ -602,53 +699,139 @@ func (j *JSONSchema) Accept(id int32) {
 	}
 }
 
-// Close completes a truncated value into parseable (not necessarily schema-valid) JSON:
-// finish any in-progress scalar, then close every open container from the top down.
+// Close computes a minimal suffix that is valid against the schema, not merely
+// parseable JSON. It drives a clone of the live automaton until completion,
+// synthesizing missing required properties and recursively choosing minimal typed
+// values. The live FSM is unchanged; callers append the returned response-only bytes.
 func (j *JSONSchema) Close() []byte {
-	st := &j.st
-	if st.complete() {
+	if j.st.complete() {
 		return nil
 	}
-	var b []byte
-	for i := len(st.stack) - 1; i >= 0; i-- {
-		f := &st.stack[i]
+	var st schemaState
+	j.st.clone(&st)
+	var out []byte
+	feed := func(p []byte) bool {
+		for _, c := range p {
+			if !st.step(c) {
+				return false
+			}
+			out = append(out, c)
+		}
+		return true
+	}
+	for guard := 0; !st.complete() && guard < 4096; guard++ {
+		f := &st.stack[len(st.stack)-1]
+		var p []byte
 		switch f.mode {
 		case smStr:
-			if f.esc {
-				b = append(b, '\\')
+			switch {
+			case f.unicode > 0:
+				p = bytes.Repeat([]byte{'0'}, int(f.unicode))
+			case f.esc:
+				p = []byte{'\\'} // complete a dangling escaped backslash
+			default:
+				p = []byte{'"'}
 			}
-			b = append(b, '"')
 		case smKeyStr:
-			if f.esc {
-				b = append(b, '\\')
+			i := firstCandidate(f.keyCand)
+			if i < 0 || f.keyPos > len(f.node.propName[i]) {
+				return nil
 			}
-			b = append(b, '"', ':', 'n', 'u', 'l', 'l') // key with no value yet
+			p = append([]byte(f.node.propName[i][f.keyPos:]), '"')
 		case smColon:
-			b = append(b, ':', 'n', 'u', 'l', 'l')
-		case smValue:
-			b = append(b, 'n', 'u', 'l', 'l')
+			p = []byte{':'}
 		case smNum:
-			if !f.numSeen {
-				b = append(b, '0') // dangling '-' → -0
+			// Complete any dangling numeric component before using whitespace as
+			// the delimiter that pops the scalar frame.
+			switch f.numPhase {
+			case npSign:
+				p = []byte{'0'}
+			case npDot, npExp, npExpSign:
+				p = []byte{'0'}
+			default:
+				p = []byte{' '}
 			}
 		case smLit:
-			if _, idx := firstBit(f.litMask); idx >= 0 { // finish the chosen literal/enum
-				b = append(b, f.lits[idx][f.litPos:]...)
+			i := firstCandidate(f.litMask)
+			if i < 0 {
+				return nil
 			}
-		}
-		switch f.mode {
-		case smObjFirst, smObjKey, smKeyStr, smColon, smObjNext:
-			b = append(b, '}')
+			p = []byte(f.lits[i][f.litPos:])
+		case smValue:
+			p = minimalSchemaValue(f.node)
+		case smObjFirst:
+			if i := firstRequired(f); i >= 0 {
+				p = quotedProperty(f.node.propName[i])
+			} else {
+				p = []byte{'}'}
+			}
+		case smObjKey:
+			i := firstRequired(f)
+			if i < 0 {
+				i = firstCandidate(f.fullMask() &^ f.used)
+			}
+			if i < 0 {
+				return nil
+			}
+			p = quotedProperty(f.node.propName[i])
+		case smObjNext:
+			if firstRequired(f) >= 0 {
+				p = []byte{','}
+			} else {
+				p = []byte{'}'}
+			}
 		case smArrFirst, smArrNext:
-			b = append(b, ']')
+			p = []byte{']'}
+		default:
+			return nil
+		}
+		if len(p) == 0 || !feed(p) {
+			return nil
 		}
 	}
-	return b
+	if !st.complete() {
+		return nil
+	}
+	return out
 }
 
-func firstBit(m uint64) (uint64, int) {
-	if m == 0 {
-		return 0, -1
+func firstCandidate(mask uint64) int {
+	if mask == 0 {
+		return -1
 	}
-	return m, bits_TrailingZeros(m)
+	return bits_TrailingZeros(mask)
+}
+
+func firstRequired(f *sframe) int {
+	return firstCandidate(f.node.reqMask &^ f.used)
+}
+
+func quotedProperty(name string) []byte {
+	// Names requiring an escape were rejected during schema parsing.
+	b := make([]byte, 0, len(name)+2)
+	b = append(b, '"')
+	b = append(b, name...)
+	return append(b, '"')
+}
+
+func minimalSchemaValue(n *schemaNode) []byte {
+	if len(n.enumVals) > 0 {
+		return []byte(n.enumVals[0])
+	}
+	switch {
+	case n.has(tObject):
+		return []byte{'{'}
+	case n.has(tArray):
+		return []byte{'[', ']'}
+	case n.has(tString):
+		return []byte{'"', '"'}
+	case n.has(tInteger) || n.has(tNumber):
+		return []byte{'0'}
+	case n.has(tBoolean):
+		return []byte("false")
+	case n.has(tNull):
+		return []byte("null")
+	default:
+		return []byte("null")
+	}
 }

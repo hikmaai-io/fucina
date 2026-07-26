@@ -451,11 +451,20 @@ int  gemma4_engine_seq_add_multiseq(gemma4_engine_t *eng, const int32_t *tokens_
                            int *out_slots, int32_t *out_first);
 // DEBUG (test-only): copy just-computed first-token logits (nrows==1: d_logits; nrows>1: d_sb[11]).
 int  gemma4_engine_debug_logits(gemma4_engine_t *eng, float *out, int nrows);
+// Production constrained-sampling boundary: copy the logits left by the
+// immediately preceding prefill (batched=0, rows=1) or exact batch decode
+// (batched=1, rows>=1). Returns the runtime vocab width, or -1.
+int  gemma4_engine_copy_logits(gemma4_engine_t *eng, float *out, int rows, int batched);
 int  gemma4_engine_debug_set_q35_clean_gdn(gemma4_engine_t *eng, int enabled);
 // DEBUG (test-only): force exact Q8 greedy-head rows/warp (1,2,4) and invalidate Qwen graphs.
 int  gemma4_engine_debug_set_q35_head_rows(gemma4_engine_t *eng, int rows);
 int  gemma4_engine_step_batch(gemma4_engine_t *eng, const int *slots,
                               const int32_t *in_tokens, int B, int32_t *out_tokens);
+// Exact host-input variant used by grammar/session frontiers. It bypasses Qwen's
+// GPU self-splice so a host-resampled constrained token, rather than the discarded
+// device sample, is the token committed on the next step.
+int  gemma4_engine_step_batch_exact(gemma4_engine_t *eng, const int *slots,
+                                    const int32_t *in_tokens, int B, int32_t *out_tokens);
 // MTP speculative batched step: per-slot draft + one batched verify. out_tokens is
 // [B*GEMMA4_SPEC_MAX] (each row's emitted run), out_lens[B] the per-row run length
 // (>=1) or -1 if the slot hit its KV limit. Output is byte-identical to step_batch.

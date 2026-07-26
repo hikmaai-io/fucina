@@ -1,5 +1,9 @@
 # Fucina OKF bundle history
 
+## 2026-07-26
+
+* **Batched structured output**: Closed the mandatory-Qwen `response_format` 501 gap with per-slot grammar state, exact host-input decode, full-logit masking, and schema-valid max-token closure. Qwen3.6-35B-A3B-FP8 TC-64/65/66/67/69-style requests passed 5/5 on GB10.
+
 ## 2026-07-25
 
 * **MoE graph-decode resolution**: Recorded the captured-stream router fix, 6/24→24/24 row/graph parity, self-test FAIL→PASS, dual 8/8 oracle passes, and resolution of the historical `qwen-gates.log:417` failure.

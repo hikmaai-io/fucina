@@ -6,8 +6,8 @@
 > Qwen has no working single-flight prefill entry point (`cmd/fucina/main.go` detects
 > `eng.IsQwen3Family()` and force-enables `--batch`/`--paged-kv`; startup fails fast if the paged
 > pool can't allocate). The "why default-off" reasoning below still applies to **Gemma-4 only**.
-> For the Qwen-specific serving behavior (mandatory batching, dense-only spec decode inside the
-> batch path, the `response_format` 501 gap), see the README's
+> For the Qwen-specific serving behavior (mandatory batching, dense-only spec decode, and
+> per-slot constrained `response_format`), see the README's
 > [Continuous batching & paged KV](../README.md#-continuous-batching--paged-kv) section and
 > [docs/qwen-models.md](qwen-models.md). The design/internals below are still accurate for both.
 
@@ -34,6 +34,10 @@ How it works end to end:
 - `FUCINA_BATCH` builds a `batch.Scheduler` (single owner goroutine) over a cgo `BatchAdapter`
   implementing `BatchEngine` (AddSeq/StepBatch/RemoveSeq/Capacity → `gemma4_engine_seq_*`).
   `serveCompletions` routes to `serveBatch` (Submit) instead of the per-request `s.kv.Lock()`.
+- Constrained requests carry one `grammar.Constraint` per scheduler slot. A shared constrained
+  step calls `gemma4_engine_step_batch_exact` (Qwen host input, no graph splice/speculation),
+  copies the compacted per-row logits, and masks/samples each constrained row independently.
+  `Close()` supplies a schema-valid suffix if a hard token/KV cap interrupts the value.
 - C `gemma4_engine_step_batch` runs ONE `decode_multiseq_forward` over B independent slots
   (per-row positions + per-row paged block tables; `paged_attn_decode_batched` for attention),
   samples one greedy token per row. Per-row admission: a slot that can't grow its KV is marked
