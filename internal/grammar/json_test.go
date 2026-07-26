@@ -1,6 +1,7 @@
 package grammar
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 )
@@ -145,5 +146,21 @@ func TestJSONNestedAndString(t *testing.T) {
 	}
 	if !j.Done() {
 		t.Fatal("nested object/array/escaped-string must complete")
+	}
+}
+
+func TestJSONCloseRepairsTrailingCommaFrontier(t *testing.T) {
+	strs := []string{"{", "}", `"`, ":", ",", "1", "a", "null", "EOS"}
+	pieces, idx := buildVocab(strs)
+	eos := idx["EOS"]
+	pieces[eos] = nil
+	j := NewJSON(pieces, eos)
+	for _, p := range []string{"{", `"`, "a", `"`, ":", "1", ","} {
+		j.Accept(idx[p])
+	}
+	full := `{"a":1,` + string(j.Close())
+	var got map[string]interface{}
+	if err := json.Unmarshal([]byte(full), &got); err != nil {
+		t.Fatalf("Close at object-key frontier produced invalid JSON: %v (%q)", err, full)
 	}
 }

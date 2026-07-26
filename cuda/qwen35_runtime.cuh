@@ -1999,8 +1999,27 @@ extern "C" void gemma4_engine_memory_stats(const gemma4_engine_t *eng,
 }
 
 // S2b decode-first batch ordering (q35_sort_batch_decode_first) lives in qwen35_graph_key.cuh.
-static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
-                             const int32_t *in_tokens, int B, int32_t *out_tokens) {
+// Copy exact full-vocabulary logits for host constrained sampling. The B=1 FP8
+// greedy fast path normally leaves only its Q8 approximate scan in d_sb[11] and
+// exact-rescores a candidate set directly into d_ms_outtok. A grammar can exclude
+// that winner, so it needs exact scores for every legal alternative: rerun only
+// the BF16 head from the already-normalized final hidden row before copying.
+static int qwen35_copy_batch_logits(gemma4_engine_t *eng, float *out, int rows) {
+    if (!eng || !out || rows <= 0 || rows > eng->q35.capacity || !eng->d_sb[11]) return -1;
+    const int H = eng->cfg.hidden_size, VOC = eng->cfg.vocab_size;
+    if (rows == 1 && eng->format == FORMAT_FP8_BLOCK && eng->d_lmhead_q8) {
+        float *xn = workspace_data<float>(eng->q35.decode_workspace[Q35_XN]);
+        bf16_head_gemv_launch(eng->d_sb[11], eng->d_lmhead_bf16, xn, H, VOC, eng->stream);
+    }
+    cudaMemcpyAsync(out, eng->d_sb[11], (size_t)rows * VOC * sizeof(float),
+                    cudaMemcpyDeviceToHost, eng->stream);
+    cudaStreamSynchronize(eng->stream);
+    return cudaGetLastError() == cudaSuccess ? VOC : -1;
+}
+
+static int qwen35_step_batch_impl(gemma4_engine_t *eng, const int *slots,
+                                  const int32_t *in_tokens, int B, int32_t *out_tokens,
+                                  int allow_splice) {
     if (!eng || !eng->loaded || B <= 0 || B > eng->q35.capacity) return -1;
     if (ensure_spec_scratch(eng) != 0 || ensure_q35_scratch(eng) != 0) return -1;
     gemma4_seq *slv[GEMMA4_MAX_SEQS]; int positions[GEMMA4_MAX_SEQS];
@@ -2017,7 +2036,7 @@ static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
     }
     if (Bv == 0) return 0;
     cudaStream_t st = eng->stream;
-    const int splice = eng->q35.gpu_splice_enabled;
+    const int splice = allow_splice && eng->q35.gpu_splice_enabled;
     if (splice) {
         // S2a — seed persistent per-slot state from this step's host inputs, device-side, then the
         // in-graph splice re-derives (d_sb[0], d_ms_pos) from slot state. The row→slot map upload
@@ -2033,7 +2052,13 @@ static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
             eng->q35.d_slot_tok, eng->q35.d_slot_pos, eng->q35.pf_tok, eng->q35.pf_pos,
             workspace_data<int>(eng->q35.routing_workspace), Bv);
     }
-    qwen35_ms_run(eng, slv, in2, positions, Bv, /*want_argmax=*/1, /*use_graph=*/1, splice);
+    // The captured graph always contains the global GPU splice. Exact host-input
+    // calls must therefore disable graph replay as well as splice itself; otherwise
+    // the graph silently ignores the grammar-accepted host token and can advance a
+    // stale slot position. A later normal call seeds its persistent splice state from
+    // host inputs before graph launch, so no exact-path writeback is required.
+    qwen35_ms_run(eng, slv, in2, positions, Bv, /*want_argmax=*/1,
+                  /*use_graph=*/allow_splice, splice);
     int32_t outs[GEMMA4_MAX_SEQS];
     cudaMemcpyAsync(outs, eng->d_ms_outtok, (size_t)Bv*sizeof(int32_t), cudaMemcpyDeviceToHost, eng->stream);
     cudaStreamSynchronize(eng->stream);
@@ -2048,6 +2073,16 @@ static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
         if (out_tokens) out_tokens[rowmap[v]] = outs[v];
     }
     return 0;
+}
+
+static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
+                             const int32_t *in_tokens, int B, int32_t *out_tokens) {
+    return qwen35_step_batch_impl(eng, slots, in_tokens, B, out_tokens, /*allow_splice=*/1);
+}
+
+static int qwen35_step_batch_exact(gemma4_engine_t *eng, const int *slots,
+                                   const int32_t *in_tokens, int B, int32_t *out_tokens) {
+    return qwen35_step_batch_impl(eng, slots, in_tokens, B, out_tokens, /*allow_splice=*/0);
 }
 
 // ─── P0 (S1a): lossless GDN snapshot / rewind / commit for DFlash (1+K) verification ─────

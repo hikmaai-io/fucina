@@ -205,12 +205,47 @@ func TestSchemaForceClose(t *testing.T) {
 	}
 }
 
+func TestSchemaForceCloseAddsNestedRequiredAndEnum(t *testing.T) {
+	schema := `{"type":"object","properties":{"rows":{"type":"array","items":{"type":"object","properties":{"kind":{"enum":["red","green"]},"n":{"type":"integer"}},"required":["kind","n"]}}},"required":["rows"]}`
+	j, n := newSchema(t, schema)
+	prefix := `{"rows":[{"kind":"r`
+	drive(t, j, n, prefix)
+	full := prefix + string(j.Close())
+	var got struct {
+		Rows []struct {
+			Kind string `json:"kind"`
+			N    int    `json:"n"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(full), &got); err != nil {
+		t.Fatalf("force-close invalid: %v (%q)", err, full)
+	}
+	if len(got.Rows) != 1 || got.Rows[0].Kind != "red" || got.Rows[0].N != 0 {
+		t.Fatalf("force-close did not satisfy schema: %#v (%q)", got, full)
+	}
+}
+
+func TestSchemaRejectsMalformedNumberContinuations(t *testing.T) {
+	for _, prefix := range []string{"-", "1.", "1e", "1e+"} {
+		j, n := newSchema(t, `{"type":"number"}`)
+		drive(t, j, n, prefix)
+		if maskAllowed(j, n)[' '] {
+			t.Errorf("%q may not terminate as a JSON number", prefix)
+		}
+		full := prefix + string(j.Close())
+		var v float64
+		if err := json.Unmarshal([]byte(full), &v); err != nil {
+			t.Errorf("Close(%q) produced invalid number %q: %v", prefix, full, err)
+		}
+	}
+}
+
 func TestSchemaParseErrors(t *testing.T) {
 	pieces, _, eos := byteVocab()
 	cases := []string{
-		`{"type":"object","required":["missing"]}`,      // required not a declared property
-		`{"type":"nonsense"}`,                            // unknown type
-		`not json`,                                       // malformed
+		`{"type":"object","required":["missing"]}`, // required not a declared property
+		`{"type":"nonsense"}`,                      // unknown type
+		`not json`,                                 // malformed
 	}
 	for _, c := range cases {
 		if _, err := NewJSONSchema(pieces, eos, json.RawMessage(c)); err == nil {

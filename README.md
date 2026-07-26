@@ -624,9 +624,9 @@ fucina -m ./models/Qwen3.6-35B-A3B-NVFP4 --host 0.0.0.0 --port 8080
 
 > [!NOTE]
 > **Tool calling / thinking / structured output** work over the standard OpenAI wire shape for
-> Qwen too — see [HTTP API](#-http-api). One caveat: `response_format`/`json_schema` (constrained
-> JSON decoding) is currently rejected with HTTP 501 for every Qwen checkpoint, because it isn't
-> supported under continuous batching and Qwen is always served through that path.
+> Qwen too — see [HTTP API](#-http-api). `response_format` (`json_object` and the supported
+> `json_schema` subset) carries an independent grammar state per continuous-batch slot. See
+> [batched structured output](docs/batched-structured-output.md) for correctness and GB10 evidence.
 
 ---
 
@@ -652,8 +652,9 @@ size.
 - **Burst-admission coalescing:** when the scheduler wakes from idle, it holds a short escalating
   window (a few ms, capped at 150 ms) so near-simultaneous requests land in the same batch instead
   of admitting one-by-one — unconditional scheduler behavior, no flag.
-- **Known gap:** `response_format`/`json_schema` (constrained decoding) is rejected with HTTP 501
-  under the batch path — it only works for Gemma-4 single-flight today.
+- **Structured output:** `response_format`/`json_schema` works in the batch path. Constrained rows
+  use exact one-token decode plus per-slot host grammar masking; speculation is disabled only for
+  shared steps containing a constrained row. Adapters without exact logits still fail closed.
 
 See [`docs/continuous-batching.md`](docs/continuous-batching.md) for the full design (paged-KV
 allocator, split-K paged attention, per-batch-size CUDA graphs) and
@@ -774,10 +775,11 @@ The next request must render a strict extension of the saved token history. See
 [`docs/session-persistence.md`](docs/session-persistence.md) for format and safety details.
 
 > [!IMPORTANT]
-> `response_format`/`json_schema` (constrained JSON decoding) is implemented but is route-guarded
-> off the continuous-batching path with HTTP `501 unsupported_under_batching` — since every Qwen
-> checkpoint is served through that path, `response_format` currently **never works for Qwen**. It
-> works for Gemma-4 in the default (non-`--batch`) single-flight mode.
+> `response_format`/`json_schema` uses host-side grammar masking. In continuous batching each slot
+> owns its own FSM and RNG; constrained shared steps use the exact host-input ABI (no speculative
+> drafts or Qwen GPU token splice). This is correctness-first and copies full logits to the host,
+> so it is slower than ordinary on-device sampling. Engines without that ABI retain the fail-closed
+> `501 unsupported_under_batching` guard.
 
 ---
 

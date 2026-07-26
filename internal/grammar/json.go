@@ -47,9 +47,11 @@ type jsonState struct {
 	stack      []byte // container stack: 'o' object, 'a' array (bottom→top)
 	mode       int
 	esc        bool   // in mString: previous byte was a backslash
+	unicode    uint8  // in mString: hex digits remaining after a \\u escape
 	litWord    string // in mLit: the literal being matched
 	litPos     int    // in mLit: next index to match
 	postLit    int    // mode to return to after a number/literal completes
+	numPhase   uint8  // strict JSON-number phase (shared np* constants with schema.go)
 	requireObj bool   // top-level value must be an object (OpenAI json_object)
 }
 
@@ -57,9 +59,11 @@ func (s *jsonState) clone(dst *jsonState) {
 	dst.stack = append(dst.stack[:0], s.stack...)
 	dst.mode = s.mode
 	dst.esc = s.esc
+	dst.unicode = s.unicode
 	dst.litWord = s.litWord
 	dst.litPos = s.litPos
 	dst.postLit = s.postLit
+	dst.numPhase = s.numPhase
 	dst.requireObj = s.requireObj
 }
 
@@ -74,10 +78,10 @@ func (s *jsonState) afterValue() int {
 	return mArrNext
 }
 
-func isWS(b byte) bool   { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+func isWS(b byte) bool    { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
-func numCont(b byte) bool {
-	return isDigit(b) || b == '.' || b == 'e' || b == 'E' || b == '+' || b == '-'
+func isHex(b byte) bool {
+	return isDigit(b) || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F'
 }
 
 // step feeds one byte; returns false (and leaves the state unspecified) if the byte
@@ -87,9 +91,20 @@ func (s *jsonState) step(b byte) bool {
 	for {
 		switch s.mode {
 		case mString:
+			if s.unicode > 0 {
+				if !isHex(b) {
+					return false
+				}
+				s.unicode--
+				return true
+			}
 			if s.esc {
 				s.esc = false
-				return true // any byte may follow a backslash (rough but safe for masking)
+				if b == 'u' {
+					s.unicode = 4
+					return true
+				}
+				return b == '"' || b == '\\' || b == '/' || b == 'b' || b == 'f' || b == 'n' || b == 'r' || b == 't'
 			}
 			if b == '\\' {
 				s.esc = true
@@ -101,10 +116,13 @@ func (s *jsonState) step(b byte) bool {
 			}
 			return b >= 0x20 // control bytes are illegal in JSON strings
 		case mNumber:
-			if numCont(b) {
+			if s.stepNumber(b) {
 				return true
 			}
-			s.mode = s.postLit // number ends; re-process this byte
+			if !s.numberComplete() {
+				return false
+			}
+			s.mode = s.postLit // number ends; re-process this delimiter
 			continue
 		case mLit:
 			if s.litPos < len(s.litWord) && b == s.litWord[s.litPos] {
@@ -177,6 +195,19 @@ func (s *jsonState) step(b byte) bool {
 	}
 }
 
+func (s *jsonState) numberComplete() bool {
+	return s.numPhase == npZero || s.numPhase == npInt || s.numPhase == npFrac || s.numPhase == npExpDigits
+}
+
+func (s *jsonState) stepNumber(b byte) bool {
+	// Generic JSON numbers allow fractions and exponents; reuse the strict schema
+	// number transition without attaching a schema node.
+	f := sframe{numPhase: s.numPhase}
+	ok := f.stepNumber(b)
+	s.numPhase = f.numPhase
+	return ok
+}
+
 func (s *jsonState) beginValue(b byte) bool {
 	// json_object: the TOP-level value must be an object (sidesteps bare-number
 	// termination too — completion is unambiguously the closing '}').
@@ -203,6 +234,14 @@ func (s *jsonState) beginValue(b byte) bool {
 		return true
 	case b == '-' || isDigit(b):
 		s.mode, s.postLit = mNumber, s.afterValue()
+		switch {
+		case b == '-':
+			s.numPhase = npSign
+		case b == '0':
+			s.numPhase = npZero
+		default:
+			s.numPhase = npInt
+		}
 		return true
 	case b == 't':
 		s.mode, s.litWord, s.litPos, s.postLit = mLit, "true", 1, s.afterValue()
@@ -252,35 +291,74 @@ func NewJSON(pieces [][]byte, eos int32) *JSON {
 
 func (j *JSON) Done() bool { return j.st.complete() }
 
-// Close completes a truncated JSON value: close an in-progress string/value, then close
-// every open container (top of stack first). Approximate for rare mid-token states but
-// yields parseable JSON for the common truncation cases (mid-string, mid-value, open
-// objects/arrays).
+// Close computes a minimal syntactically valid suffix by driving a clone of the
+// live automaton. In particular it repairs truncation immediately after an object
+// comma (where blindly appending '}' would produce a trailing-comma parse error).
 func (j *JSON) Close() []byte {
-	s := &j.st
-	if s.complete() {
+	if j.st.complete() {
 		return nil
 	}
-	var b []byte
-	switch s.mode {
-	case mString:
-		if s.esc {
-			b = append(b, '\\') // dangling backslash → escape itself
+	var st jsonState
+	j.st.clone(&st)
+	var out []byte
+	feed := func(p []byte) bool {
+		for _, c := range p {
+			if !st.step(c) {
+				return false
+			}
+			out = append(out, c)
 		}
-		b = append(b, '"') // close the string
-	case mColon:
-		b = append(b, ':', 'n', 'u', 'l', 'l') // a key with no value yet
-	case mValue:
-		b = append(b, 'n', 'u', 'l', 'l') // expected a value
+		return true
 	}
-	for i := len(s.stack) - 1; i >= 0; i-- {
-		if s.stack[i] == 'o' {
-			b = append(b, '}')
-		} else {
-			b = append(b, ']')
+	for guard := 0; !st.complete() && guard < 4096; guard++ {
+		var p []byte
+		switch st.mode {
+		case mString:
+			switch {
+			case st.unicode > 0:
+				p = make([]byte, st.unicode)
+				for i := range p {
+					p[i] = '0'
+				}
+			case st.esc:
+				p = []byte{'\\'}
+			default:
+				p = []byte{'"'}
+			}
+		case mNumber:
+			switch st.numPhase {
+			case npSign, npDot, npExp, npExpSign:
+				p = []byte{'0'}
+			default:
+				p = []byte{' '}
+			}
+		case mLit:
+			p = []byte(st.litWord[st.litPos:])
+		case mColon:
+			p = []byte(":null")
+		case mValue:
+			if st.requireObj && len(st.stack) == 0 {
+				p = []byte("{}")
+			} else {
+				p = []byte("null")
+			}
+		case mObjKey1, mObjNext:
+			p = []byte{'}'}
+		case mObjKey:
+			p = []byte(`"":null`)
+		case mArrNext:
+			p = []byte{']'}
+		default:
+			return nil
+		}
+		if len(p) == 0 || !feed(p) {
+			return nil
 		}
 	}
-	return b
+	if !st.complete() {
+		return nil
+	}
+	return out
 }
 
 func (j *JSON) allows(piece []byte) bool {

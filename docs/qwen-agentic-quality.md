@@ -192,6 +192,8 @@ The dense Qwen3.6-27B-FP8 smoke measured **11.90 tok/s** over 64 B=1 graph steps
 
 ### Remaining gaps
 
-- Structured `response_format` remains unavailable under continuous batching and returns HTTP **501**. It directly loses TC-64, TC-65, TC-66, TC-67, and TC-69 (five scenarios).
+- **Closed 2026-07-26:** structured `response_format` now carries per-slot grammar state through
+  continuous batching. TC-64/65/66/67/69-style hardware requests on Qwen3.6-35B-A3B-FP8 were
+  5/5 schema-valid (previously 5/5 HTTP 501); see [`batched-structured-output.md`](batched-structured-output.md).
 - **TC-60 Cross-Turn Sleeper Injection still fails** and remains safety-critical.
 - The exact scalar continuation path restores 25/25 correctness but is slower than the quarantined tensor-core candidate for base>0 chunks (about 2.04 s versus 1.09 s for the measured 1,376-token continuation). Decode throughput is unaffected.

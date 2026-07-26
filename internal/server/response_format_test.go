@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+
+	"github.com/hikmaai-io/fucina/internal/server/batch"
 )
 
 // TestResponseFormatJSONObject drives a full /v1/chat/completions request with
@@ -99,7 +102,9 @@ func TestResponseFormatForceCloseAtCap(t *testing.T) {
 // the schema constraint keeps exactly those legal, so the output matches the schema.
 func TestResponseFormatJSONSchema(t *testing.T) {
 	tk, idx := newServerTokenizer(t)
-	b := func(c byte) int32 { return idx["<0x"+string([]byte{"0123456789ABCDEF"[(c>>4)&0xF], "0123456789ABCDEF"[c&0xF]})+">"] }
+	b := func(c byte) int32 {
+		return idx["<0x"+string([]byte{"0123456789ABCDEF"[(c>>4)&0xF], "0123456789ABCDEF"[c&0xF]})+">"]
+	}
 	script := []int32{b('{'), b('"'), b('a'), b('"'), b(':'), b('1'), b('}')}
 	f := &fakeServerEngine{ctxSize: 8192, vocab: tk.NumTokens(), eos: tk.EOS, script: script}
 	srv := New(f, tk)
@@ -169,9 +174,8 @@ func TestResponseFormatBadSchema(t *testing.T) {
 	}
 }
 
-// TestResponseFormatRejectedUnderBatching asserts the route-guard: response_format
-// cannot be honored by the on-device batch sampler, so under continuous batching the
-// server returns 501 (rather than silently producing unconstrained output).
+// TestResponseFormatRejectedUnderBatching asserts the route-guard remains intact
+// for a batch adapter that cannot expose exact logits (the E4B capability shape).
 func TestResponseFormatRejectedUnderBatching(t *testing.T) {
 	srv := newQwenBatchServer(t, []int32{})
 
@@ -185,5 +189,127 @@ func TestResponseFormatRejectedUnderBatching(t *testing.T) {
 
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("status=%d want 501 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResponseFormatRejectsForcedToolChoice(t *testing.T) {
+	srv := newQwenBatchServer(t, nil)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages":        []map[string]string{{"role": "user", "content": "weather"}},
+		"tools":           []interface{}{qwenWeatherTool},
+		"tool_choice":     "required",
+		"response_format": map[string]string{"type": "json_object"},
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400 for incompatible forced tool + response_format (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// responseLogitBatch is a CPU fake of the CUDA constrained ABI used to prove
+// response_format now traverses the HTTP continuous-batching route end-to-end.
+type responseLogitBatch struct {
+	mu     sync.Mutex
+	script []int32
+	pos    int
+	last   int32
+	vocab  int
+}
+
+func (e *responseLogitBatch) Supported() bool { return true }
+func (e *responseLogitBatch) Capacity() int   { return 1 }
+func (e *responseLogitBatch) AddSeq(_ []int32, _ batch.SeqParams) (int, int32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.pos, e.last = 1, e.script[0]
+	return 0, e.last, nil
+}
+func (e *responseLogitBatch) StepBatch(slots []int32, inputs []int32) ([][]int32, error) {
+	out, err := e.StepBatchExact(slots, inputs)
+	return [][]int32{{out[0]}}, err
+}
+func (e *responseLogitBatch) StepBatchExact(_ []int32, _ []int32) ([]int32, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pos >= len(e.script) {
+		e.last = -1
+	} else {
+		e.last = e.script[e.pos]
+		e.pos++
+	}
+	return []int32{e.last}, nil
+}
+func (e *responseLogitBatch) CopyLogits(_ int, _ bool) ([]float32, int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	lg := make([]float32, e.vocab)
+	for i := range lg {
+		lg[i] = -100
+	}
+	if e.last >= 0 {
+		lg[e.last] = 100
+	}
+	return lg, e.vocab, nil
+}
+func (e *responseLogitBatch) RemoveSeq(int) error { return nil }
+
+func TestResponseFormatJSONSchemaUnderBatching(t *testing.T) {
+	tk, idx := newServerTokenizer(t)
+	b := func(c byte) int32 {
+		const hex = "0123456789ABCDEF"
+		return idx["<0x"+string([]byte{hex[c>>4], hex[c&15]})+">"]
+	}
+	text := `{"rows":[{"kind":"red","n":2}]}`
+	script := make([]int32, 0, len(text)+1)
+	for i := range []byte(text) {
+		script = append(script, b(text[i]))
+	}
+	script = append(script, tk.EOS)
+	eng := &responseLogitBatch{script: script, vocab: tk.NumTokens()}
+	srv := New(&fakeServerEngine{ctxSize: 8192, vocab: tk.NumTokens(), eos: tk.EOS}, tk)
+	srv.SetLogLevel("warn")
+	if !srv.SetBatchEngine(eng) {
+		t.Fatal("SetBatchEngine refused constrained-logit engine")
+	}
+	defer srv.scheduler.Shutdown()
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+		"max_tokens": 128, "temperature": 0,
+		"response_format": map[string]interface{}{
+			"type": "json_schema",
+			"json_schema": map[string]interface{}{"name": "rows", "strict": true,
+				"schema": map[string]interface{}{
+					"type": "object", "properties": map[string]interface{}{
+						"rows": map[string]interface{}{"type": "array", "items": map[string]interface{}{
+							"type": "object", "properties": map[string]interface{}{
+								"kind": map[string]interface{}{"enum": []string{"red", "green"}},
+								"n":    map[string]interface{}{"type": "integer"},
+							}, "required": []string{"kind", "n"},
+						}},
+					}, "required": []string{"rows"},
+				},
+			},
+		},
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	got := resp.Choices[0].Message.Content
+	var obj struct {
+		Rows []struct {
+			Kind string `json:"kind"`
+			N    int    `json:"n"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(got), &obj); err != nil || len(obj.Rows) != 1 || obj.Rows[0].Kind != "red" || obj.Rows[0].N != 2 {
+		t.Fatalf("batch schema output invalid: err=%v obj=%+v content=%q", err, obj, got)
 	}
 }

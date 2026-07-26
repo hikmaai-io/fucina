@@ -12214,6 +12214,9 @@ static int qwen35_seq_add_multiseq(gemma4_engine_t *eng, const int32_t *tokens_f
                           int *out_slots, int32_t *out_first);
 static int qwen35_step_batch(gemma4_engine_t *eng, const int *slots,
                              const int32_t *in_tokens, int B, int32_t *out_tokens);
+static int qwen35_step_batch_exact(gemma4_engine_t *eng, const int *slots,
+                                   const int32_t *in_tokens, int B, int32_t *out_tokens);
+static int qwen35_copy_batch_logits(gemma4_engine_t *eng, float *out, int rows);
 static int qwen35_seq_open(gemma4_engine_t *eng, float temp, int top_k, float top_p,
                            float min_p, uint64_t seed);
 static int qwen35_seq_prefill_chunk(gemma4_engine_t *eng, int slot, const int32_t *tokens,
@@ -12410,6 +12413,26 @@ extern "C" int gemma4_engine_debug_logits(gemma4_engine_t *eng, float *out, int 
     return (cudaGetLastError() == cudaSuccess) ? VOC : -1;   // returns VOC on success
 }
 
+extern "C" int gemma4_engine_copy_logits(gemma4_engine_t *eng, float *out,
+                                           int rows, int batched) {
+    if (!eng || !eng->loaded || !out || rows < 1) return -1;
+    const int VOC = eng->cfg.vocab_size;
+    if (!batched) {
+        if (rows != 1 || !eng->d_logits) return -1;
+        cudaMemcpyAsync(out, eng->d_logits, (size_t)VOC * sizeof(float),
+                        cudaMemcpyDeviceToHost, eng->stream);
+        cudaStreamSynchronize(eng->stream);
+        return cudaGetLastError() == cudaSuccess ? VOC : -1;
+    }
+    if (eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)
+        return qwen35_copy_batch_logits(eng, out, rows);
+    if (rows > GEMMA4_MAX_SEQS || !eng->d_sb[11]) return -1;
+    cudaMemcpyAsync(out, eng->d_sb[11], (size_t)rows * VOC * sizeof(float),
+                    cudaMemcpyDeviceToHost, eng->stream);
+    cudaStreamSynchronize(eng->stream);
+    return cudaGetLastError() == cudaSuccess ? VOC : -1;
+}
+
 extern "C" int gemma4_engine_debug_set_q35_clean_gdn(gemma4_engine_t *eng, int enabled) {
     if(!eng || !eng->loaded || eng->cfg.arch!=GEMMA4_ARCH_QWEN3_5) return -1;
     eng->q35.clean_gdn=enabled?1:0;
@@ -12590,6 +12613,14 @@ extern "C" int gemma4_engine_step_batch(
         if (out_tokens) out_tokens[rowmap[v]] = outs[v];
     }
     return 0;
+}
+
+extern "C" int gemma4_engine_step_batch_exact(
+    gemma4_engine_t *eng, const int *slots, const int32_t *in_tokens, int B, int32_t *out_tokens)
+{
+    if (eng && eng->loaded && eng->cfg.arch == GEMMA4_ARCH_QWEN3_5)
+        return qwen35_step_batch_exact(eng, slots, in_tokens, B, out_tokens);
+    return gemma4_engine_step_batch(eng, slots, in_tokens, B, out_tokens);
 }
 
 // ── Stage 18 — FUSED prefill+decode ──────────────────────────────────────────

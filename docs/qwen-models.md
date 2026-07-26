@@ -113,10 +113,11 @@ convention this repo's own test fixtures and golden-generation scripts use, e.g.
 - **`--timings` includes Qwen MoE prefill phases.** Wide prefills log expert dequant, router/route,
   grouped-expert, shared-expert, and remaining mixer/attention/head milliseconds. The diagnostic
   inserts CUDA synchronization boundaries and should not be used for normal serving benchmarks.
-- **`response_format`/`json_schema` (constrained JSON decoding) is rejected under continuous
-  batching** with HTTP `501 unsupported_under_batching` — since Qwen is always served through that
-  path, structured output does not currently work against any Qwen checkpoint. It works for Gemma-4
-  in the default (non-`--batch`) mode.
+- **`response_format`/`json_schema` works under mandatory continuous batching.** Each slot owns
+  an independent grammar/FSM and host RNG. A shared step containing a constrained row uses exact
+  one-token host-input decode, copies per-row logits, masks/samples that row, and disables spec for
+  that step. Prefix/state sessions retain their exact committed frontier. See
+  [`batched-structured-output.md`](batched-structured-output.md).
 
 ## Chat dialect and tool calling
 
@@ -144,7 +145,7 @@ chat-completions caller — you don't need to insert `<think>` markers yourself.
 | Safetensors `-m` load fails with a missing-index/config error | Pointed at a HF hub-cache repo root that has no `config.json` at the top level | Use `--local-dir` on download, or point `-m` at the actual `snapshots/<hash>/` dir |
 | Tokenizer init fails right after weights loaded fine | Same repo-root vs snapshot-dir mismatch — the Qwen weight loader resolved the repo root, but tokenizer auto-discovery didn't | Pass `--tokenizer <snapshot-dir>/tokenizer.json`, or re-download with `--local-dir` |
 | `fucina: Qwen3 requires paged KV but the pools are not active ...` | Paged-KV pool allocation failed (usually OOM) | Lower `--ctx`, raise `--gpu-mem-util` toward `1.0`, or use a smaller checkpoint |
-| `response_format`/`json_schema` request 501s | Expected — not supported under continuous batching, which every Qwen checkpoint uses | Not fixable today for Qwen; works for Gemma-4 single-flight |
+| `response_format`/`json_schema` request 501s | The selected batch adapter does not expose exact full logits (for example E4B) | Use a supported CUDA Qwen/Gemma adapter; Qwen3.5/3.6 batch serving supports both formats |
 | `--assistant` flag has no visible effect | It's Gemma-4-only; Qwen ignores it | Use prompt-lookup speculation (already automatic for dense Qwen) |
 
 ## Testing

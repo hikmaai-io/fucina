@@ -51,4 +51,4 @@ The unlocked `mockEngine` counter reads in `TestBatchedAdmissionCancellation` no
 
 # Overall verdict
 
-Fucina is far beyond a prototype in core Qwen/Gemma inference and GB10 optimization, but it remains an experimental lab engine rather than a release-clean product. The historical Qwen MoE self-test failure is now resolved on hardware and the router correctness fix retains decode performance. Release constraints remain: structured output is HTTP 501 for batched/Qwen serving, TC-60 fails, known Gemma/E4B gates remain red, local lint was unavailable, and GPU validation is not continuous CI.
+Fucina is far beyond a prototype in core Qwen/Gemma inference and GB10 optimization, but it remains an experimental lab engine rather than a release-clean product. The historical Qwen MoE self-test failure is now resolved on hardware and the router correctness fix retains decode performance. Release constraints remain: TC-60 fails, known Gemma/E4B gates remain red, and GPU validation is not continuous CI. Batched/Qwen structured output was closed on 2026-07-26 with 5/5 schema-valid Qwen3.6 FP8 hardware requests.

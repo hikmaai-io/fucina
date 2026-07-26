@@ -5,12 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"os"
 	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hikmaai-io/fucina/internal/grammar"
+	"github.com/hikmaai-io/fucina/internal/sampler"
 )
 
 // ─── Engine contract ───────────────────────────────────────────────
@@ -117,6 +122,22 @@ type SpecBatchEngine interface {
 // Engines that don't implement SpecGater keep speculation default-on.
 type SpecGater interface {
 	SpecWorthwhile() bool
+}
+
+// ExactBatchEngine is the one-token (non-speculative) decode boundary. Constrained
+// rows use it for the whole shared step, so no speculative tail can be committed
+// before that row's grammar accepts it. Disabling speculation is lossless and needs
+// no grammar rollback.
+type ExactBatchEngine interface {
+	StepBatchExact(active []int32, inputs []int32) (out []int32, err error)
+}
+
+// ConstraintLogitsEngine exposes logits left by the immediately preceding
+// prefill or exact batched decode. CopyLogits returns rows*vocab values in row
+// order. It is optional so engines without a full-logit path retain their
+// existing behavior and the server's fail-closed route guard.
+type ConstraintLogitsEngine interface {
+	CopyLogits(rows int, batch bool) (logits []float32, vocab int, err error)
 }
 
 // PrefillChunkHinter is the optional engine-declared prefill-chunking preference.
@@ -317,6 +338,11 @@ type Request struct {
 	// shared scheduler on filesystem I/O.
 	SessionState   *StateSnapshot
 	PersistSession bool
+	// Constraint is request-local grammar/FSM state. Only this sequence's accepted
+	// token advances it. CloseConstraint tokenizes Constraint.Close() when the
+	// max-token/KV boundary lands inside a JSON value.
+	Constraint      grammar.Constraint
+	CloseConstraint func([]byte) []int32
 	// Done receives the terminal Result exactly once when the sequence is
 	// evicted, for any reason. It MUST be buffered (cap >= 1) so the scheduler
 	// never blocks delivering it. A nil Done is allowed (fire-and-forget).
@@ -397,6 +423,9 @@ type seq struct {
 	regBlocks int
 	// reused is the exact disk-session prefix restored at admission.
 	reused int
+	// rng is private to this sequence's host constrained sampler, so random draws
+	// are independent of map iteration and batch composition.
+	rng *rand.Rand
 }
 
 // stopHit reports whether t is one of this sequence's stop tokens.
@@ -481,6 +510,11 @@ type Scheduler struct {
 	// sessionState is the explicit disk-session restore/export path. Unlike the
 	// opportunistic in-memory cache, restore failures are fatal to that request.
 	sessionState SessionStateEngine
+	// Together these are the constrained-batch capability: exact prevents a
+	// speculative commit from outrunning a grammar, while constraintLogits gives
+	// every row its own distribution to mask and sample on the host.
+	exact            ExactBatchEngine
+	constraintLogits ConstraintLogitsEngine
 
 	// Per-pass phase telemetry (owner-goroutine only, no locks): where does a
 	// scheduler pass spend its time — the engine step (cgo forward), token
@@ -623,7 +657,19 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	if se, ok := engine.(SessionStateEngine); ok {
 		s.sessionState = se
 	}
+	if ex, ok := engine.(ExactBatchEngine); ok {
+		s.exact = ex
+	}
+	if lg, ok := engine.(ConstraintLogitsEngine); ok {
+		s.constraintLogits = lg
+	}
 	return s
+}
+
+// SupportsConstraints reports whether this scheduler can perform per-slot
+// grammar masking without falling back to an unsafe unconstrained sample.
+func (s *Scheduler) SupportsConstraints() bool {
+	return s.exact != nil && s.constraintLogits != nil
 }
 
 // Start launches the owner goroutine. It is safe to call once; subsequent calls
@@ -770,7 +816,11 @@ func (s *Scheduler) run() {
 		//    one chunk (round-robin) and the separate decode step 5 runs as before. A sequence whose
 		//    prompt finished prefilling is promoted to active in either path.
 		fusedThisPass := false
-		if s.fused != nil && len(prefill) > 0 && len(active) > 0 {
+		// Fused prefill samples on device and does not expose both its decode and
+		// prefill-final distributions. Keep constrained rows on the exact/logit-copy
+		// path; unconstrained Gemma/Qwen traffic retains the existing fused gate.
+		constrainedFused := hasConstrained(active) || (len(prefill) > 0 && prefill[0].req.Constraint != nil)
+		if s.fused != nil && len(prefill) > 0 && len(active) > 0 && !constrainedFused {
 			s.stepFused(active, &prefill)
 			fusedThisPass = true
 		} else {
@@ -1009,6 +1059,16 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			continue
 		}
 
+		// Fail closed before touching the engine: a grammar request may only enter
+		// an engine that can expose exact per-row logits. This preserves the old 501
+		// behavior for adapters such as E4B while enabling Qwen/Gemma CUDA adapters.
+		if req.Constraint != nil && !s.SupportsConstraints() {
+			err := errors.New("batch: engine does not support constrained sampling")
+			reply(req, Result{Reason: FinishError, Err: err})
+			w = w[1:]
+			continue
+		}
+
 		// Reject persistence before touching the engine when it cannot export a
 		// slot snapshot. A new session has no SessionState yet, so checking only
 		// the restore branch below would otherwise run the request and fail late.
@@ -1114,6 +1174,13 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		// same stop/budget bookkeeping a decode step would, so a one-token
 		// sequence (prompt that immediately samples a stop) is evicted here
 		// rather than entering the step loop.
+		if sq.req.Constraint != nil {
+			first, err = s.samplePrefill(sq)
+			if err != nil {
+				s.evict(active, sq, Result{Reason: FinishError, Err: err})
+				continue
+			}
+		}
 		if s.deliver(active, sq, first) {
 			active[slot] = sq
 		}
@@ -1144,8 +1211,8 @@ func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma Mul
 		if req.Ctx != nil && req.Ctx.Err() != nil {
 			break // let the serial loop reply-cancel this one
 		}
-		if req.PersistSession {
-			break // persistent state must use serial restore/export admission
+		if req.PersistSession || req.Constraint != nil {
+			break // persistence/grammar needs per-request restore or prefill logits
 		}
 		if s.chunk != nil && len(req.Tokens) > s.chunkMin {
 			break // long prompt → chunked interleave path, not one-shot
@@ -1231,11 +1298,14 @@ func (s *Scheduler) newSeq(req Request, slot int) *seq {
 		remaining: req.MaxNew,
 		stops:     make(map[int32]struct{}, len(req.Stops)),
 	}
+	if req.Constraint != nil {
+		sq.rng = rand.New(rand.NewSource(int64(req.Params.Seed)))
+	}
 	// Track full history for the drafter (spec), decode-time prefix-cache
 	// registration, and/or eviction-time state snapshots. The prompt's full
 	// blocks are already registered by AddSeq, so start regBlocks past them —
 	// PrefixCommit only fires for generated blocks.
-	if s.spec != nil || s.prefixCommit != nil || s.stateSaver != nil || req.PersistSession {
+	if s.spec != nil || s.prefixCommit != nil || s.stateSaver != nil || req.PersistSession || req.Constraint != nil {
 		sq.hist = append(make([]int32, 0, len(req.Tokens)+req.MaxNew), req.Tokens...)
 		sq.regBlocks = len(req.Tokens) / 256
 	}
@@ -1291,6 +1361,13 @@ func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
 	// from the committed prompt). Idempotent; adopted blocks are skipped.
 	if s.prefixCommit != nil {
 		s.prefixCommit.PrefixCommit(sq.slot, sq.req.Tokens)
+	}
+	if sq.req.Constraint != nil {
+		first, err = s.samplePrefill(sq)
+		if err != nil {
+			s.evict(active, sq, Result{Reason: FinishError, Generated: sq.generated, Err: err})
+			return
+		}
 	}
 	if s.deliver(active, sq, first) {
 		active[sq.slot] = sq
@@ -1406,6 +1483,87 @@ func (s *Scheduler) sweepCancelledPrefill(prefill *[]*seq) {
 	*prefill = kept
 }
 
+// samplePrefill replaces the device's unconstrained first-token sample from the
+// immediately preceding one-row prefill. Prefill leaves its exact logits resident.
+func (s *Scheduler) samplePrefill(sq *seq) (int32, error) {
+	flat, vocab, err := s.constraintLogits.CopyLogits(1, false)
+	if err != nil {
+		return 0, fmt.Errorf("copy constrained prefill logits: %w", err)
+	}
+	if vocab <= 0 || len(flat) < vocab {
+		return 0, fmt.Errorf("constrained prefill logits: got %d values for vocab %d", len(flat), vocab)
+	}
+	return sampleConstrained(sq, flat[:vocab])
+}
+
+// resampleConstrainedRows masks and samples only constrained rows from an exact
+// shared decode. Device logits are compacted past KV-exhausted rows, so row tracks
+// that compacted order independently from the scheduler's slot order.
+func (s *Scheduler) resampleConstrainedRows(active map[int]*seq, slots []int32, out []int32) error {
+	valid := 0
+	for _, tok := range out {
+		if tok >= 0 {
+			valid++
+		}
+	}
+	if valid == 0 {
+		return nil
+	}
+	flat, vocab, err := s.constraintLogits.CopyLogits(valid, true)
+	if err != nil {
+		return fmt.Errorf("copy constrained batch logits: %w", err)
+	}
+	if vocab <= 0 || len(flat) < valid*vocab {
+		return fmt.Errorf("constrained batch logits: got %d values for %d rows x vocab %d", len(flat), valid, vocab)
+	}
+	row := 0
+	for i, slot := range slots {
+		if out[i] < 0 {
+			continue
+		}
+		sq := active[int(slot)]
+		if sq != nil && sq.req.Constraint != nil {
+			tok, e := sampleConstrained(sq, flat[row*vocab:(row+1)*vocab])
+			if e != nil {
+				return fmt.Errorf("slot %d constrained sample: %w", slot, e)
+			}
+			out[i] = tok
+		}
+		row++
+	}
+	return nil
+}
+
+func sampleConstrained(sq *seq, logits []float32) (int32, error) {
+	sq.req.Constraint.Mask(logits)
+	legal := false
+	for _, v := range logits {
+		if !math.IsInf(float64(v), -1) && !math.IsNaN(float64(v)) {
+			legal = true
+			break
+		}
+	}
+	if !legal {
+		return 0, errors.New("grammar masked every token")
+	}
+	return sampler.Sample(logits, sampler.Params{
+		Temperature:   float64(sq.req.Params.Temperature),
+		TopK:          sq.req.Params.TopK,
+		TopP:          float64(sq.req.Params.TopP),
+		MinP:          float64(sq.req.Params.MinP),
+		RepeatPenalty: float64(sq.req.Params.RepeatPenalty),
+	}, sq.rng, sq.hist)
+}
+
+func hasConstrained(active map[int]*seq) bool {
+	for _, sq := range active {
+		if sq.req.Constraint != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // deliver emits one sampled token to a sequence and advances its bookkeeping.
 // It returns true if the sequence should remain active for the next step, or
 // false if it was evicted here (stop token, budget exhausted, emit backpressure,
@@ -1415,6 +1573,7 @@ func (s *Scheduler) deliver(active map[int]*seq, sq *seq, token int32) bool {
 	// its KV (block pool exhausted / context limit). Stop it GRACEFULLY — evict
 	// only this sequence, never the whole batch — and do not emit the sentinel.
 	if token < 0 {
+		s.forceClose(sq)
 		s.evict(active, sq, Result{Reason: FinishLength, Generated: sq.generated})
 		return false
 	}
@@ -1431,6 +1590,11 @@ func (s *Scheduler) deliver(active map[int]*seq, sq *seq, token int32) bool {
 	if sq.req.Emit != nil && !sq.req.Emit(token) {
 		s.evict(active, sq, Result{Reason: FinishCancelled, Generated: sq.generated})
 		return false
+	}
+	// Advance exactly this slot's FSM, and only after its sampled token was
+	// accepted by the output sink. Batchmates never share or touch this state.
+	if sq.req.Constraint != nil {
+		sq.req.Constraint.Accept(token)
 	}
 	sq.generated++
 	sq.remaining--
@@ -1454,12 +1618,36 @@ func (s *Scheduler) deliver(active map[int]*seq, sq *seq, token int32) bool {
 	}
 	// Budget exhausted.
 	if sq.remaining <= 0 {
+		s.forceClose(sq)
 		s.evict(active, sq, Result{Reason: FinishLength, Generated: sq.generated})
 		return false
 	}
 	// Survives: this token is the input that advances its slot next step.
 	sq.next = token
 	return true
+}
+
+// forceClose emits a minimal grammar-provided suffix at a hard length/KV cap.
+// These bytes are response-only (no model forward), matching the single-flight
+// constrained path. They are included in history so a later saved-session suffix
+// can replay them, but never registered into the current slot's KV prefix cache.
+func (s *Scheduler) forceClose(sq *seq) {
+	if sq.req.Constraint == nil || sq.req.Constraint.Done() || sq.req.CloseConstraint == nil {
+		return
+	}
+	closing := sq.req.Constraint.Close()
+	if len(closing) == 0 {
+		return
+	}
+	for _, tok := range sq.req.CloseConstraint(closing) {
+		if sq.req.Emit != nil && !sq.req.Emit(tok) {
+			return
+		}
+		sq.generated++
+		if sq.hist != nil {
+			sq.hist = append(sq.hist, tok)
+		}
+	}
 }
 
 // evictCancelled removes every active sequence whose context has been cancelled,
@@ -1482,14 +1670,20 @@ func (s *Scheduler) step(active map[int]*seq) bool {
 	if len(active) == 0 {
 		return true
 	}
+	// Any constrained row makes this shared step exact for every row. This cleanly
+	// disables speculative decoding: no draft is committed, so grammar state never
+	// needs rollback and unconstrained batchmates still receive lossless plain tokens.
+	if hasConstrained(active) {
+		return s.stepExact(active)
+	}
 	// A persistent sequence needs an exact stop frontier. Speculative engines
 	// may commit an entire accepted run before the scheduler observes a stop in
 	// its middle; that tail cannot be represented by the rendered conversation.
 	// Use the engine's one-token ABI for the whole shared step whenever any row
 	// will be exported. Ordinary traffic keeps the speculative fast path.
 	for _, sq := range active {
-		if sq.req.PersistSession && s.sessionState != nil {
-			return s.stepSessionExact(active)
+		if sq.req.PersistSession && s.exact != nil {
+			return s.stepExact(active)
 		}
 	}
 	if s.spec != nil {
@@ -1498,9 +1692,10 @@ func (s *Scheduler) step(active map[int]*seq) bool {
 	return s.stepPlain(active)
 }
 
-// stepSessionExact is the persistent-session analogue of stepPlain. The
-// SessionStateEngine guarantees exactly one newly sampled token per row.
-func (s *Scheduler) stepSessionExact(active map[int]*seq) bool {
+// stepExact is the persistent-session and constrained analogue of stepPlain.
+// ExactBatchEngine guarantees exactly one newly sampled token per row; constrained
+// rows replace that device sample from their independently masked host logits.
+func (s *Scheduler) stepExact(active map[int]*seq) bool {
 	slots := make([]int32, 0, len(active))
 	inputs := make([]int32, 0, len(active))
 	for slot, sq := range active {
@@ -1508,7 +1703,7 @@ func (s *Scheduler) stepSessionExact(active map[int]*seq) bool {
 		inputs = append(inputs, sq.next)
 	}
 	t0 := time.Now()
-	out, err := s.sessionState.StepBatchExact(slots, inputs)
+	out, err := s.exact.StepBatchExact(slots, inputs)
 	engineDur := time.Since(t0)
 	s.telEngine += engineDur
 	s.logFirstDecode(active, engineDur)
@@ -1516,6 +1711,9 @@ func (s *Scheduler) stepSessionExact(active map[int]*seq) bool {
 	s.telBatch += int64(len(slots))
 	if err == nil && len(out) != len(slots) {
 		err = fmt.Errorf("StepBatchExact returned %d tokens for %d slots", len(out), len(slots))
+	}
+	if err == nil && hasConstrained(active) {
+		err = s.resampleConstrainedRows(active, slots, out)
 	}
 	if err != nil {
 		log.Printf("batch: StepBatchExact failed (%d active): %v", len(active), err)
