@@ -96,6 +96,8 @@ Examples:
   fucina -m ./Qwen3.6-35B-A3B-FP8 --host 0.0.0.0 --port 8080 &
   curl http://localhost:8080/v1/chat/completions \\
     -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+  curl http://localhost:8080/v1/messages \\
+    -d '{"model":"local","max_tokens":64,"messages":[{"role":"user","content":"Hello"}]}'
 
 See llms.txt / README.md for the full model support matrix, checkpoint download commands,
 tool-calling examples, and diagnostics.

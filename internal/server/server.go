@@ -90,8 +90,9 @@ type Server struct {
 
 	debugDumpFull atomic.Bool // set once the debug dump file hits its size cap
 
-	// apiKey, when non-empty, is required as `Authorization: Bearer <key>` on all
-	// /v1/* routes (constant-time compared). Empty = auth disabled (localhost dev).
+	// apiKey, when non-empty, is required on all /v1/* routes (constant-time
+	// compared). OpenAI routes accept Authorization: Bearer; /v1/messages also
+	// accepts Anthropic's x-api-key header. Empty = auth disabled (localhost dev).
 	apiKey string
 
 	// maxOutputTokens is an absolute ceiling on tokens generated per request,
@@ -655,8 +656,9 @@ func (s *Server) SetBatchEngine(eng BatchEngine) bool {
 	return true
 }
 
-// SetAPIKey enables bearer-token auth on /v1/* routes. Empty disables auth
-// (localhost dev default). The key is compared in constant time.
+// SetAPIKey enables authentication on /v1/* routes. OpenAI routes use bearer
+// auth; /v1/messages accepts either bearer auth or Anthropic's x-api-key.
+// Empty disables auth (localhost dev default). Keys are compared in constant time.
 func (s *Server) SetAPIKey(key string) { s.apiKey = key }
 
 // SetMaxOutputTokens sets an absolute ceiling on generated tokens per request,
@@ -756,6 +758,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	authed := func(f http.HandlerFunc) http.HandlerFunc { return s.logRequest(s.requireAuth(f)) }
 	mux.HandleFunc("/v1/models", authed(s.handleModels))
 	mux.HandleFunc("/v1/chat/completions", authed(s.handleChatCompletions))
+	mux.HandleFunc("/v1/messages", s.logRequest(s.requireAnthropicAuth(s.handleAnthropicMessages)))
 	mux.HandleFunc("/v1/completions", authed(s.handleCompletions))
 	mux.HandleFunc("/v1/embeddings", authed(s.handleEmbeddings))
 	mux.HandleFunc("/health", open(s.handleHealth))

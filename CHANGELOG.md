@@ -35,9 +35,9 @@ First public release as `github.com/hikmaai-io/fucina` (formerly the internal `g
   (`--assistant`); distribution-exact at any temperature.
 - **Prefix-reuse KV cache**, **on-GPU sampling**, native **Q4_0 (QAT) / Q8_0** GGUF loading, and a
   packed-Q4_0 coalesced-load decode path.
-- **OpenAI-compatible HTTP server** — `/v1/chat/completions` (streaming + non-streaming), tool
-  calling, the gemma-4 thinking channel, `/v1/models`, `/health`, `/metrics`; plus one-shot and
-  interactive CLI modes.
+- **OpenAI- and Anthropic-compatible HTTP server** — `/v1/chat/completions` and `/v1/messages`
+  (streaming + non-streaming), tool calling/use, thinking channels/blocks, `/v1/models`, `/health`,
+  `/metrics`; plus one-shot and interactive CLI modes.
 - **(Experimental, optional) DiffusionGemma 26B-A4B** engine via `-dm`.
 - **Continuous batching over a paged KV cache** (`FUCINA_PAGED_KV=1 FUCINA_BATCH=1`):
   vLLM-style block-pool allocator with free-list and per-sequence block tables,

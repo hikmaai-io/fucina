@@ -10,7 +10,7 @@ A from-scratch inference engine, hand-tuned for exactly one accelerator — the 
 (Blackwell, `sm_121a`, CUDA 13). It serves **Gemma 4 12B**, **Qwen3 / Qwen3.5 / Qwen3.6** (dense
 and MoE, GGUF / FP8-safetensors / NVFP4), and the experimental **DiffusionGemma 26B-A4B** text-
 diffusion MoE — FP8/NVFP4 Tensor-Core attention, CUDA-graph decode, continuous batching over a
-paged KV cache, speculative decoding, and an OpenAI-compatible server, all in a single static
+paged KV cache, speculative decoding, and OpenAI/Anthropic-compatible APIs, all in a single static
 binary.
 
 [Features](#-features) · [Quick start](#-quick-start) · [Model support](#-models) ·
@@ -23,7 +23,7 @@ binary.
 ![CUDA](https://img.shields.io/badge/CUDA-13.0-76B900?logo=nvidia&logoColor=white)
 ![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
 ![Models](https://img.shields.io/badge/models-Gemma%204%20%C2%B7%20Qwen3%2F3.5%2F3.6-412991)
-![API](https://img.shields.io/badge/API-OpenAI--compatible-412991?logo=openai&logoColor=white)
+![API](https://img.shields.io/badge/API-OpenAI%20%2B%20Anthropic-412991)
 ![Status](https://img.shields.io/badge/status-experimental-orange)
 
 </div>
@@ -40,9 +40,9 @@ binary.
 ## About
 
 **fucina** runs Google's **Gemma 4 12B** and Alibaba's **Qwen3 / Qwen3.5 / Qwen3.6** families
-(dense and sparse-MoE) entirely on the GPU and serves them over an OpenAI-compatible HTTP API, plus
-one-shot and interactive CLI modes. It started as a focused experiment in *how fast a single
-Blackwell GB10 can drive a dense 12B model* and has since grown into a small multi-architecture
+(dense and sparse-MoE) entirely on the GPU and serves them over OpenAI- and Anthropic-compatible
+HTTP APIs, plus one-shot and interactive CLI modes. It started as a focused experiment in *how
+fast a single Blackwell GB10 can drive a dense 12B model* and has since grown into a small multi-architecture
 engine — but it still bets everything on one accelerator instead of portability: FP8/NVFP4 Tensor
 Cores, position-independent CUDA-graph decode, an on-GPU sampler, continuous batching over a paged
 KV cache, and speculative decoding measured head-to-head against `llama.cpp` and `vLLM`.
@@ -106,8 +106,8 @@ separate Qwen3.6 code path.
   suffix — the difference between sub-second and multi-second agentic turns. Rewinds stay exact within
   the sliding ring's window (covers same-conversation turns and speculation); a deeper divergence
   falls back to a full re-prefill (see `FUCINA_SLIDING_RING`).
-- 🌐 **OpenAI-compatible API** — `/v1/chat/completions` (streaming + non-streaming), `/v1/models`,
-  `/health`, `/metrics`.
+- 🌐 **OpenAI- and Anthropic-compatible APIs** — `/v1/chat/completions` and `/v1/messages`
+  (streaming + non-streaming), `/v1/models`, `/health`, `/metrics`.
 - 🛠️ **Tool calling**, OpenAI-shaped on the wire for both dialects — Gemma-4's native format and
   Qwen3-Coder's XML `<tool_call>` form (auto-selected with the chat dialect, no flag) — plus a
   **thinking/reasoning channel** on both (reasoning as `reasoning_content`, controllable per request
@@ -725,7 +725,8 @@ fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/chat/completions` | Chat completions — streaming + non-streaming, tool calls, thinking channel |
+| `POST /v1/chat/completions` | OpenAI chat completions — streaming + non-streaming, tool calls, thinking channel |
+| `POST /v1/messages` | Anthropic Messages API — streaming + non-streaming, tool use/results, thinking blocks |
 | `POST /v1/completions` | Legacy raw-prompt completions (handled by the chat path) |
 | `GET  /v1/models` | Lists the loaded model id |
 | `POST /v1/embeddings` | Stub — returns an empty data list |
@@ -733,7 +734,10 @@ fucina -m ./models/gemma-4-12b-it-qat-q4_0.gguf \
 | `GET  /readyz` | Readiness — checks the tokenizer + engine are loaded; `503` when not serviceable |
 | `GET  /metrics` | KV/context utilization, prefix-cache hit rate, prefill/decode throughput, `speculation`, `requests_detail` (total, errors, avg latency, avg TTFT), `saturation` (in-flight / max) |
 
-`/v1/*` routes accept an optional `Authorization: Bearer <key>` (see `--api-key`); `/health`, `/healthz`, `/readyz`, `/metrics` are always open. Every response carries an `X-Request-Id` (echoed from the request when present) for log correlation.
+`/v1/*` routes accept an optional `Authorization: Bearer <key>` (see `--api-key`); the Anthropic
+endpoint also accepts `x-api-key: <key>`. `/health`, `/healthz`, `/readyz`, and `/metrics` are always
+open. Every response carries an `X-Request-Id` (echoed from the request when present) for log
+correlation.
 
 The chat dialect (Gemma-4 native format, or Qwen ChatML + Qwen3-Coder XML tool calls) is picked
 **automatically from the loaded vocab** — no flag. The wire format is OpenAI-shaped either way:
@@ -765,8 +769,25 @@ specific tool with
 `"tool_choice": {"type":"function","function":{"name":"get_weather"}}`.
 
 Reasoning/thinking works the same for both dialects: `"reasoning_effort": "low"|"medium"|"high"` or
-`"thinking": true/false` in the request; the model's reasoning appears in
+`"thinking": true/false` in an OpenAI request; the model's reasoning appears in
 `choices[0].message.reasoning_content`.
+
+The same server can be used directly with Anthropic SDKs by setting their base URL to the fucina
+server and calling `/v1/messages`. Anthropic `system`, content blocks, `tools`, `tool_choice`,
+`stop_sequences`, `thinking`, and SSE event shapes are translated to the same generation
+path. For example:
+
+```sh
+curl http://localhost:8080/v1/messages \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "local",
+    "max_tokens": 64,
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+```
 
 For restart-safe conversations, start with `--session-dir DIR` and include
 `"session": "NAME"` in chat or legacy completion requests. Gemma saves flat KV;
@@ -789,7 +810,7 @@ The next request must render a strict extension of the saved token history. See
 ┌───────────────────────────────────────────────────────────────────┐
 │  cmd/fucina           CLI: server / one-shot / interactive          │
 ├───────────────────────────────────────────────────────────────────┤
-│  internal/server      OpenAI-compatible HTTP API + KV cache          │
+│  internal/server      OpenAI/Anthropic HTTP APIs + KV cache          │
 │  internal/server/batch continuous-batching scheduler (Qwen; opt-in   │
 │                        for Gemma-4)                                  │
 │  internal/chat        chat-template + tool-call dialects (Gemma/Qwen)│
