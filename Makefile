@@ -30,7 +30,7 @@ CGO_LDFLAGS  := -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lcuda -lpthre
         e4b-load-test e4b-gguf-load-test e4b-fwd-test e4b-gen-test e4b-batch-test e4b-nvfp4-test \
         e4b-bench e4b-all e4b-mtp-load-test e4b-spec-test e4b-spec-stream-test \
         go-test go-test-race go-test-cgo vet lint check paged-kv-test paged-prefix-test \
-        gpu-gates qwen35-state-test qwen35-shard-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-meta-test qwen35-clean-gdn-test qwen35-head-policy-test qwen35-head-rows-test qwen35-moe-fp8-engine-test \
+        gemma4-long-prefill-test gpu-gates qwen35-state-test qwen35-shard-test qwen35-chunk-parity-test qwen35-multiseq-prefill-test qwen35-clean-gdn-meta-test qwen35-clean-gdn-test qwen35-head-policy-test qwen35-head-rows-test qwen35-moe-fp8-engine-test \
         qwen35-http-session-restart-test \
         qwen35-detect-test qwen35-load-test qwen35-layer-parity-test qwen35-parity-test qwen35-batch-test qwen35-burst-test \
         qwen35-prefill-test qwen35-longctx-test qwen35-fp8-test qwen35-mtp-test qwen35-moe-fp8-test qwen35-moe-fp8-engine-test qwen36-unsloth-nvfp4-test qwen36-ssd-stream-test qwen35-decode-bench qwen35-fp8-bench fp8-block-test \
@@ -160,6 +160,18 @@ packed-kv-test:
 	$(NVCC) -arch=$(CUDA_ARCH) -o /tmp/fucina_packed_kv_test \
 		cuda/packed_kv_test.cu -diag-suppress 550
 	/tmp/fucina_packed_kv_test
+
+# ─── Dense Gemma-4 classic long-prefill boundary gate (GPU) ─────────────
+# Drives a Q4 12B model through the classic 32-row chunked path on its first call.
+# 4376 tokens crosses the 4096-token / 64-global-split boundary and reaches 69
+# splits while exercising each row's MAX_SPLITS-strided attention scratch.
+GEMMA4_MODEL ?= /opt/spark/models/gemma-4-12b-it-qat-q4_0.gguf
+gemma4-long-prefill-test: lib libdg
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -std=c++17 -Icuda cuda/test_gemma4_long_prefill.cu \
+		cuda/libfucina.a cuda/libdg.a -o /tmp/fucina_gemma4_long_prefill \
+		-lcudart -lcublas -lcublasLt -lcuda -lpthread -lstdc++ -lm
+	flock -w 1800 /tmp/fucina_gpu.lock -c "FUCINA_NO_PACKED=1 FUCINA_FP4=0 \
+		/tmp/fucina_gemma4_long_prefill $(GEMMA4_MODEL)"
 
 # ─── Qwen3.5 hybrid (qwen35) arch detection (HOST-only, no GPU) ──────────
 # Proves gemma4_detect_from_gguf reads the qwen35.* GGUF metadata into the config
