@@ -232,22 +232,24 @@ func (m *ChatMessage) UnmarshalJSON(data []byte) error {
 }
 
 type ChatRequest struct {
-	Model            string          `json:"model"`
-	Messages         []ChatMessage   `json:"messages"`
-	Prompt           json.RawMessage `json:"prompt,omitempty"` // legacy /v1/completions
-	MaxTokens        int             `json:"max_tokens"`
-	Temperature      *float64        `json:"temperature"`
-	TopP             *float64        `json:"top_p"`
-	TopK             *int            `json:"top_k"`
-	MinP             *float64        `json:"min_p"`
-	Seed             *int64          `json:"seed"`
-	RepeatPenalty    *float64        `json:"repeat_penalty"`
-	FrequencyPenalty *float64        `json:"frequency_penalty"`
-	PresencePenalty  *float64        `json:"presence_penalty"`
-	Stream           bool            `json:"stream"`
-	Stop             StopField       `json:"stop,omitempty"`
-	Tools            []Tool          `json:"tools,omitempty"`
-	ToolChoice       interface{}     `json:"tool_choice,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []ChatMessage   `json:"messages"`
+	Prompt              json.RawMessage `json:"prompt,omitempty"` // legacy /v1/completions
+	MaxTokens           int             `json:"max_tokens"`
+	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64        `json:"temperature"`
+	TopP                *float64        `json:"top_p"`
+	TopK                *int            `json:"top_k"`
+	MinP                *float64        `json:"min_p"`
+	Seed                *int64          `json:"seed"`
+	RepeatPenalty       *float64        `json:"repeat_penalty"`
+	FrequencyPenalty    *float64        `json:"frequency_penalty"`
+	PresencePenalty     *float64        `json:"presence_penalty"`
+	Stream              bool            `json:"stream"`
+	StreamOptions       *StreamOptions  `json:"stream_options,omitempty"`
+	Stop                StopField       `json:"stop,omitempty"`
+	Tools               []Tool          `json:"tools,omitempty"`
+	ToolChoice          interface{}     `json:"tool_choice,omitempty"`
 
 	// Thinking / reasoning control. gemma-4 gates a reasoning channel: when
 	// enabled the model emits a <|channel>thought…<channel|> block before its
@@ -770,10 +772,14 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	open := func(f http.HandlerFunc) http.HandlerFunc { return s.logRequest(f) }
 	authed := func(f http.HandlerFunc) http.HandlerFunc { return s.logRequest(s.requireAuth(f)) }
 	mux.HandleFunc("/v1/models", authed(s.handleModels))
+	mux.HandleFunc("/v1/models/", authed(s.handleModelDetail))
 	mux.HandleFunc("/v1/chat/completions", authed(s.handleChatCompletions))
 	mux.HandleFunc("/v1/messages", s.logRequest(s.requireAnthropicAuth(s.handleAnthropicMessages)))
 	mux.HandleFunc("/v1/completions", authed(s.handleCompletions))
 	mux.HandleFunc("/v1/embeddings", authed(s.handleEmbeddings))
+	mux.HandleFunc("/tokenize", authed(s.handleTokenize))
+	mux.HandleFunc("/detokenize", authed(s.handleDetokenize))
+	mux.HandleFunc("/version", authed(s.handleVersion))
 	mux.HandleFunc("/health", open(s.handleHealth))
 	mux.HandleFunc("/healthz", open(s.handleHealth))
 	mux.HandleFunc("/readyz", open(s.handleReady))
@@ -802,9 +808,7 @@ func BearerAuth(key string, next http.HandlerFunc) http.HandlerFunc {
 		h := r.Header.Get("Authorization")
 		if !strings.HasPrefix(h, prefix) ||
 			subtle.ConstantTimeCompare([]byte(h[len(prefix):]), []byte(key)) != 1 {
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
-				"error": map[string]string{"message": "invalid or missing API key", "type": "invalid_request_error"},
-			})
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_request_error", "invalid or missing API key", nil, "invalid_api_key")
 			return
 		}
 		next(w, r)
@@ -943,7 +947,7 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 				log.Printf("fucina: [%s] PANIC in %s %s: %v", reqID, r.Method, r.URL.Path, rv)
 				if !rec.wroteHeader {
 					rec.status = http.StatusInternalServerError
-					http.Error(rec, "internal server error", http.StatusInternalServerError)
+					writeOpenAIError(rec, http.StatusInternalServerError, "server_error", "internal server error", nil, "internal_error")
 				}
 			}
 			dur := time.Since(start)
@@ -963,6 +967,9 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	writeJSON(w, http.StatusOK, ModelsResponse{
 		Object: "list",
 		Data: []ModelInfo{{
@@ -979,8 +986,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // and /v1/completions (legacy=true, text_completion format). Apart from the
 // response shape both paths share the same prompt/prefill/generation machinery.
 func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy bool) {
-	if r.Method != "POST" {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 	// Admission control: the engine is single-flight, so without a bound, K
@@ -992,9 +998,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		defer func() { <-s.inflight }()
 	default:
 		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-			"error": map[string]string{"message": "server busy: too many concurrent requests", "type": "overloaded"},
-		})
+		writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "server busy: too many concurrent requests", nil, "overloaded")
 		return
 	}
 	// Bound the body read: an agent context is large (hundreds of KB) but finite;
@@ -1002,12 +1006,20 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		writeOpenAIRequestError(w, "request body is too large or unreadable", nil)
+		return
+	}
+	if err := validateSupportedContentParts(body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "messages", "unsupported_multimodal")
 		return
 	}
 	var req ChatRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+	if err := decodeOpenAIJSON(body, &req, s.openAIStrict()); err != nil {
+		writeOpenAIRequestError(w, "invalid JSON: "+err.Error(), nil)
+		return
+	}
+	if err := validateStreamOptions(req.Stream, req.StreamOptions); err != nil {
+		writeOpenAIRequestError(w, err.Error(), "stream_options")
 		return
 	}
 
@@ -1029,7 +1041,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	if wantTools {
 		if name, forced := forcedToolChoice(req.ToolChoice); forced {
 			if name != "" && !toolNamed(req.Tools, name) {
-				http.Error(w, fmt.Sprintf("tool_choice selects unknown function %q", name), http.StatusBadRequest)
+				writeOpenAIRequestError(w, fmt.Sprintf("tool_choice selects unknown function %q", name), "tool_choice")
 				return
 			}
 			if pfx := s.dialect.ForcedCallPrefix(name); pfx != "" {
@@ -1043,7 +1055,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	// Those contracts cannot both be honored; reject explicitly instead of emitting
 	// a malformed call whose body was grammar-forced to an unrelated object.
 	if req.ResponseFormat != nil && toolRequired {
-		http.Error(w, "response_format cannot be combined with required/specific tool_choice", http.StatusBadRequest)
+		writeOpenAIRequestError(w, "response_format cannot be combined with required/specific tool_choice", "response_format")
 		return
 	}
 	var prompt string
@@ -1056,12 +1068,12 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		prompt = s.renderChatTemplate(req.Messages, req.Tools, enableThinking) + forcedPrefix
 	}
 	if prompt == "" {
-		http.Error(w, "empty prompt", http.StatusBadRequest)
+		writeOpenAIRequestError(w, "empty prompt", "messages")
 		return
 	}
 	tokens := s.tokenizer.Encode(prompt, true, false)
 	if len(tokens) == 0 {
-		http.Error(w, "tokenization failed", http.StatusInternalServerError)
+		writeOpenAIError(w, http.StatusInternalServerError, "server_error", "tokenization failed", nil, "tokenization_failed")
 		return
 	}
 
@@ -1071,16 +1083,14 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	if req.Session != "" {
 		sessionPath, err = s.sessionFilePath(req.Session)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeOpenAIRequestError(w, err.Error(), "session")
 			return
 		}
 		// Two concurrent writers to one named conversation have no valid merge
 		// semantics and would race atomic renames (last writer wins). Reject the
 		// second request rather than lose a turn or restore stale state.
 		if !s.claimSession(req.Session) {
-			writeJSON(w, http.StatusConflict, map[string]interface{}{
-				"error": map[string]string{"message": "session is already in use by another request", "type": "session_conflict"},
-			})
+			writeOpenAIError(w, http.StatusConflict, "invalid_request_error", "session is already in use by another request", "session", "session_conflict")
 			return
 		}
 		defer s.releaseSession(req.Session)
@@ -1132,8 +1142,13 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		return
 	}
 	ctx := int(s.engine.ContextSize())
-	if req.MaxTokens > 0 {
-		params.MaxTokens = req.MaxTokens // explicit client cap
+	completionLimit, explicitLimit, err := resolveCompletionLimit(req.MaxTokens, req.MaxCompletionTokens)
+	if err != nil {
+		writeOpenAIRequestError(w, err.Error(), "max_completion_tokens")
+		return
+	}
+	if explicitLimit {
+		params.MaxTokens = completionLimit // max_completion_tokens takes precedence over max_tokens
 		// Clamp to the window. A client (pi) sizes max_tokens to its CONFIGURED
 		// contextWindow, which may exceed the server's actual --ctx. Left unclamped,
 		// budget = ctx-MaxTokens below goes negative, the compaction guard never
@@ -1173,7 +1188,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		case "json_schema":
 			c, err := s.schemaConstraint(rf.JSONSchema)
 			if err != nil {
-				http.Error(w, "invalid response_format.json_schema: "+err.Error(), http.StatusBadRequest)
+				writeOpenAIRequestError(w, "invalid response_format.json_schema: "+err.Error(), "response_format")
 				return
 			}
 			params.Constraint = c
@@ -1197,7 +1212,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	// the spec path; clamp them here so a malformed request cannot crash or
 	// corrupt the engine. Rejects the request rather than guessing on NaN/Inf.
 	if msg := validateAndClampParams(&params, s.tokenizer.NumTokens()); msg != "" {
-		http.Error(w, msg, http.StatusBadRequest)
+		writeOpenAIRequestError(w, msg, nil)
 		return
 	}
 
@@ -1236,27 +1251,23 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			// Preserve the existing fail-closed gate for batch adapters that cannot
 			// expose exact per-row logits (notably E4B). Mandatory Qwen batching and
 			// the CUDA Gemma adapter implement the constrained capability.
-			writeJSON(w, http.StatusNotImplemented, map[string]interface{}{
-				"error": map[string]string{
-					"message": "response_format constrained sampling is unavailable on this batch engine",
-					"type":    "unsupported_under_batching",
-				},
-			})
+			writeOpenAIError(w, http.StatusNotImplemented, "invalid_request_error", "response_format constrained sampling is unavailable on this batch engine", "response_format", "unsupported_under_batching")
 			return
 		}
 		var diskState *batch.StateSnapshot
 		if sessionPath != "" {
 			if s.sessionKind != session.KindQ35Slot {
-				http.Error(w, "disk sessions on the batch path require a Qwen3.5/3.6 slot-state engine", http.StatusBadRequest)
+				writeOpenAIRequestError(w, "disk sessions on the batch path require a Qwen3.5/3.6 slot-state engine", "session")
 				return
 			}
 			diskState, err = s.loadBatchSession(sessionPath, tokens)
 			if err != nil {
-				http.Error(w, fmt.Sprintf("session %s: %v", req.Session, err), http.StatusBadRequest)
+				writeOpenAIRequestError(w, fmt.Sprintf("session %s: %v", req.Session, err), "session")
 				return
 			}
 		}
-		s.serveBatch(w, r, params, tokens, wantTools, legacy, sessionPath, diskState)
+		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		s.serveBatch(w, r, params, tokens, wantTools, legacy, includeUsage, sessionPath, diskState)
 		return
 	}
 
@@ -1270,8 +1281,11 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		var ok bool
 		sse, ok = newSSEWriter(w, legacy, s.modelName)
 		if !ok {
-			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			writeOpenAIError(w, http.StatusInternalServerError, "server_error", "streaming not supported", "stream", "streaming_unavailable")
 			return
+		}
+		if req.StreamOptions != nil {
+			sse.setIncludeUsage(req.StreamOptions.IncludeUsage)
 		}
 		sse.begin()
 	}
@@ -1301,7 +1315,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			sse.stopHeartbeat()
 			s.finishStream(sse, "cancelled", PromptAccounting{PromptTokens: len(tokens)}, 0)
 		} else {
-			http.Error(w, "client closed request", 499)
+			writeOpenAIError(w, 499, "invalid_request_error", "client closed request", nil, "client_closed_request")
 		}
 		prometheusMetrics.Cancellation()
 		log.Printf("fucina: request cancelled while queued; skipping prefill")
@@ -1318,7 +1332,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 				sse.stopHeartbeat()
 				sse.errorEvent(fmt.Sprintf("session %s: %v", req.Session, err))
 			} else {
-				http.Error(w, fmt.Sprintf("session %s: %v", req.Session, err), http.StatusBadRequest)
+				writeOpenAIRequestError(w, fmt.Sprintf("session %s: %v", req.Session, err), "session")
 			}
 			return
 		}
@@ -1399,7 +1413,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		if sse != nil {
 			sse.errorEvent(fmt.Sprintf("prefill failed: %v", err))
 		} else {
-			http.Error(w, fmt.Sprintf("prefill failed: %v", err), http.StatusInternalServerError)
+			writeOpenAIError(w, http.StatusInternalServerError, "server_error", fmt.Sprintf("prefill failed: %v", err), nil, "prefill_failed")
 		}
 		return
 	}
@@ -1450,7 +1464,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 // Sampling note: device-supported controls stay per-row on the paged sampler. A
 // non-default repeat penalty uses the scheduler's exact-logit host fallback, which
 // preserves request-local RNG/history without changing CUDA decode kernels.
-func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params GenerationParams, tokens []int32, wantTools, legacy bool, sessionPath string, diskState *batch.StateSnapshot) {
+func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params GenerationParams, tokens []int32, wantTools, legacy, includeUsage bool, sessionPath string, diskState *batch.StateSnapshot) {
 	stops := s.tokenizer.StopIDs()
 
 	seed := uint64(params.Seed)
@@ -1513,14 +1527,12 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 		// Queue full / shutting down: shed load the same way the single-flight
 		// path does (503), or report shutdown.
 		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-			"error": map[string]string{"message": "server busy: too many concurrent requests", "type": "overloaded"},
-		})
+		writeOpenAIError(w, http.StatusServiceUnavailable, "server_error", "server busy: too many concurrent requests", nil, "overloaded")
 		return
 	}
 
 	if params.Stream {
-		s.streamBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, len(tokens), sessionPath)
+		s.streamBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, includeUsage, len(tokens), sessionPath)
 	} else {
 		s.collectBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, len(tokens), sessionPath)
 	}
@@ -1596,13 +1608,14 @@ func drainTokensBurst(tokCh <-chan int32, done <-chan batch.Result, onTok func(i
 // response. Text decodes incrementally (whole-slice decode, emit the new
 // suffix) so multi-byte UTF-8 pieces are never split mid-character.
 func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc,
-	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool, promptTokens int, sessionPath string) {
+	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy, includeUsage bool, promptTokens int, sessionPath string) {
 
 	sse, ok := newSSEWriter(w, legacy, s.modelName)
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		writeOpenAIError(w, http.StatusInternalServerError, "server_error", "streaming not supported", "stream", "streaming_unavailable")
 		return
 	}
+	sse.setIncludeUsage(includeUsage)
 	sse.begin()
 
 	tcOpen, tcEnd := s.tokenizer.ToolCallOpen, s.tokenizer.ToolCallEnd
@@ -1886,7 +1899,7 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 		if res.Err != nil {
 			msg += ": " + res.Err.Error()
 		}
-		http.Error(w, msg, http.StatusInternalServerError)
+		writeOpenAIError(w, http.StatusInternalServerError, "server_error", msg, nil, "generation_failed")
 		return
 	}
 	s.saveBatchSessionResult(sessionPath, res)
@@ -2000,20 +2013,7 @@ func (s *Server) finishStream(sse *sseWriter, finish string, prompt PromptAccoun
 		TotalTokens:         prompt.PromptTokens + completion,
 		PromptTokensDetails: prompt.PromptTokensDetails(),
 	}
-	if sse.legacy {
-		sse.event(CompletionStreamResponse{
-			ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
-			Choices: []CompletionStreamChoice{{Index: 0, Text: "", FinishReason: finish}},
-			Usage:   usage,
-		})
-	} else {
-		sse.event(StreamResponse{
-			ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
-			Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: finish}},
-			Usage:   usage,
-		})
-	}
-	sse.done()
+	sse.finish(finish, usage)
 }
 
 func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
@@ -2021,13 +2021,10 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]interface{}{
-		"error": map[string]interface{}{
-			"message": "the loaded generation model does not support embeddings",
-			"type":    "invalid_request_error",
-			"code":    "model_not_embedding",
-		},
-	})
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	writeOpenAIError(w, http.StatusNotImplemented, "invalid_request_error", "the loaded generation model does not support embeddings", "model", "model_not_embedding")
 }
 
 // handleHealth is LOCK-FREE for the same reason as /metrics: a health endpoint
@@ -2074,7 +2071,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+	writeOpenAIError(w, http.StatusNotFound, "invalid_request_error", "not found", nil, "not_found")
 }
 
 // renderChatTemplate builds the prompt through the active chat dialect
@@ -2333,7 +2330,7 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 		}
 		if err != nil {
 			if len(toks) == 0 {
-				http.Error(w, fmt.Sprintf("generation failed: %v", err), http.StatusInternalServerError)
+				writeOpenAIError(w, http.StatusInternalServerError, "server_error", fmt.Sprintf("generation failed: %v", err), nil, "generation_failed")
 				return
 			}
 			// Partial output: deliver what exists, but make the failure visible.
