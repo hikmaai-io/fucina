@@ -101,6 +101,20 @@ func TestAnthropicMessagesNonStream(t *testing.T) {
 	}
 }
 
+func TestPromptAccountingToAnthropicUsage(t *testing.T) {
+	usage := promptAccountingToAnthropicUsage(PromptAccounting{
+		PromptTokens:  1024,
+		CachedTokens:  768,
+		Source:        CacheSourceDiskSession,
+	}, 17, 128)
+	if usage.InputTokens != 128 || usage.CacheReadInputTokens != 768 || usage.CacheCreationInputTokens != 128 {
+		t.Fatalf("usage=%+v", usage)
+	}
+	if usage.InputTokens+usage.CacheReadInputTokens+usage.CacheCreationInputTokens != 1024 {
+		t.Fatalf("logical input invariant failed: %+v", usage)
+	}
+}
+
 func TestAnthropicMessagesStream(t *testing.T) {
 	tk, idx := newServerTokenizer(t)
 	f := &fakeServerEngine{ctxSize: 8192, vocab: tk.NumTokens(), eos: tk.EOS, script: helloWorldScript(idx)}

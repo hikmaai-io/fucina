@@ -395,6 +395,22 @@ func anthropicMessageID(id string) string {
 	return "msg_" + id
 }
 
+func promptAccountingToAnthropicUsage(prompt PromptAccounting, completionTokens, cacheCreationTokens int) anthropicUsage {
+	prompt = prompt.Normalized()
+	if cacheCreationTokens < 0 {
+		cacheCreationTokens = 0
+	}
+	if max := prompt.NewPrefillTokens(); cacheCreationTokens > max {
+		cacheCreationTokens = max
+	}
+	return anthropicUsage{
+		InputTokens:              prompt.PromptTokens - prompt.CachedTokens - cacheCreationTokens,
+		OutputTokens:             completionTokens,
+		CacheReadInputTokens:     prompt.CachedTokens,
+		CacheCreationInputTokens: cacheCreationTokens,
+	}
+}
+
 func chatToAnthropic(resp ChatResponse) anthropicResponse {
 	out := anthropicResponse{
 		ID: anthropicMessageID(resp.ID), Type: "message", Role: "assistant",

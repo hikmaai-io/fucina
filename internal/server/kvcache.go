@@ -33,7 +33,8 @@ type kvSnapshotter interface {
 type savedSeq struct {
 	tokens []int32
 	state  []byte
-	used   int64 // LRU clock stamp
+	used   int64       // LRU clock stamp
+	source CacheSource // where this snapshot originally came from
 }
 
 // KVCache implements prefix-reuse on top of the engine's append-only KV cache.
@@ -156,10 +157,19 @@ func (c *KVCache) SetSnapshotBudget(bytes int64) {
 
 // PrefillResult reports what happened during a cache-aware prefill.
 type PrefillResult struct {
-	PromptTokens int       // total prompt length
-	ReusedTokens int       // prefix tokens served from cache (no recompute)
-	NewTokens    int       // suffix tokens that were actually prefilled
-	Logits       []float32 // logits for the last prompt token
+	PromptTokens int         // total prompt length
+	ReusedTokens int         // prefix tokens served from cache (no recompute)
+	NewTokens    int         // suffix tokens that were actually prefilled
+	Source       CacheSource // where the physically skipped tokens came from
+	Logits       []float32   // logits for the last prompt token
+}
+
+func (r PrefillResult) PromptAccounting() PromptAccounting {
+	return PromptAccounting{
+		PromptTokens: r.PromptTokens,
+		CachedTokens: r.ReusedTokens,
+		Source:       r.Source,
+	}.Normalized()
 }
 
 // Lock acquires exclusive access to the single physical KV cache for the full
@@ -244,7 +254,7 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 	// request is about to destroy a large live prefix, save it first so the
 	// owning conversation's next turn can come back cheaply.
 	if c.snap != nil && c.snapBudget > 0 {
-		lcp = c.maybeSwap(prompt, lcp)
+		lcp = c.maybeSwap(prompt, lcp, res)
 	}
 
 	// Never reuse the entire prompt: we must run at least the final token
@@ -276,6 +286,11 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 	suffix := prompt[lcp:]
 	res.ReusedTokens = lcp
 	res.NewTokens = len(suffix)
+	if lcp > 0 {
+		if res.Source == CacheSourceNone {
+			res.Source = CacheSourceLiveSeq
+		}
+	}
 
 	logits, err := c.engine.Prefill(suffix)
 	if err != nil {
@@ -317,7 +332,7 @@ func (c *KVCache) Prefill(prompt []int32) (*PrefillResult, error) {
 // liveLCP is the prompt's match against the live sequence; it returns the
 // (possibly improved) LCP to continue with. The caller must hold Lock() and
 // have healed the bookkeeping/engine skew (cachedTokens fully materialized).
-func (c *KVCache) maybeSwap(prompt []int32, liveLCP int) int {
+func (c *KVCache) maybeSwap(prompt []int32, liveLCP int, res *PrefillResult) int {
 	// Best snapshot for this prompt.
 	best, bestLCP := -1, 0
 	for i, s := range c.saved {
@@ -365,6 +380,7 @@ func (c *KVCache) maybeSwap(prompt []int32, liveLCP int) int {
 		return 0
 	}
 	c.cachedTokens = append(c.cachedTokens[:0], pinned.tokens...)
+	res.Source = pinned.source
 	log.Printf("fucina: kvcache: restored snapshot (%d tokens, lcp %d vs live %d)",
 		len(pinned.tokens), bestLCP, liveLCP)
 	return bestLCP
@@ -405,7 +421,7 @@ func (c *KVCache) saveLive() {
 	c.snapClock++
 	toks := make([]int32, n)
 	copy(toks, c.cachedTokens)
-	c.saved = append(c.saved, &savedSeq{tokens: toks, state: buf, used: c.snapClock})
+	c.saved = append(c.saved, &savedSeq{tokens: toks, state: buf, used: c.snapClock, source: CacheSourceHostSnapshot})
 	c.snapBytes += size
 	log.Printf("fucina: kvcache: saved live sequence (%d tokens, %.0f MB; pool %d seqs / %.0f MB)",
 		n, float64(size)/(1<<20), len(c.saved), float64(c.snapBytes)/(1<<20))
@@ -514,7 +530,7 @@ func (c *KVCache) SeedSnapshot(tokens []int32, state []byte) error {
 	copy(toks, tokens)
 	st := make([]byte, len(state))
 	copy(st, state)
-	c.saved = append(c.saved, &savedSeq{tokens: toks, state: st, used: c.snapClock})
+	c.saved = append(c.saved, &savedSeq{tokens: toks, state: st, used: c.snapClock, source: CacheSourceDiskSession})
 	c.snapBytes += int64(len(st))
 	return nil
 }
