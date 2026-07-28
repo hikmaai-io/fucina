@@ -181,10 +181,9 @@ func TestStreamMultiToolCalls(t *testing.T) {
 	srv.SetLogLevel("warn")
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
-		"messages":       []map[string]string{{"role": "user", "content": "hi"}},
-		"tools":          toolsField(),
-		"stream":         true,
-		"stream_options": map[string]bool{"include_usage": true},
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		"tools":    toolsField(),
+		"stream":   true,
 	}))
 	rec := httptest.NewRecorder()
 	mux(srv).ServeHTTP(rec, req)
