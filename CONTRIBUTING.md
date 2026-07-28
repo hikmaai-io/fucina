@@ -25,8 +25,8 @@ The Go server, tokenizer, sampler, chat, and batch-scheduler packages are **pure
 anywhere:
 
 ```sh
-go test ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
-go vet  ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+go test -tags nocuda ./internal/metrics/ ./internal/server/ ./internal/server/batch/ ./internal/grammar/ ./internal/session/ ./internal/dist/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+go vet  -tags nocuda ./internal/metrics/ ./internal/server/ ./internal/server/batch/ ./internal/grammar/ ./internal/session/ ./internal/dist/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 gofmt -l .   # must print nothing
 ```
 
