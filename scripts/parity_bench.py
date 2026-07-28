@@ -21,7 +21,7 @@ import argparse, hashlib, json, sys, time, urllib.request
 def http_json(url, payload=None, timeout=600):
     req = urllib.request.Request(
         url, data=(json.dumps(payload).encode() if payload is not None else None),
-        headers={"Content-Type": "application/json"} if payload is not None else {})
+        headers={"Accept": "application/json", **({"Content-Type": "application/json"} if payload is not None else {})})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 

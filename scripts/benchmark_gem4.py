@@ -33,11 +33,11 @@ ALPHA = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lim
 
 def http_json(url, payload=None, timeout=600):
     if payload is None:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
     else:
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Accept": "application/json", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
@@ -87,7 +87,7 @@ class Server:
         req = urllib.request.Request(
             self.base + "/v1/chat/completions",
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Accept": "application/json", "Content-Type": "application/json"})
         t0 = time.monotonic()
         first = None
         stamps = []

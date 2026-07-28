@@ -770,7 +770,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", open(s.handleHealth))
 	mux.HandleFunc("/healthz", open(s.handleHealth))
 	mux.HandleFunc("/readyz", open(s.handleReady))
-	mux.HandleFunc("/metrics", open(s.handleMetrics))
+	mux.HandleFunc("/metrics", open(s.handleMetricsDispatch))
+	mux.HandleFunc("/metrics/json", open(s.handleMetrics))
 	mux.HandleFunc("/", open(s.handleNotFound))
 }
 
@@ -913,6 +914,10 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: 200}
 		start := time.Now()
+		inferenceRequest := strings.HasPrefix(r.URL.Path, "/v1/")
+		if inferenceRequest {
+			prometheusMetrics.RequestStarted()
+		}
 		// Correlation: honor an inbound X-Request-Id (cross-service tracing) or
 		// mint one, echo it back, and tag every log line for this request so a
 		// 500 can be tied to its access line under concurrency.
@@ -937,8 +942,9 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 			dur := time.Since(start)
 			// Only the inference endpoints count toward SLO metrics; /metrics and
 			// /health self-scrapes would otherwise dominate the averages.
-			if strings.HasPrefix(r.URL.Path, "/v1/") {
+			if inferenceRequest {
 				s.metrics.recordRequest(rec.status, dur)
+				prometheusMetrics.RequestFinished(prometheusRequestOutcome(rec.status), dur)
 			}
 			if s.logEnabled(logLevelInfo) {
 				log.Printf("fucina: [%s] %s %s -> %d (%.0fms)",
@@ -1275,7 +1281,9 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		// Prefill panics.
 		defer sse.stopHeartbeat()
 	}
+	queueStart := time.Now()
 	s.kv.Lock()
+	observePrometheusQueueWait(time.Since(queueStart))
 	defer s.kv.Unlock()
 
 	// The wait for the lock can be long (another request's prefill+generation).
@@ -1288,6 +1296,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		} else {
 			http.Error(w, "client closed request", 499)
 		}
+		prometheusMetrics.Cancellation()
 		log.Printf("fucina: request cancelled while queued; skipping prefill")
 		return
 	}
@@ -1395,6 +1404,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		prefillTPS = float64(pf.NewTokens) / prefillElapsed.Seconds()
 	}
 	s.metrics.recordPrefill(pf.NewTokens, prefillElapsed.Seconds())
+	observePrometheusPrefill(prefillElapsed)
 	used := s.engine.NTokens()
 	s.lastUsed.Store(int64(used))
 	log.Printf("fucina: prefill %d tokens (%d cached, %d new) in %.2fs (%.1f tok/s) | ctx %d/%d (%.0f%%)",
@@ -2484,6 +2494,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	generated := 0
 	genStart := time.Now()
 	ttftRecorded := false
+	lastTokenAt := time.Time{}
 	lastWrite := time.Now() // last time any bytes hit the wire (for the keep-alive)
 
 	// emitContent streams a piece of visible text in the right wire shape for the
@@ -2491,11 +2502,17 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	emitContent := func(text string) {
 		// First visible token marks time-to-first-token (the latency the user
 		// actually feels). Recorded once per request.
+		now := time.Now()
 		if !ttftRecorded {
-			s.metrics.recordTTFT(time.Since(genStart))
+			ttft := now.Sub(genStart)
+			s.metrics.recordTTFT(ttft)
+			prometheusMetrics.ObserveTTFT(ttft)
 			ttftRecorded = true
+		} else if !lastTokenAt.IsZero() {
+			prometheusMetrics.ObserveITL(now.Sub(lastTokenAt))
 		}
-		lastWrite = time.Now()
+		lastTokenAt = now
+		lastWrite = now
 		if legacy {
 			sse.event(CompletionStreamResponse{
 				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
@@ -2765,6 +2782,7 @@ func (s *Server) logGenSpeed(start time.Time, generated int) {
 		tps = float64(generated) / elapsed.Seconds()
 	}
 	s.metrics.recordDecode(generated, elapsed.Seconds())
+	observePrometheusDecode(elapsed)
 	log.Printf("fucina: generated %d tokens in %.2fs (%.1f tok/s)",
 		generated, elapsed.Seconds(), tps)
 }

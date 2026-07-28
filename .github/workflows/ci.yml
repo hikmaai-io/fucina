@@ -20,7 +20,8 @@ jobs:
     env:
       # Pure-Go packages only (mirrors the Makefile GO_TEST_PKGS). The cgo engine
       # package and cmd/ require the CUDA toolchain and are excluded.
-      PKGS: ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+      PKGS: ./internal/metrics/ ./internal/server/ ./internal/server/batch/ ./internal/grammar/ ./internal/session/ ./internal/dist/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+      TAGS: nocuda
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +41,7 @@ jobs:
         run: make qwen35-clean-gdn-meta-test
 
       - name: go vet
-        run: go vet $PKGS
+        run: go vet -tags "$TAGS" $PKGS
 
       - name: golangci-lint
         # v7 is required for golangci-lint v2 (v6 only supports v1.x).
@@ -51,12 +52,15 @@ jobs:
           version: v2.11.4
           # Lint only the pure-Go packages (same set as $PKGS). The cgo engine and
           # cmd/ need libfucina.a and are excluded, mirroring the Makefile.
-          args: ./internal/server/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+          args: --build-tags=nocuda ./internal/metrics/ ./internal/server/ ./internal/server/batch/ ./internal/grammar/ ./internal/session/ ./internal/dist/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 
       - name: go test (race)
-        run: go test $PKGS -race -count=1
+        run: go test -tags "$TAGS" $PKGS -race -count=1
+
+      - name: GB10 qualification runner contract
+        run: python3 -m unittest scripts/test_run_gb10_qualification.py
 
       - name: go test (coverage)
         run: |
-          go test $PKGS -count=1 -coverprofile=cover.out
+          go test -tags "$TAGS" $PKGS -count=1 -coverprofile=cover.out
           go tool cover -func=cover.out | tail -1
