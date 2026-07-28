@@ -371,9 +371,10 @@ type Result struct {
 	Reason FinishReason
 	// Generated is the number of tokens emitted for this sequence.
 	Generated int
-	// ReusedTokens is the restored disk-session prefix length (zero on a cold
-	// admission). It is also surfaced through the engine prefix-cache metrics.
+	// ReusedTokens is the physically skipped prompt prefix length for this request.
 	ReusedTokens int
+	// Source identifies where ReusedTokens came from.
+	Source ReuseSource
 	// Err is the underlying engine error when Reason is FinishError, else nil.
 	Err error
 	// SessionState is the updated snapshot requested by PersistSession.
@@ -434,8 +435,9 @@ type seq struct {
 	// regBlocks is how many full 256-token blocks of hist have been registered with
 	// the prefix cache; used to call PrefixCommit only when a new block completes.
 	regBlocks int
-	// reused is the exact disk-session prefix restored at admission.
+	// reused is the physically skipped prompt prefix restored/adopted at admission.
 	reused int
+	source ReuseSource
 	// rng is private to this sequence's host constrained sampler, so random draws
 	// are independent of map iteration and batch composition.
 	rng *rand.Rand
@@ -1146,6 +1148,7 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			sq := s.newSeq(req, slot)
 			sq.prefillPos = nShared
 			sq.reused = nShared
+			sq.source = ReuseSourceDiskSession
 			*prefill = append(*prefill, sq)
 			log.Printf("batch: disk session restored (%d cached, %d new prompt tokens)", nShared, len(req.Tokens)-nShared)
 			w = w[1:]
@@ -1172,6 +1175,12 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			}
 			sq := s.newSeq(req, slot)
 			sq.prefillPos = nShared // adopted prefix already in KV; chunk-prefill only the suffix
+			if info, ok := s.chunk.(OpenReuseInfoEngine); ok {
+				ri := info.LastOpenSeqReuse().Normalized()
+				sq.reused, sq.source = ri.ReusedTokens, ri.Source
+			} else if nShared > 0 {
+				sq.reused, sq.source = nShared, ReuseSourceGPUPagedBlock
+			}
 			*prefill = append(*prefill, sq)
 			w = w[1:]
 			admitted = true
@@ -1198,6 +1207,10 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		}
 
 		sq := s.newSeq(req, slot)
+		if info, ok := s.engine.(AdmitReuseInfoEngine); ok {
+			ri := info.LastAddSeqReuse().Normalized()
+			sq.reused, sq.source = ri.ReusedTokens, ri.Source
+		}
 		if s.phaseTiming {
 			s.admissionID++
 			sq.admissionID, sq.admittedAt, sq.firstDecodePending = s.admissionID, time.Now(), true
@@ -2054,6 +2067,7 @@ const specCorpusCap = 1 << 16 // tokens kept in the cross-request suffix-decodin
 func (s *Scheduler) evict(active map[int]*seq, sq *seq, res Result) {
 	delete(active, sq.slot)
 	res.ReusedTokens = sq.reused
+	res.Source = sq.source
 	// Ordinary requests retain the low-latency behavior: reply before expensive
 	// teardown. A persistent request must wait for ExportSession while the slot
 	// is still live, so its Result is delivered by flushEvictions instead.

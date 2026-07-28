@@ -495,6 +495,12 @@ func TestSnapshotSurvivesInterloper(t *testing.T) {
 	if res.ReusedTokens != 2048 || res.NewTokens != 32 {
 		t.Fatalf("after restore: reused=%d new=%d, want 2048/32", res.ReusedTokens, res.NewTokens)
 	}
+	if res.Source != CacheSourceHostSnapshot {
+		t.Fatalf("after restore source=%q want %q", res.Source, CacheSourceHostSnapshot)
+	}
+	if got := res.PromptAccounting(); got.CachedTokens != 2048 || got.NewPrefillTokens() != 32 {
+		t.Fatalf("after restore accounting=%+v want cached=2048 new=32", got)
+	}
 }
 
 // Small live sequences are not worth snapshotting; unrelated requests just
@@ -548,6 +554,9 @@ func TestSnapshotRestorePinnedUnderPressure(t *testing.T) {
 	res := prefillReal(t, kv, append(append([]int32{}, a...), 7, 8, 9))
 	if f.restores != 1 || res.ReusedTokens != 2048 {
 		t.Fatalf("pinned restore failed (restores=%d reused=%d)", f.restores, res.ReusedTokens)
+	}
+	if res.Source != CacheSourceHostSnapshot {
+		t.Fatalf("pinned restore source=%q want %q", res.Source, CacheSourceHostSnapshot)
 	}
 }
 

@@ -416,9 +416,10 @@ type CompletionStreamResponse struct {
 }
 
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
 }
 
 type Delta struct {
@@ -1263,7 +1264,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	if r.Context().Err() != nil {
 		if sse != nil {
 			sse.stopHeartbeat()
-			s.finishStream(sse, "cancelled", len(tokens), 0)
+			s.finishStream(sse, "cancelled", PromptAccounting{PromptTokens: len(tokens)}, 0)
 		} else {
 			http.Error(w, "client closed request", 499)
 		}
@@ -1354,7 +1355,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			// only the suffix.
 			log.Printf("fucina: prefill aborted by client disconnect")
 			if sse != nil {
-				s.finishStream(sse, "cancelled", len(tokens), 0)
+				s.finishStream(sse, "cancelled", PromptAccounting{PromptTokens: len(tokens)}, 0)
 			}
 			return
 		}
@@ -1367,7 +1368,8 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		return
 	}
 	prefillElapsed := time.Since(prefillStart)
-	promptTokens := pf.PromptTokens
+	acct := pf.PromptAccounting()
+	promptTokens := acct.PromptTokens
 	prefillTPS := 0.0
 	if prefillElapsed.Seconds() > 0 && pf.NewTokens > 0 {
 		prefillTPS = float64(pf.NewTokens) / prefillElapsed.Seconds()
@@ -1382,9 +1384,9 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	logits := pf.Logits
 
 	if params.Stream {
-		s.streamResponse(r.Context(), sse, params, promptTokens, logits, wantTools)
+		s.streamResponse(r.Context(), sse, params, acct, logits, wantTools)
 	} else {
-		s.generateResponse(r.Context(), w, params, promptTokens, logits, wantTools, legacy)
+		s.generateResponse(r.Context(), w, params, acct, logits, wantTools, legacy)
 	}
 	// Persist the updated conversation back to the request's session file
 	// (still under the kv lock, so the live sequence is exactly this request).
@@ -1478,7 +1480,7 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 	}
 
 	if params.Stream {
-		s.streamBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, sessionPath)
+		s.streamBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, len(tokens), sessionPath)
 	} else {
 		s.collectBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, len(tokens), sessionPath)
 	}
@@ -1490,6 +1492,14 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 // tokCh to empty after Done guarantees no in-flight token is lost.
 func drainTokens(tokCh <-chan int32, done <-chan batch.Result, onTok func(int32)) batch.Result {
 	return drainTokensBurst(tokCh, done, onTok, nil)
+}
+
+func promptAccountingFromBatchResult(promptTokens int, res batch.Result) PromptAccounting {
+	return PromptAccounting{
+		PromptTokens: promptTokens,
+		CachedTokens: res.ReusedTokens,
+		Source:       CacheSource(res.Source),
+	}.Normalized()
 }
 
 // drainTokensBurst is drainTokens with a burst boundary hook: onBurstEnd (when
@@ -1546,7 +1556,7 @@ func drainTokensBurst(tokCh <-chan int32, done <-chan batch.Result, onTok func(i
 // response. Text decodes incrementally (whole-slice decode, emit the new
 // suffix) so multi-byte UTF-8 pieces are never split mid-character.
 func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc,
-	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool, sessionPath string) {
+	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool, promptTokens int, sessionPath string) {
 
 	sse, ok := newSSEWriter(w, legacy, s.modelName)
 	if !ok {
@@ -1790,7 +1800,7 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 		// Never report a clean stop for a tool_choice contract violation.
 		finish = "length"
 	}
-	s.finishStream(sse, finish, 0, generated)
+	s.finishStream(sse, finish, promptAccountingFromBatchResult(promptTokens, res), generated)
 }
 
 // collectBatch accumulates a non-streaming batched sequence and writes the full
@@ -1845,6 +1855,7 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 	}
 	generated := len(ids)
 	s.logGenSpeed(genStart, generated)
+	prompt := promptAccountingFromBatchResult(promptTokens, res)
 	finish := batchFinish(res, r.Context())
 	if stopped && r.Context().Err() == nil {
 		finish = "stop" // self-initiated cutoff, refined to tool_calls below
@@ -1897,8 +1908,10 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 			Model:   s.modelName,
 			Choices: []CompletionChoice{{Index: 0, Text: text, FinishReason: finish}},
 			Usage: Usage{
-				PromptTokens: promptTokens, CompletionTokens: generated,
-				TotalTokens: promptTokens + generated,
+				PromptTokens:        prompt.PromptTokens,
+				CompletionTokens:    generated,
+				TotalTokens:         prompt.PromptTokens + generated,
+				PromptTokensDetails: prompt.PromptTokensDetails(),
 			},
 		})
 		return
@@ -1911,8 +1924,10 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 		Model:   s.modelName,
 		Choices: []Choice{{Index: 0, Message: msg, FinishReason: finish}},
 		Usage: Usage{
-			PromptTokens: promptTokens, CompletionTokens: generated,
-			TotalTokens: promptTokens + generated,
+			PromptTokens:        prompt.PromptTokens,
+			CompletionTokens:    generated,
+			TotalTokens:         prompt.PromptTokens + generated,
+			PromptTokensDetails: prompt.PromptTokensDetails(),
 		},
 	})
 }
@@ -1937,11 +1952,13 @@ func batchFinish(res batch.Result, _ context.Context) string {
 
 // finishStream emits the terminal finish_reason + usage chunk and [DONE] on an
 // already-begun SSE stream (used by the early-exit paths that never generate).
-func (s *Server) finishStream(sse *sseWriter, finish string, promptTokens, completion int) {
+func (s *Server) finishStream(sse *sseWriter, finish string, prompt PromptAccounting, completion int) {
+	prompt = prompt.Normalized()
 	usage := &Usage{
-		PromptTokens:     promptTokens,
-		CompletionTokens: completion,
-		TotalTokens:      promptTokens + completion,
+		PromptTokens:        prompt.PromptTokens,
+		CompletionTokens:    completion,
+		TotalTokens:         prompt.PromptTokens + completion,
+		PromptTokensDetails: prompt.PromptTokensDetails(),
 	}
 	if sse.legacy {
 		sse.event(CompletionStreamResponse{
@@ -2208,7 +2225,7 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 // lock OWNER and holds s.kv.Lock() for the whole request; this function runs
 // under that lock and must NOT release it. When legacy is true it emits the
 // /v1/completions text_completion shape instead of the chat.completion shape.
-func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools, legacy bool) {
+func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, prompt PromptAccounting, logits []float32, wantTools, legacy bool) {
 	generated := 0
 	var toks []int32
 	tcEnd := s.tokenizer.ToolCallEnd
@@ -2412,8 +2429,10 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 				Index: 0, Text: text, FinishReason: finish,
 			}},
 			Usage: Usage{
-				PromptTokens: promptTokens, CompletionTokens: generated,
-				TotalTokens: promptTokens + generated,
+				PromptTokens:        prompt.PromptTokens,
+				CompletionTokens:    generated,
+				TotalTokens:         prompt.PromptTokens + generated,
+				PromptTokensDetails: prompt.PromptTokensDetails(),
 			},
 		})
 		return
@@ -2428,8 +2447,10 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			Index: 0, Message: msg, FinishReason: finish,
 		}},
 		Usage: Usage{
-			PromptTokens: promptTokens, CompletionTokens: generated,
-			TotalTokens: promptTokens + generated,
+			PromptTokens:        prompt.PromptTokens,
+			CompletionTokens:    generated,
+			TotalTokens:         prompt.PromptTokens + generated,
+			PromptTokensDetails: prompt.PromptTokensDetails(),
 		},
 	})
 }
@@ -2438,7 +2459,7 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 // (headers + role delta went out before the prefill; see serveCompletions).
 // The caller (handler) is the lock OWNER and holds s.kv.Lock() for the whole
 // request; this function runs under that lock and must NOT release it.
-func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools bool) {
+func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params GenerationParams, prompt PromptAccounting, logits []float32, wantTools bool) {
 	legacy := sse.legacy
 	generated := 0
 	genStart := time.Now()
@@ -2713,7 +2734,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	}
 
 	s.logGenSpeed(genStart, generated)
-	s.finishStream(sse, finish, promptTokens, generated)
+	s.finishStream(sse, finish, prompt, generated)
 }
 
 // logGenSpeed logs generation throughput in tokens/second and records it for /metrics.

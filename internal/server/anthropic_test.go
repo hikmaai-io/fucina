@@ -96,8 +96,25 @@ func TestAnthropicMessagesNonStream(t *testing.T) {
 	if len(resp.Content) != 1 || resp.Content[0]["type"] != "text" || resp.Content[0]["text"] != "hello world" {
 		t.Errorf("content = %#v", resp.Content)
 	}
-	if resp.Usage.InputTokens == 0 || resp.Usage.OutputTokens != 2 {
+	if resp.Usage.OutputTokens != 2 {
 		t.Errorf("usage = %+v", resp.Usage)
+	}
+	if got := resp.Usage.InputTokens + resp.Usage.CacheReadInputTokens + resp.Usage.CacheCreationInputTokens; got == 0 {
+		t.Errorf("logical input is zero: %+v", resp.Usage)
+	}
+}
+
+func TestPromptAccountingToAnthropicUsage(t *testing.T) {
+	usage := promptAccountingToAnthropicUsage(PromptAccounting{
+		PromptTokens: 1024,
+		CachedTokens: 768,
+		Source:       CacheSourceDiskSession,
+	}, 17, 128)
+	if usage.InputTokens != 128 || usage.CacheReadInputTokens != 768 || usage.CacheCreationInputTokens != 128 {
+		t.Fatalf("usage=%+v", usage)
+	}
+	if usage.InputTokens+usage.CacheReadInputTokens+usage.CacheCreationInputTokens != 1024 {
+		t.Fatalf("logical input invariant failed: %+v", usage)
 	}
 }
 

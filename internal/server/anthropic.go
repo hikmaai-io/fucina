@@ -395,11 +395,35 @@ func anthropicMessageID(id string) string {
 	return "msg_" + id
 }
 
+func usageToPromptAccounting(u Usage) PromptAccounting {
+	cached := 0
+	if u.PromptTokensDetails != nil {
+		cached = u.PromptTokensDetails.CachedTokens
+	}
+	return PromptAccounting{PromptTokens: u.PromptTokens, CachedTokens: cached}.Normalized()
+}
+
+func promptAccountingToAnthropicUsage(prompt PromptAccounting, completionTokens, cacheCreationTokens int) anthropicUsage {
+	prompt = prompt.Normalized()
+	if cacheCreationTokens < 0 {
+		cacheCreationTokens = 0
+	}
+	if max := prompt.NewPrefillTokens(); cacheCreationTokens > max {
+		cacheCreationTokens = max
+	}
+	return anthropicUsage{
+		InputTokens:              prompt.PromptTokens - prompt.CachedTokens - cacheCreationTokens,
+		OutputTokens:             completionTokens,
+		CacheReadInputTokens:     prompt.CachedTokens,
+		CacheCreationInputTokens: cacheCreationTokens,
+	}
+}
+
 func chatToAnthropic(resp ChatResponse) anthropicResponse {
 	out := anthropicResponse{
 		ID: anthropicMessageID(resp.ID), Type: "message", Role: "assistant",
 		Model: resp.Model, StopReason: "end_turn", StopSequence: nil,
-		Usage:   anthropicUsage{InputTokens: resp.Usage.PromptTokens, OutputTokens: resp.Usage.CompletionTokens},
+		Usage:   promptAccountingToAnthropicUsage(usageToPromptAccounting(resp.Usage), resp.Usage.CompletionTokens, usageToPromptAccounting(resp.Usage).NewPrefillTokens()),
 		Content: make([]map[string]interface{}, 0),
 	}
 	if len(resp.Choices) == 0 {
@@ -475,6 +499,7 @@ type anthropicResponseWriter struct {
 	blockIndex   int
 	blockType    string
 	outputTokens int
+	promptUsage  PromptAccounting
 }
 
 func newAnthropicResponseWriter(w http.ResponseWriter, stream bool, inputTokens int) *anthropicResponseWriter {
@@ -648,14 +673,19 @@ func (w *anthropicResponseWriter) consumeSSERecord(record string) {
 		w.closeBlock()
 	}
 	if chunk.Usage != nil {
+		w.promptUsage = usageToPromptAccounting(*chunk.Usage)
 		w.outputTokens = chunk.Usage.CompletionTokens
 	}
 	if choice.FinishReason != "" && !w.stopped {
 		w.closeBlock()
+		usage := anthropicUsage{InputTokens: w.inputTokens, OutputTokens: w.outputTokens}
+		if w.promptUsage.PromptTokens > 0 {
+			usage = promptAccountingToAnthropicUsage(w.promptUsage, w.outputTokens, w.promptUsage.NewPrefillTokens())
+		}
 		w.emitAnthropicSSE("message_delta", map[string]interface{}{
 			"type":  "message_delta",
 			"delta": map[string]interface{}{"stop_reason": anthropicStopReason(choice.FinishReason), "stop_sequence": nil},
-			"usage": map[string]int{"output_tokens": w.outputTokens},
+			"usage": usage,
 		})
 		w.emitAnthropicSSE("message_stop", map[string]string{"type": "message_stop"})
 		w.stopped = true

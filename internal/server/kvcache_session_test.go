@@ -133,6 +133,9 @@ func TestSessionSeedSnapshotRestoresOnMatch(t *testing.T) {
 	if res.NewTokens != 50 {
 		t.Errorf("prefilled %d new tokens, want 50", res.NewTokens)
 	}
+	if res.Source != CacheSourceDiskSession {
+		t.Errorf("source = %q, want %q", res.Source, CacheSourceDiskSession)
+	}
 }
 
 func TestSessionSeedSnapshotValidates(t *testing.T) {

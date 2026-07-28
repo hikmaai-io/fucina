@@ -1301,6 +1301,8 @@ type BatchAdapter struct {
 	// Reused host buffer for constrained batch logits (up to rows*runtime vocab).
 	// Scheduler ownership is single-threaded, so no adapter lock is needed.
 	constraintLogits []float32
+	lastAddReuse     batch.ReuseInfo
+	lastOpenReuse    batch.ReuseInfo
 }
 
 // seqStateSnap is one saved conversation: the exact token sequence committed
@@ -1549,6 +1551,9 @@ func (a *BatchAdapter) restoreSnapAt(i, slot int) int {
 // count > 0 means paged mode is enabled (seq_capacity returns 0 when it is not).
 func (a *BatchAdapter) Supported() bool { return a.eng.SeqFreeCapacity() > 0 }
 
+func (a *BatchAdapter) LastAddSeqReuse() batch.ReuseInfo  { return a.lastAddReuse.Normalized() }
+func (a *BatchAdapter) LastOpenSeqReuse() batch.ReuseInfo { return a.lastOpenReuse.Normalized() }
+
 // AddSeq admits a new sequence (prefill + first token sampled with params). On
 // success it records the slot so Capacity() stays accurate. On hybrid engines
 // a prompt extending a saved conversation restores that snapshot and prefills
@@ -1645,6 +1650,7 @@ func (a *BatchAdapter) CopyLogits(rows int, batched bool) ([]float32, int, error
 }
 
 func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int32, error) {
+	a.lastAddReuse = batch.ReuseInfo{}
 	if a.snapOn() {
 		a.scLookups++
 		// Probe BEFORE opening: a miss must not pay a slot open+reset+remove
@@ -1655,6 +1661,7 @@ func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int3
 				if n := a.restoreSnapAt(i, slot); n > 0 {
 					first, err2 := a.eng.SeqPrefillChunk(slot, prompt[n:], true)
 					if err2 == nil {
+						a.lastAddReuse = batch.ReuseInfo{ReusedTokens: n, Source: batch.ReuseSourceHostSnapshot}
 						return slot, first, nil
 					}
 					log.Printf("fucina: state-snapshot suffix prefill failed, falling back cold: %v", err2)
@@ -1666,11 +1673,16 @@ func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int3
 			}
 		}
 	}
+	_, hb0, _, _ := a.eng.PrefixCacheStats()
 	slot, first, err := a.eng.SeqAdd(prompt, params)
 	if err != nil {
 		return 0, 0, err
 	}
 	a.active++
+	_, hb1, _, _ := a.eng.PrefixCacheStats()
+	if d := hb1 - hb0; d > 0 {
+		a.lastAddReuse = batch.ReuseInfo{ReusedTokens: int(d) * 256, Source: batch.ReuseSourceGPUPagedBlock}
+	}
 	return slot, first, nil
 }
 
@@ -1769,9 +1781,13 @@ func (a *BatchAdapter) StepBatchSpec(reqs []batch.SpecReq) ([][]int32, error) {
 // it so Capacity() stays accurate — the slot is held from open, through the chunked
 // prefill, into the decode batch, until RemoveSeq.
 func (a *BatchAdapter) OpenSeq(prompt []int32, params batch.SeqParams) (slot int, nShared int, err error) {
+	a.lastOpenReuse = batch.ReuseInfo{}
 	slot, nShared, err = a.eng.SeqOpenPrefix(prompt, params)
 	if err != nil {
 		return 0, 0, err
+	}
+	if nShared > 0 {
+		a.lastOpenReuse = batch.ReuseInfo{ReusedTokens: nShared, Source: batch.ReuseSourceGPUPagedBlock}
 	}
 	a.active++
 	// Hybrid engines get no radix-tree prefix (nShared==0 always): try the
@@ -1787,6 +1803,7 @@ func (a *BatchAdapter) OpenSeq(prompt []int32, params batch.SeqParams) (slot int
 		switch {
 		case n > 0:
 			nShared = n
+			a.lastOpenReuse = batch.ReuseInfo{ReusedTokens: n, Source: batch.ReuseSourceHostSnapshot}
 		case n < 0:
 			// Restore failed mid-copy: the slot's recurrent state is garbage
 			// and a plain suffix prefill would run FROM it. Free + reopen so
