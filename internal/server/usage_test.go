@@ -26,6 +26,16 @@ func TestPromptAccountingNormalized(t *testing.T) {
 	}
 }
 
+func TestPromptAccountingFullHitAllowsCachedEqualsPrompt(t *testing.T) {
+	got := (PromptAccounting{PromptTokens: 9, CachedTokens: 9, Source: CacheSourceDiskSession}).Normalized()
+	if got.CachedTokens != 9 || got.NewPrefillTokens() != 0 {
+		t.Fatalf("full hit=%+v", got)
+	}
+	if details := got.PromptTokensDetails(); details == nil || details.CachedTokens != 9 {
+		t.Fatalf("details=%+v", details)
+	}
+}
+
 func TestMergePromptAccountingKeepsLargestPhysicalSkip(t *testing.T) {
 	a := PromptAccounting{PromptTokens: 2000, CachedTokens: 256, Source: CacheSourceGPUPagedBlock}
 	b := PromptAccounting{PromptTokens: 1024, CachedTokens: 768, Source: CacheSourceDiskSession}

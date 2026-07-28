@@ -9,6 +9,12 @@ func TestReuseInfoNormalized(t *testing.T) {
 	}
 }
 
+func TestPagedOrdinaryAdoptionCountsOnlyCompleteBlocks(t *testing.T) {
+	if got := AdoptedCachedTokens(300); got != 256 {
+		t.Fatalf("paged 300 shared -> %d want 256", got)
+	}
+}
+
 func TestAdoptedCachedTokens(t *testing.T) {
 	for _, tc := range []struct {
 		shared int
