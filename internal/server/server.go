@@ -2018,10 +2018,12 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"object": "list",
-		"data":   []interface{}{},
-		"model":  s.modelName,
+	writeJSON(w, http.StatusNotImplemented, map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": "the loaded generation model does not support embeddings",
+			"type":    "invalid_request_error",
+			"code":    "model_not_embedding",
+		},
 	})
 }
 
