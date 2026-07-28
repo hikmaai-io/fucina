@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	prommetrics "github.com/hikmaai-io/fucina/internal/metrics"
 )
@@ -70,6 +71,19 @@ func nonNegative(value int64) uint64 {
 		return 0
 	}
 	return uint64(value)
+}
+
+func observePrometheusQueueWait(elapsed time.Duration) {
+	prometheusMetrics.ObserveQueueWait(elapsed)
+	prometheusMetrics.ObservePhase(prommetrics.PhaseQueue, elapsed)
+}
+
+func observePrometheusPrefill(elapsed time.Duration) {
+	prometheusMetrics.ObservePhase(prommetrics.PhasePrefill, elapsed)
+}
+
+func observePrometheusDecode(elapsed time.Duration) {
+	prometheusMetrics.ObservePhase(prommetrics.PhaseDecode, elapsed)
 }
 
 func prometheusRequestOutcome(status int) prommetrics.RequestOutcome {
