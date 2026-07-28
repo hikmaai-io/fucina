@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "description": "SOL-05 retained Qwen serving cells: six dense plus six MoE concurrency cells",
+  "metric": "agg_decode_tps",
+  "max_winning_regression": 0.02,
+  "concurrency": [1, 2, 4, 8, 16, 32],
+  "bench": {
+    "max_tokens": 128,
+    "long_tokens": 3500,
+    "diverse": true,
+    "ignore_eos": true,
+    "verify_sample": 4
+  },
+  "models": {
+    "dense": {
+      "model_path": "/opt/spark/models/models--Qwen--Qwen3.5-9B-FP8",
+      "served_model": "qwen35",
+      "port": 18080,
+      "baseline": "benchmark-evidence/results/2026-07-18-d32b/fucina-q35dense-d32b.json",
+      "vllm_reference": "benchmark-evidence/results/2026-07-18-d32b/vllm-q35dense-fresh.json",
+      "winning_cells": [1, 2, 4, 8, 16],
+      "target_cell": 32
+    },
+    "moe": {
+      "model_path": "/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8",
+      "served_model": "qwen35",
+      "port": 18080,
+      "baseline": "benchmark-evidence/results/2026-07-18-d32b/fucina-q35moe-d32b.json",
+      "vllm_reference": "benchmark-evidence/results/2026-07-18-d32b/vllm-q35moe-fresh.json",
+      "winning_cells": [1, 2, 4, 8, 16, 32]
+    }
+  }
+}
