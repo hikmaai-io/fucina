@@ -34,3 +34,22 @@ func TestAdoptedCachedTokens(t *testing.T) {
 		}
 	}
 }
+
+func TestResidentCachedPrefixRequiresExactStrictPrefixAndReportsFullBlocks(t *testing.T) {
+	resident := make([]int32, 3021)
+	for i := range resident {
+		resident[i] = int32(i)
+	}
+	prompt := append(append([]int32(nil), resident...), 99)
+	physical, reported := ResidentCachedPrefix(resident, prompt)
+	if physical != 3021 || reported != 2816 {
+		t.Fatalf("physical=%d reported=%d", physical, reported)
+	}
+	prompt[17]++
+	if physical, reported := ResidentCachedPrefix(resident, prompt); physical != 0 || reported != 0 {
+		t.Fatalf("mismatch reused physical=%d reported=%d", physical, reported)
+	}
+	if physical, reported := ResidentCachedPrefix(resident, resident); physical != 0 || reported != 0 {
+		t.Fatalf("non-strict prefix reused physical=%d reported=%d", physical, reported)
+	}
+}

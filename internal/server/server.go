@@ -1476,6 +1476,8 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 	// through the structural bytes and leave unterminated JSON.
 	tokCh := make(chan int32, 8192)
 	done := make(chan batch.Result, 1)
+	batchStarted := time.Now()
+	var ttftOnce sync.Once
 
 	// cancel lets the handler end its OWN sequence early (tool calls captured
 	// and the model moving on) without waiting for a natural stop; the
@@ -1496,6 +1498,7 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 			return s.tokenizer.Encode(string(closing), false, false)
 		},
 		Emit: func(t int32) bool {
+			ttftOnce.Do(func() { prometheusMetrics.ObserveTTFT(time.Since(batchStarted)) })
 			select {
 			case tokCh <- t:
 				return true

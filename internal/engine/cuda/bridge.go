@@ -1303,6 +1303,21 @@ type BatchAdapter struct {
 	constraintLogits []float32
 	lastAddReuse     batch.ReuseInfo
 	lastOpenReuse    batch.ReuseInfo
+
+	// Gemma mixes sliding and global attention, so the immutable radix cache is
+	// intentionally disabled for that dual-pool geometry. Keep one completed
+	// greedy slot resident instead: a strict prompt extension can continue that
+	// exact physical KV state and skip the committed prefix without any kernel
+	// change or host copy. One entry is bounded and leaves normal batch capacity.
+	live          *residentPagedSeq
+	liveLookups   int64
+	liveHitBlocks int64
+	liveEvictions int64
+}
+
+type residentPagedSeq struct {
+	slot   int
+	tokens []int32 // exact committed frontier (may end inside a 256-token block)
 }
 
 // seqStateSnap is one saved conversation: the exact token sequence committed
@@ -1554,6 +1569,49 @@ func (a *BatchAdapter) Supported() bool { return a.eng.SeqFreeCapacity() > 0 }
 func (a *BatchAdapter) LastAddSeqReuse() batch.ReuseInfo  { return a.lastAddReuse.Normalized() }
 func (a *BatchAdapter) LastOpenSeqReuse() batch.ReuseInfo { return a.lastOpenReuse.Normalized() }
 
+// takeResident returns an exact live-slot prefix. The physical frontier may be
+// non-block-aligned, but externally reported reuse is rounded down to complete
+// 256-token blocks; the partial tail is never claimed as cached. Live continuation
+// is restricted to greedy requests because a retained slot also retains its sampler
+// counter, while greedy argmax is counter-independent.
+func (a *BatchAdapter) takeResident(prompt []int32, params batch.SeqParams) (slot, physical, reported int, ok bool) {
+	if params.Temperature > 0 || len(prompt) <= 256 || a.live == nil {
+		return 0, 0, 0, false
+	}
+	a.liveLookups++
+	r := a.live
+	physical, reported = batch.ResidentCachedPrefix(r.tokens, prompt)
+	if reported == 0 {
+		return 0, 0, 0, false
+	}
+	a.live = nil
+	a.active++
+	a.liveHitBlocks += int64(reported / 256)
+	return r.slot, physical, reported, true
+}
+
+// RetainSeq implements batch.LiveSequenceCacheEngine. Hybrid Qwen engines keep
+// using host snapshots; this no-copy path is for paged non-hybrid slots. A cache
+// is never retained when doing so would consume the final free serving slot.
+func (a *BatchAdapter) RetainSeq(slot int, tokens []int32, params batch.SeqParams) bool {
+	if params.Temperature > 0 || a.snapOn() || a.eng.SeqFreeCapacity() < 1 {
+		return false
+	}
+	n := a.eng.SeqNTokens(slot)
+	if n < 256 || n > len(tokens) {
+		return false
+	}
+	if a.live != nil {
+		a.eng.SeqRemove(a.live.slot)
+		a.liveEvictions++
+	}
+	a.live = &residentPagedSeq{slot: slot, tokens: append([]int32(nil), tokens[:n]...)}
+	if a.active > 0 {
+		a.active--
+	}
+	return true
+}
+
 // AddSeq admits a new sequence (prefill + first token sampled with params). On
 // success it records the slot so Capacity() stays accurate. On hybrid engines
 // a prompt extending a saved conversation restores that snapshot and prefills
@@ -1651,6 +1709,19 @@ func (a *BatchAdapter) CopyLogits(rows int, batched bool) ([]float32, int, error
 
 func (a *BatchAdapter) AddSeq(prompt []int32, params batch.SeqParams) (int, int32, error) {
 	a.lastAddReuse = batch.ReuseInfo{}
+	if slot, physical, reported, ok := a.takeResident(prompt, params); ok {
+		first, err := a.eng.SeqPrefillChunk(slot, prompt[physical:], true)
+		if err == nil {
+			a.lastAddReuse = batch.ReuseInfo{ReusedTokens: reported, Source: batch.ReuseSourceLiveSeq}
+			return slot, first, nil
+		}
+		// The retained frontier is no longer trustworthy after a failed append.
+		a.eng.SeqRemove(slot)
+		if a.active > 0 {
+			a.active--
+		}
+		log.Printf("fucina: resident paged suffix prefill failed, falling back cold: %v", err)
+	}
 	if a.snapOn() {
 		a.scLookups++
 		// Probe BEFORE opening: a miss must not pay a slot open+reset+remove
@@ -1782,6 +1853,10 @@ func (a *BatchAdapter) StepBatchSpec(reqs []batch.SpecReq) ([][]int32, error) {
 // prefill, into the decode batch, until RemoveSeq.
 func (a *BatchAdapter) OpenSeq(prompt []int32, params batch.SeqParams) (slot int, nShared int, err error) {
 	a.lastOpenReuse = batch.ReuseInfo{}
+	if slot, physical, reported, ok := a.takeResident(prompt, params); ok {
+		a.lastOpenReuse = batch.ReuseInfo{ReusedTokens: reported, Source: batch.ReuseSourceLiveSeq}
+		return slot, physical, nil
+	}
 	slot, nShared, err = a.eng.SeqOpenPrefix(prompt, params)
 	if err != nil {
 		return 0, 0, err
@@ -1868,7 +1943,14 @@ func (a *BatchAdapter) Capacity() int { return a.eng.SeqFreeCapacity() + a.activ
 // reported in 256-token block units to match the radix-tree accounting.
 func (a *BatchAdapter) PrefixCacheStats() (lookups, hitBlocks, cachedBlocks, evictions int64) {
 	lk, hb, cb, ev := a.eng.PrefixCacheStats()
-	return lk + a.scLookups, hb + a.scHitTokens/256, cb + int64(len(a.snaps)), ev + a.scEvictions
+	liveBlocks := int64(0)
+	if a.live != nil {
+		liveBlocks = int64(len(a.live.tokens) / 256)
+	}
+	return lk + a.scLookups + a.liveLookups,
+		hb + a.scHitTokens/256 + a.liveHitBlocks,
+		cb + int64(len(a.snaps)) + liveBlocks,
+		ev + a.scEvictions + a.liveEvictions
 }
 
 // PrefixCommit forwards decode-time block registration so generated text becomes

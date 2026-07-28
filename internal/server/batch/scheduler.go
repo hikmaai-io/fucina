@@ -246,6 +246,14 @@ type StateSaverEngine interface {
 	SaveState(slot int, tokens []int32)
 }
 
+// LiveSequenceCacheEngine optionally keeps a cleanly finished paged slot resident
+// and re-admits a later strict prompt extension without copying or re-prefilling its
+// committed prefix. RetainSeq returns true only when it took ownership of slot; the
+// scheduler then MUST NOT call RemoveSeq. Implementations must bound retained slots.
+type LiveSequenceCacheEngine interface {
+	RetainSeq(slot int, tokens []int32, params SeqParams) bool
+}
+
 // StateSnapshot is an opaque, exact-position engine snapshot paired with the
 // committed token history that produced it. The scheduler never interprets
 // State; hybrid engines use it for full-layer K/V plus recurrent state.
@@ -519,7 +527,8 @@ type Scheduler struct {
 
 	// stateSaver, when non-nil, snapshots a finishing sequence's slot state
 	// keyed by its token history (hybrid engines' in-memory conversation cache).
-	stateSaver StateSaverEngine
+	stateSaver   StateSaverEngine
+	liveRetainer LiveSequenceCacheEngine
 	// sessionState is the explicit disk-session restore/export path. Unlike the
 	// opportunistic in-memory cache, restore failures are fatal to that request.
 	sessionState SessionStateEngine
@@ -666,6 +675,9 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	}
 	if ss, ok := engine.(StateSaverEngine); ok {
 		s.stateSaver = ss
+	}
+	if lr, ok := engine.(LiveSequenceCacheEngine); ok {
+		s.liveRetainer = lr
 	}
 	if se, ok := engine.(SessionStateEngine); ok {
 		s.sessionState = se
@@ -1390,7 +1402,7 @@ func (s *Scheduler) newSeq(req Request, slot int) *seq {
 	// registration, and/or eviction-time state snapshots. The prompt's full
 	// blocks are already registered by AddSeq, so start regBlocks past them —
 	// PrefixCommit only fires for generated blocks.
-	if s.spec != nil || s.prefixCommit != nil || s.stateSaver != nil || req.PersistSession || requiresHostSampling(req) {
+	if s.spec != nil || s.prefixCommit != nil || s.stateSaver != nil || s.liveRetainer != nil || req.PersistSession || requiresHostSampling(req) {
 		sq.hist = append(make([]int32, 0, len(req.Tokens)+req.MaxNew), req.Tokens...)
 		sq.regBlocks = len(req.Tokens) / 256
 	}
@@ -2093,6 +2105,7 @@ func (s *Scheduler) flushEvictions() {
 		// using the adapter's opportunistic in-memory conversation cache. Error /
 		// shutdown evictions never snapshot because their state may be suspect.
 		clean := res.Reason == FinishStop || res.Reason == FinishLength || res.Reason == FinishCancelled
+		retained := false
 		if clean && len(sq.hist) > 0 {
 			if sq.req.PersistSession {
 				if s.sessionState == nil {
@@ -2100,12 +2113,22 @@ func (s *Scheduler) flushEvictions() {
 				} else {
 					res.SessionState, res.SessionErr = s.sessionState.ExportSession(sq.slot, sq.hist)
 				}
-			} else if s.stateSaver != nil {
-				s.stateSaver.SaveState(sq.slot, sq.hist)
+			} else {
+				// Gemma's sliding/global paged geometry cannot share immutable radix
+				// blocks. A bounded resident-slot cache is its physical reuse path:
+				// ownership transfers to the adapter, so teardown must be skipped.
+				if s.liveRetainer != nil {
+					retained = s.liveRetainer.RetainSeq(sq.slot, sq.hist, sq.req.Params)
+				}
+				if !retained && s.stateSaver != nil {
+					s.stateSaver.SaveState(sq.slot, sq.hist)
+				}
 			}
 		}
-		if err := s.engine.RemoveSeq(sq.slot); err != nil {
-			log.Printf("batch: RemoveSeq(%d): %v", sq.slot, err)
+		if !retained {
+			if err := s.engine.RemoveSeq(sq.slot); err != nil {
+				log.Printf("batch: RemoveSeq(%d): %v", sq.slot, err)
+			}
 		}
 		// Feed the finished sequence's tokens to the cross-request drafter corpus (spec
 		// engines only). Trim from the FRONT so the ring keeps the most recent traffic.

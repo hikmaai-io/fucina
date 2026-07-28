@@ -39,6 +39,26 @@ func TestMetricsDispatchDefaultsToPrometheusSmokeSeries(t *testing.T) {
 	}
 }
 
+func TestBatchRequestEmitsLiveTTFTProducer(t *testing.T) {
+	prometheusMetrics = prommetrics.New()
+	srv := newQwenBatchServer(t, []int32{17, qImEnd})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", chatBody(t, map[string]interface{}{
+		"messages":    []map[string]string{{"role": "user", "content": "hi"}},
+		"temperature": 0, "max_tokens": 2,
+	}))
+	rec := httptest.NewRecorder()
+	mux(srv).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	scrape := httptest.NewRecorder()
+	srv.handleMetricsDispatch(scrape, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(scrape.Body.String(), "fucina_ttft_seconds_count 1") {
+		t.Fatalf("batch TTFT producer did not emit:\n%s", scrape.Body.String())
+	}
+}
+
 func TestMetricsDispatchPreservesJSONAtMetricsPath(t *testing.T) {
 	srv, _ := newTestServer(t, 8192, nil)
 	for _, request := range []*http.Request{

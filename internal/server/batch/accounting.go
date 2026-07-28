@@ -43,3 +43,22 @@ func AdoptedCachedTokens(sharedPrefixTokens int) int {
 	}
 	return (sharedPrefixTokens / adoptedBlockTokens) * adoptedBlockTokens
 }
+
+// ResidentCachedPrefix validates that resident is a strict token prefix of prompt.
+// physical is the exact already-committed frontier used to append the suffix;
+// reported is conservatively rounded down to complete paged-KV blocks.
+func ResidentCachedPrefix(resident, prompt []int32) (physical, reported int) {
+	if len(resident) == 0 || len(resident) >= len(prompt) {
+		return 0, 0
+	}
+	for i, token := range resident {
+		if prompt[i] != token {
+			return 0, 0
+		}
+	}
+	reported = AdoptedCachedTokens(len(resident))
+	if reported == 0 {
+		return 0, 0
+	}
+	return len(resident), reported
+}
