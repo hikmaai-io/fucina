@@ -452,6 +452,13 @@ type Request struct {
 	// MaxNew bounds generated tokens for this sequence (a runaway cap). Values
 	// < 1 are treated as 1 so every admitted sequence makes progress.
 	MaxNew int
+	// MinNew is the minimum number of generated tokens that must exist BEFORE a
+	// Stops id may terminate the sequence (vLLM min_tokens, host-side length
+	// contract). A stop token sampled earlier is delivered to Emit like any
+	// ordinary token, committed to the sequence, and decoding continues. Values
+	// < 1 mean no minimum; MinNew is clamped to MaxNew at Submit so MinNew ==
+	// MaxNew forces an exact-length generation ending in FinishLength.
+	MinNew int
 	// Ctx cancels the sequence: once Ctx.Done() fires the scheduler evicts it
 	// (freeing its slot) before the next step.
 	Ctx context.Context
@@ -862,6 +869,12 @@ func (s *Scheduler) Start() {
 func (s *Scheduler) Submit(req Request) error {
 	if req.MaxNew < 1 {
 		req.MaxNew = 1
+	}
+	if req.MinNew < 0 {
+		req.MinNew = 0
+	}
+	if req.MinNew > req.MaxNew {
+		req.MinNew = req.MaxNew
 	}
 	if s.phaseTiming || s.recorder != nil {
 		req.submittedAt = time.Now()
@@ -2018,8 +2031,13 @@ func (s *Scheduler) deliver(active map[int]*seq, sq *seq, token int32) bool {
 		}
 	}
 
-	// Stop token: deliver it (done above), then evict.
-	if sq.stopHit(token) {
+	// Stop token: deliver it (done above), then evict — unless fewer than MinNew
+	// tokens were generated BEFORE it (min_tokens contract): then the stop token
+	// is an ordinary committed token and decoding continues. sq.generated was
+	// incremented above and includes this token, so generated-1 is the count
+	// preceding it; with MinNew == 0 the condition is always true (generated >= 1
+	// here), preserving the existing stop semantics exactly.
+	if sq.stopHit(token) && sq.generated-1 >= sq.req.MinNew {
 		s.evict(active, sq, Result{Reason: FinishStop, Generated: sq.generated})
 		return false
 	}

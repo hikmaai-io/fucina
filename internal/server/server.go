@@ -161,6 +161,8 @@ type GenerationParams struct {
 	FrequencyPenalty float64  `json:"frequency_penalty"`
 	PresencePenalty  float64  `json:"presence_penalty"`
 	MaxTokens        int      `json:"max_tokens"`
+	IgnoreEOS        bool     `json:"ignore_eos"` // host-side: EOS/end-of-turn stop ids never terminate generation
+	MinTokens        int      `json:"min_tokens"` // host-side: stop ids cannot terminate before this many generated tokens
 	Stream           bool     `json:"stream"`
 	Stop             []string `json:"stop,omitempty"`
 	Tools            []Tool   `json:"-"` // request tool schemas, for required-param validation
@@ -237,19 +239,26 @@ type ChatRequest struct {
 	Prompt              json.RawMessage `json:"prompt,omitempty"` // legacy /v1/completions
 	MaxTokens           int             `json:"max_tokens"`
 	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
-	Temperature         *float64        `json:"temperature"`
-	TopP                *float64        `json:"top_p"`
-	TopK                *int            `json:"top_k"`
-	MinP                *float64        `json:"min_p"`
-	Seed                *int64          `json:"seed"`
-	RepeatPenalty       *float64        `json:"repeat_penalty"`
-	FrequencyPenalty    *float64        `json:"frequency_penalty"`
-	PresencePenalty     *float64        `json:"presence_penalty"`
-	Stream              bool            `json:"stream"`
-	StreamOptions       *StreamOptions  `json:"stream_options,omitempty"`
-	Stop                StopField       `json:"stop,omitempty"`
-	Tools               []Tool          `json:"tools,omitempty"`
-	ToolChoice          interface{}     `json:"tool_choice,omitempty"`
+	// IgnoreEOS / MinTokens (vLLM sampling extensions): host-side generation-
+	// length contract. ignore_eos keeps generating after EOS/end-of-turn up to
+	// the completion limit; min_tokens forbids stop ids from ENDING generation
+	// before that many tokens exist (the sampled stop token is kept and decoding
+	// continues). Enforced entirely in Go stop handling — no kernel changes.
+	IgnoreEOS        *bool          `json:"ignore_eos,omitempty"`
+	MinTokens        *int           `json:"min_tokens,omitempty"`
+	Temperature      *float64       `json:"temperature"`
+	TopP             *float64       `json:"top_p"`
+	TopK             *int           `json:"top_k"`
+	MinP             *float64       `json:"min_p"`
+	Seed             *int64         `json:"seed"`
+	RepeatPenalty    *float64       `json:"repeat_penalty"`
+	FrequencyPenalty *float64       `json:"frequency_penalty"`
+	PresencePenalty  *float64       `json:"presence_penalty"`
+	Stream           bool           `json:"stream"`
+	StreamOptions    *StreamOptions `json:"stream_options,omitempty"`
+	Stop             StopField      `json:"stop,omitempty"`
+	Tools            []Tool         `json:"tools,omitempty"`
+	ToolChoice       interface{}    `json:"tool_choice,omitempty"`
 
 	// Thinking / reasoning control. gemma-4 gates a reasoning channel: when
 	// enabled the model emits a <|channel>thought…<channel|> block before its
@@ -1207,6 +1216,29 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		params.MaxTokens = s.maxOutputTokens
 	}
 
+	// ignore_eos / min_tokens: host-side generation-length contract (vLLM
+	// extensions). Validated against the EFFECTIVE completion limit (after the
+	// window and --max-output-tokens clamps above) so an unsatisfiable request
+	// fails explicitly instead of silently violating the contract.
+	if req.IgnoreEOS != nil {
+		params.IgnoreEOS = *req.IgnoreEOS
+	}
+	if req.MinTokens != nil {
+		if *req.MinTokens < 0 {
+			writeOpenAIRequestError(w, "min_tokens must be >= 0", "min_tokens")
+			return
+		}
+		params.MinTokens = *req.MinTokens
+	}
+	if params.MinTokens > params.MaxTokens {
+		writeOpenAIRequestError(w, fmt.Sprintf("min_tokens (%d) must not exceed the effective completion token limit (%d)", params.MinTokens, params.MaxTokens), "min_tokens")
+		return
+	}
+	if params.Constraint != nil && (params.IgnoreEOS || params.MinTokens > 0) {
+		writeOpenAIRequestError(w, "ignore_eos/min_tokens cannot be combined with response_format json_object/json_schema: constrained output must terminate when the structure completes", "response_format")
+		return
+	}
+
 	// Sanitize sampling knobs BEFORE they cross into CUDA C kernels. Unvalidated
 	// values (negative/huge top_k, NaN/Inf temp) reach the device sampler raw on
 	// the spec path; clamp them here so a malformed request cannot crash or
@@ -1466,6 +1498,9 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 // preserves request-local RNG/history without changing CUDA decode kernels.
 func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params GenerationParams, tokens []int32, wantTools, legacy, includeUsage bool, sessionPath string, diskState *batch.StateSnapshot) {
 	stops := s.tokenizer.StopIDs()
+	if params.IgnoreEOS {
+		stops = nil // ignore_eos: only MaxNew (and cancellation) can end the sequence
+	}
 
 	seed := uint64(params.Seed)
 	if params.Seed < 0 {
@@ -1504,6 +1539,7 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 		Params:         sp,
 		Stops:          stops,
 		MaxNew:         params.MaxTokens,
+		MinNew:         params.MinTokens,
 		Ctx:            ctx,
 		SessionState:   diskState,
 		PersistSession: sessionPath != "",
@@ -1717,7 +1753,11 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 	}
 
 	res := drainTokensBurst(tokCh, done, func(t int32) {
-		if stopped || s.tokenizer.IsStop(t) {
+		// A stop id is dropped from the rendered output only when it may actually
+		// TERMINATE generation: under ignore_eos (no terminal stop exists) or
+		// before the min_tokens floor (scheduler-suppressed), it is ordinary
+		// output and must be streamed and counted (host-side length contract).
+		if stopped || (s.tokenizer.IsStop(t) && !params.IgnoreEOS && generated >= params.MinTokens) {
 			return
 		}
 		generated++
@@ -1872,7 +1912,9 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 	stopped := false
 
 	res := drainTokens(tokCh, done, func(t int32) {
-		if stopped || s.tokenizer.IsStop(t) {
+		// Same contract as streamBatch: only a potentially-terminal stop id is
+		// dropped; ignore_eos / pre-min_tokens stop ids are ordinary output.
+		if stopped || (s.tokenizer.IsStop(t) && !params.IgnoreEOS && len(ids) >= params.MinTokens) {
 			return
 		}
 		ids = append(ids, t)
@@ -2132,6 +2174,7 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 		stopLoop
 		stopThink
 		stopEmit
+		stopStopTok // host-detected stop id past the min_tokens threshold
 	)
 	var all []int32
 	detector := &cycleDetector{}
@@ -2146,10 +2189,23 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 		why := stopNone
 		history := s.kv.CurrentTokens()
 		baseN := s.engine.NTokens()
-		toks, _, err := s.engine.GenerateSpecStream(history, logits, remaining, stops,
+		// min_tokens: while fewer than MinTokens tokens exist the ENGINE must not
+		// stop on a stop id (host-side length contract, no kernel involvement).
+		// Stop detection moves into the callback below, which re-arms once the
+		// threshold is crossed MID-round, so one engine call still covers the
+		// whole budget without a resume.
+		effStops := stops
+		hostStops := false
+		if params.MinTokens > len(all) && len(stops) > 0 {
+			effStops = nil
+			hostStops = true
+		}
+		produced := 0
+		toks, _, err := s.engine.GenerateSpecStream(history, logits, remaining, effStops,
 			s.draftK, float32(params.Temperature), params.TopK,
 			float32(params.TopP), float32(params.MinP), float32(params.RepeatPenalty), seed,
 			func(t int32) bool {
+				produced++
 				if ctx.Err() != nil {
 					why = stopCancelled
 					return true
@@ -2170,7 +2226,11 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 				case inCh && !inTC:
 					thinkToks++
 				}
-				if detector.push(t) {
+				// Repetition-loop safety cut. Suppressed under ignore_eos (the
+				// client asked for an exact-length generation; post-EOS repetition
+				// is expected) and while the min_tokens floor is unmet, so the
+				// host-side length contract is never silently violated.
+				if detector.push(t) && !params.IgnoreEOS && len(all)+produced-1 >= params.MinTokens {
 					why = stopLoop
 					return true
 				}
@@ -2181,6 +2241,18 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 				if inCh && !inTC && !thinkClosed && budget > 0 && thinkToks >= budget {
 					why = stopThink
 					return true
+				}
+				// min_tokens host stop detection: the engine was given no stop ids
+				// this round, so once at least MinTokens tokens precede t, a
+				// sampled stop id ends generation here (after the token was
+				// delivered above, matching the engine-side stop contract).
+				if hostStops && len(all)+produced-1 >= params.MinTokens {
+					for _, sid := range stops {
+						if t == sid {
+							why = stopStopTok
+							return true
+						}
+					}
 				}
 				return false
 			})
@@ -2207,6 +2279,10 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 		switch why {
 		case stopCancelled:
 			return all, "cancelled", nil
+		case stopStopTok:
+			// Host-detected stop id past the min_tokens floor: same terminal
+			// contract as the engine-side stop below (token already delivered).
+			return all, "stop", nil
 		case stopLoop:
 			log.Printf("fucina: WARNING: repetition loop detected after %d tokens — cutting generation", len(all))
 			return all, "length", nil
@@ -2242,10 +2318,11 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 			logits = lg
 			continue
 		default:
-			// The engine stopped on its own: a stop token, or max_new exhausted.
+			// The engine stopped on its own: a stop token (only possible when
+			// effStops was passed through), or max_new exhausted.
 			if n := len(toks); n > 0 {
 				last := toks[n-1]
-				for _, sid := range stops {
+				for _, sid := range effStops {
 					if last == sid {
 						return all, "stop", nil
 					}
@@ -2321,6 +2398,9 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			}
 		}
 		stops := s.tokenizer.StopIDs()
+		if params.IgnoreEOS {
+			stops = nil // ignore_eos: generation runs to max_tokens
+		}
 		var err error
 		var specFinish string
 		if params.Constraint != nil {
@@ -2368,7 +2448,14 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 				break
 			}
 			token, err := s.sampleToken(logits, params, rng)
-			if err != nil || s.tokenizer.IsStop(token) {
+			if err != nil {
+				capExit = false
+				break
+			}
+			// ignore_eos / min_tokens: a stop id may only END generation when
+			// neither suppresses it; otherwise it is committed like any token
+			// and the loop continues (host-side length contract).
+			if s.tokenizer.IsStop(token) && !params.IgnoreEOS && generated >= params.MinTokens {
 				capExit = false
 				break
 			}
@@ -2563,7 +2650,9 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	// the per-token callback via runSpec) and the repeat-penalty fallback loop
 	// below, so both paths stream byte-identical wire output.
 	processToken := func(token int32) bool {
-		if s.tokenizer.IsStop(token) {
+		// ignore_eos / min_tokens: a stop id only ends the stream when neither
+		// suppresses it; otherwise it is ordinary output (host length contract).
+		if s.tokenizer.IsStop(token) && !params.IgnoreEOS && generated >= params.MinTokens {
 			return true
 		}
 		rawToks = append(rawToks, token)
@@ -2705,6 +2794,9 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 		// repeat_penalty != 1.0 no longer drops to a per-token CPU decode loop
 		// (1 MB logits D2H + host top-k per token, and no drafting).
 		stops := s.tokenizer.StopIDs()
+		if params.IgnoreEOS {
+			stops = nil // ignore_eos: generation runs to max_tokens
+		}
 		var specFinish string
 		var err error
 		if params.Constraint != nil {
