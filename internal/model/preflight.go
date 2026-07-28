@@ -185,7 +185,13 @@ func preflightGemmaSafetensors(s DescriptorSnapshot, root map[string]any, t map[
 		p := fmt.Sprintf("%slayers.%d.", r, l)
 		expectSTLinear(c, p+"self_attn.q_proj.weight", g.AttentionHead*hd, g.HiddenSize, s.SourceQuant)
 		expectSTLinear(c, p+"self_attn.k_proj.weight", nkv*hd, g.HiddenSize, s.SourceQuant)
-		expectSTLinear(c, p+"self_attn.v_proj.weight", nkv*hd, g.HiddenSize, s.SourceQuant)
+		// Gemma global attention is K=V and valid checkpoints omit v_proj; sliding
+		// attention carries a distinct V projection.
+		if mix == MixerSlidingAttention {
+			expectSTLinear(c, p+"self_attn.v_proj.weight", nkv*hd, g.HiddenSize, s.SourceQuant)
+		} else if _, ok := c.tensors[p+"self_attn.v_proj.weight"]; ok {
+			expectSTLinear(c, p+"self_attn.v_proj.weight", nkv*hd, g.HiddenSize, s.SourceQuant)
+		}
 		expectSTLinear(c, p+"self_attn.o_proj.weight", g.HiddenSize, g.AttentionHead*hd, s.SourceQuant)
 		expectSTLinear(c, p+"mlp.gate_proj.weight", g.Intermediate, g.HiddenSize, s.SourceQuant)
 		expectSTLinear(c, p+"mlp.up_proj.weight", g.Intermediate, g.HiddenSize, s.SourceQuant)
@@ -239,7 +245,7 @@ func preflightQwenSafetensors(s DescriptorSnapshot, root map[string]any, t map[s
 			if si == 0 {
 				si = g.Intermediate
 			}
-			c.expect(p+"mlp.shared_expert_gate.weight", i64(g.HiddenSize), "BF16")
+			c.expectElements(p+"mlp.shared_expert_gate.weight", int64(g.HiddenSize), "BF16")
 			expectSTLinear(c, p+"mlp.shared_expert.gate_proj.weight", si, g.HiddenSize, s.SourceQuant)
 			expectSTLinear(c, p+"mlp.shared_expert.up_proj.weight", si, g.HiddenSize, s.SourceQuant)
 			expectSTLinear(c, p+"mlp.shared_expert.down_proj.weight", g.HiddenSize, si, s.SourceQuant)
@@ -293,7 +299,9 @@ func preflightE4BSafetensors(s DescriptorSnapshot, cfg map[string]any, t map[str
 		}
 		c.expect(p+"per_layer_input_gate.weight", i64(pd, g.HiddenSize), "BF16")
 		c.expect(p+"per_layer_projection.weight", i64(g.HiddenSize, pd), "BF16")
-		c.optional(p+"layer_scalar", []int64{}, "BF16")
+		if _, ok := t[p+"layer_scalar"]; ok {
+			c.expectElements(p+"layer_scalar", 1, "BF16")
+		}
 	}
 }
 

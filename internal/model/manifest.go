@@ -257,7 +257,12 @@ func descriptorID(s DescriptorSnapshot) string {
 		v = strings.ToLower(s.Architecture)
 	}
 	q := strings.ToLower(strings.NewReplacer("_", "-", " ", "-").Replace(s.SourceQuant))
-	return strings.Trim(strings.ToLower(s.Family)+"-"+v+"-"+q, "-")
+	family := strings.ToLower(s.Family)
+	base := v
+	if !strings.HasPrefix(base, family) {
+		base = family + "-" + base
+	}
+	return strings.Trim(base+"-"+q, "-")
 }
 
 func fingerprint(metadata any, tensors map[string]TensorInfo) string {
