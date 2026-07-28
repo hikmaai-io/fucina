@@ -1,0 +1,286 @@
+{
+  "independent_starts": 3,
+  "workload": {
+    "cold_warm_reps": 3,
+    "prefix_words": 2048,
+    "max_tokens": 64,
+    "burst_reps": 3,
+    "concurrency": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ]
+  },
+  "subjects": [
+    {
+      "id": "gemma-4-12b-q4_0-qat",
+      "size_b": 12,
+      "quant": "Q4_0-QAT",
+      "artifact": "/models/gemma-4-12b-it-Q4_0-QAT.gguf",
+      "artifact_sha256": "REPLACE_WITH_SHA256",
+      "model": "gemma-4-12b-q4_0-qat",
+      "engines": {
+        "fucina": {
+          "command": [
+            "./fucina",
+            "-m",
+            "{artifact}",
+            "--ctx",
+            "16384",
+            "--parallel",
+            "32",
+            "--max-concurrent",
+            "64",
+            "--port",
+            "18080"
+          ],
+          "base_url": "http://127.0.0.1:18080",
+          "ready_path": "/readyz",
+          "startup_timeout_s": 900
+        },
+        "vllm": {
+          "command": [
+            "vllm",
+            "serve",
+            "{vllm_artifact}",
+            "--served-model-name",
+            "{model}",
+            "--port",
+            "18080",
+            "--max-model-len",
+            "16384",
+            "--enable-prefix-caching"
+          ],
+          "base_url": "http://127.0.0.1:18080",
+          "ready_path": "/health",
+          "startup_timeout_s": 900
+        }
+      },
+      "vllm_artifact": "/models/gemma-4-12b-it-Q4_0-QAT-vllm",
+      "vllm_artifact_sha256": "REPLACE_WITH_SHA256"
+    },
+    {
+      "id": "gemma-4-12b-q8_0",
+      "size_b": 12,
+      "quant": "Q8_0",
+      "artifact": "/models/gemma-4-12b-it-Q8_0.gguf",
+      "artifact_sha256": "REPLACE_WITH_SHA256",
+      "model": "gemma-4-12b-q8_0",
+      "engines": {
+        "fucina": {
+          "command": [
+            "./fucina",
+            "-m",
+            "{artifact}",
+            "--ctx",
+            "16384",
+            "--parallel",
+            "32",
+            "--max-concurrent",
+            "64",
+            "--port",
+            "18080"
+          ],
+          "base_url": "http://127.0.0.1:18080"
+        },
+        "vllm": {
+          "command": [
+            "vllm",
+            "serve",
+            "{vllm_artifact}",
+            "--served-model-name",
+            "{model}",
+            "--port",
+            "18080",
+            "--max-model-len",
+            "16384",
+            "--enable-prefix-caching"
+          ],
+          "base_url": "http://127.0.0.1:18080",
+          "ready_path": "/health"
+        }
+      },
+      "vllm_artifact": "/models/gemma-4-12b-it-Q8_0-vllm",
+      "vllm_artifact_sha256": "REPLACE_WITH_SHA256"
+    },
+    {
+      "id": "gemma-4-12b-nvfp4",
+      "size_b": 12,
+      "quant": "NVFP4",
+      "artifact": "/models/gemma-4-12b-it-NVFP4",
+      "artifact_sha256": "REPLACE_WITH_SHA256",
+      "model": "gemma-4-12b-nvfp4",
+      "engines": {
+        "fucina": {
+          "command": [
+            "./fucina",
+            "-m",
+            "{artifact}",
+            "--ctx",
+            "16384",
+            "--parallel",
+            "32",
+            "--max-concurrent",
+            "64",
+            "--port",
+            "18080"
+          ],
+          "base_url": "http://127.0.0.1:18080"
+        },
+        "vllm": {
+          "command": [
+            "vllm",
+            "serve",
+            "{vllm_artifact}",
+            "--served-model-name",
+            "{model}",
+            "--port",
+            "18080",
+            "--max-model-len",
+            "16384",
+            "--enable-prefix-caching"
+          ],
+          "base_url": "http://127.0.0.1:18080",
+          "ready_path": "/health"
+        }
+      },
+      "vllm_artifact": "/models/gemma-4-12b-it-NVFP4-vllm",
+      "vllm_artifact_sha256": "REPLACE_WITH_SHA256"
+    },
+    {
+      "id": "gemma-4-31b-q4_0-qat",
+      "size_b": 31,
+      "quant": "Q4_0-QAT",
+      "artifact": "/models/gemma-4-31b-it-Q4_0-QAT.gguf",
+      "artifact_sha256": "REPLACE_WITH_SHA256",
+      "model": "gemma-4-31b-q4_0-qat",
+      "engines": {
+        "fucina": {
+          "command": [
+            "./fucina",
+            "-m",
+            "{artifact}",
+            "--ctx",
+            "16384",
+            "--parallel",
+            "32",
+            "--max-concurrent",
+            "64",
+            "--port",
+            "18080"
+          ],
+          "base_url": "http://127.0.0.1:18080"
+        },
+        "vllm": {
+          "command": [
+            "vllm",
+            "serve",
+            "{vllm_artifact}",
+            "--served-model-name",
+            "{model}",
+            "--port",
+            "18080",
+            "--max-model-len",
+            "16384",
+            "--enable-prefix-caching"
+          ],
+          "base_url": "http://127.0.0.1:18080",
+          "ready_path": "/health"
+        }
+      },
+      "vllm_artifact": "/models/gemma-4-31b-it-Q4_0-QAT-vllm",
+      "vllm_artifact_sha256": "REPLACE_WITH_SHA256"
+    },
+    {
+      "id": "gemma-4-31b-q8_0",
+      "size_b": 31,
+      "quant": "Q8_0",
+      "artifact": "/models/gemma-4-31b-it-Q8_0.gguf",
+      "artifact_sha256": "REPLACE_WITH_SHA256",
+      "model": "gemma-4-31b-q8_0",
+      "engines": {
+        "fucina": {
+          "command": [
+            "./fucina",
+            "-m",
+            "{artifact}",
+            "--ctx",
+            "16384",
+            "--parallel",
+            "32",
+            "--max-concurrent",
+            "64",
+            "--port",
+            "18080"
+          ],
+          "base_url": "http://127.0.0.1:18080"
+        },
+        "vllm": {
+          "command": [
+            "vllm",
+            "serve",
+            "{vllm_artifact}",
+            "--served-model-name",
+            "{model}",
+            "--port",
+            "18080",
+            "--max-model-len",
+            "16384",
+            "--enable-prefix-caching"
+          ],
+          "base_url": "http://127.0.0.1:18080",
+          "ready_path": "/health"
+        }
+      },
+      "vllm_artifact": "/models/gemma-4-31b-it-Q8_0-vllm",
+      "vllm_artifact_sha256": "REPLACE_WITH_SHA256"
+    },
+    {
+      "id": "gemma-4-31b-nvfp4",
+      "size_b": 31,
+      "quant": "NVFP4",
+      "artifact": "/models/gemma-4-31b-it-NVFP4",
+      "artifact_sha256": "REPLACE_WITH_SHA256",
+      "model": "gemma-4-31b-nvfp4",
+      "engines": {
+        "fucina": {
+          "command": [
+            "./fucina",
+            "-m",
+            "{artifact}",
+            "--ctx",
+            "16384",
+            "--parallel",
+            "32",
+            "--max-concurrent",
+            "64",
+            "--port",
+            "18080"
+          ],
+          "base_url": "http://127.0.0.1:18080"
+        },
+        "vllm": {
+          "command": [
+            "vllm",
+            "serve",
+            "{vllm_artifact}",
+            "--served-model-name",
+            "{model}",
+            "--port",
+            "18080",
+            "--max-model-len",
+            "16384",
+            "--enable-prefix-caching"
+          ],
+          "base_url": "http://127.0.0.1:18080",
+          "ready_path": "/health"
+        }
+      },
+      "vllm_artifact": "/models/gemma-4-31b-it-NVFP4-vllm",
+      "vllm_artifact_sha256": "REPLACE_WITH_SHA256"
+    }
+  ]
+}
