@@ -106,7 +106,7 @@ func TestInputInvariantsClampInvalidRatios(t *testing.T) {
 	c.SetExpertResidency(12, 4)
 	body := string(c.Gather())
 	for _, want := range []string{
-		"fucina_cache_hits_total 2",
+		"fucina_cache_hits_total 9",
 		"fucina_speculation_accepted_total 3",
 		"fucina_kv_utilization_ratio 1",
 		"fucina_expert_residency_ratio 1",

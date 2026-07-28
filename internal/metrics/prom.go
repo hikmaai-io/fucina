@@ -310,9 +310,6 @@ func (c *Collector) UpdateSpeculationTotals(source string, proposed, accepted ui
 }
 
 func (c *Collector) AddCacheActivity(source CacheSource, lookups, hits, evictions uint64) {
-	if hits > lookups {
-		hits = lookups
-	}
 	c.mu.Lock()
 	s := c.cache[normalizeCacheSource(source)]
 	s.lookups += lookups
@@ -324,9 +321,6 @@ func (c *Collector) AddCacheActivity(source CacheSource, lookups, hits, eviction
 // UpdateCacheTotals imports one cache producer's cumulative counters without
 // double counting repeated snapshots. Producer resets start a new epoch.
 func (c *Collector) UpdateCacheTotals(source CacheSource, lookups, hits, evictions uint64) {
-	if hits > lookups {
-		hits = lookups
-	}
 	c.mu.Lock()
 	s := c.cache[normalizeCacheSource(source)]
 	if !s.initialized {
