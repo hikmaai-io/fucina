@@ -111,7 +111,8 @@ type Server struct {
 	// serveCompletions routes through it (per-step serialization, no per-request
 	// kv lock) instead of the single-flight kv path. Its presence is a pure
 	// additive opt-in: with it nil the behaviour is exactly as before.
-	scheduler *batch.Scheduler
+	scheduler            *batch.Scheduler
+	batchSamplingSupport batch.SamplingSupport
 }
 
 // prefillAborter is satisfied by engines that support cooperative prefill
@@ -229,19 +230,22 @@ func (m *ChatMessage) UnmarshalJSON(data []byte) error {
 }
 
 type ChatRequest struct {
-	Model       string          `json:"model"`
-	Messages    []ChatMessage   `json:"messages"`
-	Prompt      json.RawMessage `json:"prompt,omitempty"` // legacy /v1/completions
-	MaxTokens   int             `json:"max_tokens"`
-	Temperature *float64        `json:"temperature"`
-	TopP        *float64        `json:"top_p"`
-	TopK        *int            `json:"top_k"`
-	MinP        *float64        `json:"min_p"`
-	Seed        *int64          `json:"seed"`
-	Stream      bool            `json:"stream"`
-	Stop        StopField       `json:"stop,omitempty"`
-	Tools       []Tool          `json:"tools,omitempty"`
-	ToolChoice  interface{}     `json:"tool_choice,omitempty"`
+	Model            string          `json:"model"`
+	Messages         []ChatMessage   `json:"messages"`
+	Prompt           json.RawMessage `json:"prompt,omitempty"` // legacy /v1/completions
+	MaxTokens        int             `json:"max_tokens"`
+	Temperature      *float64        `json:"temperature"`
+	TopP             *float64        `json:"top_p"`
+	TopK             *int            `json:"top_k"`
+	MinP             *float64        `json:"min_p"`
+	Seed             *int64          `json:"seed"`
+	RepeatPenalty    *float64        `json:"repeat_penalty"`
+	FrequencyPenalty *float64        `json:"frequency_penalty"`
+	PresencePenalty  *float64        `json:"presence_penalty"`
+	Stream           bool            `json:"stream"`
+	Stop             StopField       `json:"stop,omitempty"`
+	Tools            []Tool          `json:"tools,omitempty"`
+	ToolChoice       interface{}     `json:"tool_choice,omitempty"`
 
 	// Thinking / reasoning control. gemma-4 gates a reasoning channel: when
 	// enabled the model emits a <|channel>thought…<channel|> block before its
@@ -616,6 +620,7 @@ func (s *Server) SetBatchEngine(eng BatchEngine) bool {
 	// (the engine still processes Capacity() at a time; this only bounds the wait queue,
 	// not concurrency). The scheduler's ErrQueueFull still sheds load past this.
 	depth := 3 * slots
+	s.batchSamplingSupport = batch.SamplingSupportFor(eng)
 	s.scheduler = batch.New(eng, depth)
 	s.scheduler.Start()
 	// Warm the per-B CUDA decode graphs BEFORE serving (vLLM captures its graphs at
@@ -1106,6 +1111,13 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	if req.Seed != nil {
 		params.Seed = *req.Seed
 	}
+	if req.RepeatPenalty != nil {
+		params.RepeatPenalty = *req.RepeatPenalty
+	}
+	if unsupported := unsupportedPenaltyParameter(req.FrequencyPenalty, req.PresencePenalty); unsupported != "" {
+		writeUnsupportedParameter(w, unsupported)
+		return
+	}
 	ctx := int(s.engine.ContextSize())
 	if req.MaxTokens > 0 {
 		params.MaxTokens = req.MaxTokens // explicit client cap
@@ -1199,6 +1211,14 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	// (the single-flight kv path) is left exactly as before for when batching is
 	// off (s.scheduler == nil).
 	if s.scheduler != nil {
+		if e4bBatchSamplingUnsupported(s.batchSamplingSupport, params) {
+			writeE4BBatchSamplingUnsupported(w)
+			return
+		}
+		if repeatPenaltyUnsupported(s.batchSamplingSupport, params) {
+			writeUnsupportedParameter(w, "repeat_penalty")
+			return
+		}
 		if params.Constraint != nil && !s.scheduler.SupportsConstraints() {
 			// Preserve the existing fail-closed gate for batch adapters that cannot
 			// expose exact per-row logits (notably E4B). Mandatory Qwen batching and
@@ -1410,9 +1430,9 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 // for the batched path, but it never touches the kv lock — the scheduler owns
 // the engine and serializes per step, not per request.
 //
-// Sampling note: the current batched C ABI samples greedily on-device regardless
-// of SeqParams. The params are still forwarded so the contract is stable for when
-// the kernels grow temperature/top-k support.
+// Sampling note: device-supported controls stay per-row on the paged sampler. A
+// non-default repeat penalty uses the scheduler's exact-logit host fallback, which
+// preserves request-local RNG/history without changing CUDA decode kernels.
 func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params GenerationParams, tokens []int32, wantTools, legacy bool, sessionPath string, diskState *batch.StateSnapshot) {
 	stops := s.tokenizer.StopIDs()
 
