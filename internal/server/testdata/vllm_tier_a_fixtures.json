@@ -1,0 +1,9 @@
+{
+  "tokenize_response_keys": ["count", "max_model_len", "tokens"],
+  "detokenize_response_keys": ["prompt"],
+  "version_response_keys": ["version"],
+  "model_detail_required_keys": ["id", "object", "owned_by", "family", "architecture", "capabilities", "fingerprints"],
+  "error_required_keys": ["message", "type"],
+  "usage_only_choices_length": 0,
+  "usage_required_keys": ["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details"]
+}

@@ -18,12 +18,16 @@ func twoTurnCompletionPrompt(t *testing.T, prompt1 string, first CompletionRespo
 
 func runLegacyCompletion(t *testing.T, srv *Server, prompt string, stream bool) (CompletionResponse, []string) {
 	t.Helper()
-	req := httptest.NewRequest("POST", "/v1/completions", chatBody(t, map[string]interface{}{
+	body := map[string]interface{}{
 		"prompt":      prompt,
 		"max_tokens":  16,
 		"temperature": 0,
 		"stream":      stream,
-	}))
+	}
+	if stream {
+		body["stream_options"] = map[string]bool{"include_usage": true}
+	}
+	req := httptest.NewRequest("POST", "/v1/completions", chatBody(t, body))
 	rec := httptest.NewRecorder()
 	mux(srv).ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -152,10 +156,11 @@ func TestCompletionSecondTurnStreamCollectedUsageParity(t *testing.T) {
 func TestBatchStreamFinalUsagePromptTokensNonZero(t *testing.T) {
 	srv := newQwenBatchServer(t, []int32{17, 18, qImEnd})
 	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
-		"messages":    []map[string]string{{"role": "user", "content": "hi"}},
-		"stream":      true,
-		"max_tokens":  16,
-		"temperature": 0,
+		"messages":       []map[string]string{{"role": "user", "content": "hi"}},
+		"stream":         true,
+		"stream_options": map[string]bool{"include_usage": true},
+		"max_tokens":     16,
+		"temperature":    0,
 	}))
 	rec := httptest.NewRecorder()
 	mux(srv).ServeHTTP(rec, req)

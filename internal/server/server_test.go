@@ -380,10 +380,11 @@ func TestChatCompletionsStream(t *testing.T) {
 	srv.SetLogLevel("warn")
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
-		"messages":    []map[string]string{{"role": "user", "content": "hi"}},
-		"max_tokens":  16,
-		"temperature": 0,
-		"stream":      true,
+		"messages":       []map[string]string{{"role": "user", "content": "hi"}},
+		"max_tokens":     16,
+		"temperature":    0,
+		"stream":         true,
+		"stream_options": map[string]bool{"include_usage": true},
 	}))
 	rec := httptest.NewRecorder()
 	mux(srv).ServeHTTP(rec, req)
@@ -420,6 +421,12 @@ func TestChatCompletionsStream(t *testing.T) {
 		if err := json.Unmarshal([]byte(e), &sr); err != nil {
 			t.Fatalf("bad chunk %q: %v", e, err)
 		}
+		if sr.Usage != nil {
+			sawUsage = true
+			if sr.Usage.CompletionTokens != 2 {
+				t.Errorf("usage completion=%d want 2", sr.Usage.CompletionTokens)
+			}
+		}
 		if len(sr.Choices) == 0 {
 			continue
 		}
@@ -433,12 +440,6 @@ func TestChatCompletionsStream(t *testing.T) {
 		}
 		if sr.Choices[0].FinishReason == "stop" {
 			sawFinish = true
-		}
-		if sr.Usage != nil {
-			sawUsage = true
-			if sr.Usage.CompletionTokens != 2 {
-				t.Errorf("usage completion=%d want 2", sr.Usage.CompletionTokens)
-			}
 		}
 	}
 	if !sawRole {
