@@ -25,6 +25,7 @@ import (
 	"github.com/hikmaai-io/fucina/internal/engine/cuda"
 	"github.com/hikmaai-io/fucina/internal/engine/diffusion"
 	"github.com/hikmaai-io/fucina/internal/engine/e4b"
+	"github.com/hikmaai-io/fucina/internal/model"
 	"github.com/hikmaai-io/fucina/internal/sampler"
 	gemserver "github.com/hikmaai-io/fucina/internal/server"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
@@ -161,7 +162,17 @@ func main() {
 	// created. The (mmap-ing) detector is guarded by a cheap suffix/dir pre-filter so a
 	// multi-GB non-E4B GGUF never reaches it.
 	if e4b.LooksLikeCheckpoint(args.ModelPath) && e4b.IsE4B(args.ModelPath) {
-		runE4B(args)
+		var modelStore *model.Store
+		if strings.HasSuffix(strings.ToLower(args.ModelPath), ".gguf") {
+			log.Printf("fucina: capability manifest preflight unavailable for E4B GGUF; using engine loader checks")
+		} else {
+			descriptor, err := model.LoadDescriptor(args.ModelPath)
+			if err != nil {
+				log.Fatalf("fucina: model manifest preflight failed: %v", err)
+			}
+			modelStore = model.NewStore(descriptor)
+		}
+		runE4B(args, modelStore)
 		return
 	}
 
@@ -210,6 +221,15 @@ func main() {
 		}
 		os.Setenv("FUCINA_PAGED_MAXSEQS", fmt.Sprintf("%d", maxSeqs))
 	}
+
+	// Build and preflight the source-derived manifest before CUDA allocates weights.
+	descriptor, err := model.LoadDescriptor(args.ModelPath)
+	if err != nil {
+		log.Fatalf("fucina: model manifest preflight failed: %v", err)
+	}
+	modelStore := model.NewStore(descriptor)
+	log.Printf("fucina: model manifest: %s/%s source=%s qualification=%s",
+		descriptor.Family(), descriptor.Variant(), descriptor.SourceQuantization(), descriptor.Qualification())
 
 	// Initialize engine (weight format Q4_0-QAT/Q8_0 auto-detected from the GGUF)
 	log.Printf("fucina: loading model %s (ctx=%d, device=%d)...",
@@ -292,6 +312,7 @@ func main() {
 		eng.Warmup()
 		log.Printf("fucina: prefill scratch warmed in %.2fs", time.Since(warmStart).Seconds())
 		srv := gemserver.New(eng, tok)
+		srv.SetModelStore(modelStore)
 		// Report a quantization-aware model id (GGUF basename minus extension), e.g.
 		// gemma-4-12b-it-qat-q4_0, so clients can see which build/quant they hit.
 		srv.SetModelName(deriveModelID(args.ModelPath))

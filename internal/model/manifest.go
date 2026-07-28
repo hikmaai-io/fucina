@@ -383,6 +383,16 @@ func intSlice(m map[string]any, key string) []int {
 	return nil
 }
 
+func metadataArrayLen(v any) int {
+	switch x := v.(type) {
+	case []any:
+		return len(x)
+	case []string:
+		return len(x)
+	}
+	return 0
+}
+
 func boolSlice(m map[string]any, key string) []bool {
 	v := m[key]
 	switch x := v.(type) {
@@ -449,6 +459,9 @@ func buildGemmaGGUF(s DescriptorSnapshot, m map[string]any, tensors map[string]T
 		g.VocabSize, _ = intValue(m, "tokenizer.ggml.token_count")
 	}
 	if g.VocabSize <= 0 {
+		g.VocabSize = metadataArrayLen(m["tokenizer.ggml.tokens"])
+	}
+	if g.VocabSize <= 0 {
 		mismatch(errs, "metadata.gemma4.vocab_size", MismatchMetadata, "positive integer or tokenizer token count", "missing")
 	}
 	g.HeadDim, _ = intValue(m, "gemma4.attention.key_length_swa")
@@ -510,6 +523,9 @@ func buildQwenGGUF(s DescriptorSnapshot, m map[string]any, tensors map[string]Te
 	g.GlobalKVHeads = g.KVHeads
 	g.HeadDim = requiredInt(m, errs, "qwen35.attention.key_length", "qwen35.attention.key_length")
 	g.VocabSize, _ = intValue(m, "qwen35.vocab_size", "tokenizer.ggml.token_count")
+	if g.VocabSize <= 0 {
+		g.VocabSize = metadataArrayLen(m["tokenizer.ggml.tokens"])
+	}
 	if g.VocabSize <= 0 {
 		mismatch(errs, "metadata.qwen35.vocab_size", MismatchMetadata, "positive integer", "missing")
 	}

@@ -21,6 +21,7 @@ import (
 
 	"github.com/hikmaai-io/fucina/internal/chat"
 	"github.com/hikmaai-io/fucina/internal/grammar"
+	"github.com/hikmaai-io/fucina/internal/model"
 	"github.com/hikmaai-io/fucina/internal/sampler"
 	"github.com/hikmaai-io/fucina/internal/server/batch"
 	"github.com/hikmaai-io/fucina/internal/session"
@@ -58,6 +59,7 @@ type Server struct {
 	kv              *KVCache
 	dialect         chat.Dialect // per-model chat wire format, detected from the vocab
 	modelName       string
+	modelStore      *model.Store
 	genParams       GenerationParams
 	thinkingDefault bool         // startup default for the gemma-4 reasoning channel
 	debug           bool         // dump full request bodies + rendered prompts
@@ -713,6 +715,11 @@ func (s *Server) SetModelName(name string) {
 		s.modelName = name
 	}
 }
+
+// SetModelStore publishes the startup-preflighted descriptor for model-detail routes.
+// It must be called before Start; ModelStore may return nil for unsupported families.
+func (s *Server) SetModelStore(store *model.Store) { s.modelStore = store }
+func (s *Server) ModelStore() *model.Store         { return s.modelStore }
 
 // SetThinkingDefault sets the startup default for the gemma-4 reasoning channel.
 // Per-request reasoning_effort / thinking / enable_thinking overrides it.
