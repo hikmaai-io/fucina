@@ -1,0 +1,296 @@
+2026/07/28 20:40:19 fucina: model manifest: qwen3.5/Qwen3.5-9B-dense source=FP8_BLOCK_128 qualification=validated
+2026/07/28 20:40:19 fucina: loading model /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8 (ctx=262144, device=0)...
+fucina: loaded /opt/spark/models/models--Qwen--Qwen3.5-9B-FP8 (directory)
+fucina: qwen35 geometry (runtime-derived) — NQ=16 NKV=4 NVH=32 INNER=4096 CONVD=8192 (M2 baked NQ16/NVH32/INNER4096)
+fucina: qwen35 host preflight passed (all required tensors validated before CUDA allocation)
+fucina: Qwen3.5 block-FP8 checkpoint detected → batched engine
+fucina: qwen35 tensor plan finalized: entries=433 core=3.65 GiB scales=0.00 MiB
+fucina: qwen35-Q4K mixer repacked in place (200 tensors → packed dp4a GEMV)
+fucina: qwen35 allocation decision: source=block-FP8 mixer=Q4_K experts=n/a d_weights=3.65 GiB
+fucina: qwen35 allocation ledger: experts=0.00 core=3.65 scales=0.00 embed=6.69 head=2.90 moe-scratch=0.00 misc=0.00 total=13.24 GiB
+fucina: qwen35 free-memory trace: enter=32.71 after-experts=26.14 after-core=28.07 before-scratch=18.96 after-scratch=18.96 final=18.96 GiB
+fucina: qwen35 host-memory trace: free 32.71->18.96 available 111.53->96.82 cached 74.89->73.94 reclaimable 3.57->3.56 GiB
+fucina: qwen35 observed deltas: experts=+6.57 core=-1.93 embed/head=+9.11 moe-scratch=+0.00 fill-total=+13.75 ledger-residual=+0.51 GiB
+fucina: qwen35 Q4_K-dense served via batched engine (32 layers, vocab 248320, H 4096, NKV 4, 3.65 GiB)
+fucina: ── GPU memory budget ──────────────────────────────
+fucina:   total device mem :   119.69 GiB
+fucina:   free at start    :    32.97 GiB  (shared box: 86.72 GiB held by others)
+fucina:   --gpu-mem-util   :     0.90
+fucina:   budget (our cap) :   107.72 GiB
+fucina:   weights+scratch  :    14.01 GiB  (resident, measured)
+fucina:   KV sliding ring  :     0.00 GiB  (cap 8192, ctx-independent)
+fucina:   KV global        :     0.00 GiB  (ctx 262144)
+fucina:   packed Q4_0 copy :     0.00 GiB  (n/a)
+fucina:   NVFP4 prefill wts:     0.00 GiB  (n/a)
+fucina:   ─────────────────────────────────────────────────
+fucina:   our total        :    14.01 GiB  (within budget by 93.71 GiB)
+fucina: engine initialized (3.65 GB model, 262144 ctx, Q8_0)
+fucina: 24 sliding + 8 global layers
+fucina: KV cache: sliding=0.0 MB, global=0.0 MB
+fucina: qwen35 exact Q8 LM-head rows/warp=1 (safe default)
+fucina: qwen35 M4 attn caps context at 25280 (store-in-shared); requested 262144
+fucina: qwen35 memory-plan inputs: requested=32 slotctx=8192 maxctx=25280 cuda-free=18.94 GiB available=96.80 GiB model-resident=13.24 GiB (ledger) workspace=4.00 GiB reserve/slot=0.28 GiB (max 0.80) physical-room=96.30 GiB budget-room=94.48 GiB chosen-room=94.48 GiB fit=328
+fucina: qwen35 prefill weight-cache ON (decision=auto, need 17.00 GiB, cuda-free 14.90 GiB, available 92.75 GiB, physical=fit, budget=fit, reserved-before 12.82 GiB, room 94.48 GiB)
+fucina: qwen35 NVFP4 prefill GEMM off (not requested; FUCINA_QWEN35_FP4!=1)
+fucina: qwen35 memory plan ready: maxctx=25280 slotctx=8192 slots=32/32 workspace=4.00 GiB reserve/slot=0.28 GiB (recurrent 0.03 + KV 0.25; max-KV 0.77) committed=4.00 GiB reserved=29.82 GiB
+fucina: qwen35 M4 batch graph captured (nt=1 nr=1 utc=1)
+2026/07/28 20:41:11 fucina: prefill scratch warmed in 2.63s
+2026/07/28 20:41:11 fucina: ChatML vocab detected — using the Qwen chat dialect (template + tool calls)
+fucina: qwen35 M4 batch graph captured (nt=31 nr=31 utc=1)
+2026/07/28 20:41:14 fucina: hybrid state-snapshot conversation cache enabled (budget 8192 MiB)
+fucina: qwen35 M4 batch graph captured (nt=30 nr=30 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=29 nr=29 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=28 nr=28 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=27 nr=27 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=26 nr=26 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=25 nr=25 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=24 nr=24 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=23 nr=23 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=22 nr=22 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=21 nr=21 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=20 nr=20 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=19 nr=19 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=18 nr=18 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=17 nr=17 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=16 nr=16 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=15 nr=15 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=14 nr=14 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=13 nr=13 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=12 nr=12 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=11 nr=11 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=10 nr=10 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=9 nr=9 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=8 nr=8 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=7 nr=7 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=6 nr=6 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=5 nr=5 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=4 nr=4 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=3 nr=3 utc=1)
+fucina: qwen35 M4 batch graph captured (nt=2 nr=2 utc=1)
+2026/07/28 20:41:16 fucina: batch decode graphs warmed (B=1..32) in 4.5s
+2026/07/28 20:41:16 fucina: continuous batching ENABLED (paged KV multi-sequence)
+2026/07/28 20:41:16 fucina: server starting on 127.0.0.1:18080
+2026/07/28 20:41:16 fucina: model=/opt/spark/models/models--Qwen--Qwen3.5-9B-FP8 ctx=262144
+2026/07/28 20:41:16 fucina: server listening on 127.0.0.1:18080
+2026/07/28 20:41:16 fucina: [5e9fe52772f1488a] GET /health -> 200 (0ms)
+2026/07/28 20:41:16 fucina: chat: 0 msgs, 0 tools, sys=0ch, 17 prompt-tok, thinking=false, stream=true
+2026/07/28 20:41:17 fucina: generated 16 tokens in 0.53s (30.1 tok/s)
+2026/07/28 20:41:17 fucina: [65ac724464111987] POST /v1/completions -> 200 (532ms)
+2026/07/28 20:41:17 fucina: chat: 0 msgs, 0 tools, sys=0ch, 17 prompt-tok, thinking=false, stream=true
+2026/07/28 20:41:17 batch: telemetry: 64 steps / 5.8s — avgB 8.3, engine 43.60 ms/step, deliver 0.004, evict 0.002 (n=33), admit 44.062 (eng 44.053), pass 87.68 — 529 tok (91 tok/s)
+2026/07/28 20:41:20 fucina: generated 128 tokens in 3.78s (33.8 tok/s)
+2026/07/28 20:41:20 fucina: [e190d9a43854e5a5] POST /v1/completions -> 200 (3785ms)
+2026/07/28 20:41:20 fucina: chat: 0 msgs, 0 tools, sys=0ch, 17 prompt-tok, thinking=false, stream=true
+2026/07/28 20:41:22 batch: telemetry: 169 steps / 5.0s — avgB 1.0, engine 29.05 ms/step, deliver 0.002, evict 0.076 (n=1), admit 0.610 (eng 0.534), pass 29.67 — 169 tok (34 tok/s)
+2026/07/28 20:41:24 fucina: generated 128 tokens in 3.80s (33.7 tok/s)
+2026/07/28 20:41:24 fucina: [b10aaac55c8c046f] POST /v1/completions -> 200 (3796ms)
+2026/07/28 20:41:24 fucina: chat: 0 msgs, 0 tools, sys=0ch, 17 prompt-tok, thinking=false, stream=true
+2026/07/28 20:41:27 batch: telemetry: 169 steps / 5.0s — avgB 1.0, engine 29.12 ms/step, deliver 0.001, evict 0.004 (n=1), admit 0.535 (eng 0.531), pass 29.65 — 169 tok (34 tok/s)
+2026/07/28 20:41:28 fucina: generated 128 tokens in 3.80s (33.7 tok/s)
+2026/07/28 20:41:28 fucina: [929b655c4d94382d] POST /v1/completions -> 200 (3799ms)
+2026/07/28 20:41:28 fucina: chat: 0 msgs, 0 tools, sys=0ch, 5950 prompt-tok, thinking=false, stream=true
+2026/07/28 20:41:40 batch: telemetry: 64 steps / 12.9s — avgB 1.0, engine 30.46 ms/step, deliver 0.002, evict 0.010 (n=1), admit 170.371 (eng 0.000), pass 34.83 — 64 tok (5 tok/s)
+2026/07/28 20:41:43 fucina: generated 128 tokens in 14.87s (8.6 tok/s)
+2026/07/28 20:41:43 fucina: [4759c9a17bebf4df] POST /v1/completions -> 200 (14872ms)
+2026/07/28 20:41:43 fucina: chat: 0 msgs, 0 tools, sys=0ch, 5950 prompt-tok, thinking=false, stream=true
+2026/07/28 20:41:54 batch: telemetry: 89 steps / 13.6s — avgB 1.0, engine 31.16 ms/step, deliver 0.002, evict 0.879 (n=1), admit 121.138 (eng 0.000), pass 34.34 — 89 tok (7 tok/s)
+2026/07/28 20:41:58 fucina: generated 128 tokens in 14.74s (8.7 tok/s)
+2026/07/28 20:41:58 fucina: [9f9f9c1edae821c8] POST /v1/completions -> 200 (14745ms)
+2026/07/28 20:41:58 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:41:59 batch: telemetry: 160 steps / 5.0s — avgB 1.0, engine 30.75 ms/step, deliver 0.002, evict 0.025 (n=1), admit 0.564 (eng 0.537), pass 31.34 — 160 tok (32 tok/s)
+2026/07/28 20:42:01 fucina: generated 128 tokens in 3.80s (33.7 tok/s)
+2026/07/28 20:42:01 fucina: [6f9eb9a8c144ddf6] POST /v1/completions -> 200 (3798ms)
+2026/07/28 20:42:01 fucina: chat: 0 msgs, 0 tools, sys=0ch, 10 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:01 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:04 batch: telemetry: 158 steps / 5.0s — avgB 1.4, engine 31.01 ms/step, deliver 0.002, evict 0.086 (n=1), admit 0.651 (eng 0.565), pass 31.71 — 223 tok (45 tok/s)
+2026/07/28 20:42:06 fucina: generated 128 tokens in 4.39s (29.2 tok/s)
+2026/07/28 20:42:06 fucina: generated 128 tokens in 4.39s (29.2 tok/s)
+2026/07/28 20:42:06 fucina: [00337301c1a3798f] POST /v1/completions -> 200 (4390ms)
+2026/07/28 20:42:06 fucina: [7abf45c7f319e5a9] POST /v1/completions -> 200 (4390ms)
+2026/07/28 20:42:06 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:06 fucina: chat: 0 msgs, 0 tools, sys=0ch, 10 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:06 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:06 fucina: chat: 0 msgs, 0 tools, sys=0ch, 19 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:09 batch: telemetry: 144 steps / 5.0s — avgB 3.1, engine 33.78 ms/step, deliver 0.005, evict 0.172 (n=2), admit 0.867 (eng 0.692), pass 34.73 — 452 tok (90 tok/s)
+2026/07/28 20:42:10 fucina: generated 128 tokens in 4.43s (28.9 tok/s)
+2026/07/28 20:42:10 fucina: generated 128 tokens in 4.43s (28.9 tok/s)
+2026/07/28 20:42:10 fucina: [2036fbe7a35f9c60] POST /v1/completions -> 200 (4430ms)
+2026/07/28 20:42:10 fucina: [9c2b1501f53bee98] POST /v1/completions -> 200 (4430ms)
+2026/07/28 20:42:10 fucina: generated 128 tokens in 4.43s (28.9 tok/s)
+2026/07/28 20:42:10 fucina: [d15fdd3b47b7b778] POST /v1/completions -> 200 (4431ms)
+2026/07/28 20:42:10 fucina: generated 128 tokens in 4.43s (28.9 tok/s)
+2026/07/28 20:42:10 fucina: [54a7fd47844cba10] POST /v1/completions -> 200 (4431ms)
+2026/07/28 20:42:10 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:10 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:10 fucina: chat: 0 msgs, 0 tools, sys=0ch, 10 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:10 fucina: chat: 0 msgs, 0 tools, sys=0ch, 19 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:10 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:10 fucina: chat: 0 msgs, 0 tools, sys=0ch, 12 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:10 fucina: chat: 0 msgs, 0 tools, sys=0ch, 11 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:10 fucina: chat: 0 msgs, 0 tools, sys=0ch, 19 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:14 batch: telemetry: 137 steps / 5.0s — avgB 6.7, engine 35.47 ms/step, deliver 0.014, evict 0.248 (n=4), admit 1.086 (eng 0.835), pass 36.76 — 916 tok (182 tok/s)
+2026/07/28 20:42:15 fucina: generated 128 tokens in 4.79s (26.7 tok/s)
+2026/07/28 20:42:15 fucina: [e3b1d77d7188df6c] POST /v1/completions -> 200 (4789ms)
+2026/07/28 20:42:15 fucina: generated 128 tokens in 4.79s (26.7 tok/s)
+2026/07/28 20:42:15 fucina: [ae235e57ece9c6e7] POST /v1/completions -> 200 (4789ms)
+2026/07/28 20:42:15 fucina: generated 128 tokens in 4.79s (26.7 tok/s)
+2026/07/28 20:42:15 fucina: generated 128 tokens in 4.79s (26.7 tok/s)
+2026/07/28 20:42:15 fucina: generated 128 tokens in 4.79s (26.7 tok/s)
+2026/07/28 20:42:15 fucina: [8c2213c488dca023] POST /v1/completions -> 200 (4789ms)
+2026/07/28 20:42:15 fucina: generated 128 tokens in 4.79s (26.7 tok/s)
+2026/07/28 20:42:15 fucina: generated 128 tokens in 4.79s (26.7 tok/s)
+2026/07/28 20:42:15 fucina: [8b710cf4227f266e] POST /v1/completions -> 200 (4790ms)
+2026/07/28 20:42:15 fucina: [ece3fbe938090221] POST /v1/completions -> 200 (4788ms)
+2026/07/28 20:42:15 fucina: [af0490edcba42e97] POST /v1/completions -> 200 (4787ms)
+2026/07/28 20:42:15 fucina: generated 128 tokens in 4.79s (26.7 tok/s)
+2026/07/28 20:42:15 fucina: [079b512fc1f7aa2b] POST /v1/completions -> 200 (4788ms)
+2026/07/28 20:42:15 fucina: [be8958a76dee59a2] POST /v1/completions -> 200 (4787ms)
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 10 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 11 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 12 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 19 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 19 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 12 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 17 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 14 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 18 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:15 fucina: chat: 0 msgs, 0 tools, sys=0ch, 14 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:19 batch: telemetry: 110 steps / 5.0s — avgB 13.5, engine 43.33 ms/step, deliver 0.010, evict 0.463 (n=8), admit 1.838 (eng 1.363), pass 45.55 — 1480 tok (295 tok/s)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.19s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [098ae037e8255350] POST /v1/completions -> 200 (6186ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [99f3ff8bd3630500] POST /v1/completions -> 200 (6185ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [179d3aab4cdbd73d] POST /v1/completions -> 200 (6184ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [7766eb7f34ab6408] POST /v1/completions -> 200 (6182ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [449abd2206c2f9c6] POST /v1/completions -> 200 (6182ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [70e7225c64095598] POST /v1/completions -> 200 (6181ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [a903cc815eea65d9] POST /v1/completions -> 200 (6181ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [05f9817872d5459d] POST /v1/completions -> 200 (6181ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.19s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [ca09c7148a608f7e] POST /v1/completions -> 200 (6182ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [27d1abea9e17acbb] POST /v1/completions -> 200 (6187ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [75a5fe0e58924fdb] POST /v1/completions -> 200 (6182ms)
+2026/07/28 20:42:21 fucina: [af6feba1cfeb74e2] POST /v1/completions -> 200 (6182ms)
+2026/07/28 20:42:21 fucina: [7d3bcb25651c6558] POST /v1/completions -> 200 (6184ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [a3800c44cde87f51] POST /v1/completions -> 200 (6184ms)
+2026/07/28 20:42:21 fucina: generated 128 tokens in 6.18s (20.7 tok/s)
+2026/07/28 20:42:21 fucina: [8483eb31856b4566] POST /v1/completions -> 200 (6185ms)
+2026/07/28 20:42:21 fucina: [148fea1a2ccc1463] POST /v1/completions -> 200 (6184ms)
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 10 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 19 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 12 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 11 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 19 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 17 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 12 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 18 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 14 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 14 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 10 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 19 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 12 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 11 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 19 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 16 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 15 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 17 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 12 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 18 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 14 prompt-tok, thinking=false, stream=true
+2026/07/28 20:42:21 fucina: chat: 0 msgs, 0 tools, sys=0ch, 14 prompt-tok, thinking=false, stream=true
+fucina: qwen35 M4 batch graph captured (nt=32 nr=32 utc=1)
+2026/07/28 20:42:24 batch: telemetry: 81 steps / 5.0s — avgB 21.7, engine 57.19 ms/step, deliver 0.020, evict 1.243 (n=16), admit 4.171 (eng 2.925), pass 61.73 — 1760 tok (352 tok/s)
+2026/07/28 20:42:29 batch: telemetry: 68 steps / 5.0s — avgB 32.0, engine 73.37 ms/step, deliver 0.035, evict 0.000 (n=0), admit 0.008 (eng 0.000), pass 73.76 — 2176 tok (434 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [2278b6af7eed46fc] POST /v1/completions -> 200 (9708ms)
+2026/07/28 20:42:31 fucina: [599be06d6a177b20] POST /v1/completions -> 200 (9709ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [8095b7cad638cebe] POST /v1/completions -> 200 (9718ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [a6ec3a365c5b3066] POST /v1/completions -> 200 (9717ms)
+2026/07/28 20:42:31 fucina: [a649fddc6d5ace4a] POST /v1/completions -> 200 (9715ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [b53aab312d378722] POST /v1/completions -> 200 (9716ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [dee433952a9c2330] POST /v1/completions -> 200 (9713ms)
+2026/07/28 20:42:31 fucina: [d28fefcd06c7e18a] POST /v1/completions -> 200 (9716ms)
+2026/07/28 20:42:31 fucina: [44d76098f31dec24] POST /v1/completions -> 200 (9718ms)
+2026/07/28 20:42:31 fucina: [ad51cb6122667318] POST /v1/completions -> 200 (9708ms)
+2026/07/28 20:42:31 fucina: [7e55c9a4da8e689b] POST /v1/completions -> 200 (9715ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [4baf92a5907b1936] POST /v1/completions -> 200 (9713ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [cfce52464d528d55] POST /v1/completions -> 200 (9716ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [a7653316bc6a8a6b] POST /v1/completions -> 200 (9709ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [429f7da1095e9e2e] POST /v1/completions -> 200 (9710ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [b8bccbc93867990b] POST /v1/completions -> 200 (9712ms)
+2026/07/28 20:42:31 fucina: [2de4d90622068f14] POST /v1/completions -> 200 (9717ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [4f682e1e8bc70bc7] POST /v1/completions -> 200 (9716ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [27d6730149dac7a7] POST /v1/completions -> 200 (9710ms)
+2026/07/28 20:42:31 fucina: [3a3f47bf94ec56bb] POST /v1/completions -> 200 (9714ms)
+2026/07/28 20:42:31 fucina: [3c65b798007fc967] POST /v1/completions -> 200 (9713ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.72s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [411efa53b1b67db5] POST /v1/completions -> 200 (9709ms)
+2026/07/28 20:42:31 fucina: [e78c893ef323c1e4] POST /v1/completions -> 200 (9709ms)
+2026/07/28 20:42:31 fucina: [7800e2d3b70b119f] POST /v1/completions -> 200 (9718ms)
+2026/07/28 20:42:31 fucina: [59ea9525c75691c4] POST /v1/completions -> 200 (9714ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [b88c3c5c85ca0d43] POST /v1/completions -> 200 (9711ms)
+2026/07/28 20:42:31 fucina: [cdfb238a2de42882] POST /v1/completions -> 200 (9711ms)
+2026/07/28 20:42:31 fucina: [ee27408fd1612925] POST /v1/completions -> 200 (9712ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [fc382c11ed5f582b] POST /v1/completions -> 200 (9718ms)
+2026/07/28 20:42:31 fucina: [572d1f2190594baa] POST /v1/completions -> 200 (9712ms)
+2026/07/28 20:42:31 fucina: generated 128 tokens in 9.71s (13.2 tok/s)
+2026/07/28 20:42:31 fucina: [a7b667908d06dbfa] POST /v1/completions -> 200 (9712ms)
+2026/07/28 20:42:31 fucina: [13ae3dfb8c18083e] POST /v1/completions -> 200 (9711ms)
+2026/07/28 20:42:31 fucina: shutting down...
