@@ -1,0 +1,92 @@
+{
+  "label": "divnat-06b39ed",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 84.01653100736439,
+    "decode_tps": 58.95921198260708,
+    "ntok": 128,
+    "sample": "Continuous batching (also known as **dynamic batching** or **in-flight batching**) is a technique used in Large Language Model (LLM) serving to maximize throughput by eliminating the idle time that oc"
+  },
+  "single_long": {
+    "ttft_ms": 5224.733039969578,
+    "decode_tps": 51.496820360520914,
+    "ntok": 128,
+    "sample": "\n\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Input: A long text that is heavily repetitive. It repeats the same paragraph about large language model (LLM) inference multiple times (over 5"
+  },
+  "concurrency": [
+    {
+      "N": 2,
+      "agg_decode_tps": 61.08944700978369,
+      "median_ttft_ms": 84.40191854606383,
+      "p95_ttft_ms": 105.67659203661606,
+      "ttfts_ms_raw": [
+        63.13,
+        105.68
+      ],
+      "median_per_stream_tps": 54.06678204449989,
+      "wall_s": 0.933058045047801
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 165.90457730348678,
+      "median_ttft_ms": 171.52815201552585,
+      "p95_ttft_ms": 205.5422340054065,
+      "ttfts_ms_raw": [
+        140.1,
+        141.91,
+        171.0,
+        171.35,
+        171.71,
+        171.91,
+        203.34,
+        205.54
+      ],
+      "median_per_stream_tps": 31.67706205708375,
+      "wall_s": 4.062576277006883
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 374.70717979127465,
+      "median_ttft_ms": 438.8212225167081,
+      "p95_ttft_ms": 505.5190859711729,
+      "ttfts_ms_raw": [
+        363.83,
+        364.29,
+        367.36,
+        370.46,
+        370.96,
+        373.67,
+        431.65,
+        431.88,
+        434.11,
+        434.83,
+        435.01,
+        435.59,
+        435.66,
+        437.21,
+        437.58,
+        438.02,
+        439.62,
+        439.68,
+        441.48,
+        442.26,
+        443.79,
+        444.1,
+        496.87,
+        497.72,
+        498.04,
+        499.92,
+        501.44,
+        504.22,
+        505.33,
+        505.52,
+        507.88,
+        509.29
+      ],
+      "median_per_stream_tps": 17.48264618142887,
+      "wall_s": 7.675326641998254
+    }
+  ],
+  "diverse": true
+}

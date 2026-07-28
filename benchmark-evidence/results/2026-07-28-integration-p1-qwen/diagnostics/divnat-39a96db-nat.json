@@ -1,0 +1,92 @@
+{
+  "label": "divnat-39a96db-nat",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 82.16513099614531,
+    "decode_tps": 60.87418654474032,
+    "ntok": 128,
+    "sample": "Continuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous batching improves LLL serving throughput.\n\nAnswer:\n\nContinuous "
+  },
+  "single_long": {
+    "ttft_ms": 5180.718587478623,
+    "decode_tps": 52.9817261873565,
+    "ntok": 128,
+    "sample": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+  },
+  "concurrency": [
+    {
+      "N": 2,
+      "agg_decode_tps": 101.06946483164724,
+      "median_ttft_ms": 71.4701434771996,
+      "p95_ttft_ms": 81.32794895209372,
+      "ttfts_ms_raw": [
+        61.61,
+        81.33
+      ],
+      "median_per_stream_tps": 52.030998536097314,
+      "wall_s": 2.5131230329861864
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 204.9572494429615,
+      "median_ttft_ms": 188.40424850350246,
+      "p95_ttft_ms": 222.19358303118497,
+      "ttfts_ms_raw": [
+        152.74,
+        155.63,
+        187.92,
+        188.09,
+        188.72,
+        189.21,
+        190.06,
+        222.19
+      ],
+      "median_per_stream_tps": 30.6279816267769,
+      "wall_s": 4.337489902973175
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 465.0546370154019,
+      "median_ttft_ms": 449.663170526037,
+      "p95_ttft_ms": 501.4228539657779,
+      "ttfts_ms_raw": [
+        376.78,
+        376.94,
+        379.56,
+        383.09,
+        383.89,
+        386.4,
+        443.31,
+        445.15,
+        445.7,
+        446.77,
+        447.12,
+        447.78,
+        448.11,
+        448.16,
+        448.3,
+        449.36,
+        449.97,
+        450.77,
+        450.84,
+        451.46,
+        451.66,
+        453.21,
+        454.45,
+        454.67,
+        454.8,
+        454.83,
+        455.36,
+        456.15,
+        501.27,
+        501.42,
+        501.62,
+        507.59
+      ],
+      "median_per_stream_tps": 18.332656155098448,
+      "wall_s": 7.386228899995331
+    }
+  ],
+  "diverse": true
+}

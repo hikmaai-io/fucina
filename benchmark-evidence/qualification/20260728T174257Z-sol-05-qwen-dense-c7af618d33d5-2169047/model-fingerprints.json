@@ -1,0 +1,9 @@
+[
+  {
+    "path": "/opt/spark/models/models--Qwen--Qwen3.5-9B-FP8",
+    "resolved_path": "/opt/spark/models/models--Qwen--Qwen3.5-9B-FP8",
+    "sha256": "565c2288bd9a9f0fa6b18930d35773af3169f9ece605cf94b82c706279d6e666",
+    "file_count": 17,
+    "bytes": 12208446065
+  }
+]

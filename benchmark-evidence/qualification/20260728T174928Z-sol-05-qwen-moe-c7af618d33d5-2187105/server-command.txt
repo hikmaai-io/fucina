@@ -1,0 +1,1 @@
+./fucina -m '/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/0b2752837483aa34b3db6e83e151b150c0e00e49' --port '18080' --parallel 32 --max-concurrent 64
