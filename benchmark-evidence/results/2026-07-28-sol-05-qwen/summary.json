@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "config": "benchmark-evidence/configs/qwen-retained-12.json",
+  "tolerance": 0.02,
+  "models": {
+    "dense": {
+      "candidate_runs": [
+        "benchmark-evidence/qualification/20260728T164930Z-sol-05-qwen-dense-ed7a6b94d3df-2069170/run-1/raw-results.json",
+        "benchmark-evidence/qualification/20260728T164930Z-sol-05-qwen-dense-ed7a6b94d3df-2069170/run-2/raw-results.json",
+        "benchmark-evidence/qualification/20260728T164930Z-sol-05-qwen-dense-ed7a6b94d3df-2069170/run-3/raw-results.json"
+      ],
+      "cells": [
+        {
+          "N": 1,
+          "candidate": 33.44094518912469,
+          "baseline": 33.436678823528965,
+          "delta": 0.00012759537567230694,
+          "vllm_reference": 10.236853615825556,
+          "competitive_gap": 2.2667210496618817,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 89.57864798139781,
+          "p95_ttft_ms": 89.57864798139781
+        },
+        {
+          "N": 2,
+          "candidate": 58.26508114345357,
+          "baseline": 59.26552899580545,
+          "delta": -0.01688077149235745,
+          "vllm_reference": 44.22886981410999,
+          "competitive_gap": 0.3173540582957812,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 100.38524496485479,
+          "p95_ttft_ms": 100.43422895250842
+        },
+        {
+          "N": 4,
+          "candidate": 115.51190667205293,
+          "baseline": 117.27351687134635,
+          "delta": -0.015021381180424287,
+          "vllm_reference": 85.75353201440984,
+          "competitive_gap": 0.3470221454276956,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 137.9640205122996,
+          "p95_ttft_ms": 155.23477498209104
+        },
+        {
+          "N": 8,
+          "candidate": 201.391044018184,
+          "baseline": 204.6068917798417,
+          "delta": -0.015717201574607653,
+          "vllm_reference": 164.3973802443177,
+          "competitive_gap": 0.2250258715734308,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 185.36554198362865,
+          "p95_ttft_ms": 185.73348596692085
+        },
+        {
+          "N": 16,
+          "candidate": 317.4632225213895,
+          "baseline": 313.11764732994544,
+          "delta": 0.013878410330750102,
+          "vllm_reference": 280.810364145882,
+          "competitive_gap": 0.13052530481555258,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 236.55017648707144,
+          "p95_ttft_ms": 240.29126297682524
+        },
+        {
+          "N": 32,
+          "candidate": 443.056045009164,
+          "baseline": 438.7954321524336,
+          "delta": 0.009709793093858554,
+          "vllm_reference": 521.7642644996018,
+          "competitive_gap": -0.15085015369138588,
+          "winning_cell": false,
+          "passed": true,
+          "median_ttft_ms": 383.10509599978104,
+          "p95_ttft_ms": 390.1831900002435
+        }
+      ]
+    },
+    "moe": {
+      "candidate_runs": [
+        "benchmark-evidence/qualification/20260728T165919Z-sol-05-qwen-moe-1b90bf7e8e9b-2092075/run-1/raw-results.json",
+        "benchmark-evidence/qualification/20260728T165919Z-sol-05-qwen-moe-1b90bf7e8e9b-2092075/run-2/raw-results.json",
+        "benchmark-evidence/qualification/20260728T165919Z-sol-05-qwen-moe-1b90bf7e8e9b-2092075/run-3/raw-results.json"
+      ],
+      "cells": [
+        {
+          "N": 1,
+          "candidate": 39.511335045441356,
+          "baseline": 58.96243236710953,
+          "delta": -0.3298896694180208,
+          "vllm_reference": 14.017909830596103,
+          "competitive_gap": 1.8186324154548483,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 58.69550001807511,
+          "p95_ttft_ms": 58.69550001807511
+        },
+        {
+          "N": 2,
+          "candidate": 61.68881167470055,
+          "baseline": 101.38572277576628,
+          "delta": -0.39154340487233064,
+          "vllm_reference": 74.0661024534209,
+          "competitive_gap": -0.1671114095210322,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 87.39949949085712,
+          "p95_ttft_ms": 108.46265300642699
+        },
+        {
+          "N": 4,
+          "candidate": 107.94254621479578,
+          "baseline": 133.9767472022496,
+          "delta": -0.19431880181531003,
+          "vllm_reference": 111.73906881646197,
+          "competitive_gap": -0.03397668015206212,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 123.04712200420909,
+          "p95_ttft_ms": 148.30203499877825
+        },
+        {
+          "N": 8,
+          "candidate": 167.90714607456422,
+          "baseline": 229.75365985687665,
+          "delta": -0.26918619629754437,
+          "vllm_reference": 155.2142577686236,
+          "competitive_gap": 0.08177656156344715,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 182.58943702676333,
+          "p95_ttft_ms": 216.47891798056662
+        },
+        {
+          "N": 16,
+          "candidate": 231.31521450190746,
+          "baseline": 320.13669526154354,
+          "delta": -0.27744860890461553,
+          "vllm_reference": 207.24324846484149,
+          "competitive_gap": 0.11615319782612721,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 277.3410225054249,
+          "p95_ttft_ms": 318.32006300101057
+        },
+        {
+          "N": 32,
+          "candidate": 376.90399278509875,
+          "baseline": 472.41238842062825,
+          "delta": -0.20217165759525002,
+          "vllm_reference": 321.27494724791063,
+          "competitive_gap": 0.17315089773950598,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 455.18390351207927,
+          "p95_ttft_ms": 519.5220780442469
+        }
+      ]
+    }
+  },
+  "passed": false,
+  "failures": [
+    "moe N=1: 39.511 < 57.783 (-32.99% vs retained baseline)",
+    "moe N=2: 61.689 < 99.358 (-39.15% vs retained baseline)",
+    "moe N=4: 107.943 < 131.297 (-19.43% vs retained baseline)",
+    "moe N=8: 167.907 < 225.159 (-26.92% vs retained baseline)",
+    "moe N=16: 231.315 < 313.734 (-27.74% vs retained baseline)",
+    "moe N=32: 376.904 < 462.964 (-20.22% vs retained baseline)"
+  ]
+}
