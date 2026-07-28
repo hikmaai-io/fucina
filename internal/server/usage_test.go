@@ -27,13 +27,16 @@ func TestPromptAccountingNormalized(t *testing.T) {
 }
 
 func TestMergePromptAccountingKeepsLargestPhysicalSkip(t *testing.T) {
-	a := PromptAccounting{PromptTokens: 1024, CachedTokens: 256, Source: CacheSourceGPUPagedBlock}
+	a := PromptAccounting{PromptTokens: 2000, CachedTokens: 256, Source: CacheSourceGPUPagedBlock}
 	b := PromptAccounting{PromptTokens: 1024, CachedTokens: 768, Source: CacheSourceDiskSession}
 	got := MergePromptAccounting(a, b)
 	if got.CachedTokens != 768 || got.Source != CacheSourceDiskSession {
 		t.Fatalf("merged=%+v", got)
 	}
-	if got.NewPrefillTokens() != 256 {
-		t.Fatalf("new_prefill=%d want 256", got.NewPrefillTokens())
+	if got.PromptTokens != 2000 {
+		t.Fatalf("prompt_tokens=%d want 2000", got.PromptTokens)
+	}
+	if got.NewPrefillTokens() != 1232 {
+		t.Fatalf("new_prefill=%d want 1232", got.NewPrefillTokens())
 	}
 }

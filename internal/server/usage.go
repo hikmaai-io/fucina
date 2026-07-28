@@ -51,7 +51,7 @@ func (p PromptAccounting) Normalized() PromptAccounting {
 	return p
 }
 
-// MergePromptAccounting keeps the larger physically skipped prefix for one request.
+// PromptTokensDetails returns the OpenAI-compatible cache detail payload.
 func (p PromptAccounting) PromptTokensDetails() *PromptTokensDetails {
 	p = p.Normalized()
 	if p.CachedTokens == 0 {
@@ -60,14 +60,20 @@ func (p PromptAccounting) PromptTokensDetails() *PromptTokensDetails {
 	return &PromptTokensDetails{CachedTokens: p.CachedTokens}
 }
 
+// MergePromptAccounting keeps the larger physically skipped prefix while preserving
+// the largest logical prompt length seen for the request.
 func MergePromptAccounting(a, b PromptAccounting) PromptAccounting {
 	a = a.Normalized()
 	b = b.Normalized()
-	if b.PromptTokens > a.PromptTokens {
-		a.PromptTokens = b.PromptTokens
-	}
+	out := a
 	if b.CachedTokens > a.CachedTokens {
-		return b
+		out = b
 	}
-	return a
+	if a.PromptTokens > out.PromptTokens {
+		out.PromptTokens = a.PromptTokens
+	}
+	if b.PromptTokens > out.PromptTokens {
+		out.PromptTokens = b.PromptTokens
+	}
+	return out.Normalized()
 }

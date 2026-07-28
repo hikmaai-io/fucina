@@ -2,6 +2,13 @@ package batch
 
 import "testing"
 
+func TestReuseInfoNormalized(t *testing.T) {
+	got := (ReuseInfo{ReusedTokens: -3, Source: ReuseSourceHostSnapshot}).Normalized()
+	if got.ReusedTokens != 0 || got.Source != ReuseSourceNone {
+		t.Fatalf("normalized=%+v", got)
+	}
+}
+
 func TestAdoptedCachedTokens(t *testing.T) {
 	for _, tc := range []struct {
 		shared int
