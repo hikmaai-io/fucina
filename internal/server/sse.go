@@ -31,18 +31,19 @@ import (
 // stopHeartbeat() returns (it joins), the handler goroutine is the only writer.
 // No further synchronization is needed — but the discipline is load-bearing.
 type sseWriter struct {
-	w        http.ResponseWriter
-	flusher  http.Flusher
-	rc       *http.ResponseController
-	legacy   bool
-	model    string
-	id       string
-	object   string
-	created  int64
-	began    bool
-	writeErr atomic.Bool // a write deadline expired: client is stuck/gone
-	hbStop   chan struct{}
-	hbDone   chan struct{}
+	w            http.ResponseWriter
+	flusher      http.Flusher
+	rc           *http.ResponseController
+	legacy       bool
+	model        string
+	id           string
+	object       string
+	created      int64
+	began        bool
+	writeErr     atomic.Bool // a write deadline expired: client is stuck/gone
+	includeUsage bool        // stream_options.include_usage
+	hbStop       chan struct{}
+	hbDone       chan struct{}
 }
 
 const sseWriteTimeout = 30 * time.Second
@@ -169,6 +170,38 @@ func (e *sseWriter) errorEvent(msg string) {
 	e.event(map[string]interface{}{
 		"error": map[string]string{"message": msg, "type": "server_error"},
 	})
+	e.done()
+}
+
+// setIncludeUsage applies stream_options.include_usage before begin.
+func (e *sseWriter) setIncludeUsage(include bool) { e.includeUsage = include }
+
+// finish emits the terminal choice, then (only when requested) the vLLM/OpenAI
+// usage-only chunk with an empty choices array, followed by [DONE].
+func (e *sseWriter) finish(reason string, usage *Usage) {
+	if e.legacy {
+		e.event(CompletionStreamResponse{
+			ID: e.id, Object: e.object, Created: e.created, Model: e.model,
+			Choices: []CompletionStreamChoice{{Index: 0, Text: "", FinishReason: reason}},
+		})
+		if e.includeUsage {
+			e.event(CompletionStreamResponse{
+				ID: e.id, Object: e.object, Created: e.created, Model: e.model,
+				Choices: []CompletionStreamChoice{}, Usage: usage,
+			})
+		}
+	} else {
+		e.event(StreamResponse{
+			ID: e.id, Object: e.object, Created: e.created, Model: e.model,
+			Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: reason}},
+		})
+		if e.includeUsage {
+			e.event(StreamResponse{
+				ID: e.id, Object: e.object, Created: e.created, Model: e.model,
+				Choices: []StreamChoice{}, Usage: usage,
+			})
+		}
+	}
 	e.done()
 }
 
