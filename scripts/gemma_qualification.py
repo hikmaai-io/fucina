@@ -168,12 +168,13 @@ def metric_cached_delta(before: Optional[Dict[str, Any]],
 
 
 def completion_request(base_url: str, model: str, prompt: str, max_tokens: int,
-                       ignore_eos: bool = True, timeout: float = 600) -> Dict[str, Any]:
+                       ignore_eos: bool = True, timeout: float = 600,
+                       isolated_cache_metrics: bool = False) -> Dict[str, Any]:
     """Issue one streaming greedy request and retain per-token SSE event times.
 
-    Both Fucina and vLLM emit one text piece per committed token.  ``token_trace``
-    keeps those boundaries for the MTP losslessness gate; if an implementation
-    includes token ids in an SSE extension they are retained too.
+    ``token_trace`` retains observed event boundaries, but they are accepted as
+    token boundaries only when their count equals final completion usage. Explicit
+    token IDs or standard logprob token strings take precedence for losslessness.
     """
     payload: Dict[str, Any] = {
         "model": model,
@@ -182,10 +183,16 @@ def completion_request(base_url: str, model: str, prompt: str, max_tokens: int,
         "temperature": 0.0,
         "stream": True,
         "stream_options": {"include_usage": True},
+        # Standard OpenAI/vLLM token-granular strings when supported. Fucina
+        # currently ignores this extension, so the MTP gate has a fail-closed
+        # per-event fallback below.
+        "logprobs": 1,
     }
     if ignore_eos:
         payload.update({"ignore_eos": True, "min_tokens": max_tokens})
-    metrics_before = optional_metrics(base_url)
+    # Global cache counters can attribute a single isolated request, never one
+    # member of an overlapping burst.
+    metrics_before = optional_metrics(base_url) if isolated_cache_metrics else None
     data = json.dumps(payload).encode()
     req = urllib.request.Request(base_url.rstrip("/") + "/v1/completions", data=data,
                                  headers={"Content-Type": "application/json"})
@@ -193,6 +200,7 @@ def completion_request(base_url: str, model: str, prompt: str, max_tokens: int,
     event_offsets: List[float] = []
     pieces: List[str] = []
     token_ids: List[int] = []
+    logprob_tokens: List[str] = []
     usage: Optional[Dict[str, Any]] = None
     with urllib.request.urlopen(req, timeout=timeout) as response:
         for raw in response:
@@ -213,21 +221,28 @@ def completion_request(base_url: str, model: str, prompt: str, max_tokens: int,
                 continue
             choice = choices[0]
             piece = choice.get("text")
-            if piece:
+            ids = choice.get("token_ids")
+            event_has_token = bool(piece)
+            if isinstance(ids, list):
+                token_ids.extend(int(x) for x in ids)
+                event_has_token = event_has_token or bool(ids)
+            elif isinstance(choice.get("token_id"), int):
+                token_ids.append(int(choice["token_id"]))
+                event_has_token = True
+            lp_tokens = (choice.get("logprobs") or {}).get("tokens")
+            if isinstance(lp_tokens, list):
+                logprob_tokens.extend(str(x) for x in lp_tokens)
+                event_has_token = event_has_token or bool(lp_tokens)
+            if event_has_token:
                 event_offsets.append(time.perf_counter() - started)
-                pieces.append(piece)
-                ids = choice.get("token_ids")
-                if isinstance(ids, list):
-                    token_ids.extend(int(x) for x in ids)
-                elif isinstance(choice.get("token_id"), int):
-                    token_ids.append(int(choice["token_id"]))
+                pieces.append(piece if isinstance(piece, str) else "")
     wall = time.perf_counter() - started
-    metrics_after = optional_metrics(base_url)
+    metrics_after = optional_metrics(base_url) if isolated_cache_metrics else None
     if usage is None:
         raise QualificationError("stream ended without final usage; include_usage contract failed")
     cached = cached_from_usage(usage)
     cache_source = "usage.prompt_tokens_details"
-    if cached is None:
+    if cached is None and isolated_cache_metrics:
         cached = metric_cached_delta(metrics_before, metrics_after)
         cache_source = "metrics.prefix_cache.reused_tokens"
     if cached is None:
@@ -238,8 +253,11 @@ def completion_request(base_url: str, model: str, prompt: str, max_tokens: int,
     completion_tokens = accounting["completion_tokens"]
     itls = [event_offsets[i] - event_offsets[i - 1] for i in range(1, len(event_offsets))]
     decode_window = ((event_offsets[-1] - event_offsets[0]) if len(event_offsets) > 1 else 0.0)
+    trace_is_per_token = len(event_offsets) == completion_tokens
+    if not trace_is_per_token:
+        itls = []  # event intervals are not token ITLs when chunks coalesce
     per_stream = ((completion_tokens - 1) / decode_window
-                  if completion_tokens > 1 and decode_window > 0 else None)
+                  if trace_is_per_token and completion_tokens > 1 and decode_window > 0 else None)
     return {
         "ttft_s": event_offsets[0] if event_offsets else None,
         "itl_s": itls,
@@ -248,6 +266,8 @@ def completion_request(base_url: str, model: str, prompt: str, max_tokens: int,
         "per_stream_decode_tok_s": per_stream,
         "token_trace": pieces,
         "token_ids": token_ids,
+        "logprob_tokens": logprob_tokens,
+        "trace_is_per_token": trace_is_per_token,
         "text": "".join(pieces),
         "usage": accounting,
         "cached_tokens_source": cache_source,
@@ -266,11 +286,13 @@ def cold_warm_probe(base_url: str, model: str, reps: int, prefix_words: int,
     for i in range(reps):
         nonce = f"{uuid.uuid4().hex}-{i}"
         base = prompt_words(prefix_words, nonce)
-        first = completion_request(base_url, model, base, max_tokens)
-        # Exact extension of the completed first request. Only execution-skipped
-        # tokens reported by the server/metrics count as cached.
-        second_prompt = base + first["text"] + "\nNow state one additional consequence:"
-        second = completion_request(base_url, model, second_prompt, max_tokens)
+        first = completion_request(base_url, model, base, max_tokens,
+                                   isolated_cache_metrics=True)
+        # Extend the exact original prompt instead of re-tokenizing decoded model
+        # output (detokenization is not guaranteed to be token-id invertible).
+        second_prompt = base + "\nNow state one additional consequence:"
+        second = completion_request(base_url, model, second_prompt, max_tokens,
+                                    isolated_cache_metrics=True)
         cold.append(first)
         warm.append(second)
     return {"cold": cold, "warm_prefix": warm,
@@ -282,6 +304,7 @@ def burst_probe(base_url: str, model: str, concurrency: int, reps: int,
                 max_tokens: int) -> Dict[str, Any]:
     bursts = []
     for rep in range(reps):
+        metrics_before = optional_metrics(base_url)
         prompts = [prompt_words(64, f"burst-{rep}-{i}-{uuid.uuid4().hex}")
                    for i in range(concurrency)]
         barrier = threading.Barrier(concurrency)
@@ -295,8 +318,12 @@ def burst_probe(base_url: str, model: str, concurrency: int, reps: int,
             rows = list(pool.map(worker, prompts))
         wall = time.perf_counter() - started
         generated = sum(row["usage"]["completion_tokens"] for row in rows)
+        metrics_after = optional_metrics(base_url)
         bursts.append({"wall_s": wall, "completion_tokens": generated,
                        "aggregate_tok_s": generated / wall if wall > 0 else None,
+                       "aggregate_cached_tokens": metric_cached_delta(metrics_before, metrics_after),
+                       "cache_counter_before": nested_number(metrics_before, "prefix_cache", "reused_tokens"),
+                       "cache_counter_after": nested_number(metrics_after, "prefix_cache", "reused_tokens"),
                        "streams": rows})
     all_streams = [row for burst in bursts for row in burst["streams"]]
     return {
@@ -362,7 +389,7 @@ def gpu_memory_mib(pids: Sequence[int]) -> Optional[float]:
 
 
 class MemorySampler:
-    def __init__(self, pid: int, interval: float = 0.2):
+    def __init__(self, pid: int, interval: float = 1.0):
         self.pid, self.interval = pid, interval
         self.samples: List[Dict[str, Any]] = []
         self._stop = threading.Event()
@@ -380,7 +407,7 @@ class MemorySampler:
                 "rss_mib": sum(read_proc_kb(p, "VmRSS") for p in pids) / 1024,
                 "hwm_mib": sum(read_proc_kb(p, "VmHWM") for p in pids) / 1024,
                 "gpu_mib": gpu_memory_mib(pids),
-                "pids": pids,
+                "pid_count": len(pids),
             })
             self._stop.wait(self.interval)
 
@@ -446,9 +473,24 @@ class ManagedServer:
                     os.killpg(self.proc.pid, signal.SIGKILL)
                 except OSError:
                     pass
-                self.proc.wait(timeout=10)
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired as exc:
+                    raise QualificationError(f"server process group would not terminate: {self.proc.pid}") from exc
         if self.log:
             self.log.close()
+        # Fixed-port starts must not accidentally observe the previous process's
+        # readiness response. Require the route to become unreachable first.
+        deadline = time.perf_counter() + 10
+        while time.perf_counter() < deadline:
+            try:
+                urllib.request.urlopen(self.base_url + self.spec.get("ready_path", "/readyz"),
+                                       timeout=0.5).close()
+            except Exception:
+                break
+            time.sleep(0.1)
+        else:
+            raise QualificationError(f"server endpoint remained live after shutdown: {self.base_url}")
         return memory
 
 
@@ -717,12 +759,36 @@ def speculation_delta(before: Optional[Dict[str, Any]], after: Optional[Dict[str
     result = {}
     for key in ("verify_forwards", "drafted", "accepted", "emitted"):
         a, b = nested_number(before, "speculation", key), nested_number(after, "speculation", key)
-        result[key] = max(0, int((b or 0) - (a or 0)))
+        if a is None or b is None:
+            raise QualificationError(f"speculation telemetry missing counter {key}")
+        if b < a:
+            raise QualificationError(f"speculation counter reset: {key} {a} -> {b}")
+        result[key] = int(b - a)
     return result
 
 
-def trace_key(row: Dict[str, Any]) -> List[Any]:
-    return row["token_ids"] if row.get("token_ids") else row["token_trace"]
+def compare_token_rows(mtp: Dict[str, Any], plain: Dict[str, Any],
+                       allow_text_fallback: bool) -> Dict[str, Any]:
+    """Compare like-for-like token traces and fail closed on coalesced SSE."""
+    mtp_n, plain_n = mtp["usage"]["completion_tokens"], plain["usage"]["completion_tokens"]
+    if len(mtp.get("token_ids", [])) == mtp_n and len(plain.get("token_ids", [])) == plain_n:
+        left, right, method = mtp["token_ids"], plain["token_ids"], "token_ids"
+        return {"equal": left == right, "method": method, "mtp_trace": left,
+                "plain_trace": right}
+    if (len(mtp.get("logprob_tokens", [])) == mtp_n and
+            len(plain.get("logprob_tokens", [])) == plain_n):
+        left, right, method = (mtp["logprob_tokens"], plain["logprob_tokens"],
+                               "logprobs.tokens")
+        return {"equal": left == right, "method": method, "mtp_trace": left,
+                "plain_trace": right}
+    if allow_text_fallback and mtp.get("trace_is_per_token") and plain.get("trace_is_per_token"):
+        # Equal concatenated text + equal token counts is less brittle than SSE
+        # segmentation, while the per-token assertion rules out coalesced events.
+        equal = mtp["text"] == plain["text"] and mtp_n == plain_n
+        return {"equal": equal, "method": "per-token-sse-text-fallback",
+                "mtp_trace": mtp["token_trace"], "plain_trace": plain["token_trace"]}
+    return {"equal": False, "method": "unverifiable-no-token-granular-trace",
+            "mtp_trace": [], "plain_trace": []}
 
 
 def mtp_probe(args: argparse.Namespace) -> int:
@@ -739,24 +805,28 @@ def mtp_probe(args: argparse.Namespace) -> int:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.batch) as pool:
             rows = list(pool.map(worker, prompts))
         after = optional_metrics(base_url)
-        return {"rows": rows, "speculation_delta": speculation_delta(before, after)}
+        return {"rows": rows, "speculation_delta": speculation_delta(before, after),
+                "speculation_before": (before or {}).get("speculation"),
+                "speculation_after": (after or {}).get("speculation")}
 
     mtp, plain = run(args.mtp_url), run(args.plain_url)
     equality = []
     for i, (a, b) in enumerate(zip(mtp["rows"], plain["rows"])):
-        equal = trace_key(a) == trace_key(b)
-        equality.append({"stream": i, "equal": equal, "mtp_trace": trace_key(a),
-                         "plain_trace": trace_key(b)})
+        comparison = compare_token_rows(a, b, args.allow_text_fallback)
+        comparison["stream"] = i
+        equality.append(comparison)
     delta = mtp["speculation_delta"]
+    plain_delta = plain["speculation_delta"]
     engaged = delta["verify_forwards"] > 0 and delta["drafted"] > 0 and delta["accepted"] > 0
+    plain_is_plain = plain_delta["verify_forwards"] == 0 and plain_delta["drafted"] == 0
     result = {"schema_version": SCHEMA_VERSION, "kind": "gemma-batch-mtp-probe",
               "created_at": utc_now(), "batch": args.batch, "max_tokens": args.max_tokens,
               "mtp": mtp, "plain": plain,
-              "gate": {"mtp_engaged": engaged,
+              "gate": {"mtp_engaged": engaged, "plain_decode_verified": plain_is_plain,
                        "token_trace_equal": all(x["equal"] for x in equality),
                        "streams": equality}}
     pathlib.Path(args.out).write_text(json.dumps(result, indent=2) + "\n")
-    if not engaged or not result["gate"]["token_trace_equal"]:
+    if not engaged or not plain_is_plain or not result["gate"]["token_trace_equal"]:
         raise QualificationError(f"batch MTP gate failed; see {args.out}")
     print(args.out)
     return 0
@@ -797,6 +867,8 @@ def build_parser() -> argparse.ArgumentParser:
     mtp.add_argument("--batch", type=int, default=4)
     mtp.add_argument("--max-tokens", type=int, default=32)
     mtp.add_argument("--out", required=True)
+    mtp.add_argument("--allow-text-fallback", action="store_true",
+                     help="allow exact text+count only when both SSE traces prove one event/token")
     mtp.set_defaults(func=mtp_probe)
     oracle = sub.add_parser("oracle", help="compare trusted and candidate oracle artifacts")
     oracle.add_argument("--reference", required=True)

@@ -14,15 +14,15 @@ API, and writes `fucina.gemma-qualification.v1` evidence.
   `artifact` and optional `vllm_artifact` are fingerprinted independently.
 - Keep `independent_starts >= 3`. Startup-to-ready is measured from process
   creation until the configured readiness route first returns 2xx.
-- Cold prompts carry a unique leading nonce. Warm-prefix requests exactly extend
-  the completed cold request. Only server-reported execution skips count as
-  cached; a logical longest-common-prefix estimate is never substituted.
+- Cold prompts carry a unique leading nonce. Warm-prefix requests extend the
+  exact cold prompt text, never re-tokenized model output. Only server-reported
+  execution skips count as cached; a logical LCP estimate is never substituted.
 - The runner asserts on every response:
   `0 <= cached_tokens <= prompt_tokens`,
   `new_prefill_tokens = prompt_tokens - cached_tokens`, and
   `total_tokens = prompt_tokens + completion_tokens`.
-- TTFT is request send to first non-empty token event. ITL values are adjacent
-  token-event intervals. Per-stream decode throughput excludes the first token;
+- TTFT is request send to the first observed token event. ITL is emitted only
+  when final usage proves one observed event per token. Per-stream throughput excludes the first token;
   aggregate throughput uses all completed tokens divided by whole-burst wall
   time. Raw event offsets and arrays are retained alongside p50/p95/p99.
 - Memory sampling covers the launched process tree: RSS/HWM from `/proc` and GPU
@@ -72,15 +72,18 @@ python3 scripts/gemma_qualification.py mtp-probe \
   --mtp-url http://127.0.0.1:18080 \
   --plain-url http://127.0.0.1:18081 \
   --model gemma-4-12b-q4_0-qat --batch 4 --max-tokens 32 \
+  --allow-text-fallback \
   --out benchmark-evidence/results/mtp-probe.json
 ```
 
 The gate is not allowed to pass by silently falling back to plain decode. The
 MTP server must increase `verify_forwards`, `drafted`, and `accepted` under a
-real concurrent batch. Every stream must exactly equal plain greedy decode.
-The harness compares explicit SSE token IDs when an implementation supplies
-those; otherwise it compares the one-event-per-committed-token text-piece trace,
-which preserves token boundaries used by Fucina's streaming path. This mirrors
+real concurrent batch, while plain must show zero verify/draft work. Every stream
+must exactly equal plain greedy decode. The harness compares like-for-like SSE
+token IDs first, then standard `logprobs.tokens`. Without either it fails closed
+unless `--allow-text-fallback` is explicit; that fallback requires one event per
+usage token on both sides, equal token counts, and equal concatenated text.
+Coalesced traces cannot pass. This mirrors
 the non-triviality and token-equality checks in
 `internal/server/batch/spec_lossless_test.go`.
 

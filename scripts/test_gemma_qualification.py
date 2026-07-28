@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure-CPU tests for scripts/gemma_qualification.py."""
 
+import argparse
 import importlib.util
 import json
 import pathlib
@@ -79,6 +80,72 @@ class FakeServer:
         self.thread.join(timeout=2)
 
 
+class SpeculationServer:
+    """Tiny streaming server whose counters prove the MTP path did real work."""
+
+    def __init__(self, engaged):
+        self.engaged = engaged
+        self.count = 0
+        self.lock = threading.Lock()
+
+    def __enter__(self):
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                if self.path != "/metrics":
+                    self.send_error(404)
+                    return
+                multiplier = owner.count if owner.engaged else 0
+                body = json.dumps({
+                    "prefix_cache": {"reused_tokens": 0},
+                    "speculation": {"verify_forwards": multiplier,
+                                    "drafted": multiplier * 3,
+                                    "accepted": multiplier * 2,
+                                    "emitted": multiplier * 3},
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                self.rfile.read(length)
+                with owner.lock:
+                    owner.count += 1
+                events = [
+                    {"choices": [{"text": " one", "token_id": 101}]},
+                    {"choices": [{"text": " two", "token_id": 102}]},
+                    {"choices": [], "usage": {
+                        "prompt_tokens": 50, "completion_tokens": 2, "total_tokens": 52,
+                        "prompt_tokens_details": {"cached_tokens": 0}}},
+                ]
+                encoded = ("".join("data: " + json.dumps(x) + "\n\n" for x in events)
+                           + "data: [DONE]\n\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.httpd.server_address
+        self.url = f"http://{host}:{port}"
+        return self
+
+    def __exit__(self, *_args):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=2)
+
+
 class DistributionTests(unittest.TestCase):
     def test_percentiles_retain_raw_values(self):
         got = gq.distribution([4, 1, 3, 2])
@@ -116,6 +183,23 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(len(server.httpd.requests), 1)
         self.assertTrue(server.httpd.requests[0]["stream_options"]["include_usage"])
         self.assertEqual(server.httpd.requests[0]["temperature"], 0.0)
+
+
+class MTPTests(unittest.TestCase):
+    def test_probe_requires_activity_and_token_equality(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                SpeculationServer(True) as mtp, SpeculationServer(False) as plain:
+            out = pathlib.Path(directory) / "mtp.json"
+            args = argparse.Namespace(mtp_url=mtp.url, plain_url=plain.url,
+                                      model="gemma", batch=2, max_tokens=32,
+                                      out=str(out), allow_text_fallback=False)
+            self.assertEqual(gq.mtp_probe(args), 0)
+            evidence = json.loads(out.read_text())
+        self.assertTrue(evidence["gate"]["mtp_engaged"])
+        self.assertTrue(evidence["gate"]["token_trace_equal"])
+        self.assertTrue(evidence["gate"]["plain_decode_verified"])
+        self.assertGreater(evidence["mtp"]["speculation_delta"]["accepted"], 0)
+        self.assertEqual(evidence["plain"]["speculation_delta"]["accepted"], 0)
 
 
 class OracleTests(unittest.TestCase):
