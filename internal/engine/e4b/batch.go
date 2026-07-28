@@ -16,6 +16,12 @@ type BatchAdapter struct {
 // NewBatchAdapter wraps eng for the batch scheduler. Supported() reports usability.
 func NewBatchAdapter(eng *Engine) *BatchAdapter { return &BatchAdapter{eng: eng} }
 
+// SamplingSupport advertises E4B batch as greedy-only until SOL-09. The HTTP
+// layer uses this capability to reject non-greedy requests before any prefill.
+func (a *BatchAdapter) SamplingSupport() batch.SamplingSupport {
+	return batch.GreedyOnlySamplingSupport
+}
+
 // Supported reports whether batched serving is usable (a free slot exists).
 func (a *BatchAdapter) Supported() bool { return a.eng.SeqCapacity() > 0 }
 
