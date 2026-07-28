@@ -6,6 +6,7 @@ config=${1:-benchmark-evidence/configs/qwen-retained-12.json}
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 [[ -f "$config" ]] || { echo "missing config: $config" >&2; exit 2; }
+python3 scripts/qwen_retained_cells.py validate --config "$config"
 [[ -x ./fucina ]] || { echo "missing ./fucina; build first with: make lib fucina" >&2; exit 2; }
 
 # One lock covers both three-start claims; vLLM and other Fucina qualification

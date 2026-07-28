@@ -2,12 +2,13 @@
 """Validate the 12 retained Qwen throughput cells for SOL-05.
 
 Candidate values are medians across independently started servers. The eleven
-historical winning cells are hard gates at -2%; dense N=32 is reported as the
+retained winning cells are hard gates at -2%; dense N=32 is reported as the
 remaining competitive-gap target rather than being mislabeled a win.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 import sys
@@ -29,7 +30,11 @@ def unwrap_run(value):
 
 
 def cells(run):
-    return {int(cell["N"]): cell for cell in run.get("concurrency", [])}
+    rows = run.get("concurrency", [])
+    out = {int(cell["N"]): cell for cell in rows}
+    if len(out) != len(rows):
+        raise ValueError("concurrency matrix contains duplicate N cells")
+    return out
 
 
 def median_runs(paths):
@@ -50,22 +55,140 @@ def median_runs(paths):
     return out
 
 
-def validate_config(config):
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def require_keys(value, keys, context):
+    if not isinstance(value, dict):
+        raise ValueError(f"missing or invalid {context}")
+    missing = sorted(set(keys) - set(value))
+    if missing:
+        raise ValueError(f"missing {context}: {', '.join(missing)}")
+
+
+def require_sha256(value, context):
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError(f"missing or invalid {context}")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise ValueError(f"missing or invalid {context}") from exc
+
+
+def validate_config(config, root):
+    if config.get("schema_version") != 2:
+        raise ValueError("config schema_version must be 2 with refreeze provenance")
     expected = set(config["concurrency"])
-    if len(expected) != 6 or set(config["models"]) != {"dense", "moe"}:
-        raise ValueError("config must define dense+moe and six concurrency cells")
+    if config["concurrency"] != [1, 2, 4, 8, 16, 32] or set(config["models"]) != {"dense", "moe"}:
+        raise ValueError("config must define dense+moe and the six retained concurrency cells")
+
+    bench = config.get("bench")
+    required_contract = {
+        "max_tokens": 128,
+        "min_tokens": 128,
+        "ignore_eos": True,
+        "independent_server_starts": 3,
+        "aggregation": "cellwise_median",
+    }
+    require_keys(bench, required_contract, "bench length contract")
+    for key, expected_value in required_contract.items():
+        if bench[key] != expected_value:
+            raise ValueError(f"bench length contract requires {key}={expected_value!r}")
+
     winning = sum(len(model["winning_cells"]) for model in config["models"].values())
     if winning != 11:
         raise ValueError(f"config must identify exactly 11 winning cells, got {winning}")
     for name, model in config["models"].items():
         if not set(model["winning_cells"]).issubset(expected):
             raise ValueError(f"{name}: winning cell outside concurrency matrix")
+        if model.get("baseline") == model.get("vllm_reference"):
+            raise ValueError(f"{name}: Fucina baseline and vLLM reference must remain separate")
+
+    provenance_ref = config.get("baseline_provenance")
+    if not isinstance(provenance_ref, str) or not provenance_ref:
+        raise ValueError("missing baseline_provenance")
+    provenance_path = root / provenance_ref
+    provenance = load_json(provenance_path)
+    if provenance.get("schema_version") != 1 or provenance.get("record_type") != "qwen_retained_baseline_refreeze":
+        raise ValueError("invalid baseline provenance schema or record type")
+
+    countersign = provenance.get("gate_owner_countersign")
+    require_keys(countersign, {"status", "date", "decision"}, "gate-owner countersign")
+    if countersign["status"] != "COUNTERSIGNED" or not countersign["date"]:
+        raise ValueError("baseline provenance lacks a dated gate-owner countersign")
+
+    commits = provenance.get("source_commits")
+    require_keys(commits, {"length_contract", "evidence", "merged_main"}, "source commits")
+    for key, value in commits.items():
+        if not isinstance(value, str) or len(value) != 40:
+            raise ValueError(f"missing or invalid source commit {key}")
+
+    contract = provenance.get("generation_contract")
+    provenance_contract = {
+        "max_tokens": 128,
+        "min_tokens": 128,
+        "ignore_eos": True,
+        "completion_tokens_per_request": 128,
+        "decode_intervals_per_request": 127,
+        "concurrency": [1, 2, 4, 8, 16, 32],
+        "diverse_prompts": True,
+    }
+    require_keys(contract, provenance_contract, "provenance generation contract")
+    for key, expected_value in provenance_contract.items():
+        if contract[key] != expected_value:
+            raise ValueError(f"provenance generation contract requires {key}={expected_value!r}")
+
+    aggregation = provenance.get("aggregation")
+    if aggregation != {"statistic": "cellwise_median", "independent_server_starts": 3}:
+        raise ValueError("baseline provenance requires cellwise median across 3 starts")
+
+    roots = provenance.get("qualification_roots")
+    require_keys(roots, {"dense", "moe"}, "qualification roots")
+    hashes = provenance.get("hashes")
+    require_keys(hashes, {
+        "source_config_sha256", "bench_serving_py_sha256", "prompt_pool_sha256",
+        "short_prompt_sha256", "candidate_summary_sha256", "model_sha256",
+        "baseline_sha256",
+    }, "provenance hashes")
+    for key in ("source_config_sha256", "bench_serving_py_sha256", "prompt_pool_sha256",
+                "short_prompt_sha256", "candidate_summary_sha256"):
+        require_sha256(hashes[key], key)
+    require_keys(hashes["model_sha256"], {"dense", "moe"}, "model hashes")
+    require_keys(hashes["baseline_sha256"], {"dense", "moe"}, "baseline hashes")
+
+    summary_path = root / provenance["candidate_summary"]
+    if sha256(summary_path) != hashes["candidate_summary_sha256"]:
+        raise ValueError("candidate summary hash does not match provenance")
+
+    baseline_refs = provenance.get("baselines")
+    require_keys(baseline_refs, {"dense", "moe"}, "provenance baselines")
+    for name, model in config["models"].items():
+        if baseline_refs[name] != model["baseline"]:
+            raise ValueError(f"{name}: config baseline does not match provenance")
+        baseline_path = root / model["baseline"]
+        require_sha256(hashes["baseline_sha256"][name], f"{name} baseline hash")
+        if sha256(baseline_path) != hashes["baseline_sha256"][name]:
+            raise ValueError(f"{name}: baseline hash does not match provenance")
+        if set(cells(load_json(baseline_path))) != expected:
+            raise ValueError(f"{name}: baseline must contain all six retained cells")
+
+        require_sha256(hashes["model_sha256"][name], f"{name} model hash")
+        qualification = root / roots[name]
+        manifest = load_json(qualification / "manifest.json")
+        model_hashes = [item.get("sha256") for item in manifest.get("model_fingerprints", [])]
+        if manifest.get("source_commit") != commits["length_contract"]:
+            raise ValueError(f"{name}: qualification source commit does not match provenance")
+        if manifest.get("independent_server_starts") != 3:
+            raise ValueError(f"{name}: qualification did not use 3 starts")
+        if hashes["model_sha256"][name] not in model_hashes:
+            raise ValueError(f"{name}: qualification model hash does not match provenance")
 
 
 def check(config_path, candidates):
     root = Path(config_path).resolve().parents[2]
     config = load_json(config_path)
-    validate_config(config)
+    validate_config(config, root)
     tolerance = float(config["max_winning_regression"])
     metric = config["metric"]
     expected = set(config["concurrency"])
@@ -74,6 +197,9 @@ def check(config_path, candidates):
 
     for name, model in config["models"].items():
         paths = candidates.get(name, [])
+        required_starts = config["bench"]["independent_server_starts"]
+        if len(paths) != required_starts:
+            raise ValueError(f"{name}: expected exactly {required_starts} independent candidate runs")
         candidate = median_runs(paths)
         if set(candidate) != expected:
             missing = sorted(expected - set(candidate))
@@ -140,6 +266,8 @@ def main():
     check_parser.add_argument("--config", required=True)
     check_parser.add_argument("--candidate", action="append", default=[], metavar="MODEL=JSON")
     check_parser.add_argument("--json-out", default="")
+    validate = sub.add_parser("validate", help="validate the retained config and refreeze provenance")
+    validate.add_argument("--config", required=True)
     wrap = sub.add_parser("wrap", help="wrap one bench_serving object as qualification raw array")
     wrap.add_argument("--input", required=True)
     wrap.add_argument("--output", required=True)
@@ -148,6 +276,14 @@ def main():
     if args.command == "wrap":
         value = unwrap_run(load_json(args.input))
         Path(args.output).write_text(json.dumps([value], indent=2) + "\n")
+        return 0
+    if args.command == "validate":
+        try:
+            config_path = Path(args.config).resolve()
+            validate_config(load_json(config_path), config_path.parents[2])
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            parser.error(str(exc))
+        print(f"CONFIG VALID — contract and provenance verified: {args.config}")
         return 0
 
     candidates = {"dense": [], "moe": []}

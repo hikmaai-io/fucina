@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "description": "SOL-05 retained Qwen serving cells: six dense plus six MoE concurrency cells",
+  "schema_version": 2,
+  "description": "Retained Qwen serving guard: exact-length three-start baselines for six dense plus six MoE concurrency cells",
   "metric": "agg_decode_tps",
   "max_winning_regression": 0.02,
   "concurrency": [
@@ -16,14 +16,17 @@
     "long_tokens": 3500,
     "diverse": true,
     "ignore_eos": true,
-    "verify_sample": 4
+    "verify_sample": 4,
+    "min_tokens": 128,
+    "independent_server_starts": 3,
+    "aggregation": "cellwise_median"
   },
   "models": {
     "dense": {
       "model_path": "/opt/spark/models/models--Qwen--Qwen3.5-9B-FP8",
       "served_model": "qwen35",
       "port": 18080,
-      "baseline": "benchmark-evidence/results/2026-07-18-d32b/fucina-q35dense-d32b.json",
+      "baseline": "benchmark-evidence/results/2026-07-28-integration-p1-qwen/refrozen-dense-baseline.json",
       "vllm_reference": "benchmark-evidence/results/2026-07-18-d32b/vllm-q35dense-fresh.json",
       "winning_cells": [
         1,
@@ -38,7 +41,7 @@
       "model_path": "/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/0b2752837483aa34b3db6e83e151b150c0e00e49",
       "served_model": "qwen35",
       "port": 18080,
-      "baseline": "benchmark-evidence/results/2026-07-18-d32b/fucina-q35moe-d32b.json",
+      "baseline": "benchmark-evidence/results/2026-07-28-integration-p1-qwen/refrozen-moe-baseline.json",
       "vllm_reference": "benchmark-evidence/results/2026-07-18-d32b/vllm-q35moe-fresh.json",
       "winning_cells": [
         1,
@@ -49,5 +52,6 @@
         32
       ]
     }
-  }
+  },
+  "baseline_provenance": "benchmark-evidence/results/2026-07-28-integration-p1-qwen/baseline-provenance.json"
 }

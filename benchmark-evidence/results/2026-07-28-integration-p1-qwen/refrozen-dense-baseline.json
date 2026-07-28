@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "description": "Refrozen exact-length three-start Qwen dense retained throughput baseline",
+  "metric": "agg_decode_tps",
+  "aggregation": "cellwise_median",
+  "independent_server_starts": 3,
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 33.47657444646621
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 58.223021563260595
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 115.75113991514789
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 218.81994048408507
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 331.15805428997913
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 436.48649165867005
+    }
+  ]
+}

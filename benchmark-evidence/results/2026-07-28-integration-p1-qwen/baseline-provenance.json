@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "record_type": "qwen_retained_baseline_refreeze",
+  "gate_owner_countersign": {
+    "status": "COUNTERSIGNED",
+    "date": "2026-07-28",
+    "decision": "Authorize Phase-1 FAILED-with-attribution waiver and baseline re-freeze"
+  },
+  "source_commits": {
+    "length_contract": "c7af618d33d54e196626e4a5f11abf4b38e9e70b",
+    "evidence": "a591fac2a81c9bcd605a82c7a0deda3a987fd909",
+    "merged_main": "915eacac5b5517911d684ac1397309410d0c2294"
+  },
+  "candidate_summary": "benchmark-evidence/results/2026-07-28-integration-p1-qwen/retained-gate-summary.json",
+  "qualification_roots": {
+    "dense": "benchmark-evidence/qualification/20260728T174257Z-sol-05-qwen-dense-c7af618d33d5-2169047",
+    "moe": "benchmark-evidence/qualification/20260728T174928Z-sol-05-qwen-moe-c7af618d33d5-2187105"
+  },
+  "generation_contract": {
+    "endpoint": "/v1/completions",
+    "max_tokens": 128,
+    "ignore_eos": true,
+    "min_tokens": 128,
+    "temperature": 0.0,
+    "completion_tokens_per_request": 128,
+    "decode_intervals_per_request": 127,
+    "concurrency": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "diverse_prompts": true
+  },
+  "aggregation": {
+    "statistic": "cellwise_median",
+    "independent_server_starts": 3
+  },
+  "hashes": {
+    "source_config_sha256": "cac443a9832fc6df53c424b25a932627412a4854a38fe0bb1caad2f042fc14c8",
+    "bench_serving_py_sha256": "e2b8d68cdf88e5362554f575a3c142b0ee2730fbacd3f9ce524dabd16f9032d2",
+    "prompt_pool_sha256": "456997423534bc4e67e4ff496d19ddb757a0d3d271ad57feb4aa5347bd9550f4",
+    "prompt_pool_hash_contract": "sha256(UTF-8 JSON of DIVERSE_PROMPTS, ensure_ascii=false, separators=(comma,colon))",
+    "short_prompt_sha256": "e8750f7fbf719993168150c17e2ba980c2d825445d2cad550c9793b0c6d773e1",
+    "candidate_summary_sha256": "de28e04d5ca5704cd0835b99e9cf98b7f61217d69dc3d51a5969d7fbbe48a9f3",
+    "model_sha256": {
+      "dense": "565c2288bd9a9f0fa6b18930d35773af3169f9ece605cf94b82c706279d6e666",
+      "moe": "c527a5d8613af686341f714fb13c9bcc4560865f1967e4381dc44e2e68fd5500"
+    },
+    "baseline_sha256": {
+      "dense": "922fa294c7205f84c6db4d5e3c57089e8da65984bbd31efa09bf6c16ce2ba872",
+      "moe": "fc8b4b8506117075fe590c13532a4ceb166b249705c7dd79aea86e03168138a8"
+    }
+  },
+  "baselines": {
+    "dense": "benchmark-evidence/results/2026-07-28-integration-p1-qwen/refrozen-dense-baseline.json",
+    "moe": "benchmark-evidence/results/2026-07-28-integration-p1-qwen/refrozen-moe-baseline.json"
+  },
+  "vllm_references": {
+    "dense": "benchmark-evidence/results/2026-07-18-d32b/vllm-q35dense-fresh.json",
+    "moe": "benchmark-evidence/results/2026-07-18-d32b/vllm-q35moe-fresh.json",
+    "note": "Competitive references remain separate and are not refrozen Fucina baselines."
+  },
+  "supersedes": {
+    "historical_baselines": {
+      "dense": "benchmark-evidence/results/2026-07-18-d32b/fucina-q35dense-d32b.json",
+      "moe": "benchmark-evidence/results/2026-07-18-d32b/fucina-q35moe-d32b.json"
+    },
+    "reason": "The July MoE gate was captured in a broken-EOS, pre-router-correctness window. It is not a correctness-qualified target for the fixed router and explicit exact-length contract.",
+    "retention": "The July files remain unchanged and retained as historical evidence; canonical gate references now point to the refrozen values."
+  }
+}

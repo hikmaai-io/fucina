@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "description": "Refrozen exact-length three-start Qwen moe retained throughput baseline",
+  "metric": "agg_decode_tps",
+  "aggregation": "cellwise_median",
+  "independent_server_starts": 3,
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 57.58369132786309
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 93.98535176094182
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 145.5915643128868
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 209.01177854658923
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 279.4107052828803
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 407.00436961915153
+    }
+  ]
+}
