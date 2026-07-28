@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hikmaai-io/fucina/internal/grammar"
+	"github.com/hikmaai-io/fucina/internal/metrics"
 )
 
 // ─── Engine contract ───────────────────────────────────────────────
@@ -308,6 +309,130 @@ const maxOneShotAdmitsPerPass = 1
 // matches where spec pays off (low concurrency / single-stream latency).
 const MaxVerifyRows = 32
 
+// defaultIterationTokenBudget bounds all model-token work scheduled in one owner-loop
+// iteration: prompt tokens admitted by one-shot/multisequence prefill, chunked-prefill
+// tokens, decode anchors, and speculative verification rows. A single oversized
+// one-shot request may exceed it only on an otherwise idle iteration, guaranteeing
+// progress for engines without chunked prefill.
+const defaultIterationTokenBudget = 8192
+
+// iterationBudget is deliberately scheduler-local: its unit is one model row/token
+// evaluated by a forward, independent of wall time or engine implementation. Decode
+// anchors are reserved at iteration start; later admission/prefill/verification work
+// consumes the remainder.
+type iterationBudget struct {
+	limit int
+	used  int
+}
+
+func newIterationBudget(limit int) *iterationBudget {
+	if limit < 1 {
+		limit = 1
+	}
+	return &iterationBudget{limit: limit}
+}
+
+func (b *iterationBudget) remaining() int {
+	r := b.limit - b.used
+	if r < 0 {
+		return 0
+	}
+	return r
+}
+
+func (b *iterationBudget) consume(tokens int, allowIdleOversize bool) bool {
+	if tokens <= 0 {
+		return true
+	}
+	if tokens <= b.remaining() {
+		b.used += tokens
+		return true
+	}
+	if allowIdleOversize && b.used == 0 {
+		b.used = tokens
+		return true
+	}
+	return false
+}
+
+func (b *iterationBudget) release(tokens int) {
+	b.used -= tokens
+	if b.used < 0 {
+		b.used = 0
+	}
+}
+
+// burstCoalescer learns the request inter-arrival gap and observed burst size. Its
+// plan is always capped by the configured probe/quiet/hard maxima, so adaptation can
+// reduce lone-request delay but can never make it worse than the historical window.
+type burstCoalescer struct {
+	gapEWMA   time.Duration
+	burstEWMA float64
+}
+
+type coalescePlan struct {
+	probe time.Duration
+	quiet time.Duration
+	hard  time.Duration
+}
+
+func clampDuration(v, lo, hi time.Duration) time.Duration {
+	if hi < lo {
+		lo = hi
+	}
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func (c *burstCoalescer) plan(maxProbe, maxQuiet, maxHard time.Duration, capacity int) coalescePlan {
+	if c.gapEWMA <= 0 {
+		c.gapEWMA = maxProbe / 2
+	}
+	if c.burstEWMA <= 0 {
+		c.burstEWMA = 2
+	}
+	probe := 2 * c.gapEWMA
+	if c.burstEWMA < 1.5 {
+		probe = c.gapEWMA
+	}
+	probe = clampDuration(probe, minDuration(250*time.Microsecond, maxProbe), maxProbe)
+	quiet := clampDuration(3*c.gapEWMA, minDuration(time.Millisecond, maxQuiet), maxQuiet)
+	waves := 2 + capacity/8
+	if waves > 6 {
+		waves = 6
+	}
+	hard := clampDuration(time.Duration(waves)*quiet, quiet, maxHard)
+	return coalescePlan{probe: probe, quiet: quiet, hard: hard}
+}
+
+func (c *burstCoalescer) observe(count int, elapsed time.Duration) {
+	if count > 1 {
+		gap := elapsed / time.Duration(count-1)
+		if c.gapEWMA <= 0 {
+			c.gapEWMA = gap
+		} else {
+			c.gapEWMA = (3*c.gapEWMA + gap) / 4
+		}
+	}
+	if c.burstEWMA <= 0 {
+		c.burstEWMA = float64(count)
+	} else {
+		c.burstEWMA = 0.75*c.burstEWMA + 0.25*float64(count)
+	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // ─── Public request type ───────────────────────────────────────────
 
 // Request is one unit of work submitted to the scheduler. It is the full
@@ -490,6 +615,12 @@ type Scheduler struct {
 	coalesceWindow time.Duration
 	coalesceQuiet  time.Duration
 	coalesceMax    time.Duration
+	coalescer      burstCoalescer
+
+	// iterationTokens is the unified per-owner-loop model-token budget. recorder is
+	// optional SOL-10a phase telemetry and is called only at scheduler boundaries.
+	iterationTokens int
+	recorder        metrics.SchedulerRecorder
 
 	// Exact short-burst attribution, cold-read once at construction. Disabled by default.
 	phaseTiming bool
@@ -581,16 +712,25 @@ type Scheduler struct {
 // New constructs a Scheduler over engine. queueDepth bounds the submit queue
 // (waiting requests not yet admitted to a slot); values < 1 default to a small
 // queue. The scheduler is not running until Start is called.
-func New(engine BatchEngine, queueDepth int) *Scheduler {
+func New(engine BatchEngine, queueDepth int, recorders ...metrics.SchedulerRecorder) *Scheduler {
 	if queueDepth < 1 {
 		queueDepth = 1
 	}
 	s := &Scheduler{
-		engine:      engine,
-		submit:      make(chan Request, queueDepth),
-		quit:        make(chan struct{}),
-		done:        make(chan struct{}),
-		phaseTiming: os.Getenv("FUCINA_QWEN35_PREFILL_TIMING") == "1",
+		engine:          engine,
+		submit:          make(chan Request, queueDepth),
+		quit:            make(chan struct{}),
+		done:            make(chan struct{}),
+		phaseTiming:     os.Getenv("FUCINA_QWEN35_PREFILL_TIMING") == "1",
+		iterationTokens: defaultIterationTokenBudget,
+	}
+	if len(recorders) > 0 {
+		s.recorder = recorders[0]
+	}
+	if v := os.Getenv("FUCINA_ITERATION_TOKEN_BUDGET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			s.iterationTokens = n
+		}
 	}
 	// Speculative decoding is a DEFAULT-on capability for DENSE models: if the engine
 	// can verify a batched draft step, use it. The drafter is model-agnostic
@@ -723,7 +863,7 @@ func (s *Scheduler) Submit(req Request) error {
 	if req.MaxNew < 1 {
 		req.MaxNew = 1
 	}
-	if s.phaseTiming {
+	if s.phaseTiming || s.recorder != nil {
 		req.submittedAt = time.Now()
 	}
 	// Prefer a shutdown signal over enqueuing, so Submit after Shutdown is
@@ -815,6 +955,10 @@ func (s *Scheduler) run() {
 	s.telMark = time.Now()
 	for {
 		passStart := time.Now()
+		budget := newIterationBudget(s.iterationTokens)
+		// Decode anchors are non-negotiable and are reserved before admission,
+		// chunked prefill, or speculative verification spends this iteration.
+		_ = budget.consume(len(active), false)
 		// 0. Run deferred slot teardown (state snapshots + RemoveSeq) for
 		//    sequences that finished last pass, so their slots are truly free
 		//    before admission below. Their clients were replied to instantly.
@@ -832,7 +976,15 @@ func (s *Scheduler) run() {
 		//    prefilled one-shot and joins active; a long prompt (chunked engine)
 		//    is opened and enters the prefill backlog. admitted reports whether
 		//    at least one sequence was slotted this pass.
-		admitted := s.admit(active, &prefill, &waiting)
+		admissionAttempt := len(waiting) > 0
+		admissionStart := time.Now()
+		admitted := s.admit(active, &prefill, &waiting, budget)
+		if s.recorder != nil {
+			s.recorder.SetQueueDepth(len(waiting) + len(s.submit))
+			if admissionAttempt {
+				s.recorder.ObservePhase(metrics.PhaseAdmission, time.Since(admissionStart))
+			}
+		}
 
 		// 3. Evict any active OR prefilling sequence whose context was cancelled
 		//    BEFORE the step, so a cancelled client's slot is freed promptly (and
@@ -852,15 +1004,15 @@ func (s *Scheduler) run() {
 		// repeat penalty) on the exact/logit-copy path.
 		hostSampledFused := hasHostSampling(active) || (len(prefill) > 0 && requiresHostSampling(prefill[0].req))
 		if s.fused != nil && len(prefill) > 0 && len(active) > 0 && !hostSampledFused {
-			fusedThisPass = s.stepFused(active, &prefill)
+			fusedThisPass = s.stepFused(active, &prefill, budget)
 			if !fusedThisPass {
 				// The engine declined the optional fused ABI without committing
 				// work. Keep this sequence and use the documented lossless
 				// interleave path for this and all subsequent passes.
-				s.advancePrefill(active, &prefill)
+				s.advancePrefill(active, &prefill, budget)
 			}
 		} else {
-			s.advancePrefill(active, &prefill)
+			s.advancePrefill(active, &prefill, budget)
 		}
 		s.telAdmit += time.Since(passStart)
 
@@ -882,34 +1034,10 @@ func (s *Scheduler) run() {
 				return
 			case req := <-s.submit:
 				waiting = append(waiting, req)
-				// Idle burst coalescing: concurrent clients submit within a few
-				// ms of each other, but the scheduler wakes on the FIRST one — by
-				// the time the rest arrive it is already mid-prefill and the
-				// burst admits staggered (rows out of lockstep, one prefill per
-				// pass). ESCALATING wait: a lone request pays at most the short
-				// probe window; the moment a second request lands the window
-				// extends per-arrival (quiet-period), bounded by the burst cap,
-				// so the whole burst is admitted as one lockstep batch.
-				probe := time.After(s.coalesceWindow)
-				var quiet <-chan time.Time // armed after the 2nd arrival
-				capHard := time.After(s.coalesceMax)
-			coalesce:
-				for len(waiting) < s.engine.Capacity() {
-					select {
-					case r2 := <-s.submit:
-						waiting = append(waiting, r2)
-						quiet = time.After(s.coalesceQuiet)
-					case <-probe:
-						if quiet == nil {
-							break coalesce // lone request: stop probing
-						}
-					case <-quiet:
-						break coalesce // burst went quiet: admit what we have
-					case <-capHard:
-						break coalesce
-					case <-s.quit:
-						return
-					}
+				// Adapt to observed inter-arrival gaps and burst width. Configured
+				// windows are maxima, so lone-request delay can only improve.
+				if !s.coalesceIdle(&waiting) {
+					return
 				}
 			case <-retryTimer(len(waiting) > 0):
 			}
@@ -927,7 +1055,7 @@ func (s *Scheduler) run() {
 		//    advances ALL of them together — UNLESS stepFused already decoded them
 		//    this pass (fused prefill+decode), in which case decode is done.
 		if !fusedThisPass {
-			if !s.step(active) {
+			if !s.step(active, budget) {
 				// Fatal engine error already handled inside step (all sequences
 				// evicted); fall through to re-check shutdown / new work.
 			}
@@ -1040,12 +1168,60 @@ func retryTimer(haveWaiters bool) <-chan time.Time {
 	return time.After(retryPoll)
 }
 
+// coalesceIdle collects one idle arrival wave using an adaptive plan. Fairness is
+// unchanged: only already-submitted requests are collected, admission remains FIFO
+// except for the explicitly documented short-prompt packing in admitBatched.
+func (s *Scheduler) coalesceIdle(waiting *[]Request) bool {
+	started := time.Now()
+	plan := s.coalescer.plan(s.coalesceWindow, s.coalesceQuiet, s.coalesceMax, s.engine.Capacity())
+	probe := time.After(plan.probe)
+	var quiet <-chan time.Time // armed only after a second arrival
+	hard := time.After(plan.hard)
+	count := 1
+	eligibleTokens := 0
+	for _, req := range *waiting {
+		if s.shortBatchEligible(req) {
+			eligibleTokens += len(req.Tokens) + 1
+		}
+	}
+
+coalesce:
+	for len(*waiting) < s.engine.Capacity() && eligibleTokens < s.iterationTokens {
+		select {
+		case req := <-s.submit:
+			*waiting = append(*waiting, req)
+			count++
+			if s.shortBatchEligible(req) {
+				eligibleTokens += len(req.Tokens) + 1
+			}
+			quiet = time.After(plan.quiet)
+		case <-probe:
+			if quiet == nil {
+				break coalesce
+			}
+		case <-quiet:
+			break coalesce
+		case <-hard:
+			break coalesce
+		case <-s.quit:
+			return false
+		}
+	}
+	elapsed := time.Since(started)
+	s.coalescer.observe(count, elapsed)
+	if s.recorder != nil {
+		s.recorder.ObservePhase(metrics.PhaseCoalesce, elapsed)
+		s.recorder.SetQueueDepth(len(*waiting) + len(s.submit))
+	}
+	return true
+}
+
 // admit prefills and slots waiting requests while engine capacity allows. A
 // request whose context is already cancelled is dropped without consuming a
 // slot. An AddSeq error fails just that request; others keep their place. It
 // returns true if at least one sequence was slotted (used by the run loop to
 // decide whether to retry or park).
-func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Request) bool {
+func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Request, budget *iterationBudget) bool {
 	admitted := false
 	oneShotAdmits := 0 // blocking AddSeq admissions this pass (capped to interleave decode)
 	// First tokens sampled by an idle burst are held until the entire capacity
@@ -1081,7 +1257,7 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		if ma, ok := s.engine.(MultiseqAdmitEngine); ok {
 			for {
 				free := s.engine.Capacity() - held()
-				if free < 2 || !s.admitBatched(active, waiting, ma, free, &initialFirst) {
+				if free < 2 || !s.admitBatched(active, waiting, ma, free, &initialFirst, budget) {
 					break
 				}
 				admitted = true
@@ -1100,7 +1276,7 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		// blocking forward (same decode-stall budget as the one serial AddSeq the cap already
 		// permits), but admits them all at once. Bounded to free capacity so it never overfills.
 		free := s.engine.Capacity() - held()
-		if free >= 2 && s.admitBatched(active, waiting, ma, free, nil) {
+		if free >= 2 && s.admitBatched(active, waiting, ma, free, nil, budget) {
 			admitted = true
 			oneShotAdmits++ // the batched forward counts as this pass's ONE blocking admit
 		}
@@ -1147,6 +1323,7 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 				w = w[1:]
 				continue
 			}
+			s.observeQueue(req, time.Now())
 			slot, nShared, err := s.sessionState.RestoreSession(req.Tokens, req.Params, *req.SessionState)
 			if err != nil {
 				reply(req, Result{Reason: FinishError, Err: fmt.Errorf("session restore: %w", err)})
@@ -1181,6 +1358,7 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		// re-pays per-pass fixed costs: MoE expert-slab dequants, GDN chunk-scan restarts,
 		// scalar attention for base>0 tiles). Busy batch → chunk; idle → one-shot TTFT.
 		if s.chunk != nil && len(req.Tokens) > s.chunkMin && (!s.chunkAdaptive || !idleAtEntry) {
+			s.observeQueue(req, time.Now())
 			slot, nShared, err := s.chunk.OpenSeq(req.Tokens, req.Params)
 			if err != nil {
 				log.Printf("batch: OpenSeq failed: %v", err)
@@ -1210,10 +1388,22 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			break
 		}
 
+		// One-shot prefill consumes prompt rows and creates one decode anchor
+		// that will run later in this same iteration. Only a completely idle
+		// iteration may overrun for an engine that cannot chunk a large prompt.
+		cost := len(req.Tokens) + 1
+		allowOversize := idleAtEntry && budget.used == 0
+		if !budget.consume(cost, allowOversize) {
+			break
+		}
 		tAdd := time.Now()
+		s.observeQueue(req, tAdd)
 		slot, first, err := s.engine.AddSeq(req.Tokens, req.Params)
 		engineDur := time.Since(tAdd)
 		s.telAdmitEng += engineDur
+		if s.recorder != nil {
+			s.recorder.ObservePhase(metrics.PhasePrefill, engineDur)
+		}
 		if err != nil {
 			log.Printf("batch: AddSeq failed: %v", err)
 			reply(req, Result{Reason: FinishError, Err: fmt.Errorf("prefill: %w", err)})
@@ -1226,12 +1416,11 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			ri := info.LastAddSeqReuse().Normalized()
 			sq.reused, sq.source = ri.ReusedTokens, ri.Source
 		}
+		s.markFirstDecode(sq)
 		if s.phaseTiming {
-			s.admissionID++
-			sq.admissionID, sq.admittedAt, sq.firstDecodePending = s.admissionID, time.Now(), true
 			wait := tAdd.Sub(req.submittedAt)
 			log.Printf("batch: qwen35 admission id=%d count=1 rows=1 tokens=%d wait=%.3f ms engine=%.3f ms first_token=%.3f ms",
-				s.admissionID, len(req.Tokens), wait.Seconds()*1000, engineDur.Seconds()*1000,
+				sq.admissionID, len(req.Tokens), wait.Seconds()*1000, engineDur.Seconds()*1000,
 				time.Since(req.submittedAt).Seconds()*1000)
 		}
 		w = w[1:]
@@ -1275,85 +1464,149 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 	return admitted
 }
 
-// admitBatched prefills the leading established-eligible run of waiting prompts in ONE forward
-// (P1). It retains the existing conservative token/chunk bounds so this scheduler change cannot
-// alter which numerical prefill path a request uses. Idle admission may invoke it repeatedly to
-// fill a capacity wave. Any unsupported/failed call falls back to serial admission in the same
-// pass, so a transient SeqAddMultiseq failure never becomes a permanent serial decode path.
-func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma MultiseqAdmitEngine, maxAdmit int, deferred *[]admissionFirst) bool {
-	const maxBatchTokens = 4096 // established bound: stay well under the engine prefill tile
+// shortBatchEligible identifies requests whose established numerical path is the
+// multisequence short-prefill ABI. Persistence, host sampling, empty prompts, and
+// prompts above the chunk threshold retain their request-specific serial/chunk path.
+func (s *Scheduler) shortBatchEligible(req Request) bool {
+	if req.Ctx != nil && req.Ctx.Err() != nil {
+		return false
+	}
+	if req.PersistSession || req.SessionState != nil || requiresHostSampling(req) || len(req.Tokens) == 0 {
+		return false
+	}
+	return s.chunk == nil || len(req.Tokens) <= s.chunkMin
+}
+
+func (s *Scheduler) observeQueue(req Request, admitted time.Time) {
+	if s.recorder == nil || req.submittedAt.IsZero() {
+		return
+	}
+	wait := admitted.Sub(req.submittedAt)
+	if wait < 0 {
+		wait = 0
+	}
+	s.recorder.ObserveQueueWait(wait)
+	s.recorder.ObservePhase(metrics.PhaseQueue, wait)
+}
+
+// admitBatched scans the ENTIRE waiting queue and packs every eligible short prompt
+// that fits the remaining token/slot budget, preserving FIFO order among selected
+// requests. Ineligible entries stay in place. Fairness rule: if queue head is
+// ineligible, one slot (and any immediate one-shot token cost) is reserved for it;
+// therefore later shorts may bypass it for this wave but cannot occupy its last slot.
+// When it becomes the head with only one free slot, batching is disabled and the
+// serial/chunk path admits it. This prevents starvation without restoring leading-run
+// head-of-line blocking.
+func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma MultiseqAdmitEngine, maxAdmit int, deferred *[]admissionFirst, budget *iterationBudget) bool {
+	const maxBatchTokens = 4096 // independent engine safety cap; iteration budget may be tighter
 	w := *waiting
 	capacity := s.engine.Capacity()
 	if maxAdmit < capacity {
-		capacity = maxAdmit // busy path: never claim more than the free slots
+		capacity = maxAdmit
 	}
-	var reqs []Request
-	var prompts [][]int32
-	var params []SeqParams
-	ttot := 0
-	for len(reqs) < capacity && len(reqs) < len(w) {
-		req := w[len(reqs)]
-		if req.Ctx != nil && req.Ctx.Err() != nil {
-			break // let the serial loop reply-cancel this one
+	tokenLimit := budget.remaining()
+	if len(w) == 0 || capacity < 2 || tokenLimit < 2 {
+		return false
+	}
+
+	// Reserve the head's next opportunity when this batch scans past it.
+	if !s.shortBatchEligible(w[0]) {
+		cancelled := w[0].Ctx != nil && w[0].Ctx.Err() != nil
+		if !cancelled {
+			capacity--
+			reserve := 0
+			chunked := s.chunk != nil && len(w[0].Tokens) > s.chunkMin
+			if !chunked && w[0].SessionState == nil {
+				reserve = len(w[0].Tokens) + 1
+			}
+			if reserve >= tokenLimit {
+				return false
+			}
+			tokenLimit -= reserve
 		}
-		if req.PersistSession || requiresHostSampling(req) {
-			break // persistence/host sampling needs per-request restore or prefill logits
+	}
+	if capacity < 2 {
+		return false
+	}
+
+	indices := make([]int, 0, capacity)
+	prompts := make([][]int32, 0, capacity)
+	params := make([]SeqParams, 0, capacity)
+	promptTokens, totalCost := 0, 0
+	for i, req := range w {
+		if !s.shortBatchEligible(req) {
+			continue
 		}
-		if s.chunk != nil && len(req.Tokens) > s.chunkMin {
-			break // long prompts preserve their one-shot/chunked numerical path
-		}
-		if len(req.Tokens) == 0 {
+		cost := len(req.Tokens) + 1 // prompt rows plus this iteration's decode anchor
+		if promptTokens+len(req.Tokens) > maxBatchTokens || totalCost+cost > tokenLimit {
+			// FIFO among eligible requests: never bypass an older eligible short merely
+			// because a younger one is smaller.
 			break
 		}
-		if ttot+len(req.Tokens) > maxBatchTokens {
-			break
-		}
-		reqs = append(reqs, req)
+		indices = append(indices, i)
 		prompts = append(prompts, req.Tokens)
 		params = append(params, req.Params)
-		ttot += len(req.Tokens)
+		promptTokens += len(req.Tokens)
+		totalCost += cost
+		if len(indices) == capacity {
+			break
+		}
 	}
-	if len(reqs) < 2 {
-		return false // not worth a batched call; serial handles a lone prompt
+	if len(indices) < 2 || !budget.consume(totalCost, false) {
+		return false
 	}
-	var engineStart time.Time
-	if s.phaseTiming {
-		engineStart = time.Now()
+
+	engineStart := time.Now()
+	for _, idx := range indices {
+		s.observeQueue(w[idx], engineStart)
 	}
 	slots, firsts, err := ma.SeqAddMultiseq(prompts, params)
-	var engineDur time.Duration
-	if s.phaseTiming {
-		engineDur = time.Since(engineStart)
-		s.telAdmitEng += engineDur
+	engineDur := time.Since(engineStart)
+	s.telAdmitEng += engineDur
+	if s.recorder != nil {
+		s.recorder.ObservePhase(metrics.PhasePrefill, engineDur)
 	}
 	if err != nil {
-		log.Printf("batch: SeqAddMultiseq failed (%d seqs): %v — serial fallback", len(reqs), err)
+		budget.release(totalCost)
+		log.Printf("batch: SeqAddMultiseq failed (%d seqs): %v — serial fallback", len(indices), err)
 		return false
 	}
 	if slots == nil {
-		return false // engine declined (unsupported) → serial path
+		budget.release(totalCost)
+		return false
 	}
-	var admissionID int64
-	var admittedAt time.Time
-	if s.phaseTiming {
-		s.admissionID++
-		admissionID = s.admissionID
-		admittedAt = time.Now()
-	}
-	if len(slots) != len(reqs) || len(firsts) != len(reqs) {
-		// A malformed optional result cannot be mapped safely. Free any slots the
-		// engine did report and leave the requests queued for serial admission.
+	if len(slots) != len(indices) || len(firsts) != len(indices) {
+		budget.release(totalCost)
 		for _, slot := range slots {
 			_ = s.engine.RemoveSeq(slot)
 		}
 		log.Printf("batch: SeqAddMultiseq returned %d slots/%d firsts for %d requests — serial fallback",
-			len(slots), len(firsts), len(reqs))
+			len(slots), len(firsts), len(indices))
 		return false
 	}
-	*waiting = w[len(reqs):]
-	for i, req := range reqs {
+
+	selected := make([]bool, len(w))
+	for _, idx := range indices {
+		selected[idx] = true
+	}
+	kept := make([]Request, 0, len(w)-len(indices))
+	for i, req := range w {
+		if !selected[i] {
+			kept = append(kept, req)
+		}
+	}
+	*waiting = kept
+
+	var admissionID int64
+	admittedAt := time.Now()
+	if s.phaseTiming || s.recorder != nil {
+		s.admissionID++
+		admissionID = s.admissionID
+	}
+	for i, idx := range indices {
+		req := w[idx]
 		sq := s.newSeq(req, slots[i])
-		if s.phaseTiming {
+		if s.phaseTiming || s.recorder != nil {
 			sq.admissionID, sq.admittedAt, sq.firstDecodePending = admissionID, admittedAt, true
 		}
 		if deferred != nil {
@@ -1365,24 +1618,36 @@ func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma Mul
 	if s.phaseTiming {
 		waitMin, waitMax := time.Duration(1<<63-1), time.Duration(0)
 		firstMax := time.Duration(0)
-		for _, req := range reqs {
+		for _, idx := range indices {
+			req := w[idx]
 			wait := engineStart.Sub(req.submittedAt)
-			first := time.Since(req.submittedAt)
 			if wait < waitMin {
 				waitMin = wait
 			}
 			if wait > waitMax {
 				waitMax = wait
 			}
-			if first > firstMax {
+			if first := time.Since(req.submittedAt); first > firstMax {
 				firstMax = first
 			}
 		}
 		log.Printf("batch: qwen35 admission id=%d count=1 rows=%d tokens=%d wait_min=%.3f ms wait_max=%.3f ms engine=%.3f ms first_token_max=%.3f ms",
-			admissionID, len(reqs), ttot, waitMin.Seconds()*1000, waitMax.Seconds()*1000,
+			admissionID, len(indices), promptTokens, waitMin.Seconds()*1000, waitMax.Seconds()*1000,
 			engineDur.Seconds()*1000, firstMax.Seconds()*1000)
 	}
 	return true
+}
+
+// markFirstDecode starts request-local admission-to-first-decode attribution.
+// Chunked prompts are marked only when prefill completes, while one-shot and batch
+// prompts are marked immediately after their prefill returns.
+func (s *Scheduler) markFirstDecode(sq *seq) {
+	if s.phaseTiming || s.recorder != nil {
+		s.admissionID++
+		sq.admissionID = s.admissionID
+		sq.admittedAt = time.Now()
+		sq.firstDecodePending = true
+	}
 }
 
 // newSeq builds the scheduler's per-sequence state for an admitted request bound to
@@ -1419,7 +1684,7 @@ func (s *Scheduler) newSeq(req Request, slot int) *seq {
 // removed from the backlog, its first token delivered, and (if it survives) promoted
 // to the active decode set. A prefill error or KV exhaustion evicts just that
 // sequence. It is a no-op when the backlog is empty.
-func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
+func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq, budget *iterationBudget) {
 	p := *prefill
 	if len(p) == 0 {
 		return
@@ -1427,13 +1692,37 @@ func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
 	sq := p[0]
 	toks := sq.req.Tokens
 	lo := sq.prefillPos
-	hi := lo + s.chunkSize
+	chunk := s.chunkSize
+	if chunk > budget.remaining() {
+		chunk = budget.remaining()
+	}
+	remaining := len(toks) - lo
+	// Completing the prompt promotes a new decode row before this iteration's
+	// shared step, so reserve its anchor alongside the final prefill chunk.
+	if remaining <= chunk && remaining+1 > budget.remaining() {
+		chunk--
+	}
+	if chunk < 1 {
+		return
+	}
+	hi := lo + chunk
 	if hi > len(toks) {
 		hi = len(toks)
 	}
 	last := hi == len(toks)
+	cost := hi - lo
+	if last {
+		cost++
+	}
+	if !budget.consume(cost, false) {
+		return
+	}
 
+	prefillStart := time.Now()
 	first, err := s.chunk.PrefillChunk(sq.slot, toks[lo:hi], last)
+	if s.recorder != nil {
+		s.recorder.ObservePhase(metrics.PhasePrefill, time.Since(prefillStart))
+	}
 	if err != nil {
 		log.Printf("batch: PrefillChunk(slot %d) failed: %v", sq.slot, err)
 		*prefill = p[1:]
@@ -1466,6 +1755,7 @@ func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
 			return
 		}
 	}
+	s.markFirstDecode(sq)
 	if s.deliver(active, sq, first) {
 		active[sq.slot] = sq
 	}
@@ -1481,7 +1771,7 @@ func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
 // and prefill rows, leaving no room for the extra draft/verify rows speculation needs — and prefill is
 // a transient state, so decode returns to the spec path automatically once the prompt is fully
 // prefilled. Both paths are lossless w.r.t. greedy decode, so this changes only throughput, never tokens.
-func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) bool {
+func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq, budget *iterationBudget) bool {
 	p := *prefill
 	pfSq := p[0]
 	toks := pfSq.req.Tokens
@@ -1492,8 +1782,11 @@ func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) bool {
 	// slots-1 <= fusedRows-1 — except when an unusual concurrency mix saturates the row budget, in
 	// which case decode this pass alone and let the prefill resume when a decode slot frees.
 	room := s.fusedRows - len(active)
+	if room > budget.remaining() {
+		room = budget.remaining()
+	}
 	if room < 1 {
-		s.step(active)
+		s.step(active, budget)
 		return true
 	}
 	hi := lo + room
@@ -1501,6 +1794,10 @@ func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) bool {
 		hi = len(toks)
 	}
 	last := hi == len(toks)
+	if !budget.consume(hi-lo, false) {
+		s.step(active, budget)
+		return true
+	}
 
 	// Decode arrays (stable index order: out[i] ↔ slots[i]).
 	slots := make([]int32, 0, len(active))
@@ -1510,8 +1807,18 @@ func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) bool {
 		inputs = append(inputs, sq.next)
 	}
 
+	engineStart := time.Now()
 	decOut, pfFirst, err := s.fused.StepBatchFused(slots, inputs, pfSq.slot, toks[lo:hi], last)
+	engineDur := time.Since(engineStart)
+	s.telEngine += engineDur
+	s.logFirstDecode(active, engineDur)
+	if s.recorder != nil {
+		s.recorder.ObservePhase(metrics.PhasePrefill, engineDur)
+		s.recorder.ObservePhase(metrics.PhaseDecode, engineDur)
+		s.recorder.ObserveBatchSize(len(slots))
+	}
 	if errors.Is(err, ErrFusedPrefillUnsupported) {
+		budget.release(hi - lo)
 		// Optional capability mismatch: no rows were committed. Disable it once
 		// and let run() execute PrefillChunk followed by the shared decode step.
 		// Treating -2 as a request error used to evict every concurrent long
@@ -1529,7 +1836,7 @@ func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) bool {
 		log.Printf("batch: StepBatchFused failed (slot %d, %d active): %v", pfSq.slot, len(active), err)
 		*prefill = p[1:]
 		s.evict(active, pfSq, Result{Reason: FinishError, Generated: pfSq.generated, Err: err})
-		s.step(active)
+		s.step(active, budget)
 		return true
 	}
 
@@ -1562,6 +1869,7 @@ func (s *Scheduler) stepFused(active map[int]*seq, prefill *[]*seq) bool {
 	if s.prefixCommit != nil {
 		s.prefixCommit.PrefixCommit(pfSq.slot, pfSq.req.Tokens)
 	}
+	s.markFirstDecode(pfSq)
 	if s.deliver(active, pfSq, pfFirst) {
 		active[pfSq.slot] = pfSq
 	}
@@ -1765,7 +2073,7 @@ func (s *Scheduler) evictCancelled(active map[int]*seq) {
 // SpecBatchEngine it takes the speculative path (draft per slot + one batched verify,
 // committing the accepted run); otherwise it runs a plain one-token-per-slot decode.
 // It returns false if a fatal engine error evicted everything.
-func (s *Scheduler) step(active map[int]*seq) bool {
+func (s *Scheduler) step(active map[int]*seq, budget *iterationBudget) bool {
 	if len(active) == 0 {
 		return true
 	}
@@ -1786,7 +2094,7 @@ func (s *Scheduler) step(active map[int]*seq) bool {
 		}
 	}
 	if s.spec != nil {
-		return s.stepSpec(active)
+		return s.stepSpec(active, budget)
 	}
 	return s.stepPlain(active)
 }
@@ -1806,6 +2114,7 @@ func (s *Scheduler) stepExact(active map[int]*seq) bool {
 	engineDur := time.Since(t0)
 	s.telEngine += engineDur
 	s.logFirstDecode(active, engineDur)
+	s.observeDecode(engineDur, len(slots))
 	s.telSteps++
 	s.telBatch += int64(len(slots))
 	if err == nil && len(out) != len(slots) {
@@ -1835,32 +2144,55 @@ func (s *Scheduler) stepExact(active map[int]*seq) bool {
 	return true
 }
 
+func (s *Scheduler) observeDecode(elapsed time.Duration, batchSize int) {
+	if s.recorder == nil {
+		return
+	}
+	s.recorder.ObservePhase(metrics.PhaseDecode, elapsed)
+	s.recorder.ObserveBatchSize(batchSize)
+}
+
 // logFirstDecode attributes the first post-admission decode call by admission group.
 // It allocates only in the explicitly enabled telemetry mode.
 func (s *Scheduler) logFirstDecode(active map[int]*seq, engineDur time.Duration) {
-	if !s.phaseTiming {
+	if !s.phaseTiming && s.recorder == nil {
 		return
 	}
 	type group struct {
 		rows     int
 		admitted time.Time
 	}
-	groups := make(map[int64]group)
+	var groups map[int64]group
+	if s.phaseTiming {
+		groups = make(map[int64]group)
+	}
+	now := time.Now()
 	for _, sq := range active {
 		if !sq.firstDecodePending {
 			continue
 		}
-		g := groups[sq.admissionID]
-		g.rows++
-		if g.admitted.IsZero() || sq.admittedAt.Before(g.admitted) {
-			g.admitted = sq.admittedAt
+		if s.recorder != nil {
+			delay := now.Sub(sq.admittedAt)
+			if delay < engineDur {
+				delay = engineDur
+			}
+			s.recorder.ObservePhase(metrics.PhaseFirstDecode, delay)
 		}
-		groups[sq.admissionID] = g
+		if s.phaseTiming {
+			g := groups[sq.admissionID]
+			g.rows++
+			if g.admitted.IsZero() || sq.admittedAt.Before(g.admitted) {
+				g.admitted = sq.admittedAt
+			}
+			groups[sq.admissionID] = g
+		}
 		sq.firstDecodePending = false
 	}
-	for id, g := range groups {
-		log.Printf("batch: qwen35 first-decode admission_id=%d rows=%d delay=%.3f ms engine=%.3f ms active=%d",
-			id, g.rows, time.Since(g.admitted).Seconds()*1000, engineDur.Seconds()*1000, len(active))
+	if s.phaseTiming {
+		for id, g := range groups {
+			log.Printf("batch: qwen35 first-decode admission_id=%d rows=%d delay=%.3f ms engine=%.3f ms active=%d",
+				id, g.rows, now.Sub(g.admitted).Seconds()*1000, engineDur.Seconds()*1000, len(active))
+		}
 	}
 }
 
@@ -1880,7 +2212,7 @@ func (s *Scheduler) logFirstDecode(active map[int]*seq, engineDur time.Duration)
 // being the hard ceiling. It is LOSSLESS: the scheduler only sets draft *lengths*; the
 // committed run is what a plain greedy step would have emitted (the engine's verify
 // enforces it), so any length — including zero — yields identical tokens.
-func (s *Scheduler) stepSpec(active map[int]*seq) bool {
+func (s *Scheduler) stepSpec(active map[int]*seq, budget *iterationBudget) bool {
 	// Stable order: build parallel arrays so reqs[i] ↔ slots[i] ↔ out[i] by index.
 	slots := make([]int, 0, len(active))
 	for slot := range active {
@@ -1911,10 +2243,15 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 
 	// Hardware-aware prefix scheduler: choose the per-slot verify length under the global
 	// row budget and the decode throughput model (DSpark Alg.1, training-free half).
-	admit := scheduleConfidence(surv, MaxVerifyRows)
+	verifyRows := MaxVerifyRows
+	if available := len(active) + budget.remaining(); available < verifyRows {
+		verifyRows = available
+	}
+	admit := scheduleConfidence(surv, verifyRows)
 
 	reqs := make([]SpecReq, len(slots))
 	anyDraft := false
+	draftRows := 0
 	for i, slot := range slots {
 		sq := active[slot]
 		k := admit[i]
@@ -1925,6 +2262,7 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 		if k > 0 {
 			d = drafts[i][:k]
 			anyDraft = true
+			draftRows += k
 		}
 		reqs[i] = SpecReq{Slot: int32(slot), Anchor: sq.next, Drafts: d}
 	}
@@ -1935,12 +2273,18 @@ func (s *Scheduler) stepSpec(active map[int]*seq) bool {
 	if !anyDraft {
 		return s.stepPlain(active)
 	}
+	if !budget.consume(draftRows, false) {
+		// Defensive: scheduleConfidence is already bounded by remaining(), but
+		// plain decode is always a lossless fallback if accounting changes.
+		return s.stepPlain(active)
+	}
 
 	t0 := time.Now()
 	out, err := s.spec.StepBatchSpec(reqs)
 	engineDur := time.Since(t0)
 	s.telEngine += engineDur
 	s.logFirstDecode(active, engineDur)
+	s.observeDecode(engineDur, len(slots))
 	s.telSteps++
 	s.telBatch += int64(len(slots))
 	if err != nil {
@@ -2002,6 +2346,7 @@ func (s *Scheduler) stepPlain(active map[int]*seq) bool {
 	engineDur := time.Since(t0)
 	s.telEngine += engineDur
 	s.logFirstDecode(active, engineDur)
+	s.observeDecode(engineDur, len(slots))
 	s.telSteps++
 	s.telBatch += int64(len(slots))
 	if os.Getenv("FUCINA_P0_DIAG") != "" && len(slots) > 1 {
