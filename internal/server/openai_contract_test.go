@@ -170,7 +170,18 @@ func TestOpenAIContractIncludeUsageSSEWire(t *testing.T) {
 				t.Fatalf("last event usage=%v body=%s", hasUsage, rec.Body.String())
 			}
 			if !tc.include {
+				for _, event := range events {
+					if _, ok := event["usage"]; ok {
+						t.Fatalf("default stream unexpectedly contains usage: %s", rec.Body.String())
+					}
+				}
 				return
+			}
+			for i, event := range events[:len(events)-1] {
+				raw, ok := event["usage"]
+				if !ok || string(raw) != "null" {
+					t.Fatalf("event %d usage=%s, want explicit null: %s", i, raw, rec.Body.String())
+				}
 			}
 			var choices []json.RawMessage
 			if err := json.Unmarshal(last["choices"], &choices); err != nil {

@@ -146,8 +146,26 @@ func (e *sseWriter) ping() {
 // writeEvent marshals v as one `data:` event (no flush — pair with flush()).
 func (e *sseWriter) writeEvent(v interface{}) {
 	data, _ := json.Marshal(v)
+	// OpenAI specifies that when include_usage is requested every ordinary
+	// chunk carries usage:null, followed by one usage-only aggregate chunk.
+	// Keep the response structs' omitempty behavior for default streams and
+	// inject the explicit null only for this request-scoped mode.
+	if e.includeUsage && streamResponseUsageNil(v) && len(data) > 0 && data[len(data)-1] == '}' {
+		data = append(data[:len(data)-1], []byte(`,"usage":null}`)...)
+	}
 	if _, err := fmt.Fprintf(e.w, "data: %s\n\n", data); err != nil {
 		e.writeErr.Store(true)
+	}
+}
+
+func streamResponseUsageNil(v interface{}) bool {
+	switch response := v.(type) {
+	case StreamResponse:
+		return response.Usage == nil
+	case CompletionStreamResponse:
+		return response.Usage == nil
+	default:
+		return false
 	}
 }
 
