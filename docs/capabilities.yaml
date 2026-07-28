@@ -1,0 +1,16 @@
+schema: 1
+# Machine-readable capability claims. internal/model/capabilities_test.go rebuilds each profile
+# from checkpoint metadata/tensor indexes and fails CI when these values drift from source.
+claims:
+  batch_mtp_gemma4: true
+  continuous_batching_default: true
+  e4b_serving: true
+  legacy_qwen3: false
+formats:
+  gemma4_12b_gguf_q4_0_qat: validated
+  gemma4_12b_gguf_q8_0: validated
+  gemma4_12b_safetensors_nvfp4: validated
+  qwen35_9b_safetensors_fp8: validated
+  qwen36_27b_safetensors_fp8: validated
+  qwen35_35b_a3b_safetensors_fp8: validated
+  gemma4_e4b_safetensors_bf16: loads
