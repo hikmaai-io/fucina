@@ -10,6 +10,7 @@ import (
 
 	"github.com/hikmaai-io/fucina/internal/chat"
 	"github.com/hikmaai-io/fucina/internal/engine/e4b"
+	"github.com/hikmaai-io/fucina/internal/model"
 	"github.com/hikmaai-io/fucina/internal/sampler"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
 )
@@ -31,7 +32,7 @@ const e4bCommandsHelp = "  /thinking LEVEL  set reasoning: off|on|low|medium|hig
 	"  /quit            exit (or Ctrl-D)\n"
 
 // runE4B is the CLI entry for an E4B checkpoint (already detected by main()).
-func runE4B(args CLIArgs) {
+func runE4B(args CLIArgs, modelStore *model.Store) {
 	// Desired KV slots = continuous-batching width + 1. Slot 0 is permanently reserved
 	// for the single-sequence Prefill/Decode API; the batch scheduler uses slots 1..N-1,
 	// so to give --parallel N *concurrent batch sequences* we provision N+1 slots. Single-
@@ -75,7 +76,7 @@ func runE4B(args CLIArgs) {
 	case args.Prompt != "" || args.PromptFile != "":
 		runE4BOneShot(eng, tok, args)
 	default:
-		runE4BServer(eng, tok, args) // OpenAI-compatible HTTP server (no spec/MTP for E4B)
+		runE4BServer(eng, tok, args, modelStore) // OpenAI-compatible HTTP server (no spec/MTP for E4B)
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"runtime"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/hikmaai-io/fucina/internal/grammar"
-	"github.com/hikmaai-io/fucina/internal/sampler"
 )
 
 // ─── Engine contract ───────────────────────────────────────────────
@@ -248,6 +246,14 @@ type StateSaverEngine interface {
 	SaveState(slot int, tokens []int32)
 }
 
+// LiveSequenceCacheEngine optionally keeps a cleanly finished paged slot resident
+// and re-admits a later strict prompt extension without copying or re-prefilling its
+// committed prefix. RetainSeq returns true only when it took ownership of slot; the
+// scheduler then MUST NOT call RemoveSeq. Implementations must bound retained slots.
+type LiveSequenceCacheEngine interface {
+	RetainSeq(slot int, tokens []int32, params SeqParams) bool
+}
+
 // StateSnapshot is an opaque, exact-position engine snapshot paired with the
 // committed token history that produced it. The scheduler never interprets
 // State; hybrid engines use it for full-layer K/V plus recurrent state.
@@ -371,9 +377,10 @@ type Result struct {
 	Reason FinishReason
 	// Generated is the number of tokens emitted for this sequence.
 	Generated int
-	// ReusedTokens is the restored disk-session prefix length (zero on a cold
-	// admission). It is also surfaced through the engine prefix-cache metrics.
+	// ReusedTokens is the physically skipped prompt prefix length for this request.
 	ReusedTokens int
+	// Source identifies where ReusedTokens came from.
+	Source ReuseSource
 	// Err is the underlying engine error when Reason is FinishError, else nil.
 	Err error
 	// SessionState is the updated snapshot requested by PersistSession.
@@ -434,9 +441,10 @@ type seq struct {
 	// regBlocks is how many full 256-token blocks of hist have been registered with
 	// the prefix cache; used to call PrefixCommit only when a new block completes.
 	regBlocks int
-	// reused is the exact disk-session prefix restored at admission.
+	// reused is the physically skipped prompt prefix restored/adopted at admission.
 	reused int
-	// rng is private to this sequence's host constrained sampler, so random draws
+	source ReuseSource
+	// rng is private to this sequence's host sampler, so random draws
 	// are independent of map iteration and batch composition.
 	rng *rand.Rand
 }
@@ -519,7 +527,8 @@ type Scheduler struct {
 
 	// stateSaver, when non-nil, snapshots a finishing sequence's slot state
 	// keyed by its token history (hybrid engines' in-memory conversation cache).
-	stateSaver StateSaverEngine
+	stateSaver   StateSaverEngine
+	liveRetainer LiveSequenceCacheEngine
 	// sessionState is the explicit disk-session restore/export path. Unlike the
 	// opportunistic in-memory cache, restore failures are fatal to that request.
 	sessionState SessionStateEngine
@@ -667,6 +676,9 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 	if ss, ok := engine.(StateSaverEngine); ok {
 		s.stateSaver = ss
 	}
+	if lr, ok := engine.(LiveSequenceCacheEngine); ok {
+		s.liveRetainer = lr
+	}
 	if se, ok := engine.(SessionStateEngine); ok {
 		s.sessionState = se
 	}
@@ -682,6 +694,12 @@ func New(engine BatchEngine, queueDepth int) *Scheduler {
 // SupportsConstraints reports whether this scheduler can perform per-slot
 // grammar masking without falling back to an unsafe unconstrained sample.
 func (s *Scheduler) SupportsConstraints() bool {
+	return s.exact != nil && s.constraintLogits != nil
+}
+
+// SupportsRepeatPenalty reports whether repeat-penalty rows can use the exact
+// per-row host sampler instead of being silently dropped by the paged sampler.
+func (s *Scheduler) SupportsRepeatPenalty() bool {
 	return s.exact != nil && s.constraintLogits != nil
 }
 
@@ -830,10 +848,10 @@ func (s *Scheduler) run() {
 		//    prompt finished prefilling is promoted to active in either path.
 		fusedThisPass := false
 		// Fused prefill samples on device and does not expose both its decode and
-		// prefill-final distributions. Keep constrained rows on the exact/logit-copy
-		// path; unconstrained Gemma/Qwen traffic retains the existing fused gate.
-		constrainedFused := hasConstrained(active) || (len(prefill) > 0 && prefill[0].req.Constraint != nil)
-		if s.fused != nil && len(prefill) > 0 && len(active) > 0 && !constrainedFused {
+		// prefill-final distributions. Keep every host-sampled row (grammar or
+		// repeat penalty) on the exact/logit-copy path.
+		hostSampledFused := hasHostSampling(active) || (len(prefill) > 0 && requiresHostSampling(prefill[0].req))
+		if s.fused != nil && len(prefill) > 0 && len(active) > 0 && !hostSampledFused {
 			fusedThisPass = s.stepFused(active, &prefill)
 			if !fusedThisPass {
 				// The engine declined the optional fused ABI without committing
@@ -1099,11 +1117,10 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			continue
 		}
 
-		// Fail closed before touching the engine: a grammar request may only enter
-		// an engine that can expose exact per-row logits. This preserves the old 501
-		// behavior for adapters such as E4B while enabling Qwen/Gemma CUDA adapters.
-		if req.Constraint != nil && !s.SupportsConstraints() {
-			err := errors.New("batch: engine does not support constrained sampling")
+		// Fail closed before touching the engine: grammar and repeat-penalty rows
+		// require exact per-row logits for request-local host sampling.
+		if requiresHostSampling(req) && !s.SupportsConstraints() {
+			err := errors.New("batch: engine does not support exact host sampling")
 			reply(req, Result{Reason: FinishError, Err: err})
 			w = w[1:]
 			continue
@@ -1146,6 +1163,7 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			sq := s.newSeq(req, slot)
 			sq.prefillPos = nShared
 			sq.reused = nShared
+			sq.source = ReuseSourceDiskSession
 			*prefill = append(*prefill, sq)
 			log.Printf("batch: disk session restored (%d cached, %d new prompt tokens)", nShared, len(req.Tokens)-nShared)
 			w = w[1:]
@@ -1172,6 +1190,12 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 			}
 			sq := s.newSeq(req, slot)
 			sq.prefillPos = nShared // adopted prefix already in KV; chunk-prefill only the suffix
+			if info, ok := s.chunk.(OpenReuseInfoEngine); ok {
+				ri := info.LastOpenSeqReuse().Normalized()
+				sq.reused, sq.source = ri.ReusedTokens, ri.Source
+			} else if nShared > 0 {
+				sq.reused, sq.source = nShared, ReuseSourceGPUPagedBlock
+			}
 			*prefill = append(*prefill, sq)
 			w = w[1:]
 			admitted = true
@@ -1198,6 +1222,10 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		}
 
 		sq := s.newSeq(req, slot)
+		if info, ok := s.engine.(AdmitReuseInfoEngine); ok {
+			ri := info.LastAddSeqReuse().Normalized()
+			sq.reused, sq.source = ri.ReusedTokens, ri.Source
+		}
 		if s.phaseTiming {
 			s.admissionID++
 			sq.admissionID, sq.admittedAt, sq.firstDecodePending = s.admissionID, time.Now(), true
@@ -1210,9 +1238,9 @@ func (s *Scheduler) admit(active map[int]*seq, prefill *[]*seq, waiting *[]Reque
 		admitted = true // a slot was consumed (progress), even if it self-evicts below
 		oneShotAdmits++
 
-		// A constrained row must resample its prefill token from the exact
-		// per-row logits so the grammar FSM starts from a legal state.
-		if sq.req.Constraint != nil {
+		// A host-sampled row must replace the device prefill token from exact
+		// per-row logits so repeat history and grammar state start correctly.
+		if requiresHostSampling(sq.req) {
 			first, err = s.samplePrefill(sq)
 			if err != nil {
 				s.evict(active, sq, Result{Reason: FinishError, Err: err})
@@ -1268,8 +1296,8 @@ func (s *Scheduler) admitBatched(active map[int]*seq, waiting *[]Request, ma Mul
 		if req.Ctx != nil && req.Ctx.Err() != nil {
 			break // let the serial loop reply-cancel this one
 		}
-		if req.PersistSession || req.Constraint != nil {
-			break // persistence/grammar needs per-request restore or prefill logits
+		if req.PersistSession || requiresHostSampling(req) {
+			break // persistence/host sampling needs per-request restore or prefill logits
 		}
 		if s.chunk != nil && len(req.Tokens) > s.chunkMin {
 			break // long prompts preserve their one-shot/chunked numerical path
@@ -1367,14 +1395,14 @@ func (s *Scheduler) newSeq(req Request, slot int) *seq {
 		remaining: req.MaxNew,
 		stops:     make(map[int32]struct{}, len(req.Stops)),
 	}
-	if req.Constraint != nil {
+	if requiresHostSampling(req) {
 		sq.rng = rand.New(rand.NewSource(int64(req.Params.Seed)))
 	}
 	// Track full history for the drafter (spec), decode-time prefix-cache
 	// registration, and/or eviction-time state snapshots. The prompt's full
 	// blocks are already registered by AddSeq, so start regBlocks past them —
 	// PrefixCommit only fires for generated blocks.
-	if s.spec != nil || s.prefixCommit != nil || s.stateSaver != nil || req.PersistSession || req.Constraint != nil {
+	if s.spec != nil || s.prefixCommit != nil || s.stateSaver != nil || s.liveRetainer != nil || req.PersistSession || requiresHostSampling(req) {
 		sq.hist = append(make([]int32, 0, len(req.Tokens)+req.MaxNew), req.Tokens...)
 		sq.regBlocks = len(req.Tokens) / 256
 	}
@@ -1431,7 +1459,7 @@ func (s *Scheduler) advancePrefill(active map[int]*seq, prefill *[]*seq) {
 	if s.prefixCommit != nil {
 		s.prefixCommit.PrefixCommit(sq.slot, sq.req.Tokens)
 	}
-	if sq.req.Constraint != nil {
+	if requiresHostSampling(sq.req) {
 		first, err = s.samplePrefill(sq)
 		if err != nil {
 			s.evict(active, sq, Result{Reason: FinishError, Generated: sq.generated, Err: err})
@@ -1562,8 +1590,8 @@ func (s *Scheduler) sweepCancelledPrefill(prefill *[]*seq) {
 	*prefill = kept
 }
 
-// samplePrefill replaces the device's unconstrained first-token sample from the
-// immediately preceding one-row prefill. Prefill leaves its exact logits resident.
+// samplePrefill replaces the device's first-token sample for a host-sampled row
+// from the immediately preceding one-row prefill's exact resident logits.
 func (s *Scheduler) samplePrefill(sq *seq) (int32, error) {
 	flat, vocab, err := s.constraintLogits.CopyLogits(1, false)
 	if err != nil {
@@ -1572,13 +1600,13 @@ func (s *Scheduler) samplePrefill(sq *seq) (int32, error) {
 	if vocab <= 0 || len(flat) < vocab {
 		return 0, fmt.Errorf("constrained prefill logits: got %d values for vocab %d", len(flat), vocab)
 	}
-	return sampleConstrained(sq, flat[:vocab])
+	return sampleHostLogits(flat[:vocab], sq.req.Params, sq.rng, sq.hist, sq.req.Constraint)
 }
 
-// resampleConstrainedRows masks and samples only constrained rows from an exact
-// shared decode. Device logits are compacted past KV-exhausted rows, so row tracks
-// that compacted order independently from the scheduler's slot order.
-func (s *Scheduler) resampleConstrainedRows(active map[int]*seq, slots []int32, out []int32) error {
+// resampleHostRows applies request-local grammar/repeat sampling only to rows
+// that require it after an exact shared decode. Device logits are compacted past
+// KV-exhausted rows, so row tracks that order independently from scheduler slots.
+func (s *Scheduler) resampleHostRows(active map[int]*seq, slots []int32, out []int32) error {
 	valid := 0
 	for _, tok := range out {
 		if tok >= 0 {
@@ -1601,10 +1629,10 @@ func (s *Scheduler) resampleConstrainedRows(active map[int]*seq, slots []int32, 
 			continue
 		}
 		sq := active[int(slot)]
-		if sq != nil && sq.req.Constraint != nil {
-			tok, e := sampleConstrained(sq, flat[row*vocab:(row+1)*vocab])
+		if sq != nil && requiresHostSampling(sq.req) {
+			tok, e := sampleHostLogits(flat[row*vocab:(row+1)*vocab], sq.req.Params, sq.rng, sq.hist, sq.req.Constraint)
 			if e != nil {
-				return fmt.Errorf("slot %d constrained sample: %w", slot, e)
+				return fmt.Errorf("slot %d host sample: %w", slot, e)
 			}
 			out[i] = tok
 		}
@@ -1614,29 +1642,21 @@ func (s *Scheduler) resampleConstrainedRows(active map[int]*seq, slots []int32, 
 }
 
 func sampleConstrained(sq *seq, logits []float32) (int32, error) {
-	sq.req.Constraint.Mask(logits)
-	legal := false
-	for _, v := range logits {
-		if !math.IsInf(float64(v), -1) && !math.IsNaN(float64(v)) {
-			legal = true
-			break
-		}
-	}
-	if !legal {
-		return 0, errors.New("grammar masked every token")
-	}
-	return sampler.Sample(logits, sampler.Params{
-		Temperature:   float64(sq.req.Params.Temperature),
-		TopK:          sq.req.Params.TopK,
-		TopP:          float64(sq.req.Params.TopP),
-		MinP:          float64(sq.req.Params.MinP),
-		RepeatPenalty: float64(sq.req.Params.RepeatPenalty),
-	}, sq.rng, sq.hist)
+	return sampleHostLogits(logits, sq.req.Params, sq.rng, sq.hist, sq.req.Constraint)
 }
 
 func hasConstrained(active map[int]*seq) bool {
 	for _, sq := range active {
 		if sq.req.Constraint != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasHostSampling(active map[int]*seq) bool {
+	for _, sq := range active {
+		if requiresHostSampling(sq.req) {
 			return true
 		}
 	}
@@ -1749,10 +1769,10 @@ func (s *Scheduler) step(active map[int]*seq) bool {
 	if len(active) == 0 {
 		return true
 	}
-	// Any constrained row makes this shared step exact for every row. This cleanly
-	// disables speculative decoding: no draft is committed, so grammar state never
-	// needs rollback and unconstrained batchmates still receive lossless plain tokens.
-	if hasConstrained(active) {
+	// Any host-sampled row makes this shared step exact for every row. No draft is
+	// committed before repeat penalty or grammar masking selects the next token;
+	// independently seeded batchmates still receive their lossless plain samples.
+	if hasHostSampling(active) {
 		return s.stepExact(active)
 	}
 	// A persistent sequence needs an exact stop frontier. Speculative engines
@@ -1791,8 +1811,8 @@ func (s *Scheduler) stepExact(active map[int]*seq) bool {
 	if err == nil && len(out) != len(slots) {
 		err = fmt.Errorf("StepBatchExact returned %d tokens for %d slots", len(out), len(slots))
 	}
-	if err == nil && hasConstrained(active) {
-		err = s.resampleConstrainedRows(active, slots, out)
+	if err == nil && hasHostSampling(active) {
+		err = s.resampleHostRows(active, slots, out)
 	}
 	if err != nil {
 		log.Printf("batch: StepBatchExact failed (%d active): %v", len(active), err)
@@ -2054,6 +2074,7 @@ const specCorpusCap = 1 << 16 // tokens kept in the cross-request suffix-decodin
 func (s *Scheduler) evict(active map[int]*seq, sq *seq, res Result) {
 	delete(active, sq.slot)
 	res.ReusedTokens = sq.reused
+	res.Source = sq.source
 	// Ordinary requests retain the low-latency behavior: reply before expensive
 	// teardown. A persistent request must wait for ExportSession while the slot
 	// is still live, so its Result is delivered by flushEvictions instead.
@@ -2084,6 +2105,7 @@ func (s *Scheduler) flushEvictions() {
 		// using the adapter's opportunistic in-memory conversation cache. Error /
 		// shutdown evictions never snapshot because their state may be suspect.
 		clean := res.Reason == FinishStop || res.Reason == FinishLength || res.Reason == FinishCancelled
+		retained := false
 		if clean && len(sq.hist) > 0 {
 			if sq.req.PersistSession {
 				if s.sessionState == nil {
@@ -2091,12 +2113,22 @@ func (s *Scheduler) flushEvictions() {
 				} else {
 					res.SessionState, res.SessionErr = s.sessionState.ExportSession(sq.slot, sq.hist)
 				}
-			} else if s.stateSaver != nil {
-				s.stateSaver.SaveState(sq.slot, sq.hist)
+			} else {
+				// Gemma's sliding/global paged geometry cannot share immutable radix
+				// blocks. A bounded resident-slot cache is its physical reuse path:
+				// ownership transfers to the adapter, so teardown must be skipped.
+				if s.liveRetainer != nil {
+					retained = s.liveRetainer.RetainSeq(sq.slot, sq.hist, sq.req.Params)
+				}
+				if !retained && s.stateSaver != nil {
+					s.stateSaver.SaveState(sq.slot, sq.hist)
+				}
 			}
 		}
-		if err := s.engine.RemoveSeq(sq.slot); err != nil {
-			log.Printf("batch: RemoveSeq(%d): %v", sq.slot, err)
+		if !retained {
+			if err := s.engine.RemoveSeq(sq.slot); err != nil {
+				log.Printf("batch: RemoveSeq(%d): %v", sq.slot, err)
+			}
 		}
 		// Feed the finished sequence's tokens to the cross-request drafter corpus (spec
 		// engines only). Trim from the FRONT so the ring keeps the most recent traffic.

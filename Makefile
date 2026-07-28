@@ -554,7 +554,7 @@ profile: fucina
 # cuda/libfucina.a, so `go test`/`go vet` there fails to build/link unless the
 # CUDA archive has been compiled with nvcc on a GB10 box. The server,
 # tokenizer, sampler and chat packages are pure Go and run anywhere.
-GO_TEST_PKGS := ./internal/dist/ ./internal/session/ ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
+GO_TEST_PKGS := ./internal/dist/ ./internal/grammar/ ./internal/metrics/ ./internal/session/ ./internal/server/ ./internal/server/batch/ ./internal/tokenizer/ ./internal/sampler/ ./internal/chat/
 
 # cgo-dependent Go tests (cmd/fucina: CLI parsing tests). Requires
 # cuda/libfucina.a to link, hence the `lib` prerequisite.
@@ -566,23 +566,23 @@ go-test-cgo: lib libdg
 	$(GO) test $(GO_TEST_CGO_PKGS) -count=1
 
 go-test: qwen35-clean-gdn-meta-test qwen35-head-policy-test
-	$(GO) test $(GO_TEST_PKGS) -count=1
+	$(GO) test -tags nocuda $(GO_TEST_PKGS) -count=1
 
 phase-b-test:
 	PYTHONPATH=scripts python3 -m unittest scripts/test_phase_b.py
 
 go-test-race:
-	$(GO) test $(GO_TEST_PKGS) -race -count=1
+	$(GO) test -tags nocuda $(GO_TEST_PKGS) -race -count=1
 
 # vet: restricted to non-cgo packages. `go vet ./cmd/...` is avoided because
 # cmd/fucina pulls in the cgo engine package which cannot link without
 # libfucina.a; vetting it here would fail on a CUDA-less machine.
 vet:
-	$(GO) vet $(GO_TEST_PKGS)
+	$(GO) vet -tags nocuda $(GO_TEST_PKGS)
 
 lint:
 	@if command -v golangci-lint >/dev/null 2>&1; then \
-		golangci-lint run $(GO_TEST_PKGS); \
+		golangci-lint run --build-tags=nocuda $(GO_TEST_PKGS); \
 	else \
 		echo "lint: golangci-lint not installed — skipping"; \
 	fi

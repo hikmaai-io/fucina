@@ -57,6 +57,9 @@ type mockEngine struct {
 	// multiseqErr fails only the optional burst-admission call; AddSeq remains
 	// available so tests can prove the failure is a transient serial fallback.
 	multiseqErr error
+
+	retain      bool
+	retainCalls int
 }
 
 func newMockEngine(capacity int) *mockEngine {
@@ -175,6 +178,13 @@ func (m *mockEngine) StepBatch(active []int32, inputs []int32) ([][]int32, error
 		out[i] = run
 	}
 	return out, nil
+}
+
+func (m *mockEngine) RetainSeq(_ int, _ []int32, _ SeqParams) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retainCalls++
+	return m.retain
 }
 
 func (m *mockEngine) RemoveSeq(slot int) error {
@@ -825,5 +835,45 @@ func TestSpeculativeRunStopsMidRun(t *testing.T) {
 	}
 	if live := eng.liveCount(); live != 0 {
 		t.Errorf("live slots after stop = %d want 0 (slot freed mid-run)", live)
+	}
+}
+
+func TestCleanFinishTransfersRetainedSlotOwnership(t *testing.T) {
+	eng := newMockEngine(2)
+	eng.retain = true
+	s := New(eng, 2)
+	s.Start()
+	defer s.Shutdown()
+
+	done := make(chan Result, 1)
+	if err := s.Submit(Request{
+		Tokens: []int32{1, 2, 3}, MaxNew: 1, Ctx: context.Background(),
+		Emit: func(int32) bool { return true }, Done: done,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case res := <-done:
+		if res.Reason != FinishLength {
+			t.Fatalf("reason=%s", res.Reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for result")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		eng.mu.Lock()
+		retained, removed := eng.retainCalls, eng.removeCalls
+		eng.mu.Unlock()
+		if retained > 0 {
+			if removed != 0 {
+				t.Fatalf("retained slot was also removed: removeCalls=%d", removed)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retained slot teardown was not flushed")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

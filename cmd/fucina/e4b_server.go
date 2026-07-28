@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/hikmaai-io/fucina/internal/engine/e4b"
+	"github.com/hikmaai-io/fucina/internal/model"
 	"github.com/hikmaai-io/fucina/internal/sampler"
 	gemserver "github.com/hikmaai-io/fucina/internal/server"
 	"github.com/hikmaai-io/fucina/internal/tokenizer"
@@ -129,8 +130,9 @@ func isStopToken(t int32, stops []int32) bool {
 
 // runE4BServer serves an E4B checkpoint over the OpenAI-compatible HTTP API, mirroring
 // the dense server setup in main.go (no spec / MTP / continuous batching for E4B).
-func runE4BServer(eng *e4b.Engine, tok *tokenizer.Tokenizer, args CLIArgs) {
+func runE4BServer(eng *e4b.Engine, tok *tokenizer.Tokenizer, args CLIArgs, modelStore *model.Store) {
 	srv := gemserver.New(&e4bServer{eng: eng}, tok)
+	srv.SetModelStore(modelStore)
 	srv.SetModelName(deriveModelID(args.ModelPath))
 	srv.SetThinkingDefault(gemserver.ParseThinkingLevel(args.Thinking))
 	srv.SetThinkBudget(args.ThinkBudget)

@@ -21,6 +21,7 @@ import (
 
 	"github.com/hikmaai-io/fucina/internal/chat"
 	"github.com/hikmaai-io/fucina/internal/grammar"
+	"github.com/hikmaai-io/fucina/internal/model"
 	"github.com/hikmaai-io/fucina/internal/sampler"
 	"github.com/hikmaai-io/fucina/internal/server/batch"
 	"github.com/hikmaai-io/fucina/internal/session"
@@ -58,6 +59,7 @@ type Server struct {
 	kv              *KVCache
 	dialect         chat.Dialect // per-model chat wire format, detected from the vocab
 	modelName       string
+	modelStore      *model.Store
 	genParams       GenerationParams
 	thinkingDefault bool         // startup default for the gemma-4 reasoning channel
 	debug           bool         // dump full request bodies + rendered prompts
@@ -111,7 +113,8 @@ type Server struct {
 	// serveCompletions routes through it (per-step serialization, no per-request
 	// kv lock) instead of the single-flight kv path. Its presence is a pure
 	// additive opt-in: with it nil the behaviour is exactly as before.
-	scheduler *batch.Scheduler
+	scheduler            *batch.Scheduler
+	batchSamplingSupport batch.SamplingSupport
 }
 
 // prefillAborter is satisfied by engines that support cooperative prefill
@@ -229,19 +232,22 @@ func (m *ChatMessage) UnmarshalJSON(data []byte) error {
 }
 
 type ChatRequest struct {
-	Model       string          `json:"model"`
-	Messages    []ChatMessage   `json:"messages"`
-	Prompt      json.RawMessage `json:"prompt,omitempty"` // legacy /v1/completions
-	MaxTokens   int             `json:"max_tokens"`
-	Temperature *float64        `json:"temperature"`
-	TopP        *float64        `json:"top_p"`
-	TopK        *int            `json:"top_k"`
-	MinP        *float64        `json:"min_p"`
-	Seed        *int64          `json:"seed"`
-	Stream      bool            `json:"stream"`
-	Stop        StopField       `json:"stop,omitempty"`
-	Tools       []Tool          `json:"tools,omitempty"`
-	ToolChoice  interface{}     `json:"tool_choice,omitempty"`
+	Model            string          `json:"model"`
+	Messages         []ChatMessage   `json:"messages"`
+	Prompt           json.RawMessage `json:"prompt,omitempty"` // legacy /v1/completions
+	MaxTokens        int             `json:"max_tokens"`
+	Temperature      *float64        `json:"temperature"`
+	TopP             *float64        `json:"top_p"`
+	TopK             *int            `json:"top_k"`
+	MinP             *float64        `json:"min_p"`
+	Seed             *int64          `json:"seed"`
+	RepeatPenalty    *float64        `json:"repeat_penalty"`
+	FrequencyPenalty *float64        `json:"frequency_penalty"`
+	PresencePenalty  *float64        `json:"presence_penalty"`
+	Stream           bool            `json:"stream"`
+	Stop             StopField       `json:"stop,omitempty"`
+	Tools            []Tool          `json:"tools,omitempty"`
+	ToolChoice       interface{}     `json:"tool_choice,omitempty"`
 
 	// Thinking / reasoning control. gemma-4 gates a reasoning channel: when
 	// enabled the model emits a <|channel>thought…<channel|> block before its
@@ -416,9 +422,10 @@ type CompletionStreamResponse struct {
 }
 
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
 }
 
 type Delta struct {
@@ -615,6 +622,7 @@ func (s *Server) SetBatchEngine(eng BatchEngine) bool {
 	// (the engine still processes Capacity() at a time; this only bounds the wait queue,
 	// not concurrency). The scheduler's ErrQueueFull still sheds load past this.
 	depth := 3 * slots
+	s.batchSamplingSupport = batch.SamplingSupportFor(eng)
 	s.scheduler = batch.New(eng, depth)
 	s.scheduler.Start()
 	// Warm the per-B CUDA decode graphs BEFORE serving (vLLM captures its graphs at
@@ -708,6 +716,11 @@ func (s *Server) SetModelName(name string) {
 	}
 }
 
+// SetModelStore publishes the startup-preflighted descriptor for model-detail routes.
+// It must be called before Start; ModelStore may return nil for unsupported families.
+func (s *Server) SetModelStore(store *model.Store) { s.modelStore = store }
+func (s *Server) ModelStore() *model.Store         { return s.modelStore }
+
 // SetThinkingDefault sets the startup default for the gemma-4 reasoning channel.
 // Per-request reasoning_effort / thinking / enable_thinking overrides it.
 func (s *Server) SetThinkingDefault(on bool) { s.thinkingDefault = on }
@@ -764,7 +777,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", open(s.handleHealth))
 	mux.HandleFunc("/healthz", open(s.handleHealth))
 	mux.HandleFunc("/readyz", open(s.handleReady))
-	mux.HandleFunc("/metrics", open(s.handleMetrics))
+	mux.HandleFunc("/metrics", open(s.handleMetricsDispatch))
+	mux.HandleFunc("/metrics/json", open(s.handleMetrics))
 	mux.HandleFunc("/", open(s.handleNotFound))
 }
 
@@ -907,6 +921,10 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: 200}
 		start := time.Now()
+		inferenceRequest := strings.HasPrefix(r.URL.Path, "/v1/")
+		if inferenceRequest {
+			prometheusMetrics.RequestStarted()
+		}
 		// Correlation: honor an inbound X-Request-Id (cross-service tracing) or
 		// mint one, echo it back, and tag every log line for this request so a
 		// 500 can be tied to its access line under concurrency.
@@ -931,8 +949,9 @@ func (s *Server) logRequest(next http.HandlerFunc) http.HandlerFunc {
 			dur := time.Since(start)
 			// Only the inference endpoints count toward SLO metrics; /metrics and
 			// /health self-scrapes would otherwise dominate the averages.
-			if strings.HasPrefix(r.URL.Path, "/v1/") {
+			if inferenceRequest {
 				s.metrics.recordRequest(rec.status, dur)
+				prometheusMetrics.RequestFinished(prometheusRequestOutcome(rec.status), dur)
 			}
 			if s.logEnabled(logLevelInfo) {
 				log.Printf("fucina: [%s] %s %s -> %d (%.0fms)",
@@ -1105,6 +1124,13 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	if req.Seed != nil {
 		params.Seed = *req.Seed
 	}
+	if req.RepeatPenalty != nil {
+		params.RepeatPenalty = *req.RepeatPenalty
+	}
+	if unsupported := unsupportedPenaltyParameter(req.FrequencyPenalty, req.PresencePenalty); unsupported != "" {
+		writeUnsupportedParameter(w, unsupported)
+		return
+	}
 	ctx := int(s.engine.ContextSize())
 	if req.MaxTokens > 0 {
 		params.MaxTokens = req.MaxTokens // explicit client cap
@@ -1198,6 +1224,14 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	// (the single-flight kv path) is left exactly as before for when batching is
 	// off (s.scheduler == nil).
 	if s.scheduler != nil {
+		if e4bBatchSamplingUnsupported(s.batchSamplingSupport, params) {
+			writeE4BBatchSamplingUnsupported(w)
+			return
+		}
+		if repeatPenaltyUnsupported(s.batchSamplingSupport, params) {
+			writeUnsupportedParameter(w, "repeat_penalty")
+			return
+		}
 		if params.Constraint != nil && !s.scheduler.SupportsConstraints() {
 			// Preserve the existing fail-closed gate for batch adapters that cannot
 			// expose exact per-row logits (notably E4B). Mandatory Qwen batching and
@@ -1254,7 +1288,9 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		// Prefill panics.
 		defer sse.stopHeartbeat()
 	}
+	queueStart := time.Now()
 	s.kv.Lock()
+	observePrometheusQueueWait(time.Since(queueStart))
 	defer s.kv.Unlock()
 
 	// The wait for the lock can be long (another request's prefill+generation).
@@ -1263,10 +1299,11 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	if r.Context().Err() != nil {
 		if sse != nil {
 			sse.stopHeartbeat()
-			s.finishStream(sse, "cancelled", len(tokens), 0)
+			s.finishStream(sse, "cancelled", PromptAccounting{PromptTokens: len(tokens)}, 0)
 		} else {
 			http.Error(w, "client closed request", 499)
 		}
+		prometheusMetrics.Cancellation()
 		log.Printf("fucina: request cancelled while queued; skipping prefill")
 		return
 	}
@@ -1354,7 +1391,7 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 			// only the suffix.
 			log.Printf("fucina: prefill aborted by client disconnect")
 			if sse != nil {
-				s.finishStream(sse, "cancelled", len(tokens), 0)
+				s.finishStream(sse, "cancelled", PromptAccounting{PromptTokens: len(tokens)}, 0)
 			}
 			return
 		}
@@ -1367,12 +1404,14 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 		return
 	}
 	prefillElapsed := time.Since(prefillStart)
-	promptTokens := pf.PromptTokens
+	acct := pf.PromptAccounting()
+	promptTokens := acct.PromptTokens
 	prefillTPS := 0.0
 	if prefillElapsed.Seconds() > 0 && pf.NewTokens > 0 {
 		prefillTPS = float64(pf.NewTokens) / prefillElapsed.Seconds()
 	}
 	s.metrics.recordPrefill(pf.NewTokens, prefillElapsed.Seconds())
+	observePrometheusPrefill(prefillElapsed)
 	used := s.engine.NTokens()
 	s.lastUsed.Store(int64(used))
 	log.Printf("fucina: prefill %d tokens (%d cached, %d new) in %.2fs (%.1f tok/s) | ctx %d/%d (%.0f%%)",
@@ -1382,9 +1421,9 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 	logits := pf.Logits
 
 	if params.Stream {
-		s.streamResponse(r.Context(), sse, params, promptTokens, logits, wantTools)
+		s.streamResponse(r.Context(), sse, params, acct, logits, wantTools)
 	} else {
-		s.generateResponse(r.Context(), w, params, promptTokens, logits, wantTools, legacy)
+		s.generateResponse(r.Context(), w, params, acct, logits, wantTools, legacy)
 	}
 	// Persist the updated conversation back to the request's session file
 	// (still under the kv lock, so the live sequence is exactly this request).
@@ -1408,9 +1447,9 @@ func (s *Server) serveCompletions(w http.ResponseWriter, r *http.Request, legacy
 // for the batched path, but it never touches the kv lock — the scheduler owns
 // the engine and serializes per step, not per request.
 //
-// Sampling note: the current batched C ABI samples greedily on-device regardless
-// of SeqParams. The params are still forwarded so the contract is stable for when
-// the kernels grow temperature/top-k support.
+// Sampling note: device-supported controls stay per-row on the paged sampler. A
+// non-default repeat penalty uses the scheduler's exact-logit host fallback, which
+// preserves request-local RNG/history without changing CUDA decode kernels.
 func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params GenerationParams, tokens []int32, wantTools, legacy bool, sessionPath string, diskState *batch.StateSnapshot) {
 	stops := s.tokenizer.StopIDs()
 
@@ -1437,6 +1476,8 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 	// through the structural bytes and leave unterminated JSON.
 	tokCh := make(chan int32, 8192)
 	done := make(chan batch.Result, 1)
+	batchStarted := time.Now()
+	var ttftOnce sync.Once
 
 	// cancel lets the handler end its OWN sequence early (tool calls captured
 	// and the model moving on) without waiting for a natural stop; the
@@ -1457,6 +1498,7 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 			return s.tokenizer.Encode(string(closing), false, false)
 		},
 		Emit: func(t int32) bool {
+			ttftOnce.Do(func() { prometheusMetrics.ObserveTTFT(time.Since(batchStarted)) })
 			select {
 			case tokCh <- t:
 				return true
@@ -1478,7 +1520,7 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 	}
 
 	if params.Stream {
-		s.streamBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, sessionPath)
+		s.streamBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, len(tokens), sessionPath)
 	} else {
 		s.collectBatch(w, r, cancel, tokCh, done, params, wantTools, legacy, len(tokens), sessionPath)
 	}
@@ -1490,6 +1532,14 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, params Gener
 // tokCh to empty after Done guarantees no in-flight token is lost.
 func drainTokens(tokCh <-chan int32, done <-chan batch.Result, onTok func(int32)) batch.Result {
 	return drainTokensBurst(tokCh, done, onTok, nil)
+}
+
+func promptAccountingFromBatchResult(promptTokens int, res batch.Result) PromptAccounting {
+	return PromptAccounting{
+		PromptTokens: promptTokens,
+		CachedTokens: res.ReusedTokens,
+		Source:       CacheSource(res.Source),
+	}.Normalized()
 }
 
 // drainTokensBurst is drainTokens with a burst boundary hook: onBurstEnd (when
@@ -1546,7 +1596,7 @@ func drainTokensBurst(tokCh <-chan int32, done <-chan batch.Result, onTok func(i
 // response. Text decodes incrementally (whole-slice decode, emit the new
 // suffix) so multi-byte UTF-8 pieces are never split mid-character.
 func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel context.CancelFunc,
-	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool, sessionPath string) {
+	tokCh <-chan int32, done <-chan batch.Result, params GenerationParams, wantTools, legacy bool, promptTokens int, sessionPath string) {
 
 	sse, ok := newSSEWriter(w, legacy, s.modelName)
 	if !ok {
@@ -1790,7 +1840,7 @@ func (s *Server) streamBatch(w http.ResponseWriter, r *http.Request, cancel cont
 		// Never report a clean stop for a tool_choice contract violation.
 		finish = "length"
 	}
-	s.finishStream(sse, finish, 0, generated)
+	s.finishStream(sse, finish, promptAccountingFromBatchResult(promptTokens, res), generated)
 }
 
 // collectBatch accumulates a non-streaming batched sequence and writes the full
@@ -1845,6 +1895,7 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 	}
 	generated := len(ids)
 	s.logGenSpeed(genStart, generated)
+	prompt := promptAccountingFromBatchResult(promptTokens, res)
 	finish := batchFinish(res, r.Context())
 	if stopped && r.Context().Err() == nil {
 		finish = "stop" // self-initiated cutoff, refined to tool_calls below
@@ -1897,8 +1948,10 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 			Model:   s.modelName,
 			Choices: []CompletionChoice{{Index: 0, Text: text, FinishReason: finish}},
 			Usage: Usage{
-				PromptTokens: promptTokens, CompletionTokens: generated,
-				TotalTokens: promptTokens + generated,
+				PromptTokens:        prompt.PromptTokens,
+				CompletionTokens:    generated,
+				TotalTokens:         prompt.PromptTokens + generated,
+				PromptTokensDetails: prompt.PromptTokensDetails(),
 			},
 		})
 		return
@@ -1911,8 +1964,10 @@ func (s *Server) collectBatch(w http.ResponseWriter, r *http.Request, cancel con
 		Model:   s.modelName,
 		Choices: []Choice{{Index: 0, Message: msg, FinishReason: finish}},
 		Usage: Usage{
-			PromptTokens: promptTokens, CompletionTokens: generated,
-			TotalTokens: promptTokens + generated,
+			PromptTokens:        prompt.PromptTokens,
+			CompletionTokens:    generated,
+			TotalTokens:         prompt.PromptTokens + generated,
+			PromptTokensDetails: prompt.PromptTokensDetails(),
 		},
 	})
 }
@@ -1937,11 +1992,13 @@ func batchFinish(res batch.Result, _ context.Context) string {
 
 // finishStream emits the terminal finish_reason + usage chunk and [DONE] on an
 // already-begun SSE stream (used by the early-exit paths that never generate).
-func (s *Server) finishStream(sse *sseWriter, finish string, promptTokens, completion int) {
+func (s *Server) finishStream(sse *sseWriter, finish string, prompt PromptAccounting, completion int) {
+	prompt = prompt.Normalized()
 	usage := &Usage{
-		PromptTokens:     promptTokens,
-		CompletionTokens: completion,
-		TotalTokens:      promptTokens + completion,
+		PromptTokens:        prompt.PromptTokens,
+		CompletionTokens:    completion,
+		TotalTokens:         prompt.PromptTokens + completion,
+		PromptTokensDetails: prompt.PromptTokensDetails(),
 	}
 	if sse.legacy {
 		sse.event(CompletionStreamResponse{
@@ -1964,10 +2021,12 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"object": "list",
-		"data":   []interface{}{},
-		"model":  s.modelName,
+	writeJSON(w, http.StatusNotImplemented, map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": "the loaded generation model does not support embeddings",
+			"type":    "invalid_request_error",
+			"code":    "model_not_embedding",
+		},
 	})
 }
 
@@ -2208,7 +2267,7 @@ func (s *Server) runSpec(ctx context.Context, params GenerationParams, logits []
 // lock OWNER and holds s.kv.Lock() for the whole request; this function runs
 // under that lock and must NOT release it. When legacy is true it emits the
 // /v1/completions text_completion shape instead of the chat.completion shape.
-func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools, legacy bool) {
+func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, params GenerationParams, prompt PromptAccounting, logits []float32, wantTools, legacy bool) {
 	generated := 0
 	var toks []int32
 	tcEnd := s.tokenizer.ToolCallEnd
@@ -2412,8 +2471,10 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 				Index: 0, Text: text, FinishReason: finish,
 			}},
 			Usage: Usage{
-				PromptTokens: promptTokens, CompletionTokens: generated,
-				TotalTokens: promptTokens + generated,
+				PromptTokens:        prompt.PromptTokens,
+				CompletionTokens:    generated,
+				TotalTokens:         prompt.PromptTokens + generated,
+				PromptTokensDetails: prompt.PromptTokensDetails(),
 			},
 		})
 		return
@@ -2428,8 +2489,10 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 			Index: 0, Message: msg, FinishReason: finish,
 		}},
 		Usage: Usage{
-			PromptTokens: promptTokens, CompletionTokens: generated,
-			TotalTokens: promptTokens + generated,
+			PromptTokens:        prompt.PromptTokens,
+			CompletionTokens:    generated,
+			TotalTokens:         prompt.PromptTokens + generated,
+			PromptTokensDetails: prompt.PromptTokensDetails(),
 		},
 	})
 }
@@ -2438,11 +2501,12 @@ func (s *Server) generateResponse(ctx context.Context, w http.ResponseWriter, pa
 // (headers + role delta went out before the prefill; see serveCompletions).
 // The caller (handler) is the lock OWNER and holds s.kv.Lock() for the whole
 // request; this function runs under that lock and must NOT release it.
-func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params GenerationParams, promptTokens int, logits []float32, wantTools bool) {
+func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params GenerationParams, prompt PromptAccounting, logits []float32, wantTools bool) {
 	legacy := sse.legacy
 	generated := 0
 	genStart := time.Now()
 	ttftRecorded := false
+	lastTokenAt := time.Time{}
 	lastWrite := time.Now() // last time any bytes hit the wire (for the keep-alive)
 
 	// emitContent streams a piece of visible text in the right wire shape for the
@@ -2450,11 +2514,17 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	emitContent := func(text string) {
 		// First visible token marks time-to-first-token (the latency the user
 		// actually feels). Recorded once per request.
+		now := time.Now()
 		if !ttftRecorded {
-			s.metrics.recordTTFT(time.Since(genStart))
+			ttft := now.Sub(genStart)
+			s.metrics.recordTTFT(ttft)
+			prometheusMetrics.ObserveTTFT(ttft)
 			ttftRecorded = true
+		} else if !lastTokenAt.IsZero() {
+			prometheusMetrics.ObserveITL(now.Sub(lastTokenAt))
 		}
-		lastWrite = time.Now()
+		lastTokenAt = now
+		lastWrite = now
 		if legacy {
 			sse.event(CompletionStreamResponse{
 				ID: sse.id, Object: sse.object, Created: sse.created, Model: s.modelName,
@@ -2713,7 +2783,7 @@ func (s *Server) streamResponse(ctx context.Context, sse *sseWriter, params Gene
 	}
 
 	s.logGenSpeed(genStart, generated)
-	s.finishStream(sse, finish, promptTokens, generated)
+	s.finishStream(sse, finish, prompt, generated)
 }
 
 // logGenSpeed logs generation throughput in tokens/second and records it for /metrics.
@@ -2724,6 +2794,7 @@ func (s *Server) logGenSpeed(start time.Time, generated int) {
 		tps = float64(generated) / elapsed.Seconds()
 	}
 	s.metrics.recordDecode(generated, elapsed.Seconds())
+	observePrometheusDecode(elapsed)
 	log.Printf("fucina: generated %d tokens in %.2fs (%.1f tok/s)",
 		generated, elapsed.Seconds(), tps)
 }
