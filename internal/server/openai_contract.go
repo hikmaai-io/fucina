@@ -130,13 +130,7 @@ func decodeOpenAIJSON(body []byte, dst interface{}, strict bool) error {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return err
 	}
-	allowed := jsonFieldNames(reflect.TypeOf(dst))
-	unknown := make([]string, 0)
-	for key := range raw {
-		if _, ok := allowed[key]; !ok {
-			unknown = append(unknown, key)
-		}
-	}
+	unknown := unknownJSONFields(raw, reflect.TypeOf(dst), "")
 	if len(unknown) != 0 {
 		sort.Strings(unknown)
 		if strict {
@@ -147,11 +141,64 @@ func decodeOpenAIJSON(body []byte, dst interface{}, strict bool) error {
 	return json.Unmarshal(body, dst)
 }
 
-func jsonFieldNames(t reflect.Type) map[string]struct{} {
+func unknownJSONFields(value interface{}, typ reflect.Type, path string) []string {
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		object, ok := value.(map[string]json.RawMessage)
+		if !ok {
+			// Nested values first arrive as interface{}; convert them once to raw
+			// messages so number precision and custom unmarshalling stay untouched.
+			data, err := json.Marshal(value)
+			if err != nil || json.Unmarshal(data, &object) != nil {
+				return nil
+			}
+		}
+		fields := jsonFieldTypes(typ)
+		var unknown []string
+		for key, raw := range object {
+			fieldType, ok := fields[key]
+			fieldPath := key
+			if path != "" {
+				fieldPath = path + "." + key
+			}
+			if !ok {
+				unknown = append(unknown, fieldPath)
+				continue
+			}
+			var nested interface{}
+			if json.Unmarshal(raw, &nested) == nil {
+				unknown = append(unknown, unknownJSONFields(nested, fieldType, fieldPath)...)
+			}
+		}
+		return unknown
+	case reflect.Slice, reflect.Array:
+		// json.RawMessage is intentionally opaque schema data, not a typed array.
+		if typ == reflect.TypeOf(json.RawMessage{}) {
+			return nil
+		}
+		array, ok := value.([]interface{})
+		if !ok {
+			return nil
+		}
+		var unknown []string
+		for i, item := range array {
+			unknown = append(unknown, unknownJSONFields(item, typ.Elem(), fmt.Sprintf("%s[%d]", path, i))...)
+		}
+		return unknown
+	default:
+		// Maps and interfaces are intentionally open extension/schema objects.
+		return nil
+	}
+}
+
+func jsonFieldTypes(t reflect.Type) map[string]reflect.Type {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	out := make(map[string]struct{})
+	out := make(map[string]reflect.Type)
 	if t.Kind() != reflect.Struct {
 		return out
 	}
@@ -163,14 +210,14 @@ func jsonFieldNames(t reflect.Type) map[string]struct{} {
 		}
 		if name == "" {
 			if f.Anonymous {
-				for nested := range jsonFieldNames(f.Type) {
-					out[nested] = struct{}{}
+				for nested, nestedType := range jsonFieldTypes(f.Type) {
+					out[nested] = nestedType
 				}
 				continue
 			}
 			name = f.Name
 		}
-		out[name] = struct{}{}
+		out[name] = f.Type
 	}
 	return out
 }

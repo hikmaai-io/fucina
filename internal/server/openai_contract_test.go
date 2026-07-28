@@ -284,6 +284,12 @@ func TestOpenAIContractStrictUnknownAndMultimodalErrors(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "mystery") {
 		t.Fatalf("strict error did not name field: %s", rec.Body.String())
 	}
+	var nested struct {
+		StreamOptions *StreamOptions `json:"stream_options"`
+	}
+	if err := decodeOpenAIJSON([]byte(`{"stream_options":{"include_usage":true,"mystery":1}}`), &nested, true); err == nil || !strings.Contains(err.Error(), "stream_options.mystery") {
+		t.Fatalf("nested strict error=%v", err)
+	}
 
 	srv.SetOpenAIStrict(false)
 	var logs bytes.Buffer
