@@ -1,0 +1,67 @@
+{
+ "schema_version": 1,
+ "description": "Integration Phase-1 dense N=32 TTFT three-start evidence (integration/phase1 a591fac; scheduler unchanged from sol-05)",
+ "model": "Qwen3.5-9B-FP8 (qwen35 dense)",
+ "commit": "a591fac",
+ "harness": "scripts/bench_serving.py --max-tokens 128 --long-tokens 3500 --ignore-eos --conc 1,2,4,8,16,32 --diverse (length contract enforced server-side)",
+ "runs": {
+  "step5-retained-dense": {
+   "root": "benchmark-evidence/qualification/20260728T174257Z-sol-05-qwen-dense-c7af618d33d5-2169047",
+   "n32": [
+    {
+     "run": 1,
+     "median_ttft_ms": 382.6030970085412,
+     "p95_ttft_ms": 389.73192498087883,
+     "agg_decode_tps": 430.0870756259709
+    },
+    {
+     "run": 2,
+     "median_ttft_ms": 404.1993580176495,
+     "p95_ttft_ms": 410.1056010113098,
+     "agg_decode_tps": 436.4965311997434
+    },
+    {
+     "run": 3,
+     "median_ttft_ms": 396.92630249192007,
+     "p95_ttft_ms": 404.4980090111494,
+     "agg_decode_tps": 436.48649165867005
+    }
+   ],
+   "three_start_median_ttft_ms": 396.92630249192007,
+   "three_start_median_p95_ms": 404.4980090111494,
+   "three_start_median_agg_tps": 436.48649165867005
+  },
+  "step6-dedicated": {
+   "root": "benchmark-evidence/qualification/20260728T184013Z-integration-p1-dense-ttft-a591fac2a81c-2396631",
+   "n32": [
+    {
+     "run": 1,
+     "median_ttft_ms": 403.49817799869925,
+     "p95_ttft_ms": 409.7176419454627,
+     "agg_decode_tps": 417.99039032828574
+    },
+    {
+     "run": 2,
+     "median_ttft_ms": 398.899956519017,
+     "p95_ttft_ms": 404.5410339604132,
+     "agg_decode_tps": 428.57757664542265
+    },
+    {
+     "run": 3,
+     "median_ttft_ms": 398.83818398811854,
+     "p95_ttft_ms": 402.42018597200513,
+     "agg_decode_tps": 379.8595820137281
+    }
+   ],
+   "three_start_median_ttft_ms": 398.899956519017,
+   "three_start_median_p95_ms": 404.5410339604132,
+   "three_start_median_agg_tps": 417.99039032828574
+  }
+ },
+ "references": {
+  "retained_baseline_median_ttft_ms": 479.23,
+  "vllm_fresh_median_ttft_ms": 213.09,
+  "sol05_reported_median_ttft_ms": 383.11
+ },
+ "six_start_median_ttft_ms": 398.86907025356777
+}

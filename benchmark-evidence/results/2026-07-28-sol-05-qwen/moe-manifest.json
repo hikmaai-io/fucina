@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "claim": "sol-05-qwen-moe",
+  "source_commit": "1b90bf7e8e9bf33977f6827d50b5494ff0247117",
+  "source_dirty": false,
+  "ready_url": "http://127.0.0.1:18080/health",
+  "independent_server_starts": 3,
+  "model_fingerprints": [
+    {
+      "path": "/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/0b2752837483aa34b3db6e83e151b150c0e00e49",
+      "resolved_path": "/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/0b2752837483aa34b3db6e83e151b150c0e00e49",
+      "sha256": "c527a5d8613af686341f714fb13c9bcc4560865f1967e4381dc44e2e68fd5500",
+      "file_count": 28,
+      "bytes": 37494849208
+    }
+  ],
+  "raw_result_arrays": [
+    "run-1/raw-results.json",
+    "run-2/raw-results.json",
+    "run-3/raw-results.json"
+  ],
+  "host": {
+    "platform": "Linux-6.17.0-1014-nvidia-aarch64-with-glibc2.39",
+    "machine": "aarch64"
+  }
+}

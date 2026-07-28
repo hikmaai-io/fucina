@@ -1,0 +1,1 @@
+python3 scripts/bench_serving.py --base-url http://127.0.0.1:18080 --model qwen35 --label sol-05-moe --max-tokens 128 --long-tokens 3500 --ignore-eos --conc 1,2,4,8,16,32 --diverse --verify-sample 4 --out "$FUCINA_RUN_DIR/serving.json" && python3 scripts/qwen_retained_cells.py wrap --input "$FUCINA_RUN_DIR/serving.json" --output "$FUCINA_RAW_RESULTS"

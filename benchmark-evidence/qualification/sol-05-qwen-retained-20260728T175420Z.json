@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "config": "benchmark-evidence/configs/qwen-retained-12.json",
+  "tolerance": 0.02,
+  "models": {
+    "dense": {
+      "candidate_runs": [
+        "/home/mauromedda/hack/fucina/benchmark-evidence/qualification/20260728T174257Z-sol-05-qwen-dense-c7af618d33d5-2169047/run-1/raw-results.json",
+        "/home/mauromedda/hack/fucina/benchmark-evidence/qualification/20260728T174257Z-sol-05-qwen-dense-c7af618d33d5-2169047/run-2/raw-results.json",
+        "/home/mauromedda/hack/fucina/benchmark-evidence/qualification/20260728T174257Z-sol-05-qwen-dense-c7af618d33d5-2169047/run-3/raw-results.json"
+      ],
+      "cells": [
+        {
+          "N": 1,
+          "candidate": 33.47657444646621,
+          "baseline": 33.436678823528965,
+          "delta": 0.0011931694277353966,
+          "vllm_reference": 10.236853615825556,
+          "competitive_gap": 2.2702015387534167,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 87.92926702881232,
+          "p95_ttft_ms": 87.92926702881232
+        },
+        {
+          "N": 2,
+          "candidate": 58.223021563260595,
+          "baseline": 59.26552899580545,
+          "delta": -0.017590451822654507,
+          "vllm_reference": 44.22886981410999,
+          "competitive_gap": 0.3164031052108449,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 97.41013901657425,
+          "p95_ttft_ms": 97.71372302202508
+        },
+        {
+          "N": 4,
+          "candidate": 115.75113991514789,
+          "baseline": 117.27351687134635,
+          "delta": -0.012981421524763892,
+          "vllm_reference": 85.75353201440984,
+          "competitive_gap": 0.3498119225654439,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 135.8405775099527,
+          "p95_ttft_ms": 153.98109797388315
+        },
+        {
+          "N": 8,
+          "candidate": 218.81994048408507,
+          "baseline": 204.6068917798417,
+          "delta": 0.06946515134757392,
+          "vllm_reference": 164.3973802443177,
+          "competitive_gap": 0.33104274629490904,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 179.89322199719027,
+          "p95_ttft_ms": 180.20773399621248
+        },
+        {
+          "N": 16,
+          "candidate": 331.15805428997913,
+          "baseline": 313.11764732994544,
+          "delta": 0.05761542702517741,
+          "vllm_reference": 280.810364145882,
+          "competitive_gap": 0.17929427319121793,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 244.15361997671425,
+          "p95_ttft_ms": 248.65949398372322
+        },
+        {
+          "N": 32,
+          "candidate": 436.48649165867005,
+          "baseline": 438.7954321524336,
+          "delta": -0.005261997560998877,
+          "vllm_reference": 521.7642644996018,
+          "competitive_gap": -0.16344119105726307,
+          "winning_cell": false,
+          "passed": true,
+          "median_ttft_ms": 396.92630249192007,
+          "p95_ttft_ms": 404.4980090111494
+        }
+      ]
+    },
+    "moe": {
+      "candidate_runs": [
+        "/home/mauromedda/hack/fucina/benchmark-evidence/qualification/20260728T174928Z-sol-05-qwen-moe-c7af618d33d5-2187105/run-1/raw-results.json",
+        "/home/mauromedda/hack/fucina/benchmark-evidence/qualification/20260728T174928Z-sol-05-qwen-moe-c7af618d33d5-2187105/run-2/raw-results.json",
+        "/home/mauromedda/hack/fucina/benchmark-evidence/qualification/20260728T174928Z-sol-05-qwen-moe-c7af618d33d5-2187105/run-3/raw-results.json"
+      ],
+      "cells": [
+        {
+          "N": 1,
+          "candidate": 57.58369132786309,
+          "baseline": 58.96243236710953,
+          "delta": -0.023383381314091234,
+          "vllm_reference": 14.017909830596103,
+          "competitive_gap": 3.107865724901327,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 58.63734497688711,
+          "p95_ttft_ms": 58.63734497688711
+        },
+        {
+          "N": 2,
+          "candidate": 93.98535176094182,
+          "baseline": 101.38572277576628,
+          "delta": -0.0729922400532842,
+          "vllm_reference": 74.0661024534209,
+          "competitive_gap": 0.26893880800664327,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 95.95299101783894,
+          "p95_ttft_ms": 116.26972403610125
+        },
+        {
+          "N": 4,
+          "candidate": 145.5915643128868,
+          "baseline": 133.9767472022496,
+          "delta": 0.08669278328651764,
+          "vllm_reference": 111.73906881646197,
+          "competitive_gap": 0.3029602434939702,
+          "winning_cell": true,
+          "passed": true,
+          "median_ttft_ms": 136.53953999164514,
+          "p95_ttft_ms": 162.44331700727344
+        },
+        {
+          "N": 8,
+          "candidate": 209.01177854658923,
+          "baseline": 229.75365985687665,
+          "delta": -0.09027878521373034,
+          "vllm_reference": 155.2142577686236,
+          "competitive_gap": 0.3466016688889564,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 195.5957504978869,
+          "p95_ttft_ms": 230.64207995776087
+        },
+        {
+          "N": 16,
+          "candidate": 279.4107052828803,
+          "baseline": 320.13669526154354,
+          "delta": -0.12721437617574927,
+          "vllm_reference": 207.24324846484149,
+          "competitive_gap": 0.34822585224184976,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 325.6069039925933,
+          "p95_ttft_ms": 366.932662029285
+        },
+        {
+          "N": 32,
+          "candidate": 407.00436961915153,
+          "baseline": 472.41238842062825,
+          "delta": -0.1384553419950505,
+          "vllm_reference": 321.27494724791063,
+          "competitive_gap": 0.2668412931217077,
+          "winning_cell": true,
+          "passed": false,
+          "median_ttft_ms": 535.5963209876791,
+          "p95_ttft_ms": 600.5266060237773
+        }
+      ]
+    }
+  },
+  "passed": false,
+  "failures": [
+    "moe N=1: 57.584 < 57.783 (-2.34% vs retained baseline)",
+    "moe N=2: 93.985 < 99.358 (-7.30% vs retained baseline)",
+    "moe N=8: 209.012 < 225.159 (-9.03% vs retained baseline)",
+    "moe N=16: 279.411 < 313.734 (-12.72% vs retained baseline)",
+    "moe N=32: 407.004 < 462.964 (-13.85% vs retained baseline)"
+  ]
+}

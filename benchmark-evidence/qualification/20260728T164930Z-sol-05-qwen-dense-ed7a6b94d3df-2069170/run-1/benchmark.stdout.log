@@ -1,0 +1,239 @@
+[sol-05-dense] single short ctx ...
+[sol-05-dense] single long ctx (~3500 tok) ...
+[sol-05-dense] concurrency N=1 (diverse prompts) ...
+[sol-05-dense] concurrency N=2 (diverse prompts) ...
+[sol-05-dense] concurrency N=4 (diverse prompts) ...
+[sol-05-dense] concurrency N=8 (diverse prompts) ...
+[sol-05-dense] concurrency N=16 (diverse prompts) ...
+[sol-05-dense] concurrency N=32 (diverse prompts) ...
+{
+  "label": "sol-05-dense",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 124.74686600035056,
+    "decode_tps": 34.76056590376461,
+    "ntok": 128,
+    "sample": "Continuous batching is a technique used in Large Language Model (LLM) inference to significantly improve throughput by maximizing GPU utilization. It works by processing multiple requests in parallel "
+  },
+  "single_long": {
+    "ttft_ms": 10617.701032024343,
+    "decode_tps": 32.15114492086991,
+    "ntok": 128,
+    "sample": "1. The decode phase is bandwidth bound while the prefill phase is compute bound. 2. Continuous batching interleaves prefill and decode to keep the accelerator busy. 3. Throughput and latency are gover"
+  },
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 33.54671141814395,
+      "median_ttft_ms": 88.20068300701678,
+      "p95_ttft_ms": 88.20068300701678,
+      "ttfts_ms_raw": [
+        88.2
+      ],
+      "median_per_stream_tps": 34.35366982306291,
+      "wall_s": 3.7857660149456933,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        }
+      ]
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 58.22165333503053,
+      "median_ttft_ms": 98.85389500414021,
+      "p95_ttft_ms": 98.89767097774893,
+      "ttfts_ms_raw": [
+        98.81,
+        98.9
+      ],
+      "median_per_stream_tps": 29.791174265736046,
+      "wall_s": 4.362638047023211,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        }
+      ]
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 116.21266335991278,
+      "median_ttft_ms": 136.61630998831242,
+      "p95_ttft_ms": 155.0002979929559,
+      "ttfts_ms_raw": [
+        118.25,
+        118.41,
+        154.82,
+        155.0
+      ],
+      "median_per_stream_tps": 29.997031879079618,
+      "wall_s": 4.371296425990295,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "2, 3, 5, 7, 11, 13, 17, 19. These are prime numbers because they have exactly two distinct positive divisors: 1 and themselves.\n\nName three composite "
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nExplanation:\n137 + 265 = 402\n\nStep-by-step breakdown:\n- Add the ones: 7 + 5 = 12. Write down 2, carry over 1.\n- Add the tens: 3 + 6 = 9. Add the "
+        }
+      ]
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 201.40740893212654,
+      "median_ttft_ms": 187.30933699407615,
+      "p95_ttft_ms": 189.02814504690468,
+      "ttfts_ms_raw": [
+        149.07,
+        150.72,
+        150.87,
+        187.3,
+        187.32,
+        187.44,
+        188.98,
+        189.03
+      ],
+      "median_per_stream_tps": 27.777916414188027,
+      "wall_s": 4.76149315998191,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "2, 3, 5, 7, 11, 13, 17, 19. These are prime numbers because they have exactly two distinct positive divisors: 1 and themselves.\n\nName three composite "
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nExplanation:\n137 + 265 = 402\n\nStep-by-step breakdown:\n- Add the ones: 7 + 5 = 12. Write down 2, carry 1.\n- Add the tens: 3 + 6 = 9. Add the carri"
+        }
+      ]
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 317.4632225213895,
+      "median_ttft_ms": 249.78064998867922,
+      "p95_ttft_ms": 253.36784101091325,
+      "ttfts_ms_raw": [
+        202.51,
+        202.67,
+        205.77,
+        206.06,
+        247.61,
+        248.31,
+        249.17,
+        249.44,
+        250.12,
+        250.61,
+        250.66,
+        250.76,
+        250.84,
+        252.94,
+        253.37,
+        254.67
+      ],
+      "median_per_stream_tps": 22.597615864751162,
+      "wall_s": 5.874696240993217,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "2, 3, 5, 7, 11, 13, 17, 19. These are prime numbers because they have exactly two distinct positive divisors: 1 and themselves.\n\nName three composite "
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nExplanation:\n137 + 265 = 402\n\nStep-by-step breakdown:\n- Add the ones: 7 + 5 = 12. Write down 2, carry 1.\n- Add the tens: 3 + 6 = 9. Add the carri"
+        }
+      ]
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 443.056045009164,
+      "median_ttft_ms": 373.67843551328406,
+      "p95_ttft_ms": 378.4479700261727,
+      "ttfts_ms_raw": [
+        296.07,
+        296.4,
+        297.52,
+        298.56,
+        300.09,
+        300.94,
+        302.32,
+        302.43,
+        368.32,
+        368.51,
+        369.08,
+        370.26,
+        370.42,
+        370.66,
+        370.91,
+        373.6,
+        373.76,
+        374.27,
+        374.91,
+        374.96,
+        374.97,
+        375.23,
+        376.3,
+        377.17,
+        377.26,
+        377.67,
+        377.69,
+        378.35,
+        378.44,
+        378.45,
+        379.31,
+        380.02
+      ],
+      "median_per_stream_tps": 15.798995854620502,
+      "wall_s": 8.41879947698908,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nWait, I need to make sure I follow the instruction \"Reply with one short sentence\".\n\nThe capital of France is Paris.\n\nWait, I need to check i"
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": " Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process is essential for"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "2, 3, 5, 7, 11, 13, 17, 19. These are prime numbers because they have exactly two distinct positive divisors: 1 and themselves.\n\nName three composite "
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nExplanation:\n137 + 265 = 402\n\nStep-by-step breakdown:\n- Add the ones: 7 + 5 = 12. Write down 2, carry 1.\n- Add the tens: 3 + 6 = 9. Add the carri"
+        }
+      ]
+    }
+  ],
+  "diverse": true
+}

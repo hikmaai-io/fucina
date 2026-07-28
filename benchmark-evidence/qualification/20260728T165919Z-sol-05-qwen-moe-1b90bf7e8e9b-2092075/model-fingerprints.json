@@ -1,0 +1,9 @@
+[
+  {
+    "path": "/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/0b2752837483aa34b3db6e83e151b150c0e00e49",
+    "resolved_path": "/opt/spark/models/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/0b2752837483aa34b3db6e83e151b150c0e00e49",
+    "sha256": "c527a5d8613af686341f714fb13c9bcc4560865f1967e4381dc44e2e68fd5500",
+    "file_count": 28,
+    "bytes": 37494849208
+  }
+]
