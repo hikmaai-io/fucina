@@ -181,9 +181,10 @@ func TestStreamMultiToolCalls(t *testing.T) {
 	srv.SetLogLevel("warn")
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-		"tools":    toolsField(),
-		"stream":   true,
+		"messages":       []map[string]string{{"role": "user", "content": "hi"}},
+		"tools":          toolsField(),
+		"stream":         true,
+		"stream_options": map[string]bool{"include_usage": true},
 	}))
 	rec := httptest.NewRecorder()
 	mux(srv).ServeHTTP(rec, req)
@@ -303,9 +304,10 @@ func TestStreamRunawayInsideToolCall(t *testing.T) {
 	srv.SetLogLevel("warn")
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", chatBody(t, map[string]interface{}{
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-		"tools":    toolsField(),
-		"stream":   true,
+		"messages":       []map[string]string{{"role": "user", "content": "hi"}},
+		"tools":          toolsField(),
+		"stream":         true,
+		"stream_options": map[string]bool{"include_usage": true},
 	}))
 	rec := httptest.NewRecorder()
 	mux(srv).ServeHTTP(rec, req)
@@ -318,7 +320,13 @@ func TestStreamRunawayInsideToolCall(t *testing.T) {
 			continue
 		}
 		var sr StreamResponse
-		if json.Unmarshal([]byte(e), &sr) != nil || len(sr.Choices) == 0 {
+		if json.Unmarshal([]byte(e), &sr) != nil {
+			continue
+		}
+		if sr.Usage != nil {
+			completion = sr.Usage.CompletionTokens
+		}
+		if len(sr.Choices) == 0 {
 			continue
 		}
 		if len(sr.Choices[0].Delta.ToolCalls) > 0 {
@@ -326,9 +334,6 @@ func TestStreamRunawayInsideToolCall(t *testing.T) {
 		}
 		if sr.Choices[0].FinishReason != "" {
 			finish = sr.Choices[0].FinishReason
-		}
-		if sr.Usage != nil {
-			completion = sr.Usage.CompletionTokens
 		}
 	}
 	if finish != "length" {

@@ -167,9 +167,11 @@ func (e *sseWriter) eventBuffered(v interface{}) {
 // errorEvent reports a server-side failure in-stream (the OpenAI streaming
 // convention once the 200 is out) followed by [DONE].
 func (e *sseWriter) errorEvent(msg string) {
-	e.event(map[string]interface{}{
-		"error": map[string]string{"message": msg, "type": "server_error"},
-	})
+	e.event(OpenAIErrorEnvelope{Error: OpenAIError{
+		Message: msg,
+		Type:    "server_error",
+		Code:    "stream_error",
+	}})
 	e.done()
 }
 
