@@ -625,7 +625,7 @@ func (s *Server) SetBatchEngine(eng BatchEngine) bool {
 	// not concurrency). The scheduler's ErrQueueFull still sheds load past this.
 	depth := 3 * slots
 	s.batchSamplingSupport = batch.SamplingSupportFor(eng)
-	s.scheduler = batch.New(eng, depth)
+	s.scheduler = batch.New(eng, depth, prometheusMetrics)
 	s.scheduler.Start()
 	// Warm the per-B CUDA decode graphs BEFORE serving (vLLM captures its graphs at
 	// startup for the same reason): a staircase of dummy sequences with MaxNew=1..slots
