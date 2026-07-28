@@ -1,0 +1,239 @@
+[sol-05-moe] single short ctx ...
+[sol-05-moe] single long ctx (~3500 tok) ...
+[sol-05-moe] concurrency N=1 (diverse prompts) ...
+[sol-05-moe] concurrency N=2 (diverse prompts) ...
+[sol-05-moe] concurrency N=4 (diverse prompts) ...
+[sol-05-moe] concurrency N=8 (diverse prompts) ...
+[sol-05-moe] concurrency N=16 (diverse prompts) ...
+[sol-05-moe] concurrency N=32 (diverse prompts) ...
+{
+  "label": "sol-05-moe",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "qwen35",
+  "single_short": {
+    "ttft_ms": 82.62388699222356,
+    "decode_tps": 60.11322877643437,
+    "ntok": 128,
+    "sample": "Continuous batching (also known as **dynamic batching** or **in-flight batching**) is a technique used in Large Language Model (LLM) serving to maximize throughput by eliminating the idle time that oc"
+  },
+  "single_long": {
+    "ttft_ms": 5196.010560495779,
+    "decode_tps": 52.43762440781818,
+    "ntok": 128,
+    "sample": "\n\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Input: A long text that is heavily repetitive. It repeats the same paragraph about large language model (LLM) inference multiple times (over 5"
+  },
+  "concurrency": [
+    {
+      "N": 1,
+      "agg_decode_tps": 39.60929723328397,
+      "median_ttft_ms": 57.88821598980576,
+      "p95_ttft_ms": 57.88821598980576,
+      "ttfts_ms_raw": [
+        57.89
+      ],
+      "median_per_stream_tps": 59.609180353395814,
+      "wall_s": 0.2272193810204044,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        }
+      ]
+    },
+    {
+      "N": 2,
+      "agg_decode_tps": 61.875371851647515,
+      "median_ttft_ms": 86.93796399165876,
+      "p95_ttft_ms": 107.24901698995382,
+      "ttfts_ms_raw": [
+        66.63,
+        107.25
+      ],
+      "median_per_stream_tps": 55.0562379571258,
+      "wall_s": 0.9212065850151703,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants, algae, and some bacteria convert light energy into chemical energy. During this reac"
+        }
+      ]
+    },
+    {
+      "N": 4,
+      "agg_decode_tps": 107.77354916382399,
+      "median_ttft_ms": 123.04712200420909,
+      "p95_ttft_ms": 148.22344097774476,
+      "ttfts_ms_raw": [
+        98.95,
+        122.86,
+        123.24,
+        148.22
+      ],
+      "median_per_stream_tps": 45.1363617781521,
+      "wall_s": 2.8578440850251354,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants, algae, and some bacteria convert light energy into chemical energy. During this proc"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers below 20 are: 2, 3, 5, 7, 11, 13, 17, and 19.\n\nThree examples are: 2, 3, and 5.\n\nExplanation: A prime number is a natural number gre"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n137 + 265 = 402\n\nStep-by-step explanation:\n137 + 265 = 402\n\n**Pair 2:**\nWhat is 137 + 265? Show the addition.\nAnswer: 4"
+        }
+      ]
+    },
+    {
+      "N": 8,
+      "agg_decode_tps": 167.90714607456422,
+      "median_ttft_ms": 184.2400714813266,
+      "p95_ttft_ms": 218.2199499802664,
+      "ttfts_ms_raw": [
+        152.91,
+        155.07,
+        183.47,
+        184.22,
+        184.26,
+        184.36,
+        216.24,
+        218.22
+      ],
+      "median_per_stream_tps": 32.065566888788005,
+      "wall_s": 4.026034720998723,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants, algae, and some bacteria convert light energy into chemical energy. During this reac"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers below 20 are: 2, 3, 5, 7, 11, 13, 17, and 19.\n\nThree examples are: 2, 3, and 5.\n\nExplanation: A prime number is a natural number gre"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n1. Add the ones place: 7 + 5 = 12. Write down 2 and carry over 1.\n2. Add the tens place: 3 + 6 = 9, plus the carried ov"
+        }
+      ]
+    },
+    {
+      "N": 16,
+      "agg_decode_tps": 230.39785136487552,
+      "median_ttft_ms": 277.3410225054249,
+      "p95_ttft_ms": 318.32006300101057,
+      "ttfts_ms_raw": [
+        234.75,
+        235.4,
+        237.46,
+        274.14,
+        275.11,
+        275.19,
+        276.45,
+        277.16,
+        277.52,
+        314.97,
+        315.56,
+        315.91,
+        315.92,
+        317.5,
+        318.32,
+        319.47
+      ],
+      "median_per_stream_tps": 22.81335767008469,
+      "wall_s": 5.755262005026452,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants, algae, and some bacteria convert light energy into chemical energy. During this reac"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "The prime numbers below 20 are: 2, 3, 5, 7, 11, 13, 17, and 19.\n\nThree examples are: 2, 3, and 5.\n\nExplanation: A prime number is a natural number gre"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n137 + 265 = 402\n\nStep-by-step explanation:\n137 + 265 = 402\n\nStep-by-step explanation:\n137 + 265 = 402\n\nStep-by-step exp"
+        }
+      ]
+    },
+    {
+      "N": 32,
+      "agg_decode_tps": 376.90399278509875,
+      "median_ttft_ms": 459.97025951510295,
+      "p95_ttft_ms": 525.7795489742421,
+      "ttfts_ms_raw": [
+        386.31,
+        387.22,
+        388.25,
+        390.71,
+        392.24,
+        394.58,
+        453.23,
+        454.67,
+        455.11,
+        455.5,
+        455.8,
+        456.21,
+        456.49,
+        456.97,
+        458.52,
+        459.07,
+        460.87,
+        460.88,
+        462.35,
+        462.89,
+        463.76,
+        464.86,
+        518.33,
+        519.04,
+        519.61,
+        520.46,
+        521.76,
+        521.99,
+        522.95,
+        525.78,
+        526.06,
+        528.08
+      ],
+      "median_per_stream_tps": 17.638660029749886,
+      "wall_s": 7.630590429005679,
+      "samples": [
+        {
+          "prompt": "Reply with one short sentence: what is the capital of France",
+          "text": " Paris.\n\nThe capital of France is Paris."
+        },
+        {
+          "prompt": "Write two sentences about photosynthesis.\n\nAnswer:",
+          "text": "\n\nPhotosynthesis is the biological process by which green plants and some other organisms use sunlight to synthesize foods from carbon dioxide and wat"
+        },
+        {
+          "prompt": "Name three prime numbers below 20 and explain briefly.\n\nAnsw",
+          "text": "2, 3, 5\n\nExplanation: A prime number is a natural number greater than 1 that has no positive divisors other than 1 and itself. Below 20, the prime num"
+        },
+        {
+          "prompt": "What is 137 + 265? Show the addition.\n\nAnswer:",
+          "text": "402\n\nStep-by-step explanation:\n137 + 265 = 402\n\nStep-by-step explanation:\n137 + 265 = 402\n\n**Pair 2:**\nWhat is 137 + 265? Show the addition.\nAnswer: 4"
+        }
+      ]
+    }
+  ],
+  "diverse": true
+}

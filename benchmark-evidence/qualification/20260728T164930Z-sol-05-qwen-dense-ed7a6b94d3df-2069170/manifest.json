@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "claim": "sol-05-qwen-dense",
+  "source_commit": "ed7a6b94d3df9eead3395ad0b4105c897daa844a",
+  "source_dirty": false,
+  "ready_url": "http://127.0.0.1:18080/health",
+  "independent_server_starts": 3,
+  "model_fingerprints": [
+    {
+      "path": "/opt/spark/models/models--Qwen--Qwen3.5-9B-FP8",
+      "resolved_path": "/opt/spark/models/models--Qwen--Qwen3.5-9B-FP8",
+      "sha256": "565c2288bd9a9f0fa6b18930d35773af3169f9ece605cf94b82c706279d6e666",
+      "file_count": 17,
+      "bytes": 12208446065
+    }
+  ],
+  "raw_result_arrays": [
+    "run-1/raw-results.json",
+    "run-2/raw-results.json",
+    "run-3/raw-results.json"
+  ],
+  "host": {
+    "platform": "Linux-6.17.0-1014-nvidia-aarch64-with-glibc2.39",
+    "machine": "aarch64"
+  }
+}
